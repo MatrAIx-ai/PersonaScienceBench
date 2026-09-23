@@ -1,4 +1,7 @@
-# Benchmark candidates
+# Historical benchmark candidate survey
+
+This survey records the initial selection discussion. The supported adapter roster
+and measured outcomes are documented in [current status](../status.md).
 
 Candidate benchmarks for PersonaScienceBench: existing science-agent benchmarks that could be adapted so that a simulated researcher steers an evolving, multi-turn collaboration with the agent.
 
@@ -10,7 +13,6 @@ All benchmarks below support scientific execution or analysis over multiple step
 |---|---|---|---|
 | [BixBench](#bixbench) | Computational biology | Very high: best first pilot | Check that each capsule's questions form one coherent investigation |
 | [BixBench3](#bixbench3) | Computational biology | Very high: strongest full-project fit | About 8 hours per run on average; heavy setup |
-| [sc-HeurekaBench](#sc-heurekabench) | Single-cell biology | Very high: good for analysis-interpretation dialogue | Reference-insight scoring misses valid alternative directions |
 | [AstaBench: E2E-Bench / E2E-Bench-Hard](#astabench-e2e-bench--e2e-bench-hard) | Computational research | Very high conceptually: ambitious target | More implementation and evaluation work than a bounded pilot |
 | [DiscoveryBench](#discoverybench) | Biology, social sciences, economics, other | High: exploratory collaboration across domains | Grading must be extended if the conversation goes beyond the reference finding |
 | [PaperBench](#paperbench) | Machine learning research | High: sustained research collaboration | Reproduction is narrower than open-ended discovery; can be expensive |
@@ -55,20 +57,6 @@ Each entry below has four parts:
 **Recommendation:** Very high: strongest full-project fit.
 
 **Main limitation:** Substantial execution cost and setup. The supplied runner reports about eight hours per run on average.
-
-## sc-HeurekaBench
-
-**Domain:** single-cell biology
-
-**Existing task and unit to adapt:** Answer exploratory research questions grounded in published studies, datasets and code. Adapt one open-ended investigation, optionally grouping related questions from the same study.
-
-**How the researcher could steer:** Interpret cell populations. Investigate an unexpected pattern. Discuss competing biological explanations. Choose and execute a follow-up analysis.
-
-**Evaluation to reuse:** Reference scientific insights and existing answer-quality grading. Add checks that claims follow from executed analyses.
-
-**Recommendation:** Very high, especially good for analysis-interpretation dialogue.
-
-**Main limitation:** Reference-insight scoring alone does not fully evaluate scientifically valid alternative directions.
 
 ## AstaBench: E2E-Bench / E2E-Bench-Hard
 

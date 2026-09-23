@@ -12,8 +12,8 @@ asset/conversion audit, not a live leaderboard.
 | Persona router | A–G defaults/domain/task overrides, behavioral rendering, private digest; task-derived H | Offline routing, memory and boundary tests; live persona comparisons pending |
 | Native evaluation | Source-specific judge bridges; SAB fresh program replay + isolated native evaluation | Discovery/Bix judge-sensitive; SAB 1/2 native successes; no cross-source average |
 | Terminal bridge | Two source-preserving conversions; sealed-submission Harbor verification | No live run; development host lacks Docker access |
-| Reproduction | Controller/scientific dependency locks, pinned source fetch, SAB provisioning, runtime probe | Fresh controller/scientific installs and source preparation verified; [129 tests pass](../reports/reproducibility_check.md); external access/OS prerequisites remain |
-| EXP-Bench | Prior design-only experiment in external workspace | Not packaged or reproduced by this repository |
+| Reproduction | Controller/scientific dependency locks, pinned source fetch, SAB provisioning, runtime probe | Fresh controller/scientific installs and source preparation verified; [176 tests pass](../reports/expbench/migration_validation.md); external access/OS prerequisites remain |
+| EXP-Bench | Migrated `src/expbench`, configs, preparation scripts, tests and reports | Five design tasks; separate legacy researcher/evaluation interfaces; [setup](adapters/expbench.md) |
 
 ## Live pilot evidence
 
@@ -44,6 +44,11 @@ that a particular persona improves scientific performance.
    silently repairing native evaluation or altering existing results.
 3. Validate Terminal's Harbor bridge on a Docker-capable host.
 4. Extend reviewed task coverage, keeping study groups and references isolated.
+
+EXP-Bench uses its preserved scoped researcher; the shared A–G persona router is
+not yet connected to that legacy track. Its historical comparison reports 79.5
+and 92.7/100 coverage with Sonnet 5 and o3-mini simulators respectively, both
+using Sonnet 5 actor/judge. Those are design scores, not full-experiment results.
 
 There is no implementation of demographic population sampling, LLM persona routing,
 automatic conversation initiation or a universal scientific-quality grader.

@@ -4,7 +4,9 @@ Use Python 3.12 and the checked-in lockfiles. Start with the
 [README](README.md), [current status](docs/status.md), and
 [reproduction guide](docs/reproducibility.md). The implementation is under
 `src/personasciencebench/`; upstream checkouts and generated runs are external
-inputs, not code to edit or vendor into this repository.
+inputs, not code to edit or vendor into this repository. EXP-Bench is retained
+as a separate `src/expbench/` design track; see its [guide](docs/adapters/expbench.md)
+and prepare its pinned task cards before running `tests/expbench/`.
 
 ## Development checks
 

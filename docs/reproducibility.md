@@ -178,6 +178,8 @@ implemented but has no live validation on this host. These tasks specify zero
 GPUs and retain their own native time/resource budgets. See the
 [adapter contract](adapters/terminal_bench_science.md) before attempting execution.
 
-EXP-Bench remains a separate, external design-only implementation. It is not
-included in this checkout's manifest, CLI registry, lockfiles or reproduction
-claims. Its migration is future work.
+EXP-Bench is now included under `src/expbench/` with separate design-track commands,
+configurations and pinned preparation manifests. Follow the [EXP-Bench guide](adapters/expbench.md)
+to rebuild its task cards and run its tests. It is not a `run --benchmarks` entry
+in the shared four-adapter runner, and its design scores are not combined with
+full-workflow evaluation.

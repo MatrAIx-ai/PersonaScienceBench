@@ -6,8 +6,9 @@ executes an analysis, and submits artifacts for benchmark-specific evaluation.
 The researcher has a configurable persona and bounded study knowledge; reference
 answers remain private to the evaluator.
 
-**Development preview:** four adapters, eight reviewed task conversions, and six
-completed live pilot episodes. This is a working research harness, not a claim
+**Development preview:** four shared adapters with eight reviewed task conversions
+and six completed live full-workflow episodes, plus the migrated EXP-Bench track
+with five reviewed design tasks and its historical comparisons. This is a working research harness, not a claim
 that the full upstream datasets have been converted or that persona effects have
 been validated.
 
@@ -15,15 +16,17 @@ been validated.
 
 | Benchmark | Reviewed tasks | Execution / evaluation | Measured pilot outcome |
 | --- | ---: | --- | --- |
+| [EXP-Bench](docs/adapters/expbench.md) | 5 | Migrated OpenHands design track; reference coverage + integrity monitor | Historical Sonnet-actor comparison: 79.5 vs 92.7/100 by simulator |
 | [DiscoveryBench](docs/adapters/discoverybench.md) | 2 | OpenHands + Bubblewrap; native reference-hypothesis LLM scoring | 2 completed; final Luna `final_score` 0.0 on both |
 | [BixBench](docs/adapters/bixbench.md) | 2 | OpenHands + Bubblewrap; native open-answer LLM grading | 2 completed; final Luna grade 0 on both |
 | [ScienceAgentBench](docs/adapters/scienceagentbench.md) | 2 | OpenHands + Bubblewrap; fresh program replay and unchanged native graders | 2 valid programs; 1/2 native successes |
 | [Terminal-Bench-Science](docs/adapters/terminal_bench_science.md) | 2 | Conversion and Harbor verifier bridge implemented | No live run; Docker access blocked on the development host |
 
-The earlier **EXP-Bench design-only adaptation is external to this repository**.
-Its implementation and results remain in the original workspace; this checkout
-does not install or reproduce it. Design coverage is not combined with
-completed-experiment metrics.
+**EXP-Bench is included in this repository** under `src/expbench/`, with its
+own `expbench` and `expbench-realistic` commands. It preserves the existing
+design-only pipeline rather than silently replacing its researcher or evaluator
+with the shared adapter implementation. See [EXP-Bench setup](docs/adapters/expbench.md).
+Design coverage remains separate from completed-experiment metrics.
 
 The six live pilots used GPT-6 Luna actors and the earlier neutral researcher
 configuration. DiscoveryBench/BixBench were regraded with Luna; ScienceAgentBench
@@ -79,7 +82,8 @@ uv run --locked python -m personasciencebench --help
 uv run --locked python -m pytest -q
 ```
 
-Source-backed tests skip when their external datasets are absent. The optional
+Source-backed tests skip when their external datasets are absent. EXP-Bench tests
+also require its separately prepared task cards and the actor extra. The optional
 OpenHands integration test skips unless the `actor` extra is installed. Tests use
 scripted model responses; they do not spend API credits. Check skipped-test
 reasons with `pytest -rs`.
@@ -106,12 +110,15 @@ OpenRouter, provision ScienceAgentBench and run/regrade pilots. Saved model IDs
 are historical configuration, not a guarantee of future provider availability.
 Use [configs/persona_example.json](configs/persona_example.json) for persona overrides.
 The [reproduction check](reports/reproducibility_check.md) records fresh setup,
-source acquisition, sandbox verification and 129 passing tests.
+source acquisition and sandbox verification. After the
+[EXP-Bench migration](reports/expbench/migration_validation.md), the combined suite
+passes 176 tests.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
+| `src/expbench/`, `configs/expbench/`, `scripts/expbench/` | Migrated EXP-Bench design track and reproduction utilities |
 | `src/personasciencebench/` | Schemas, adapters, persona router, researcher, sessions, runtime and CLI |
 | `configs/` | Model/persona examples and scientific environment requirements + lock |
 | `manifests/sources.json` | Source revisions, public asset URLs and checksums |
@@ -120,7 +127,7 @@ source acquisition, sandbox verification and 129 passing tests.
 | `docs/design/` | Historical selection and design proposals |
 | `reports/` | Human-readable measured pilot reports and historical construction audit |
 | `uv.lock` | Resolved controller/development dependencies, including optional extras |
-| `external/`, `prepared/`, `runs/` | Local-only source/data, episode packages and private execution records; ignored by Git |
+| `external/`, `prepared/`, `runs/`, `data/` | Local-only source/data, episode packages and private execution records; ignored by Git |
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) when extending an adapter or changing
 a simulator/evaluator. The [conversion standards](docs/benchmark_standards.md)

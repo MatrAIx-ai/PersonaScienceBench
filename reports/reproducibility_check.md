@@ -49,7 +49,8 @@ been observed during this local validation. These checks were completed before p
 ScienceAgentBench still requires a separately obtained verified archive. Its
 existing live pilot evidence is in [the SAB report](sab_pilot_report.md); this
 cleanup did not rerun it. Terminal's Docker/Harbor execution is still unvalidated
-on this host. EXP-Bench is still external to this checkout. Live persona effects
+on this host. At the time of this check EXP-Bench was external; it has subsequently been
+migrated. See [the EXP-Bench guide](../docs/adapters/expbench.md). Live persona effects
 and future provider/model availability are not established by these checks.
 
 Dependency locks describe the current reproducible development/runtime setup;

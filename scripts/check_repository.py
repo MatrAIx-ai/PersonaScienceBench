@@ -9,7 +9,7 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = re.compile(r"(?:sk-or-v1-|ghp_)[A-Za-z0-9]{20,}")
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
-LOCAL_ONLY = {"runs", "prepared", "external"}
+LOCAL_ONLY = {"runs", "prepared", "external", "data"}
 
 
 def main():

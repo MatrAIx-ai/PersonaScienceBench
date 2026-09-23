@@ -51,6 +51,7 @@ class Interaction(Record):
 
 
 class Persona(Record):
+    enabled: bool = Field(default=True, strict=True)
     id: str = Field(default="neutral", min_length=1)
     version: str = Field(default="2", min_length=1)
     role: Role = Field(default_factory=Role)
@@ -116,6 +117,8 @@ class PersonaRouter(Record):
 def resolve_persona(config: dict, episode: Episode) -> Persona:
     """Existing persona < router defaults < exact domain < full episode ID."""
     profile = Persona.model_validate(config.get("persona", {})).model_dump()
+    if not profile["enabled"]:
+        return Persona(enabled=False)
     router = PersonaRouter.model_validate(config.get("persona_router", {}))
     for patch in (router.defaults, router.domains.get(episode.domain, {}),
                   router.tasks.get(episode.id, {})):
@@ -127,6 +130,8 @@ def resolve_persona(config: dict, episode: Episode) -> Persona:
 
 def render_persona(persona: Persona) -> str:
     """Versioned behavioral rendering, with no reference data or generated biography."""
+    if not persona.enabled:
+        return ""
     p = persona
     seniority = {"junior": "Ask for explanations when a methodological choice is unclear.",
                  "mid": "Discuss methodological choices and ask for their rationale when needed.",
@@ -175,5 +180,8 @@ def persona_record(persona: Persona) -> dict:
     prompt = render_persona(persona)
     payload = {"schema_version": "2", "renderer_version": "1", "profile": persona.model_dump(),
                "identity_prompt": prompt}
+    if not persona.enabled:
+        payload = {"schema_version": "3", "renderer_version": "2", "enabled": False,
+                   "profile": None, "identity_prompt": ""}
     payload["sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return payload

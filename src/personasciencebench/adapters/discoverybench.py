@@ -43,6 +43,30 @@ REVIEWED_TASKS: dict[str, dict[str, str | int]] = {
     },
 }
 
+# Additional cases reviewed for the five-case Luna baseline.
+REVIEWED_TASKS.update({'test/meta_regression/metadata_1.json/0/0': {'metadata_sha256': 'ec0cb5a323e2c2585529ac45ea00116515cd0b026e20edb20d9aba5908391991',
+                                              'topic': 'study_linkage',
+                                              'kind': 'context',
+                                              'rationale': 'Reviewed domain-knowledge definitions '
+                                                           'and data interpretation; no gold '
+                                                           'hypothesis or workflow included.'},
+ 'test/nls_ses/metadata_1.json/0/0': {'metadata_sha256': '4117a80907e04a67f9b9461a8ca68af7cc30eb184d9814f8faaaa104516a9f91',
+                                      'topic': 'academic_measurement',
+                                      'kind': 'context',
+                                      'rationale': 'Reviewed domain-knowledge definitions and data '
+                                                   'interpretation; no gold hypothesis or workflow '
+                                                   'included.'},
+ 'test/worldbank_education_gdp_indicators/metadata_1.json/0/0': {'metadata_sha256': 'f31bd3ded8bbccc633a939f9f57bbd34cd37454b0d8ba1f7daa127739f11b2d2',
+                                                                 'topic': 'economic_indicators',
+                                                                 'kind': 'context',
+                                                                 'rationale': 'Reviewed '
+                                                                              'domain-knowledge '
+                                                                              'definitions and '
+                                                                              'data '
+                                                                              'interpretation; no '
+                                                                              'gold hypothesis or '
+                                                                              'workflow included.'}})
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -242,7 +266,7 @@ class DiscoveryBenchAdapter(Adapter):
         return summaries
 
     def pilot_task_ids(self) -> list[str]:
-        return list(REVIEWED_TASKS)
+        return list(REVIEWED_TASKS)[:2]
 
     def convert(self, task_id: str) -> Episode:
         if self.source.revision != SOURCE_REVISION:

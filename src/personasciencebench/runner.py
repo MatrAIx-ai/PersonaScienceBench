@@ -41,8 +41,8 @@ def stage_workspace(package: Path, workspace: Path):
 
 def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root: Path,
                config: dict, *, parallel=2) -> dict:
-    if not 1 <= parallel <= 4:
-        raise ValueError("parallel must be between one and four")
+    if not 1 <= parallel <= 25:
+        raise ValueError("parallel must be between one and 25")
     # ScienceAgentBench uses an explicitly versioned Bubblewrap environment
     # adaptation with unchanged native graders. Terminal still needs Harbor.
     supported = {"discoverybench", "bixbench", "scienceagentbench"}
@@ -50,9 +50,14 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
         raise ValueError("This runner executes DiscoveryBench, BixBench and the ScienceAgentBench sandbox adaptation; other sources need their runtime bridges")
     manifest = read_json(prepared / "pilot_manifest.json")
     selected = [r for r in manifest["cases"] if r["benchmark"] in benchmarks]
+    expected = config.get("pilot_cases_per_benchmark", 2)
+    if type(expected) is not int or expected < 1:
+        raise ValueError("pilot_cases_per_benchmark must be a positive integer")
+    if len({r["episode_id"] for r in selected}) != len(selected):
+        raise ValueError("Selected episode IDs must be unique")
     for name in benchmarks:
-        if sum(r["benchmark"] == name for r in selected) != 2:
-            raise ValueError(f"The pilot must include exactly two prepared {name} cases")
+        if sum(r["benchmark"] == name for r in selected) != expected:
+            raise ValueError(f"The pilot must include exactly {expected} prepared {name} cases")
     if any(not r["assets_ready"] for r in selected):
         raise ValueError("A selected episode has missing or unsafe assets")
     # Resolve all profiles before model/API calls or starting any case.
@@ -82,9 +87,11 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                   "source_task_id": episode.source_task_id, "study_id": episode.study_id,
                   "status": "infrastructure_error"}
         try:
+            runtime_root = Path(config.get("actor_python_overrides", {}).get(
+                episode.id, python_root)).resolve()
             workspace = case / "actor"
             stage_workspace(package, workspace)
-            sandbox = Sandbox(workspace.resolve(), python_root.resolve())
+            sandbox = Sandbox(workspace.resolve(), runtime_root)
             probe = sandbox.check()
             write_json(case / "sandbox_check.json", probe)
             if probe.get("exit_code") != 0:
@@ -107,7 +114,7 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
             else:
                 if episode.benchmark == "scienceagentbench":
                     evaluation = adapter.evaluate_in_sandbox(
-                        episode, session.submission, python_root.resolve(), case / "controller/native_evaluation")
+                        episode, session.submission, runtime_root, case / "controller/native_evaluation")
                     evaluation.details["judge_model"] = None
                     evaluation.details["judge_kind"] = "native_programmatic_verifier"
                 else:

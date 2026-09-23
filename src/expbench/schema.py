@@ -5,6 +5,7 @@ import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from personasciencebench.persona import Persona
 
 
 class Record(BaseModel):
@@ -36,6 +37,7 @@ class Limits(Record):
 class Config(Record):
     models: Models
     limits: Limits
+    persona: Persona | None = None
 
     @classmethod
     def load(cls, path: Path):

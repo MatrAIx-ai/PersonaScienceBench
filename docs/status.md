@@ -1,8 +1,16 @@
 # Implementation status
 
+A five-case-per-benchmark Luna baseline has finished with persona styling
+disabled and concurrent cases. [Batch results](../reports/luna_no_persona_five.md)
+are recorded separately. Its setup and explicit case selections are in
+[luna_baseline.md](luna_baseline.md). The tables below describe the earlier
+pilot release; new batch results are reported separately.
+
 Updated 2026-09-23. This page is the current status; `docs/design/` contains
 historical proposals and `reports/construction_inventory.json` is a historical
 asset/conversion audit, not a live leaderboard.
+
+## Earlier release snapshot
 
 | Component | Implemented | Validated / remaining |
 | --- | --- | --- |

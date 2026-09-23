@@ -1,143 +1,315 @@
 # PersonaScienceBench
 
-PersonaScienceBench adds a simulated researcher to scientific agent benchmarks.
-An actor inspects data, asks the researcher questions when useful, writes and
-executes an analysis, and submits artifacts for benchmark-specific evaluation.
-The researcher has a configurable persona and bounded study knowledge; reference
-answers remain private to the evaluator.
+**Scientific agents working with simulated researchers.**
 
-**Development preview:** four shared adapters with eight reviewed task conversions
-and six completed live full-workflow episodes, plus the migrated EXP-Bench track
-with five reviewed design tasks and its historical comparisons. This is a working research harness, not a claim
-that the full upstream datasets have been converted or that persona effects have
-been validated.
+PersonaScienceBench studies how a researcher's expertise and communication style
+influence an AI agent's scientific work. The agent can inspect data, run code,
+ask the researcher questions, and submit its findings. The researcher answers
+from reviewed study facts, optionally guided by a structured persona.
 
-## What works today
+**5 benchmark tracks · 1,102 source tasks/questions · 25 converted cases**
 
-| Benchmark | Reviewed tasks | Execution / evaluation | Measured pilot outcome |
-| --- | ---: | --- | --- |
-| [EXP-Bench](docs/adapters/expbench.md) | 5 | Migrated OpenHands design track; reference coverage + integrity monitor | Historical Sonnet-actor comparison: 79.5 vs 92.7/100 by simulator |
-| [DiscoveryBench](docs/adapters/discoverybench.md) | 2 | OpenHands + Bubblewrap; native reference-hypothesis LLM scoring | 2 completed; final Luna `final_score` 0.0 on both |
-| [BixBench](docs/adapters/bixbench.md) | 2 | OpenHands + Bubblewrap; native open-answer LLM grading | 2 completed; final Luna grade 0 on both |
-| [ScienceAgentBench](docs/adapters/scienceagentbench.md) | 2 | OpenHands + Bubblewrap; fresh program replay and unchanged native graders | 2 valid programs; 1/2 native successes |
-| [Terminal-Bench-Science](docs/adapters/terminal_bench_science.md) | 2 | Conversion and Harbor verifier bridge implemented | No live run; Docker access blocked on the development host |
+[Benchmarks](#benchmarks-and-coverage) · [Conversion standards](#how-we-adapt-benchmarks) ·
+[Personas](#researcher-personas) · [Get started](#get-started) · [Results](#current-results)
 
-**EXP-Bench is included in this repository** under `src/expbench/`, with its
-own `expbench` and `expbench-realistic` commands. It preserves the existing
-design-only pipeline rather than silently replacing its researcher or evaluator
-with the shared adapter implementation. See [EXP-Bench setup](docs/adapters/expbench.md).
-Design coverage remains separate from completed-experiment metrics.
-
-The six live pilots used GPT-6 Luna actors and the earlier neutral researcher
-configuration. DiscoveryBench/BixBench were regraded with Luna; ScienceAgentBench
-uses programmatic graders. The new configurable persona router has offline test
-coverage but has not been evaluated in live persona comparisons. Most actors
-asked no questions, so pilot scores do not establish a collaboration benefit.
-See [current status](docs/status.md) and the
-[DiscoveryBench/BixBench](reports/pilot_report.md) and
-[ScienceAgentBench](reports/sab_pilot_report.md) reports for limitations and costs.
-
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    Sources[Pinned sources] --> Adapter[Reviewed adapter]
-    Adapter --> Public[Public task and data]
-    Adapter --> Facts[Private researcher context]
-    Adapter --> Reference[Private evaluator reference]
-    Config[Persona router] --> Researcher[Researcher simulator]
-    Facts --> Researcher
-    Public --> Actor[Actor and isolated tools]
-    Actor <-->|Questions and published replies| Researcher
-    Actor --> Submission[Sealed answer and artifacts]
-    Submission --> Evaluator[Benchmark-specific evaluator]
-    Reference --> Evaluator
+    Inputs[Public task and inputs] --> Actor[Scientific agent]
+    Facts[Approved study facts] --> Researcher[Researcher simulator]
+    Persona[Optional persona] --> Researcher
+    Actor -->|Questions| Researcher
+    Researcher -->|Grounded replies| Actor
+    Actor -->|Sealed submission| Grader[Benchmark evaluator]
+    References[Private references and tests] --> Grader
 ```
 
-- **Persona:** A–G attributes cover role/seniority, expertise, research style,
-  evidence/risk, communication, workflow and interaction. Global defaults can
-  be overridden by exact domain and task ID. H, the knowledge boundary, comes
-  from reviewed task context rather than the persona. See [personas](docs/personas.md).
-- **Memory and disclosure:** the researcher retains questions, published replies
-  and explicitly shared progress within one episode. Grounded mode checks
-  generated prose; extractive mode publishes approved fact text verbatim.
-- **Actor independence:** the included OpenHands runner uses the same lifecycle
-  available to external actors through the [HTTP interface](docs/interaction_protocol.md).
-- **Evaluation:** preserve native scores and report adaptations explicitly.
-  Scientific failure, missing submission and infrastructure failure are distinct.
-  There is no universal design-quality score or cross-benchmark average.
+The agent decides when to ask for help. The simulator remembers the conversation
+within an episode and only sees information shared with it. Reference answers,
+solution code, and hidden tests stay private to the evaluator. Each benchmark
+keeps its own scoring contract.
 
-## Developer quick start
+## Benchmarks and coverage
 
-Use **Python 3.12**, Git and [uv](https://docs.astral.sh/uv/). The lockfiles were
-created with uv 0.11.26. Scientific execution additionally requires Linux,
-Bubblewrap and permitted user/network namespaces; these selected Python tasks
-require no GPU. Core development and persona previews require no API key or Docker.
+The five pinned source inventories contain **1,102 tasks/questions**. Evaluating
+every source unit once with persona off and once with persona on would produce
+**2,204 evaluations**, before retries or repeated runs.
 
-```bash
-git clone https://github.com/MatrAIx-ai/PersonaScienceBench.git
-cd PersonaScienceBench
-uv sync --locked --extra test --extra api --extra annotations
-uv run --locked python -m personasciencebench --help
-uv run --locked python -m pytest -q
+| Benchmark | Source inventory | Converted | Domain coverage |
+| --- | ---: | ---: | --- |
+| [DiscoveryBench](docs/benchmark_adaptations.md#discoverybench) | 264 queries | 5 | Humanities, biology, meta science, sociology, engineering, economics |
+| [BixBench](docs/benchmark_adaptations.md#bixbench) | 205 questions | 5 | Computational biology |
+| [ScienceAgentBench](docs/benchmark_adaptations.md#scienceagentbench) | 102 verified tasks | 5 | Computational chemistry, geographical information science, bioinformatics, psychology and cognitive science |
+| [Terminal-Bench-Science](docs/benchmark_adaptations.md#terminal-bench-science) | 70 active tasks | 5 | Earth, engineering, life, mathematical, and physical sciences |
+| [EXP-Bench](docs/benchmark_adaptations.md#exp-bench) | 461 tasks / 51 papers | 5 | Machine learning research |
+| **Total** | **1,102** | **25** | |
+
+The current harness supports the **25 reviewed conversions**: 20 analysis/program
+cases and five EXP-Bench design cases. Expanding to the full inventory requires
+reviewing the remaining tasks, preparing their data and environments, and connecting
+their graders. Multiple questions can share a study, so inventory size is not a
+count of independent studies.
+
+<details>
+<summary>Source counts and domain breakdown</summary>
+
+Counts refer to the [pinned sources](manifests/sources.json) and
+[EXP-Bench dataset inspection](reports/expbench/dataset_inspection.md).
+
+- **DiscoveryBench:** humanities 38; biology 26; meta science 100; sociology 69;
+  engineering 15; economics 16. Counts cover the adapter's real-data inventory.
+- **BixBench:** 205 computational-biology questions.
+- **ScienceAgentBench:** computational chemistry 20; geographical information
+  science 27; bioinformatics 27; psychology and cognitive science 28. Counts use
+  the verified split.
+- **Terminal-Bench-Science:** Earth sciences 8; engineering sciences 9; life
+  sciences 19; mathematical sciences 17; physical sciences 17. Archived tasks and
+  CI fixtures are excluded; spelling variants of domain labels are combined.
+- **EXP-Bench:** 461 tasks across 51 papers. The five converted cases cover
+  multiagent reinforcement learning, LLM quantization, time series forecasting,
+  computer vision, and scientific machine learning / fluid dynamics. A common
+  domain taxonomy has not been audited across all 461 tasks. The 12,737 native
+  grading subtasks are not counted as separate task executions.
+
+</details>
+
+### Conversion checklist
+
+**Four of the ten [original candidates](docs/design/parent_benchmark_candidates.md)
+have converted subsets.** A check marks an implemented conversion with researcher
+interaction, a grading path, and live execution evidence. It does not indicate
+full-dataset coverage or successful model performance.
+
+- [x] BixBench — five questions from distinct capsules
+- [ ] BixBench3
+- [ ] sc-HeurekaBench
+- [ ] AstaBench: E2E-Bench / E2E-Bench-Hard
+- [x] DiscoveryBench — five data-analysis cases
+- [ ] PaperBench
+- [ ] MLRC-Bench
+- [x] Terminal-Bench-Science — five task conversions with native grading
+- [x] ScienceAgentBench — five verified program-generation tasks
+- [ ] SciAgentArena
+
+Added beyond the original candidate list:
+
+- [x] EXP-Bench — five experiment-design cases
+
+## How we adapt benchmarks
+
+A conversion adds a researcher interaction layer while preserving the scientific
+task and making every change to execution or evaluation explicit.
+
+1. **Preserve the task.** Keep the scientific objective, required methods, inputs,
+   deliverables, and scoring meaning. Document changes to budgets, environments,
+   submission requirements, or evaluator behavior.
+2. **Control information access.** Export only reviewed public inputs. Give the
+   researcher source-backed facts with provenance; keep grading references private.
+3. **Separate persona from knowledge.** Persona may shape replies and preferences.
+   It cannot change the fact pool, scientific requirements, or reference answers.
+4. **Keep questions optional.** Essential requirements remain public. Record what
+   the actor asks and what the researcher discloses.
+5. **Make outcomes auditable.** Pin sources, seal submissions, retain failed
+   attempts, and report missing scores separately from scientific failures.
+
+| Benchmark | What the conversion adds or changes | What is scored |
+| --- | --- | --- |
+| DiscoveryBench | Reviewed domain context; isolated CSV analysis; injected judge and explicit parsing errors | Native hypothesis/context agreement, 0–1 |
+| BixBench | Data-format clarifications; allowlisted capsule inputs; required analysis artifact and execution declaration | Native online open-answer grade, 0/1 |
+| ScienceAgentBench | Reviewed expert-guidance excerpts; sealed program replay in a fresh sandbox | Native program validity and task success |
+| Terminal-Bench-Science | Reviewed context; isolated artifact collection; current runs disable actor networking and cap the actor at 20 iterations | Native verifier reward, 0/1 |
+| EXP-Bench | Design task cards, masked code workspaces, and scoped fact disclosure | Reference coverage, 0–100, plus a separate integrity monitor |
+
+ScienceAgentBench and Terminal retain programmatic grading. EXP-Bench is a
+**design-only track**; its coverage score assesses a plan. Its pipeline remains
+separate from the four shared adapters.
+
+Read the [full conversion standard](docs/benchmark_standards.md) for acceptance
+criteria and the [per-benchmark adaptation record](docs/benchmark_adaptations.md)
+for exact boundaries, runtime changes, and evaluator details.
+
+## Researcher personas
+
+Persona is injected into the **simulator's private system prompt**. The actor
+experiences it through researcher replies; the profile is not added to actor or
+judge prompts. Approved knowledge stays fixed across conditions.
+
+The current comparison uses a **computer-science novice** profile, with novice
+domain knowledge, statistics, and coding. Computer science remains the configured
+domain for every task; other persona fields use neutral defaults.
+
+```json
+{
+  "persona": {
+    "enabled": true,
+    "id": "computer-science-novice",
+    "version": "1",
+    "expertise": {
+      "domain": "computer science",
+      "domain_level": "novice",
+      "statistics": "novice",
+      "coding": "novice"
+    }
+  }
+}
 ```
 
-Source-backed tests skip when their external datasets are absent. EXP-Bench tests
-also require its separately prepared task cards and the actor extra. The optional
-OpenHands integration test skips unless the `actor` extra is installed. Tests use
-scripted model responses; they do not spend API credits. Check skipped-test
-reasons with `pytest -rs`.
+For the control condition, set `"persona": {"enabled": false}`. **The simulator
+stays available**, with the same approved facts and no persona instructions.
+Omitting `persona` in the shared runner instead selects an enabled neutral profile.
 
-Acquire the first four pilot tasks, verify source revisions and file hashes, then
-prepare public/controller packages:
+<details>
+<summary>Schema and injection behavior</summary>
 
-```bash
-uv run --locked python -m personasciencebench --source-root external/sources \
-  fetch-sources --benchmarks discoverybench bixbench
-uv run --locked python -m personasciencebench --source-root external/sources \
-  catalog --benchmarks discoverybench bixbench
-uv run --locked python -m personasciencebench --source-root external/sources \
-  prepare --benchmarks discoverybench bixbench --output prepared/pilot-v1
-```
-
-`fetch-sources` explicitly downloads public sources and assets. Existing mismatched
-files/checkouts are rejected rather than overwritten. Preparation is offline and
-does not run models or scientific analyses. Keep `controller/` outside actor mounts.
-
-Follow [reproduction instructions](docs/reproducibility.md) to install OpenHands,
-create the separate scientific environment, check sandbox support, configure
-OpenRouter, provision ScienceAgentBench and run/regrade pilots. Saved model IDs
-are historical configuration, not a guarantee of future provider availability.
-Use [configs/persona_example.json](configs/persona_example.json) for persona overrides.
-The [reproduction check](reports/reproducibility_check.md) records fresh setup,
-source acquisition and sandbox verification. After the
-[EXP-Bench migration](reports/expbench/migration_validation.md), the combined suite
-passes 176 tests.
-
-## Repository map
-
-| Path | Purpose |
+| Field group | Controls |
 | --- | --- |
-| `src/expbench/`, `configs/expbench/`, `scripts/expbench/` | Migrated EXP-Bench design track and reproduction utilities |
-| `src/personasciencebench/` | Schemas, adapters, persona router, researcher, sessions, runtime and CLI |
-| `configs/` | Model/persona examples and scientific environment requirements + lock |
-| `manifests/sources.json` | Source revisions, public asset URLs and checksums |
-| `tests/` | Offline boundary, adapter, transport, routing and integration checks |
-| `docs/` | Current status, reproduction, protocols, personas and adapter details |
-| `docs/design/` | Historical selection and design proposals |
-| `reports/` | Human-readable measured pilot reports and historical construction audit |
-| `uv.lock` | Resolved controller/development dependencies, including optional extras |
-| `external/`, `prepared/`, `runs/`, `data/` | Local-only source/data, episode packages and private execution records; ignored by Git |
+| `enabled`, `id`, `version` | Activation and profile identity |
+| `role` | Title and seniority |
+| `expertise` | Domain; independent domain, statistics, and coding levels |
+| `research_style` | Research approach and method preference |
+| `evidence` | Evidence standard and risk tolerance |
+| `communication` | Verbosity, technical level, and tone |
+| `workflow` | Speed/thoroughness and compute preference |
+| `interaction` | Initiative within replies and feedback style |
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) when extending an adapter or changing
-a simulator/evaluator. The [conversion standards](docs/benchmark_standards.md)
-define information boundaries, provenance and reporting requirements.
+Shared adapters resolve overrides in order: base profile → router defaults →
+exact domain → full episode ID. In grounded mode, styled replies undergo a
+model-based grounding check; rejected prose falls back to approved fact text or
+an unknown response.
 
-## Scope and licensing
+EXP-Bench accepts the same fixed profile through TOML, without the shared router.
+It publishes approved fact text verbatim, so persona can influence fact selection
+and relevance but cannot produce freely styled replies. Low expertise never
+removes approved facts or permits invented study information.
 
-This repository's implementation is MIT licensed. Upstream repositories,
-datasets and task artifacts retain their own licenses and access conditions.
-Raw datasets, verified bundles, credentials and private run traces are not
-redistributed here. Reports describe local runs; linked local run files will not
-exist in a fresh clone. Model-based grounding reduces unsupported replies but
-is not a proof of factual correctness or persona fidelity.
+</details>
+
+See the [persona guide](docs/personas.md) for allowed values, routing, prompt
+rendering, and audit records. Complete experiment configs are available for the
+[shared runners](configs/luna-cs-novice-five.json) and
+[EXP-Bench](configs/expbench/luna-cs-novice.toml).
+
+## Get started
+
+Use **Python 3.12** and **uv**. Live Python/EXP runs need Linux, Bubblewrap, and
+permitted namespaces; Terminal needs Docker. Store the provider key in an ignored
+`.env` file. Live runs make paid model calls.
+
+```bash
+uv sync --locked --extra api --extra annotations --extra actor
+.venv/bin/python -m personasciencebench --help
+```
+
+Prepare the environments and inputs using the [setup guide](docs/reproducibility.md),
+[EXP-Bench setup](docs/adapters/expbench.md), and
+[five-case run notes](docs/luna_baseline.md). ScienceAgentBench requires the verified
+archive; instance 87 also needs the expanded NetCDF environment.
+
+After preparation, preview a shared-adapter persona without calling a model.
+Replace `EPISODE` with a prepared episode directory:
+
+```bash
+.venv/bin/python -m personasciencebench persona \
+  --episode prepared/luna-five-python/EPISODE/controller/episode.private.json \
+  --config configs/luna-cs-novice-five.json
+```
+
+<details>
+<summary>Run all 25 selected cases in parallel</summary>
+
+The following launches the three runners together: 15 shared Python cases,
+five EXP-Bench cases, and five Terminal cases. All inputs and runtimes must be
+prepared first. Outputs and logs go into a new directory.
+
+```bash
+out="runs/luna-cs-novice-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$out"
+
+.venv/bin/python -m personasciencebench run \
+  --prepared prepared/luna-five-python \
+  --benchmarks discoverybench bixbench scienceagentbench \
+  --actor-python .actor-venv --config configs/luna-cs-novice-five.json \
+  --env-file .env --parallel 15 --output "$out/python" >"$out/python.log" 2>&1 &
+
+.venv/bin/python -m expbench.realistic run --mode live \
+  --config configs/expbench/luna-cs-novice.toml \
+  --workspace-map data/realistic_pilot/staged-luna/workspaces.json \
+  --env-file .env --parallel 5 --output "$out/expbench" >"$out/expbench.log" 2>&1 &
+
+.venv/bin/python -m personasciencebench.terminal_runner \
+  --prepared prepared/luna-five-terminal --config configs/luna-cs-novice-five.json \
+  --env-file .env --parallel 5 --verifier-backend native-docker \
+  --output "$out/terminal" >"$out/terminal.log" 2>&1 &
+
+wait
+```
+
+For the persona-off control, copy the shared config, set `persona.enabled=false`,
+and retain its `actor_python_overrides` so SAB 87 uses the same NetCDF environment.
+Use that copy for the shared and Terminal runners, and
+`configs/expbench/luna-no-persona.toml` for EXP. Choose a fresh output directory.
+The historical baseline config and its dependency recovery are recorded in the
+[run notes](docs/luna_baseline.md).
+
+The native-Docker verifier runs unchanged Terminal grading scripts in separate
+network-disabled containers. It is the working alternative to this host's
+unsupported Harbor network sidecar. See the
+[runtime adaptation details](docs/benchmark_adaptations.md#terminal-bench-science).
+
+</details>
+
+External actors can use the [HTTP interaction interface](docs/interaction_protocol.md).
+
+## Repository guide
+
+| Path | Contents |
+| --- | --- |
+| `src/personasciencebench/` | Shared schemas, four adapters, simulator, runtime, and CLI |
+| `src/expbench/` | EXP-Bench design pipeline |
+| `configs/`, `manifests/` | Experiment settings, source revisions, and checksums |
+| `docs/`, `reports/` | Standards, reproduction guides, and measured results |
+| `external/`, `prepared/`, `runs/`, `data/` | Ignored local sources, task packages, and private execution records |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to extend the project. The implementation
+is MIT licensed; upstream data retain their own licenses. Credentials, restricted
+data, and private traces are not redistributed. Local run paths in reports refer
+to the machine where those runs were recorded.
+
+## Current results
+
+<!-- current-results:start -->
+**Snapshot: 23 September 2026.** All 25 attempts have finished in each condition;
+scoring coverage is shown below.
+
+The comparison uses the same five cases per benchmark with
+`openai/gpt-6-luna` for the actor, simulator, and model-based judges, with
+reasoning effort `none`. Each actor has 20 iterations and up to six researcher
+questions. Native programmatic graders remain in place for ScienceAgentBench
+and Terminal.
+
+| Benchmark | Metric | No persona | CS-novice persona |
+| --- | --- | ---: | ---: |
+| DiscoveryBench | Mean score /1 | 0.2556 | 0.2500 |
+| BixBench | Correct answers | 3/5 | 3/5 |
+| ScienceAgentBench | Successful tasks | 2/5 | 2/5 |
+| EXP-Bench | Mean coverage /100 | 63.73 | 67.60 |
+| Terminal-Bench-Science | Passes / scored outcomes | 0/5 | 0/4 |
+
+The first four benchmarks have five graded cases in each condition. For Terminal,
+**no submission counts as false (reward 0)**, while the original
+`missing_submission` status is retained. The baseline includes two native grades
+and three such zeros; the persona condition includes two native grades and two
+such zeros. Its fifth case has an artifact-contract error and remains unscored.
+
+**EXP-Bench used 40% fewer researcher questions (15 → 9), while coverage rose
+by 3.87 points (63.73 → 67.60).** This is an encouraging efficiency signal from
+a small comparison. DiscoveryBench and BixBench asked zero questions in both
+conditions, so those runs did not exercise simulator persona. One run per task
+cannot establish a consistent persona effect; scores remain separate by benchmark.
+
+[Full comparison](reports/luna_cs_novice_comparison.md) ·
+[Machine-readable results](reports/luna_cs_novice_comparison.json) ·
+[Baseline report](reports/luna_no_persona_five.md)
+
+<!-- current-results:end -->

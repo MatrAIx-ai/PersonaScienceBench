@@ -5,6 +5,46 @@ not require a particular model or change model weights. Both `run` and `serve`
 use the same router. The actor receives researcher replies through the existing
 interface, not the hidden profile or private identity prompt.
 
+## Current experiment and persona off
+
+The five-case comparison uses [the fixed CS-novice config](../configs/luna-cs-novice-five.json):
+`enabled=true`, `id=computer-science-novice`, `version=1`, and expertise domain
+`computer science` with `domain_level`, `statistics`, and `coding` all `novice`.
+Other fields retain the defaults in `src/personasciencebench/persona.py`.
+Expertise levels change behavioral instructions, not access to approved facts.
+
+Set `"persona": {"enabled": false}` to remove persona instructions while keeping
+the approved-fact simulator and its memory. Top-level disable bypasses routing;
+the identity prompt is empty and shared grounded policy is
+`no-persona-grounded-v1`. Omitting the profile uses enabled neutral defaults and
+is not the disabled control.
+
+EXP-Bench accepts the same fixed profile schema through TOML:
+
+```toml
+[persona]
+enabled = true
+id = "computer-science-novice"
+version = "1"
+
+[persona.expertise]
+domain = "computer science"
+domain_level = "novice"
+statistics = "novice"
+coding = "novice"
+```
+
+See [the complete EXP configuration](../configs/expbench/luna-cs-novice.toml).
+Its scoped simulator appends the shared persona prompt but publishes only approved
+fact text. It does not use the shared router or grounded paraphrase/checking path.
+Omit `[persona]` or set `enabled=false` for its disabled condition. The shared
+`persona` preview command below applies to shared-adapter episodes, not EXP cards.
+
+[README usage](../README.md#get-started) launches the selected 25 cases in parallel.
+The actor and judge prompts do not receive the private persona. This comparison
+is of the complete fixed profile against disabled persona, not an isolated test
+of expertise alone. See the [results](../reports/luna_cs_novice_comparison.md).
+
 ## Configuration
 
 Use `configs/persona_example.json` as a complete runnable configuration. It keeps

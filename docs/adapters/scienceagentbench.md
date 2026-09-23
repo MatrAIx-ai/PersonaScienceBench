@@ -1,5 +1,9 @@
 # ScienceAgentBench adapter
 
+> The current five-case subset and runtime changes are documented in the
+> [current adaptation record](../benchmark_adaptations.md). The two-case
+> construction/pilot account below describes the earlier implementation.
+
 This adapter targets the **verified** split, pinned to annotation revision
 `9c6e96c9e74572e979b0930ee735041cef528cb7` and repository revision
 `c26e151ed601ba109dc4d35e057ff8e73fec469d`. It does not run the legacy validation

@@ -28,7 +28,9 @@ class Sandbox:
         self.workspace = Path(workspace).resolve()
         self.python_root = Path(python_root).resolve()
         self.base_prefix = Path(sys.base_prefix).resolve()
-        self.bwrap = shutil.which("bwrap", path="/usr/bin:/bin")
+        configured_bwrap = os.environ.get("PERSONASCIENCEBENCH_BWRAP")
+        self.bwrap = (shutil.which(configured_bwrap) if configured_bwrap
+                      else shutil.which("bwrap", path="/usr/bin:/bin"))
         if not self.bwrap:
             raise ValueError("Bubblewrap is required; host execution is disabled")
         if not self.workspace.is_dir() or not self.python_root.is_dir():
@@ -86,7 +88,10 @@ class Sandbox:
         args.extend(("--ro-bind", str(self.stdlib), str(self.stdlib)))
         # Hide unrelated base Python packages and editable installation pointers.
         # Actor dependencies must come from the dedicated environment instead.
-        args.extend(("--tmpfs", str(self.stdlib / "site-packages")))
+        for packages in (self.stdlib / "site-packages", self.stdlib / "dist-packages",
+                         self.base_prefix / "lib/python3/dist-packages"):
+            if packages.is_dir():
+                args.extend(("--tmpfs", str(packages)))
         base_lib = self.base_prefix / "lib"
         for library in sorted(base_lib.glob("*.so*")):
             if library.is_file():

@@ -20,6 +20,16 @@ SELECTED_PRIVATE_FILES = {
            "reference": "eval_programs/gold_results/biopsykit_questionnaire_gold.csv"},
 }
 
+SELECTED_PRIVATE_FILES.update({'67': {'script': 'CogSci_pattern_high_sim_eval.py',
+        'program': 'CogSci_pattern_high_sim.py',
+        'reference': 'eval_programs/gold_results/CogSci_pattern_high_sim_data_gold.csv'},
+ '87': {'script': 'eval_polynomial_fit.py',
+        'program': 'polynomial_fit.py',
+        'reference': 'eval_programs/gold_results/polynomial_fit_gold.csv'},
+ '92': {'script': 'eval_h_importances.py',
+        'program': 'h_importances.py',
+        'reference': 'eval_programs/gold_results/jnmf_h_importances_gold.json'}})
+
 
 def provision_archive(archive: Path, destination: Path, annotations: Path) -> dict:
     """Hash and selectively extract; no pickle or scientific code is executed.
@@ -76,7 +86,7 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
                 "reviewed_evaluators": {
                     key: {"script_sha256": file_hashes["eval_programs/" + spec["script"]],
                           "dependencies": {spec["reference"]: file_hashes[spec["reference"]]},
-                          "python_dependencies": ["pandas"] if key == "22" else ["Python standard library csv"],
+                          "python_dependencies": (["pandas"] if key in {"22", "67"} else ["numpy"] if key == "92" else ["Python standard library csv"]),
                           "judge_model_required": False}
                     for key, spec in SELECTED_PRIVATE_FILES.items()},
                 "evaluator_runtime": "bubblewrap-separate-native-verifier-v1",

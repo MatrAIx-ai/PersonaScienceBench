@@ -3,8 +3,9 @@
 EXP-Bench is included in this checkout under `src/expbench/`. It preserves the
 previous implementation as a separate design-only track, with its own schema,
 researcher, OpenHands actor and evaluation commands. It is not one of the four
-`personasciencebench.registry` adapters and does not yet use their A–G persona
-router. Consolidating its interfaces is future work; migration does not change
+`personasciencebench.registry` adapters and does not use their domain/task persona
+router. It now accepts a fixed shared A–G profile through TOML; the profile
+conditions fact selection while published replies remain extractive. Consolidating its interfaces is future work; migration does not change
 its scientific task or historical scores.
 
 ## What is included

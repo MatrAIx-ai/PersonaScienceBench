@@ -1,6 +1,7 @@
 """Versioned researcher–actor benchmark; legacy controls remain separately runnable."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.metadata
 import json
 import os
@@ -20,6 +21,7 @@ from expbench.original_control import raw_task
 from expbench.runner import file_digest
 from expbench.schema import Config, load_tasks
 from expbench.scoped_researcher import ScopedResearcher
+from personasciencebench.persona import Persona, persona_record
 
 
 class RealisticEpisode:
@@ -39,7 +41,10 @@ class RealisticEpisode:
         self.gateway = Gateway(transport, {r: getattr(config.models, r) for r in ("actor", "researcher", "judge")},
             Ledger(budget, Budget(config.limits.episode_usd)), self.output / "api_calls.jsonl")
         self.researcher = ScopedResearcher(task.researcher, task.public.question, self.gateway,
-            config.limits.researcher_questions, self.output / "researcher_history.json")
+            config.limits.researcher_questions, self.output / "researcher_history.json",
+            persona=config.persona)
+        write_json(self.output / "persona.private.json",
+                   persona_record(config.persona or Persona(enabled=False)))
         self.initial = self.final = self.design = self.failure = self.actor_status = None
         self.actor_calls = 0
         self.reproduction_command = None
@@ -175,6 +180,7 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/pilot-o3mini.toml"))
     parser.add_argument("--workspace-map", type=Path)
     parser.add_argument("--task")
+    parser.add_argument("--parallel", type=int, default=1, help="Concurrent isolated episodes (1–25)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=["mock", "live"], default="mock")
     parser.add_argument("--input-mode", choices=["interactive", "original"], default="interactive")
@@ -186,6 +192,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     transport = None
     try:
+        if not 1 <= args.parallel <= 25:
+            raise ValueError("parallel must be between one and 25")
         if not 1 <= args.judge_repeats <= 10 or args.seconds < 1:
             raise ValueError("Judge repeats must be 1–10 and seconds positive")
         if args.validate_execution and not args.continue_workflow:
@@ -218,6 +226,8 @@ def main(argv=None):
             sources = {t.task_id: {"repository": str(fixture), "fixture": True} for t in tasks}
         manifest = {"version": "realistic-v3.1", "evaluation": "reference-coverage-only", "mode": args.mode, "input_mode": args.input_mode,
             "config": config.model_dump(), "workflow": args.continue_workflow,
+            "parallel": args.parallel,
+            "persona_enabled": bool(config.persona is not None and config.persona.enabled),
             "judge_repeats": args.judge_repeats, "wall_time_seconds": args.seconds,
             "tasks_sha256": file_digest(args.tasks), "task_ids": [t.task_id for t in tasks],
             "sdk_version": importlib.metadata.version("openhands-sdk"),
@@ -236,30 +246,43 @@ def main(argv=None):
             write_json(args.output / "model_catalog.json", catalog)
             manifest["config"] = config.model_dump()
             write_json(args.output / "manifest.json", manifest)
-        for task in tasks:
+        # Register SDK tools once before starting episode threads.
+        from expbench.realistic_actor import run_actor
+
+        def one(task):
+            episode_transport = transport
             if args.mode == "mock":
                 from expbench.realistic_mock import RealisticMock
-                transport = RealisticMock()
+                episode_transport = RealisticMock()
             task_output = args.output / task.task_id.replace("/", "__")
             try:
-                episode = RealisticEpisode(task, config, transport, budget, task_output, sources[task.task_id],
+                episode = RealisticEpisode(task, config, episode_transport, budget, task_output, sources[task.task_id],
                     input_mode=args.input_mode, workflow=args.continue_workflow,
                     repeats=args.judge_repeats, seconds=args.seconds)
             except (OSError, ValueError, KeyError) as exc:
                 result = {"task_id": task.task_id, "status": "runtime_error", "mock": args.mode == "mock",
                     "initial": None, "final": None, "initial_submitted": False, "final_submitted": False,
                     "budget_charge_usd": 0, "error": str(exc), "actor_calls": 0, "researcher_questions": 0}
+                task_output.mkdir(parents=True, exist_ok=True)
                 write_json(task_output / "result.json", result)
+                return result
+            return run_episode(episode, validate_execution=args.validate_execution)
+
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            futures = [pool.submit(one, task) for task in tasks]
+            for future in as_completed(futures):
+                if future.cancelled():
+                    continue
+                result = future.result()
                 results.append(result)
-                write_json(args.output / "summary.json", {**summarize(results), "scheduled": len(tasks), "results": results})
-                print(f"{task.task_id}: runtime_error; no actor inference made", flush=True)
-                continue
-            result = run_episode(episode, validate_execution=args.validate_execution)
-            results.append(result)
-            write_json(args.output / "summary.json", {**summarize(results), "scheduled": len(tasks), "results": results})
-            print(f"{task.task_id}: {result['status']}; initial={result['initial_submitted']}; final={result['final_submitted']}", flush=True)
-            if episode.gateway.failed:
-                break
+                results.sort(key=lambda r: r["task_id"])
+                write_json(args.output / "summary.json", {**summarize(results), "scheduled": len(tasks),
+                    "parallel": args.parallel, "results": results})
+                print(f"{result['task_id']}: {result['status']}; initial={result['initial_submitted']}; final={result['final_submitted']}", flush=True)
+                if result["status"] == "error":
+                    # Already-running episodes finish; unscheduled inference is stopped.
+                    for pending in futures:
+                        pending.cancel()
         return 0 if len(results) == len(tasks) and all(r["status"] == "completed" for r in results) else 1
     except (ValueError, OSError, KeyError, ModelError) as exc:
         print(f"Error: {exc}")

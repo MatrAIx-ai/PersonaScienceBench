@@ -38,9 +38,10 @@ CI runs synthetic/offline checks with no credentials or benchmark datasets.
 5. Update the adapter guide and `docs/status.md`. Add a report only after measured
    runs; do not convert missing infrastructure into zero scientific scores.
 
-The current pilot runner requires exactly two selected tasks per benchmark. A
-larger release needs an explicit selection/splitting interface and corresponding
-runner changes; do not silently broaden pilot manifests.
+Preparation defaults to the original two tasks per benchmark. Larger runs use
+`--selection` with a JSON mapping of benchmarks to reviewed task IDs and
+`--cases-per-benchmark`; the run config must specify the matching
+`pilot_cases_per_benchmark`. Do not silently broaden pilot manifests.
 
 ## Changing shared behavior
 

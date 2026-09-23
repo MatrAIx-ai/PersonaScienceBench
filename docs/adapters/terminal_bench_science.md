@@ -1,5 +1,9 @@
 # Terminal-Bench-Science adapter
 
+> The current five-case subset and runtime changes are documented in the
+> [current adaptation record](../benchmark_adaptations.md). The two-case
+> construction/pilot account below describes the earlier implementation.
+
 The converter enumerates the 70 active release task packages under
 `tasks/<domain>/<field>/<slug>/task.toml`. Archived tasks and deliberate CI failure
 fixtures are excluded. Two reviewed researcher overlays are implemented against
@@ -77,10 +81,13 @@ files, replaced replay-agent configurations, wrong native task names, and a
 shared rather than separate verifier. Only controller-registered receipts are
 accepted by `evaluate()`; score fields in an actor submission are ignored.
 
-There is one attempt and no hidden retries. Missing submissions, absent reward
-files, malformed results, and infrastructure exceptions remain explicit failures
-without invented scientific scores. Results with native `reward=0` remain
-scientific failures rather than infrastructure errors. Independent actor time,
+There is one attempt and no hidden retries. The current runner and reports count
+an actor that finishes without a sealed submission as false (`reward=0`) under
+`terminal-missing-submission-false-v1`, while retaining `missing_submission`
+status and identifying the score as policy-assigned rather than native graded.
+Absent reward files, malformed verifier results, and infrastructure exceptions
+remain unscored. Results with native `reward=0` remain scientific failures rather
+than infrastructure errors. Independent actor time,
 resources, model usage, and researcher dialogue belong to the original episode
 record; Harbor replay time is **evaluation overhead**, not a fresh actor run.
 

@@ -59,6 +59,71 @@ PILOTS = {
     },
 }
 
+# Reviewed public environment files; native verifier and solutions stay private.
+PILOTS.update({'mathematical-sciences/statistics/symbolic-regression': {'mount': '/app',
+                                                          'input_base': '.',
+                                                          'files': ['training_data.npz',
+                                                                    'regressor.py'],
+                                                          'outputs': ['/app/regressor.py'],
+                                                          'facts': [('task.toml',
+                                                                     'task.description',
+                                                                     'scientific_scope',
+                                                                     'context',
+                                                                     'Recover a hidden sparse '
+                                                                     'non-linear rule behind a '
+                                                                     'binary label from 100 '
+                                                                     'predictors and 300 training '
+                                                                     'rows.')]},
+ 'mathematical-sciences/applied-mathematics/traffic-flux-inversion': {'mount': '/app',
+                                                                      'input_base': '.',
+                                                                      'files': ['flux_models.py',
+                                                                                'traffic_solver.py',
+                                                                                'data/episodes.npz'],
+                                                                      'outputs': ['/app/traffic_solver.py'],
+                                                                      'facts': [('task.toml',
+                                                                                 'task.description',
+                                                                                 'scientific_scope',
+                                                                                 'context',
+                                                                                 'Identify the '
+                                                                                 'flux law and '
+                                                                                 'hidden hybrid '
+                                                                                 'ramp-metering '
+                                                                                 'controller of a '
+                                                                                 'scalar traffic '
+                                                                                 'conservation law '
+                                                                                 'from sparse '
+                                                                                 'detector data, '
+                                                                                 'with the '
+                                                                                 'recovered '
+                                                                                 'procedure graded '
+                                                                                 'on unseen '
+                                                                                 'systems drawn '
+                                                                                 'from the same '
+                                                                                 'family.')]},
+ 'physical-sciences/physics/spin-glass-groundstate': {'mount': '/root/data',
+                                                      'input_base': 'data',
+                                                      'files': ['instance_0.json',
+                                                                'instance_1.json',
+                                                                'instance_2.json',
+                                                                'instance_3.json',
+                                                                'instance_4.json',
+                                                                'instance_5.json'],
+                                                      'outputs': ['/root/artifacts/spins_0.txt',
+                                                                  '/root/artifacts/spins_1.txt',
+                                                                  '/root/artifacts/spins_2.txt',
+                                                                  '/root/artifacts/spins_3.txt',
+                                                                  '/root/artifacts/spins_4.txt',
+                                                                  '/root/artifacts/spins_5.txt'],
+                                                      'facts': [('task.toml',
+                                                                 'task.description',
+                                                                 'scientific_scope',
+                                                                 'context',
+                                                                 'Find exact ground states for all '
+                                                                 'six instances of a planted 3D '
+                                                                 'Edwards-Anderson spin-glass '
+                                                                 'ensemble within one compute '
+                                                                 'budget.')]}})
+
 
 def _regular(path: Path) -> Path:
     if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
@@ -106,7 +171,7 @@ class TerminalBenchScienceAdapter(Adapter):
 
     def convert(self, task_id: str) -> Episode:
         if task_id not in PILOTS:
-            raise ValueError("Only the two reviewed pilot tasks have researcher overlays")
+            raise ValueError("This task has no reviewed researcher overlay")
         task = self.source.repository / "tasks" / task_id
         config = tomllib.loads((task / "task.toml").read_text())
         instruction = (task / "instruction.md").read_text()
@@ -132,7 +197,7 @@ class TerminalBenchScienceAdapter(Adapter):
                                   sha256=sha256(task / filename)), review_status="reviewed"))
         assets = []
         for index, name in enumerate(selection["files"]):
-            path = task / "environment/data" / name
+            path = task / "environment" / selection.get("input_base", "data") / name
             assets.append(Asset(id=f"input_{index}", source_path=str(path.resolve()),
                                 target_path=f"{selection['mount']}/{name}",
                                 sha256=sha256(_regular(path))))

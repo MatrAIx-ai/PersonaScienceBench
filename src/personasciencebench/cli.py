@@ -16,14 +16,20 @@ from personasciencebench.schema import Episode, Submission
 
 
 def prepare(args):
+    selection = read_json(args.selection) if getattr(args, "selection", None) else None
+    expected = getattr(args, "cases_per_benchmark", 2)
+    if expected < 1:
+        raise ValueError("cases_per_benchmark must be positive")
+    if selection is not None and set(selection) != set(args.benchmarks):
+        raise ValueError("Selection must contain exactly the requested benchmarks")
     args.output.mkdir(parents=True, exist_ok=False)
     args.output.chmod(0o700)
     records = []
     for name in args.benchmarks:
         adapter = load_adapter(name, args.source_root, args.manifest)
-        tasks = adapter.pilot_task_ids()
-        if len(tasks) != 2 or len(set(tasks)) != 2:
-            raise ValueError(f"{name} must supply exactly two distinct pilot candidates")
+        tasks = selection[name] if selection is not None else adapter.pilot_task_ids()
+        if not isinstance(tasks, list) or len(tasks) != expected or len(set(tasks)) != expected:
+            raise ValueError(f"{name} must supply exactly {expected} distinct reviewed candidates")
         studies = set()
         for task_id in tasks:
             if hasattr(adapter, "prepare_assets"):
@@ -31,10 +37,11 @@ def prepare(args):
             episode = adapter.convert(task_id)
             studies.add(episode.study_id)
             records.append(export_episode(episode, args.output / safe_component(episode.id)))
-        if len(studies) != 2:
+        if len(studies) != expected:
             raise ValueError(f"{name}: pilot candidates must use different study groups")
     manifest = {"schema_version": "0.1", "source_root": str(args.source_root.resolve()),
                 "source_manifest": str(args.manifest.resolve()), "cases": records,
+                "cases_per_benchmark": expected,
                 "scientific_runs_started": False, "runtime_tested": False}
     write_json(args.output / "pilot_manifest.json", manifest)
     return {"manifest": str(args.output / "pilot_manifest.json"), "cases": len(records),
@@ -85,7 +92,9 @@ def main(argv=None):
     preview.add_argument("--config", type=Path, default=project_root() / "configs/pilot.json")
     catalog = commands.add_parser("catalog", help="Enumerate metadata without running tasks or models")
     catalog.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
-    preparation = commands.add_parser("prepare", help="Export two curated candidates per benchmark")
+    preparation = commands.add_parser("prepare", help="Export explicitly selected reviewed candidates")
+    preparation.add_argument("--selection", type=Path, help="JSON mapping benchmark names to reviewed task IDs")
+    preparation.add_argument("--cases-per-benchmark", type=int, default=2)
     preparation.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
     preparation.add_argument("--output", type=Path, required=True)
     serving = commands.add_parser("serve", help="Start a researcher interface for an independent actor")

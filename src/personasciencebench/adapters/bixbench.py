@@ -65,6 +65,38 @@ PILOTS = {
     "bix-8-q2": "48a6b469-9c9d-4bef-b5b4-f29b7d6fa046",
 }
 
+# Reviewed input-only members and schema facts for the Luna baseline.
+CAPSULES.update({'93f63fb8-b56c-4ad1-8d3b-d651e2107423': {'archive_sha256': '5ac4a82eb6aa71cfb8a283f6b6cd13da3419d9f14e9ce61db51d26a6ca98932a',
+                                          'files': {'data.xlsx': '0088a66f710fb0e402d46647c2fa1cb2bbf42ffb9f36edc71100b610685d4399'}},
+ '9e52daf6-ca58-43e8-e732-fbac3459d295': {'archive_sha256': '71595fce1f8e3c0a209f03bdc3d5fd623d78385a781e1dbef4fac636365a43df',
+                                          'files': {'Swarm_2.csv': 'c85fbaa900c3db64d55ffb81421267e68e5c43d7d37d90a767328c6e63522475'}},
+ '1d54e4a7-8b0f-4224-bd31-efcfded0d46c': {'archive_sha256': '6b29bb5d03693e4098452042ae0169a98926d45ce6ca26b0a45682c8feb7039f',
+                                          'files': {'experiment_metadata.csv': '6a88817c361e575c3ec2a591839cbe5a0241f45d092efcde9c6d54b43a7e4e06',
+                                                    'raw_counts.csv': 'a20bb7fa693655b3537379afd1f1675d0bd7648fa9239fa538c139d76cb4f1f1'}}})
+PILOTS.update({'bix-51-q1': '93f63fb8-b56c-4ad1-8d3b-d651e2107423',
+ 'bix-54-q1': '9e52daf6-ca58-43e8-e732-fbac3459d295',
+ 'bix-13-q1': '1d54e4a7-8b0f-4224-bd31-efcfded0d46c'})
+ADDITIONAL_FACTS = {'bix-51-q1': [('input_schema',
+                'data_format',
+                'data.xlsx',
+                'worksheet Sheet1, row 1',
+                'The workbook has a worksheet named Sheet1 with columns including Groups, '
+                'Efficacy, Age, Family history, ECOG-PS, Child-Pugh, Chemotherapy experience, HBV '
+                'infection, Gender, BMI, and Toxic and side effect.')],
+ 'bix-54-q1': [('input_schema',
+                'data_format',
+                'Swarm_2.csv',
+                'CSV header',
+                'The CSV columns are DishNumber, StrainNumber, Ratio, Replicate, Area, '
+                'Circularity, and Round. Ratio entries use colon-separated strings.')],
+ 'bix-13-q1': [('input_schema',
+                'data_format',
+                'experiment_metadata.csv',
+                'CSV headers of experiment_metadata.csv and raw_counts.csv',
+                'The experiment metadata columns are SampleNumber, AzentaName, Media, Strain, and '
+                'Replicate. Raw-count columns use sample labels such as resub-1, which also occur '
+                'in AzentaName.')]}
+
 
 @dataclass
 class _Message:
@@ -151,7 +183,7 @@ class BixBenchAdapter(Adapter):
         ) for row in self._rows()]
 
     def pilot_task_ids(self) -> list[str]:
-        return list(PILOTS)
+        return ["bix-10-q2", "bix-8-q2"]
 
     def prepare_assets(self, task_id: str) -> list[Path]:
         """Extract reviewed inputs from an already acquired pinned ZIP, offline."""
@@ -192,7 +224,9 @@ class BixBenchAdapter(Adapter):
 
     def _facts(self, task_id: str) -> list[Fact]:
         capsule = PILOTS[task_id]
-        if task_id == "bix-10-q2":
+        if task_id in ADDITIONAL_FACTS:
+            items = ADDITIONAL_FACTS[task_id]
+        elif task_id == "bix-10-q2":
             items = [
                 ("demographics", "sample_metadata", "TASK008_BCG-CORONA_DM.csv", "header; columns TRTGRP, patients_seen, expect_interact, VISITNAM",
                  "The demographics table records TRTGRP as BCG or Placebo, patients_seen as 1-50, 51-100, or >100, and expect_interact as Yes or No. Its VISITNAM entries are Screening-Day -3 to 1."),
@@ -221,7 +255,7 @@ class BixBenchAdapter(Adapter):
 
     def convert(self, task_id: str) -> Episode:
         if task_id not in PILOTS:
-            raise ValueError("Only the two reviewed BixBench pilot questions can be converted")
+            raise ValueError("This BixBench question has no reviewed conversion")
         row = next(row for row in self._rows() if row["question_id"] == task_id)
         capsule = PILOTS[task_id]
         if row["capsule_uuid"] != capsule or row["version"] != "1.5":

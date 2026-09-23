@@ -73,6 +73,46 @@ PILOTS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Reviewed public datasets and background excerpts; references remain private.
+PILOTS.update({'67': {'study': 'brand-d/cogsci-jnmf:CogSci_pattern_high_sim_data',
+        'files': ['CogSci_pattern_high_sim_data/fit_result_openness_W_high.npy',
+                  'CogSci_pattern_high_sim_data/PSYCOP.csv',
+                  'CogSci_pattern_high_sim_data/Matching.csv',
+                  'CogSci_pattern_high_sim_data/VerbalModels.csv',
+                  'CogSci_pattern_high_sim_data/fit_result_conscientiousness_W_high.npy',
+                  'CogSci_pattern_high_sim_data/MMT.csv',
+                  'CogSci_pattern_high_sim_data/Conversion.csv',
+                  'CogSci_pattern_high_sim_data/PHM.csv',
+                  'CogSci_pattern_high_sim_data/Atmosphere.csv'],
+        'facts': [('scientific_context',
+                   'context',
+                   'Joint Nonnegative Matrix Factorization (JNMF) is a method for factor analysis '
+                   'that is capable of simultaneously decomposing two datasets into related latent '
+                   'state representations.')],
+        'output': 'pred_results/CogSci_pattern_high_sim_data_pred.csv',
+        'unknowns': ['Undocumented analysis choices and evaluator reference results.']},
+ '87': {'study': 'SciTools/iris:polynomial_fit',
+        'files': ['polynomial_fit/A1B_north_america.nc'],
+        'facts': [('scientific_context',
+                   'context',
+                   'NetCDF (Network Common Data Form) files are commonly used to store '
+                   'multi-dimensional scientific data such as temperature, humidity, wind speed, '
+                   'etc.')],
+        'output': 'pred_results/polynomial_fit_pred.csv',
+        'unknowns': ['Undocumented analysis choices and evaluator reference results.']},
+ '92': {'study': 'brand-d/cogsci-jnmf:jnmf_visualization',
+        'files': ['jnmf_visualization/fit_result_conscientiousness_W_low.npy',
+                  'jnmf_visualization/fit_result_conscientiousness_H_low.npy',
+                  'jnmf_visualization/fit_result_conscientiousness_W_high.npy',
+                  'jnmf_visualization/fit_result_conscientiousness_H_high.npy'],
+        'facts': [('scientific_context',
+                   'context',
+                   'Joint Nonnegative Matrix Factorization (JNMF) is a method for factor analysis '
+                   'that is capable of simultaneously decomposing two datasets into related latent '
+                   'state representations.')],
+        'output': 'pred_results/jnmf_h_importances.json',
+        'unknowns': ['Undocumented analysis choices and evaluator reference results.']}})
+
 
 def _relative(value: str) -> str:
     path = PurePosixPath(value)
@@ -129,7 +169,7 @@ class ScienceAgentBenchAdapter(Adapter):
     def convert(self, task_id: str) -> Episode:
         task_id = str(task_id)
         if task_id not in PILOTS:
-            raise ValueError("Only verified instances 22 and 45 have reviewed interactive conversions")
+            raise ValueError("This verified instance has no reviewed interactive conversion")
         row = self._load_rows()[task_id]
         selected = PILOTS[task_id]
         dataset_revision = self.source.dataset_revision or DATASET_REVISION

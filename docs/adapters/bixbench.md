@@ -1,5 +1,9 @@
 # BixBench adapter
 
+> The current five-case subset and runtime changes are documented in the
+> [current adaptation record](../benchmark_adaptations.md). The two-case
+> construction/pilot account below describes the earlier implementation.
+
 Status: two reviewed episodes have completed live isolated analysis and final
 Luna grading. Both received native grade zero; neither actor asked the researcher.
 See the [pilot report](../../reports/pilot_report.md) and

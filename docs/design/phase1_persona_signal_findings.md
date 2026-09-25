@@ -57,7 +57,7 @@ Screened offline (repo tracks) or from papers and READMEs (external).
 
 | Benchmark | Researcher-exclusive, answer-changing information | Practical fit |
 | --- | --- | --- |
-| BixBench, ScienceAgentBench, SciAgentGym, PhySciBench, MLAgentBench, OpenProblems | Essentially none; tasks are self-contained. ScienceAgentBench `domain_knowledge` is mostly background or tool hints (decisive in about 2 to 3 of 102). | ScienceAgentBench: most tasks need packages absent from the actor runtime |
+| BixBench, ScienceAgentBench, SciAgentBench, PhySciBench, MLAgentBench, OpenProblems | Essentially none; tasks are self-contained. ScienceAgentBench `domain_knowledge` is mostly background or tool hints (decisive in about 2 to 3 of 102). | ScienceAgentBench: most tasks need packages absent from the actor runtime |
 | LABBench2 | Partly, but mostly the answer itself | Light |
 | DiscoveryBench, IG-Bench, RExBench, NatureBench | Partly. DiscoveryBench `archaeology` construct definitions (38 queries) are not inferable from data. | DiscoveryBench is LLM-judged; RExBench and NatureBench need GPUs and hours |
 | Terminal-Bench-Science, PaperBench | Yes: README Difficulty sections that are not part of the agent's instruction; author-developed rubrics and judge-only addenda | Heavy (hours, Harbor/Docker or GPU) |

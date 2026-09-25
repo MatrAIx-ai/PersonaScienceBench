@@ -1,4 +1,4 @@
-"""Deterministic A–G persona routing; H comes exclusively from task context."""
+"""Backward-compatible persona routing and opt-in science catalog rendering."""
 
 from copy import deepcopy
 import hashlib
@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from personasciencebench.schema import Episode, Record
+from personasciencebench.collaboration.profiles import SciencePersona, render_profile, catalog_sha256
 
 Level = Literal["novice", "intermediate", "expert"]
 
@@ -61,6 +62,8 @@ class Persona(Record):
     communication: Communication = Field(default_factory=Communication)
     workflow: Workflow = Field(default_factory=Workflow)
     interaction: Interaction = Field(default_factory=Interaction)
+    # Explicit opt-in: old profiles retain their original rendering and behavior.
+    science_profile: SciencePersona | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -132,6 +135,8 @@ def render_persona(persona: Persona) -> str:
     """Versioned behavioral rendering, with no reference data or generated biography."""
     if not persona.enabled:
         return ""
+    if persona.science_profile is not None:
+        return render_profile(persona.science_profile)
     p = persona
     seniority = {"junior": "Ask for explanations when a methodological choice is unclear.",
                  "mid": "Discuss methodological choices and ask for their rationale when needed.",
@@ -178,10 +183,14 @@ def render_persona(persona: Persona) -> str:
 
 def persona_record(persona: Persona) -> dict:
     prompt = render_persona(persona)
-    payload = {"schema_version": "2", "renderer_version": "1", "profile": persona.model_dump(),
+    profile = persona.model_dump() if persona.science_profile is not None else persona.model_dump(exclude={"science_profile"})
+    payload = {"schema_version": "2", "renderer_version": "1", "profile": profile,
                "identity_prompt": prompt}
     if not persona.enabled:
         payload = {"schema_version": "3", "renderer_version": "2", "enabled": False,
                    "profile": None, "identity_prompt": ""}
+    elif persona.science_profile is not None:
+        payload.update(schema_version="science-persona-1.0", renderer_version="science-renderer-1.0",
+                       catalog_sha256=catalog_sha256())
     payload["sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return payload

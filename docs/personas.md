@@ -1,5 +1,19 @@
 # Researcher personas
 
+## Science catalog extension
+
+The new [56-attribute catalog](collaboration/ATTRIBUTE_CATALOG.md) can be enabled with
+`persona.science_profile`; see [the complete config overlay](../examples/ode_collaboration/shared_runner_persona.json).
+Merge this persona block into an existing run configuration. A science profile must assign all 56 attributes;
+`active_attributes` optionally projects a nonempty subset into the simulator prompt. When enabled, the science
+profile supplies the persona rendering; legacy group defaults do not additionally condition it. Existing
+profiles and explicit `enabled=false` keep their prior behavior. A router entry containing `science_profile`
+must supply a complete valid profile, not a partial attribute patch.
+
+This renderer integration does not automatically add the new task disclosure state machine to every runner.
+The [worked ODE session and live entry point](collaboration/ODE_WORKED_EXAMPLE.md) provide that complete
+integration for one task. Original persona documentation follows below.
+
 Personas condition the researcher simulator through its system message. They do
 not require a particular model or change model weights. Both `run` and `serve`
 use the same router. The actor receives researcher replies through the existing

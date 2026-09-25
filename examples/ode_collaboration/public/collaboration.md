@@ -1,0 +1,3 @@
+# Collaboration protocol
+
+The adjacent instruction.md is the unmodified scientific task. The researcher can discuss workflow, reporting, numerical_help, and stopping. Questions are optional. Use the host's ask/report/submit interface; only the host can record artifact evidence. A first final submission can return review feedback and a response slot before sealing. The collaboration condition allows six researcher question calls and 40 interaction actions, with one final response slot added only if a last-action disclosure needs it. These are interaction limits; the original 28,800-second, 4-CPU, 8-GB scientific allocation and three required output paths remain unchanged. Researcher preferences do not alter scientific grading.

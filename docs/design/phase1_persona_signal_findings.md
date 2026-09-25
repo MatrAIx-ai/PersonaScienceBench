@@ -12,7 +12,8 @@ are kept by the author and not committed.
   these episodes cannot show a persona effect.
 - The actor does ask when information is genuinely held only by the researcher.
   In the team's Luna baseline, EXP-Bench episodes asked 5, 4, 0, 6 and 0
-  questions; HiL-Bench (external) reports 1-7 questions per task.
+  questions; HiL-Bench (external) reports about 1 to 7 questions per task on
+  average, depending on model and domain.
 - Two native grading behaviours add noise that can hide small persona effects.
 - There are two coherent design logics (below). The one Phase 1 currently
   implies, with no real information gap, needs explicit outcome definitions and
@@ -21,7 +22,8 @@ are kept by the author and not committed.
 ## Local evidence
 
 Model `openai/gpt-6-luna` for actor, researcher and judge; `configs/pilot.json`
-settings unless stated; three predeclared repeats per condition.
+settings unless stated. Each condition in the table used three predeclared
+repeats per task.
 
 | Run (task) | Condition | Correct | Researcher questions |
 | --- | --- | --- | --- |
@@ -29,7 +31,7 @@ settings unless stated; three predeclared repeats per condition.
 | `bix-7-q2` | All approved facts in the public brief (standards section 8 control) | 3/3 | 0 |
 | `bix-7-q2` | Phase 1 example arms: off, reference, `coding_fluency_low`, `coding_fluency_high` | 0/12 | 0 |
 | `bix-7-q2` | Persona off, actor `reasoning_effort` medium | 2/3 | 0 |
-| Five BixBench tasks | Researcher-only and facts-in-brief | see note 1 | 0 in all 30 |
+| Five BixBench tasks (`bix-19-q1`, `bix-7-q2`, `bix-14-q2`, `bix-52-q7`, `bix-6-q6`) | Researcher-only vs facts-in-brief | 2/15 vs 3/15 | 0 in all 30 |
 
 1. The facts-in-brief control closed the gap for `bix-7-q2`, but more actor
    reasoning also closed it without the researcher. The gap was a reasoning
@@ -42,9 +44,9 @@ settings unless stated; three predeclared repeats per condition.
 - `str_verifier` requires an exact alphanumeric match. Answers such as
   "337 samples per group." score 0 although the number is correct
   (`bix-19-q1`, `bix-42-q1`).
-- Prose answers to `range_verifier` questions fall through to the LLM range
-  judge. The identical value 0.0216 was graded correct in 2 of 6 episodes
-  (`bix-6-q6`).
+- In the adapter's native open-ended grader, `range_verifier` questions are
+  always graded by an LLM judge rather than a numeric range check. The
+  identical value 0.0216 was graded correct in 2 of 6 episodes (`bix-6-q6`).
 
 These graders are frozen for Phase 1. We suggest reporting native answers next
 to native grades so grading noise is visible.
@@ -55,17 +57,18 @@ Screened offline (repo tracks) or from papers and READMEs (external).
 
 | Benchmark | Researcher-exclusive, answer-changing information | Practical fit |
 | --- | --- | --- |
-| BixBench, ScienceAgentBench, SciAgentGym, PhySciBench, MLAgentBench, OpenProblems | Essentially none; tasks are self-contained. ScienceAgentBench `domain_knowledge` is mostly background or tool hints (decisive in about 2 of 102). | ScienceAgentBench: most tasks need packages absent from the actor runtime |
+| BixBench, ScienceAgentBench, SciAgentGym, PhySciBench, MLAgentBench, OpenProblems | Essentially none; tasks are self-contained. ScienceAgentBench `domain_knowledge` is mostly background or tool hints (decisive in about 2 to 3 of 102). | ScienceAgentBench: most tasks need packages absent from the actor runtime |
 | LABBench2 | Partly, but mostly the answer itself | Light |
 | DiscoveryBench, IG-Bench, RExBench, NatureBench | Partly. DiscoveryBench `archaeology` construct definitions (38 queries) are not inferable from data. | DiscoveryBench is LLM-judged; RExBench and NatureBench need GPUs and hours |
-| Terminal-Bench-Science, PaperBench | Yes: agent-invisible README Difficulty sections; author rubrics and judge-only addenda | Heavy (hours, Harbor/Docker or GPU) |
+| Terminal-Bench-Science, PaperBench | Yes: README Difficulty sections that are not part of the agent's instruction; author-developed rubrics and judge-only addenda | Heavy (hours, Harbor/Docker or GPU) |
 | EXP-Bench | Yes, by design: setup facts held by the scoped researcher | Agents ask; not in the Phase 1 planner |
-| ASI-Bench | Yes: each task ships guidance levels B1 (full method) to B3 (objective and data); paper reports 50.91 at B1 vs 26.62 at B3 | Long, token-heavy tasks; some judge-graded |
+| ASI-Bench | Yes: each task ships guidance levels B1 (full method) to B3 (objective and data only), plus B4 (B3 with distractors); the paper reports 50.91 at B1 vs 26.62 at B3, aggregated over 18 agent-model configurations | Long, token-heavy tasks; the paper describes deterministic gates and scorers |
 | HiL-Bench, SciConvBench | Yes; built to test asking | HiL-Bench is SQL/software; SciConvBench grades dialogue only |
 
 "SciAgentBench" in the team list (arXiv 2602.12984) is SciAgentGym, not the
-ScienceAgentBench (arXiv 2410.05080) integrated in this repository. None of the
-screened benchmarks conditions its user simulator on a persona.
+ScienceAgentBench (arXiv 2410.05080) integrated in this repository. Neither
+HiL-Bench nor SciConvBench conditions its simulator on a persona, and the other
+external benchmarks have no user simulator.
 
 ## Two design logics
 
@@ -86,21 +89,26 @@ screened benchmarks conditions its user simulator on a persona.
    controls for what the actor would do anyway.
 2. **Robustness to persona pressure.** A persona states a confident but wrong
    prior. The native grader checks whether the scientific answer follows the
-   data rather than the persona. This is fully deterministic.
+   data rather than the persona. This is deterministic wherever the native
+   grader is.
 3. **Communication fit.** Judge-scored against the rubric-anchored attributes
    and reported separately from correctness.
 4. **Process measures.** Questions, steps, cost, and checks consistent with the
    persona (for example robustness checks under a cautious persona).
 
-Logic B also needs interaction to happen. A fixed, persona-independent trigger
-(for example a researcher review of every submitted plan, the same in all arms)
-fits the standards' documented-trigger allowance. Without it, zero-question
-episodes leave nothing to measure.
+Logic B also needs interaction to happen. A fixed, persona-independent trigger,
+such as a researcher review of the plan at a fixed checkpoint identical in all
+arms, fits the standards' documented-trigger allowance. Plan submission is
+currently optional, so making it a fixed step would be a registered protocol
+change. Without such a trigger, zero-question episodes leave nothing to measure.
 
 ## Options for Phase 1
 
-1. Keep existing tasks; make question behaviour (e.g. Ask-F1) a primary
-   outcome and report persona effects conditional on interaction.
+1. Keep existing tasks; make question behaviour a primary outcome and report
+   persona effects conditional on interaction. Without HiL-Bench-style blockers,
+   an Ask-F1-style measure can be computed against each task's reviewed fact
+   pool: the share of questions that retrieve an approved fact, and the share
+   of approved facts retrieved.
 2. Add existing-benchmark tasks where the researcher holds non-inferable
    information (DiscoveryBench `archaeology` first), confirmed by an offline key
    check and a facts-in-brief control.

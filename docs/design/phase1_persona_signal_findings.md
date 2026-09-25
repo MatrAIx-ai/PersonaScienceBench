@@ -65,10 +65,8 @@ Screened offline (repo tracks) or from papers and READMEs (external).
 | ASI-Bench | Yes: each task ships guidance levels B1 (full method) to B3 (objective and data only), plus B4 (B3 with distractors); the paper reports 50.91 at B1 vs 26.62 at B3, aggregated over 18 agent-model configurations | Long, token-heavy tasks; the paper describes deterministic gates and scorers |
 | HiL-Bench, SciConvBench | Yes; built to test asking | HiL-Bench is SQL/software; SciConvBench grades dialogue only |
 
-"SciAgentBench" in the team list (arXiv 2602.12984) is SciAgentGym, not the
-ScienceAgentBench (arXiv 2410.05080) integrated in this repository. Neither
-HiL-Bench nor SciConvBench conditions its simulator on a persona, and the other
-external benchmarks have no user simulator.
+Neither HiL-Bench nor SciConvBench conditions its simulator on a persona, and
+the other external benchmarks have no user simulator.
 
 ## Two design logics
 

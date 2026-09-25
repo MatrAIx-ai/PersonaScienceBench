@@ -61,9 +61,20 @@ condition, 0 researcher questions in every episode):
 | Researcher-only (standard) | 0/3 (300.9 each time) | 2/3 (15.8%, 61.6%, 61.6%) |
 | All approved facts in the public brief (standards section 8 control) | 3/3 (52.33) | 3/3 (61.7%) |
 
-The control shows the questions are solvable given the researcher's reviewed
-knowledge; the actor did not ask for it. These are small descriptive runs, not
-a persona comparison.
+The control shows the questions are solvable given the reviewed facts; the actor
+did not ask for them. Two follow-up local runs on `bix-7-q2` qualify this:
+
+| Follow-up | Result |
+| --- | --- |
+| Phase 1 example arms (off, reference, `coding_fluency_low`, `coding_fluency_high`), 3 repeats each | 0/12 correct, 0 researcher questions; answers varied within every arm (1.13 to 665.79) |
+| Persona off, actor `reasoning_effort` low / medium, 3 repeats each | low: 0/3 (answered in text without submitting); medium: 2/3 correct (52.33) with 0 questions |
+
+With more reasoning the actor infers the reference-call step from the data itself,
+so the earlier gap reflects actor reasoning at effort `none` rather than
+information that only the researcher holds. These questions are therefore not
+evidence of persona sensitivity; they are contributed as reviewed tasks with
+source-backed researcher facts. These are small descriptive runs, not a persona
+comparison.
 
 ## Identity and provenance
 

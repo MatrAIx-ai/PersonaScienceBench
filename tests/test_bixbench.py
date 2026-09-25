@@ -170,3 +170,24 @@ def test_missing_inputs_block_scoring_before_any_judge_call(adapter, tmp_path):
     result = adapter.evaluate(episode, submission(episode), judge)
     assert result.status == "blocked" and result.metrics == {}
     assert judge.calls == []
+
+
+@pytest.mark.parametrize("task_id", ["bix-7-q2", "bix-2-q2"])
+def test_chip_additions_keep_boundaries_and_native_subfolder(adapter, task_id):
+    episode = adapter.convert(task_id)
+    assert episode.study_id == PILOTS[task_id]
+    episode.evaluator.reference["target"] = "PRIVATE_SENTINEL_GOLD_70202"
+    exported = json.dumps(episode.actor_input())
+    researcher = episode.researcher.model_dump_json()
+    assert "PRIVATE_SENTINEL" not in exported and "PRIVATE_SENTINEL" not in researcher
+    assert "CapsuleNotebook" not in exported and ".ipynb" not in exported
+    allowed = CAPSULES[PILOTS[task_id]]["files"]
+    assert {asset.target_path for asset in episode.assets} == {f"data/{name}" for name in allowed}
+    for fact in episode.researcher.facts:
+        member = fact.source.source_path.split(f"CapsuleData-{PILOTS[task_id]}/", 1)[1]
+        assert fact.review_status == "reviewed" and fact.source.sha256 == allowed[member]
+    written = adapter.prepare_assets(task_id)
+    root = adapter.source.assets / "prepared" / PILOTS[task_id]
+    assert sorted(path.relative_to(root).as_posix() for path in written) == sorted(allowed)
+    assert any("/" in name for name in allowed)
+    assert not any(path.suffix == ".ipynb" for path in written)

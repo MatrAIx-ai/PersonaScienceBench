@@ -98,6 +98,231 @@ ADDITIONAL_FACTS = {'bix-51-q1': [('input_schema',
                 'in AzentaName.')]}
 
 
+# CHIP data-coding questions (bix-7-q2, bix-2-q2): input-only members and schema facts.
+# Keys were recomputed offline before conversion; see docs/adapters/bixbench.md.
+CAPSULES.update({
+    "a02b761a-02b6-46b5-9d5e-2964d5a74960": {
+        "archive_sha256": "9852ea865a9b394cf0c14469074493f49f8ae79e610fd89ed55b39e4d185e7b4",
+        "files": {
+            "230214_Schenz_et_al_2022_CHIP_Genes.xlsx": "e3ff97a22e0a1e08f567ed52dd3419ba64eb53f330abf771d4ae680dae05d60b",
+            "230215_Trio_Status.xlsx": "a26d468b8f6843cc5402fc2d95ab16ac8ea5f9b73f1af31da7c97db2743561b9",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_179-P1.xlsx": "1bfb68ffa376f4cdc5b004dd94d177756247dc35b6fc1438e9c9ed26a038d11e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_184-PM.xlsx": "84b91c2b24e090a0751ecba20c9ee97d0c12542b599d6e29ce18b5b40ee84852",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_185-PF.xlsx": "92f445997f48d95a37fc30bc2dc2bfee0e9b614b0d6c8d52820285a5c3f5d03b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_285-PF.xlsx": "30e3bf0f3243ba52c6a628db61aa4503ba4bf09e4819f3130fae9b802e80a8ba",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_286-P.xlsx": "092a37eb8ffec902e38eb7592ed68badf104916e721ff9bdddebf91f1b22dc4c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_287-PM.xlsx": "e0d16f529fbff1c889bc486f83a16b45830f9d696d5d96d33c231f716a0feb74",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_353-PF.xlsx": "7006ef221d6b0d9e68023ef7234d7b6f70bfd46cba284c1493585fe313f75060",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_354-PM.xlsx": "738cfa6dede7dfb2dec68de877b0cdc71231a3959058e289431cd84358bc8134",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_360-P.xlsx": "85256a06b3fd5ad34bb8fa3fe6407dbea45c74566017b00e3548a865816b7570",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_364-P.xlsx": "c4d78d2b772ad835b8837808280e9aa72d2406d269d1fa5efced65c5a8b5b885",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_380-P.xlsx": "ac1e7109862f57c43ba12dbbec45e2bcbfa446b5e75901a478d5e5df914adddc",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_381-PM.xlsx": "1d078c8ccf88543616d9e3e4e74d58864248339b82665e1dcaee42d582054ca6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_396-PF.xlsx": "59516d5e28aaaaa87d5a7ba3f2e9be827747b17a87ca23409135ebb1a79cf9cf",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_397-PM.xlsx": "6118a2079d37f3cafbc13ccfa56fa76097e447b68e37085ad9ce47cdc73a3998",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_409-P1.xlsx": "b0ffd7e11089326c725be1a6caef8565d9b6f5b76fe4f3c1e20457278c92ed0e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_488-P2.xlsx": "3470eba954d4b5f84f4effb87751afc6c25cc205de6cd6816d0c8110a611f786",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_489-PF.xlsx": "9a3cdea0176308f0cdf72287a858d28153a8f3bdaf5203b7c687182b21828a7d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_490-PM.xlsx": "a2914a67c401669aa155a7f5e05b11a66d49e51064824bf3bbe90d0803540758",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_498-P.xlsx": "2ffb2a703b4680824b40a71c0bc52f0a729bd7205a89f3da48bbe6b929e48c5a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_499-PF.xlsx": "da959a6b6347fa64db2d8a5ed84c2b1520ca3d749db8f0e361762e7eeb5451ad",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_500-PM.xlsx": "072c62b109297aa0a9c0e067847fa900224154fcbf2e05e3fd1a37e381dfe6ef",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_502-P1.xlsx": "afc08db8161df2295c748c565fafe1fe34ffcc379a4ab359662d3c1c3df32f2f",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_503-PF.xlsx": "35ffeae56155cb9280cd9e28cfdae96d5e5a639700c22dba9a384933eab9ecca",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_504-PM.xlsx": "52817b8814e51cc64a1d71b40a5d69a5f876c68335496d4dd637dbdcb0968bb4",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_556-PF.xlsx": "9531607a63f860be686dbf7fc7d21e34e74e20e6df97ae2b7c0e3a12d5ecb660",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_557-PM.xlsx": "f6ee634602c1f57b154180739745174c40e8c77fa6ac64867ff263f80887c5a9",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_613-PF.xlsx": "6dbf92e0ee26aa21823119f2c92f542c681d0f618315546df965b16384c1e69a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_614-PM.xlsx": "da30a6d29e9158867fa1693937eab99fc2de9a41f1789acecad6c2c98ab3b646",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_615-P1.xlsx": "0811013c39eb0da3ceccc43386a690c5af6621d4469c2a77dedb199159392e8a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5456220.xlsx": "bb9256ce4a066f30e0d498fc98b88975aa78a17eddf7248bbef73174bdb2de7b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5456232.xlsx": "1e226d7b4b9e39456c8e8c2b6d07fcc0dfd88423f8526a843a447b2f15eb2587",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462651.xlsx": "4cdca97e24d372ddc365a1a639212239e111ec1e0ecc9e45279b4b3673366314",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462820.xlsx": "71a78af018031c00de73830ef5c879ffb0e5159e419e90708ac42db43fc0c4e3",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462858.xlsx": "19fb28a3e521a09412666b550b73283cfdc5816ccf06f2e29fef3d68ee3ddc72",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462872.xlsx": "695e34ffa2f6ba0b7aa1ef307b41d33b11b32e5d9847642f2e8b7bbd38785f59",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462955.xlsx": "8ed839020cc4e7188162aac4ff54e5c5022184cae2f957ceecbb1a4cdd3f8295",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462967.xlsx": "44ee022c301b01c186545649400309094626a49e2f2c4f5f1e9d8ed36c1a811e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463095.xlsx": "51dc2a1604a29b8ae324f41a9f3bff6dfb171d478f6a98e201b207c215a74add",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463149.xlsx": "f050c59259d4912f821f2d7838b101f893f319c2b01782817bacb334fcadecce",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463270.xlsx": "3583dc0f7b387580b493361e8c3c8a7baaef86f83548d09cc5b38b67d8f81a4e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463506.xlsx": "b4466c9ca984954d620fe79addb1c0073518122cd3f823de8ad27e410292d24c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5466052.xlsx": "8bf8184cf89ac38841182d5e96999102a5d9d5bc5f1a1e7c7b3978e00ad3b5f1",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5466100.xlsx": "2bcf14ba367f2eb56c77303ac14014930ec8a6d36aca12e859b33a60a2794f33",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5469760.xlsx": "1471c4400a6e51efe0df3b90b1a725d75f69cb2b9d895555c5f0c0f2d64bbfc0",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5469979.xlsx": "f76dbc97faa5a97317628b16291c04d6bd801a432112860c96d6527b6d6d80a6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5470425.xlsx": "6046fdedaf25cd78806ac525bb6c23325a2293ea7d5210ebe95f4ae90cbb5997",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550148.xlsx": "27b448bca2523fadcb1269ee76142418c76d99eeb9cc74c38035f77d8c596377",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550381.xlsx": "cba2a6317bc5edcb76151a189bb42007e05e33366fd311f64b9d6ea8a5393782",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550774.xlsx": "3b37110a5eef38424a39f33f258a057bde97431bb049bb3f817cd17bba4cb08d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550794.xlsx": "18e53b52711f2ccf00b1cb70ece09895c19f3f263ea383594b4ee13ab157fb6e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5551062.xlsx": "acd75fb67d5cc4389643f744e4d29d38cb3fea37b00fcc729a8b9e81c42e406b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5553488.xlsx": "fecb4258bb19fdcb81fc79f5097b894cad7fc2980686fccd43157e63e43d7862",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5555687.xlsx": "94275ebec88a73e14c69789a1f0bd0dba8f7656003e579db4de01d095cd1fd77",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5556325.xlsx": "51e4268e0c5fa3ee88f600b6453a1e56addc53008aeac48d428a445ad3ce5d16",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5560909.xlsx": "802c86f94aa412407d44b860d04ea2dcb555e9e16c871ba7b0d3b2878660cd0c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5560927.xlsx": "ca620e6a08e8400075158d909922925c9776860239f7c46830be468857694fd2",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561089.xlsx": "f7eb768afb56dd687270aae19cd8da600c45c398c6e3b797432467b7e7e41599",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561107.xlsx": "c93b2ea09755d7c1f3c7a43ab6ba4d56f815762da804353b67b4d115b19cfe2f",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561237.xlsx": "647d44457ecdedb1a10a2d14735ae8ce369e8fb5472292dea35ae12960fc344c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561287.xlsx": "47f12e3de3d4b1827d7b362179dd41a701db3fccccdfa1c24ad7e0b9d987728d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561319.xlsx": "b14f4388565eb43988ab4e02e18b5217cc49f037f1188cc2463cd2573ec41f9b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561584.xlsx": "44c126a5368f01f11bb2279e6c848034a5fb4d44138d7a74d3c072153792b14a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561706.xlsx": "82273738fd071b78e3f6a8506884a2e96f8c93db1637d350a1e6b57197156369",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561875.xlsx": "b32f2f48bc9957204bdb14a5d356fcd19421fd51188deba43efec768466fc203",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561934.xlsx": "676a9b345302ca287c07129cc02f76946ec1966bdd8332ca23f630253629a6a8",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561950.xlsx": "b9cdd33cd374fc6d0478a46eca6a98e4b5de090b961c338df55ead5e6b1c56ee",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562000.xlsx": "845fa7c3c0bf890bc4cabd387900d2778d55d9f47153fe56082f8c8ab0330f15",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562034.xlsx": "eb68efa7717925ef951af9b6cba5eb72331c0512f113025ae6c8c191a9f670f5",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562184.xlsx": "2535488a7271d8648b025e9a251df3c9c925603965678f1be1a28da2407fb3e6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562220.xlsx": "311defa005f8e534c003e6c536661da2b5a49a5a1cbcb8465087ae7cc62c8f1d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562238.xlsx": "4ca9c363fe0df478e26d16d07a6e3b47f5821413297f6092557422cf2ef3e1e2",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565258.xlsx": "3a79d9b3117e1c8a239a8f579147ac2f7378e1884661df9e0a9bec01619d4783",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565278.xlsx": "3fd5a2eea9c9c25a88202b7d43a97284296ebb16d7c440da4da1780e5e8d3c21",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565931.xlsx": "2fb187d378c7efb5e2d75c75ba431a7aadb55cc3a4e07da1c643617f6311732d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565968.xlsx": "7d92b18efee05de81abaa038a728e5bd76c953a879ca354c555eed93d2e5541a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5566591.xlsx": "654a2db28386d0e3f5663f939e5260370599d0f0ef64fa9caf6de4c1d2135bc3",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5566906.xlsx": "5a34ae8e264e2fab6c7980e1d770f77b804d1e72ed0ec64bc370da725d74f518",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567694.xlsx": "ed44b21dde73ee31c037cb5a6f62db16c7bf07a8fbfe3caef466bd172d1607db",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567876.xlsx": "05216393bdd9cfcc650e4716cb2fff5f06df8bcbd20b643e08f016e42c9e604d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567954.xlsx": "d36aa76ec3e23715a8b713d8ddd93debb1212699a8272cff205d05a5f76ae941",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5571393.xlsx": "b1f512a2fcde86fcedc4e63671de23a8da1ef9b4f5f5e1fa3f05e0ce46349e72",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688631.xlsx": "14079aacb36d0940bbeef41617e2bdf1237debd40996649e5532b4f44912face",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688669.xlsx": "c9e758a48c254b7e8a3177dc22678b7e684e739dc646593b148c14edcda90e2b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688704.xlsx": "f19cc55b3cb0565dd0d8c7893f6e0a9793796980a2c06f58ca12efa7040cf9d8",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688812.xlsx": "da42e52dbf6f7b8281e0a354afaaff990d15ce85e9d9c3aeb26f679e638efb38",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR6447679.xlsx": "af3bec69d25a8128d8b63bf840e52250eb8b4fbca1cf286b966e1ebc94e62549",
+        },
+    },
+    "30b33e47-92d8-4372-a9f6-da32896493d0": {
+        "archive_sha256": "7f9234d46d92985574164c53b3c62d39fa53dd06f8c10b1dbfb13652dc353be1",
+        "files": {
+            "230214_Schenz_et_al_2022_CHIP_Genes.xlsx": "e3ff97a22e0a1e08f567ed52dd3419ba64eb53f330abf771d4ae680dae05d60b",
+            "230215_Trio_Status.xlsx": "a26d468b8f6843cc5402fc2d95ab16ac8ea5f9b73f1af31da7c97db2743561b9",
+            "CHIP VAF mean proportions.xlsx": "1e6050173ddf4d7ca8c253294e10fe37e4b5f54f5c1dbab05281b3da658818c9",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_179-P1.xlsx": "1bfb68ffa376f4cdc5b004dd94d177756247dc35b6fc1438e9c9ed26a038d11e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_184-PM.xlsx": "84b91c2b24e090a0751ecba20c9ee97d0c12542b599d6e29ce18b5b40ee84852",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_185-PF.xlsx": "92f445997f48d95a37fc30bc2dc2bfee0e9b614b0d6c8d52820285a5c3f5d03b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_285-PF.xlsx": "30e3bf0f3243ba52c6a628db61aa4503ba4bf09e4819f3130fae9b802e80a8ba",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_286-P.xlsx": "092a37eb8ffec902e38eb7592ed68badf104916e721ff9bdddebf91f1b22dc4c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_287-PM.xlsx": "e0d16f529fbff1c889bc486f83a16b45830f9d696d5d96d33c231f716a0feb74",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_353-PF.xlsx": "7006ef221d6b0d9e68023ef7234d7b6f70bfd46cba284c1493585fe313f75060",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_354-PM.xlsx": "738cfa6dede7dfb2dec68de877b0cdc71231a3959058e289431cd84358bc8134",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_360-P.xlsx": "85256a06b3fd5ad34bb8fa3fe6407dbea45c74566017b00e3548a865816b7570",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_364-P.xlsx": "c4d78d2b772ad835b8837808280e9aa72d2406d269d1fa5efced65c5a8b5b885",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_380-P.xlsx": "ac1e7109862f57c43ba12dbbec45e2bcbfa446b5e75901a478d5e5df914adddc",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_381-PM.xlsx": "1d078c8ccf88543616d9e3e4e74d58864248339b82665e1dcaee42d582054ca6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_396-PF.xlsx": "59516d5e28aaaaa87d5a7ba3f2e9be827747b17a87ca23409135ebb1a79cf9cf",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_397-PM.xlsx": "6118a2079d37f3cafbc13ccfa56fa76097e447b68e37085ad9ce47cdc73a3998",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_409-P1.xlsx": "b0ffd7e11089326c725be1a6caef8565d9b6f5b76fe4f3c1e20457278c92ed0e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_488-P2.xlsx": "3470eba954d4b5f84f4effb87751afc6c25cc205de6cd6816d0c8110a611f786",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_489-PF.xlsx": "9a3cdea0176308f0cdf72287a858d28153a8f3bdaf5203b7c687182b21828a7d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_490-PM.xlsx": "a2914a67c401669aa155a7f5e05b11a66d49e51064824bf3bbe90d0803540758",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_498-P.xlsx": "2ffb2a703b4680824b40a71c0bc52f0a729bd7205a89f3da48bbe6b929e48c5a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_499-PF.xlsx": "da959a6b6347fa64db2d8a5ed84c2b1520ca3d749db8f0e361762e7eeb5451ad",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_500-PM.xlsx": "072c62b109297aa0a9c0e067847fa900224154fcbf2e05e3fd1a37e381dfe6ef",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_502-P1.xlsx": "afc08db8161df2295c748c565fafe1fe34ffcc379a4ab359662d3c1c3df32f2f",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_503-PF.xlsx": "35ffeae56155cb9280cd9e28cfdae96d5e5a639700c22dba9a384933eab9ecca",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_504-PM.xlsx": "52817b8814e51cc64a1d71b40a5d69a5f876c68335496d4dd637dbdcb0968bb4",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_556-PF.xlsx": "9531607a63f860be686dbf7fc7d21e34e74e20e6df97ae2b7c0e3a12d5ecb660",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_557-PM.xlsx": "f6ee634602c1f57b154180739745174c40e8c77fa6ac64867ff263f80887c5a9",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_613-PF.xlsx": "6dbf92e0ee26aa21823119f2c92f542c681d0f618315546df965b16384c1e69a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_614-PM.xlsx": "da30a6d29e9158867fa1693937eab99fc2de9a41f1789acecad6c2c98ab3b646",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_615-P1.xlsx": "0811013c39eb0da3ceccc43386a690c5af6621d4469c2a77dedb199159392e8a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5456220.xlsx": "bb9256ce4a066f30e0d498fc98b88975aa78a17eddf7248bbef73174bdb2de7b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5456232.xlsx": "1e226d7b4b9e39456c8e8c2b6d07fcc0dfd88423f8526a843a447b2f15eb2587",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462651.xlsx": "4cdca97e24d372ddc365a1a639212239e111ec1e0ecc9e45279b4b3673366314",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462820.xlsx": "71a78af018031c00de73830ef5c879ffb0e5159e419e90708ac42db43fc0c4e3",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462858.xlsx": "19fb28a3e521a09412666b550b73283cfdc5816ccf06f2e29fef3d68ee3ddc72",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462872.xlsx": "695e34ffa2f6ba0b7aa1ef307b41d33b11b32e5d9847642f2e8b7bbd38785f59",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462955.xlsx": "8ed839020cc4e7188162aac4ff54e5c5022184cae2f957ceecbb1a4cdd3f8295",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5462967.xlsx": "44ee022c301b01c186545649400309094626a49e2f2c4f5f1e9d8ed36c1a811e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463095.xlsx": "51dc2a1604a29b8ae324f41a9f3bff6dfb171d478f6a98e201b207c215a74add",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463149.xlsx": "f050c59259d4912f821f2d7838b101f893f319c2b01782817bacb334fcadecce",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463270.xlsx": "3583dc0f7b387580b493361e8c3c8a7baaef86f83548d09cc5b38b67d8f81a4e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5463506.xlsx": "b4466c9ca984954d620fe79addb1c0073518122cd3f823de8ad27e410292d24c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5466052.xlsx": "8bf8184cf89ac38841182d5e96999102a5d9d5bc5f1a1e7c7b3978e00ad3b5f1",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5466100.xlsx": "2bcf14ba367f2eb56c77303ac14014930ec8a6d36aca12e859b33a60a2794f33",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5469760.xlsx": "1471c4400a6e51efe0df3b90b1a725d75f69cb2b9d895555c5f0c0f2d64bbfc0",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5469979.xlsx": "f76dbc97faa5a97317628b16291c04d6bd801a432112860c96d6527b6d6d80a6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5470425.xlsx": "6046fdedaf25cd78806ac525bb6c23325a2293ea7d5210ebe95f4ae90cbb5997",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550148.xlsx": "27b448bca2523fadcb1269ee76142418c76d99eeb9cc74c38035f77d8c596377",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550381.xlsx": "cba2a6317bc5edcb76151a189bb42007e05e33366fd311f64b9d6ea8a5393782",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550774.xlsx": "3b37110a5eef38424a39f33f258a057bde97431bb049bb3f817cd17bba4cb08d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5550794.xlsx": "18e53b52711f2ccf00b1cb70ece09895c19f3f263ea383594b4ee13ab157fb6e",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5551062.xlsx": "acd75fb67d5cc4389643f744e4d29d38cb3fea37b00fcc729a8b9e81c42e406b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5553488.xlsx": "fecb4258bb19fdcb81fc79f5097b894cad7fc2980686fccd43157e63e43d7862",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5555687.xlsx": "94275ebec88a73e14c69789a1f0bd0dba8f7656003e579db4de01d095cd1fd77",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5556325.xlsx": "51e4268e0c5fa3ee88f600b6453a1e56addc53008aeac48d428a445ad3ce5d16",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5560909.xlsx": "802c86f94aa412407d44b860d04ea2dcb555e9e16c871ba7b0d3b2878660cd0c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5560927.xlsx": "ca620e6a08e8400075158d909922925c9776860239f7c46830be468857694fd2",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561089.xlsx": "f7eb768afb56dd687270aae19cd8da600c45c398c6e3b797432467b7e7e41599",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561107.xlsx": "c93b2ea09755d7c1f3c7a43ab6ba4d56f815762da804353b67b4d115b19cfe2f",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561237.xlsx": "647d44457ecdedb1a10a2d14735ae8ce369e8fb5472292dea35ae12960fc344c",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561287.xlsx": "47f12e3de3d4b1827d7b362179dd41a701db3fccccdfa1c24ad7e0b9d987728d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561319.xlsx": "b14f4388565eb43988ab4e02e18b5217cc49f037f1188cc2463cd2573ec41f9b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561584.xlsx": "44c126a5368f01f11bb2279e6c848034a5fb4d44138d7a74d3c072153792b14a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561706.xlsx": "82273738fd071b78e3f6a8506884a2e96f8c93db1637d350a1e6b57197156369",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561875.xlsx": "b32f2f48bc9957204bdb14a5d356fcd19421fd51188deba43efec768466fc203",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561934.xlsx": "676a9b345302ca287c07129cc02f76946ec1966bdd8332ca23f630253629a6a8",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5561950.xlsx": "b9cdd33cd374fc6d0478a46eca6a98e4b5de090b961c338df55ead5e6b1c56ee",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562000.xlsx": "845fa7c3c0bf890bc4cabd387900d2778d55d9f47153fe56082f8c8ab0330f15",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562034.xlsx": "eb68efa7717925ef951af9b6cba5eb72331c0512f113025ae6c8c191a9f670f5",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562184.xlsx": "2535488a7271d8648b025e9a251df3c9c925603965678f1be1a28da2407fb3e6",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562220.xlsx": "311defa005f8e534c003e6c536661da2b5a49a5a1cbcb8465087ae7cc62c8f1d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5562238.xlsx": "4ca9c363fe0df478e26d16d07a6e3b47f5821413297f6092557422cf2ef3e1e2",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565258.xlsx": "3a79d9b3117e1c8a239a8f579147ac2f7378e1884661df9e0a9bec01619d4783",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565278.xlsx": "3fd5a2eea9c9c25a88202b7d43a97284296ebb16d7c440da4da1780e5e8d3c21",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565931.xlsx": "2fb187d378c7efb5e2d75c75ba431a7aadb55cc3a4e07da1c643617f6311732d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5565968.xlsx": "7d92b18efee05de81abaa038a728e5bd76c953a879ca354c555eed93d2e5541a",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5566591.xlsx": "654a2db28386d0e3f5663f939e5260370599d0f0ef64fa9caf6de4c1d2135bc3",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5566906.xlsx": "5a34ae8e264e2fab6c7980e1d770f77b804d1e72ed0ec64bc370da725d74f518",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567694.xlsx": "ed44b21dde73ee31c037cb5a6f62db16c7bf07a8fbfe3caef466bd172d1607db",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567876.xlsx": "05216393bdd9cfcc650e4716cb2fff5f06df8bcbd20b643e08f016e42c9e604d",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5567954.xlsx": "d36aa76ec3e23715a8b713d8ddd93debb1212699a8272cff205d05a5f76ae941",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5571393.xlsx": "b1f512a2fcde86fcedc4e63671de23a8da1ef9b4f5f5e1fa3f05e0ce46349e72",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688631.xlsx": "14079aacb36d0940bbeef41617e2bdf1237debd40996649e5532b4f44912face",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688669.xlsx": "c9e758a48c254b7e8a3177dc22678b7e684e739dc646593b148c14edcda90e2b",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688704.xlsx": "f19cc55b3cb0565dd0d8c7893f6e0a9793796980a2c06f58ca12efa7040cf9d8",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR5688812.xlsx": "da42e52dbf6f7b8281e0a354afaaff990d15ce85e9d9c3aeb26f679e638efb38",
+            "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_SRR6447679.xlsx": "af3bec69d25a8128d8b63bf840e52250eb8b4fbca1cf286b966e1ebc94e62549",
+        },
+    },
+})
+PILOTS.update({"bix-7-q2": "a02b761a-02b6-46b5-9d5e-2964d5a74960", "bix-2-q2": "30b33e47-92d8-4372-a9f6-da32896493d0"})
+
+_CHIP_EXAMPLE = "CHIP_DP10_GQ20_PASS/230209_Exome_GRCh38_CHIP_179-P1.xlsx"
+_CHIP_LAYOUT = ("file_layout", "data_format", _CHIP_EXAMPLE, "folder listing; worksheet rows 1-2",
+    "The 86 per-sample exome workbooks are in the folder CHIP_DP10_GQ20_PASS. Each has one worksheet "
+    "whose first two rows form a two-level header, for example a sample block containing Zygosity and "
+    "Variant Allele Freq, a 'RefSeq Genes 110, NCBI' block containing Sequence Ontology (Combined), and "
+    "a ClinVar block containing Classification. File names end with the sample identifier, such as 179-P1.")
+_CHIP_ZYGOSITY = ("zygosity", "measurement_labels", _CHIP_EXAMPLE, "Zygosity column across all 86 workbooks",
+    "Across the 86 workbooks, Zygosity takes the values Reference, Heterozygous, and Homozygous Variant, and "
+    "1,151 of 57,258 rows are blank. Rows marked Reference are reference calls, in which the sample does not "
+    "carry the alternate allele.")
+_CHIP_ANNOTATION = ("annotation", "variant_annotation", _CHIP_EXAMPLE,
+    "Sequence Ontology (Combined) column across all 86 workbooks",
+    "Sequence Ontology (Combined) terms include intron_variant, synonymous_variant, missense_variant, "
+    "3_prime_UTR_variant, 5_prime_UTR_variant, and splice_region_variant; no term contains 'intergenic'.")
+_CHIP_TRIO = ("trio_status", "sample_metadata", "230215_Trio_Status.xlsx",
+    "columns Sample ID, Status, BLM Mutation Status",
+    "230215_Trio_Status.xlsx lists 87 people. Status takes Patient, Child, Mother, and Father; fourteen "
+    "entries read 'Mother ' with a trailing space. BLM Mutation Status takes Affected, Carrier, and "
+    "Unaffected: all Patients are Affected, all Children are Unaffected, and parents are either Carrier or "
+    "Unaffected. Three Sample IDs end in a tab character. Exome file names begin with a Sample ID; Sample "
+    "ID 533 has no exome workbook.")
+ADDITIONAL_FACTS.update({
+    "bix-7-q2": [_CHIP_LAYOUT, _CHIP_ZYGOSITY, _CHIP_ANNOTATION],
+    "bix-2-q2": [_CHIP_LAYOUT, _CHIP_ZYGOSITY, _CHIP_TRIO,
+        ("vaf_summary", "data_format", "CHIP VAF mean proportions.xlsx", "Sheet1 title and header rows",
+         "CHIP VAF mean proportions.xlsx has one worksheet titled 'Mean proportion comparisons via multinomial "
+         "random effect model'. Its rows report differences, standard errors and p values between groups named "
+         "Affected, Carrier, Control Child and Control Parent within VAF categories; it does not list each "
+         "group's own proportion."),
+    ],
+})
+
 @dataclass
 class _Message:
     """Only the Message.content surface used by the selected native grader."""
@@ -217,7 +442,10 @@ class BixBenchAdapter(Adapter):
                 target = output / name
                 if target.is_symlink() or output.is_symlink():
                     raise ValueError("Prepared inputs must not be symlinks")
-                output.mkdir(parents=True, exist_ok=True)
+                if not target.resolve().is_relative_to(output.resolve()):
+                    raise ValueError("Prepared input escapes its capsule directory")
+                # Some capsules keep reviewed inputs in a native subfolder.
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
                 written.append(target)
         return written

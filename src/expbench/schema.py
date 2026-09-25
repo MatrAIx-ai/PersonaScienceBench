@@ -43,7 +43,8 @@ class Config(Record):
 
     @classmethod
     def load(cls, path: Path):
-        return cls.model_validate(tomllib.loads(path.read_text()))
+        data = json.loads(path.read_text()) if path.suffix == ".json" else tomllib.loads(path.read_text())
+        return cls.model_validate(data)
 
 
 class PublicTask(Record):

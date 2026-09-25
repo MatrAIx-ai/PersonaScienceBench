@@ -31,7 +31,7 @@ The researcher now returns one typed `researcher_decision` tool call per request
 
 ## Enable it
 
-For the shared Python runner and Terminal runner, use `configs/luna-collaboration-ten.json`. For BixBench, `configs/luna-bixbench-collaboration-ten.json` is the benchmark-specific equivalent. The relevant configuration is:
+For the shared Python runner and Terminal runner, use `configs/conversion-v2-two.json`. The relevant configuration is:
 
 ```json
 "collaboration": {"protocol": "active_researcher", "max_requests": 12}
@@ -41,7 +41,7 @@ In active mode, `max_requests` controls dialogue; the passive simulator’s `max
 
 The shipped persona-off configurations use GPT-6 Luna for actor, researcher and LLM judges, with 60 total actor calls per case. Native programmatic graders remain programmatic. Use a fresh output directory and set the selected case count and parallelism through the existing runner options. Omitting `collaboration` preserves the earlier passive simulator behavior for historical configurations.
 
-For the EXP realistic runner, use `configs/expbench/luna-collaboration.toml` with interactive input and design-only mode. Collaboration deliberately rejects the original-input control and experimental full-workflow mode. The legacy EXP runner is unchanged.
+For the EXP realistic runner, use `configs/expbench/conversion-v2-two.toml` with interactive input and design-only mode. Collaboration deliberately rejects the original-input control and experimental full-workflow mode. The legacy EXP runner is unchanged.
 
 ## Interpret the traces
 

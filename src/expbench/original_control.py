@@ -165,8 +165,8 @@ def judge_saved(tasks, designs_from, config, output):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["prepare", "judge-saved"])
-    parser.add_argument("--tasks", type=Path, default=(ROOT / "data/design_pilot/tasks.jsonl"))
-    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/pilot-o3mini.toml"))
+    parser.add_argument("--tasks", type=Path, default=(ROOT / "data/conversion-v2-exp/tasks.jsonl"))
+    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/default.toml"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--designs-from", type=Path, nargs="+")
     args = parser.parse_args(argv)

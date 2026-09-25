@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from personasciencebench.schema import Episode, Record
+from personasciencebench.science_personas.profiles import SciencePersona, catalog_sha256, render_profile
 
 Level = Literal["novice", "intermediate", "expert"]
 
@@ -61,6 +62,8 @@ class Persona(Record):
     communication: Communication = Field(default_factory=Communication)
     workflow: Workflow = Field(default_factory=Workflow)
     interaction: Interaction = Field(default_factory=Interaction)
+    # Explicit opt-in; existing profiles keep the original renderer.
+    science_profile: SciencePersona | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -132,6 +135,8 @@ def render_persona(persona: Persona) -> str:
     """Versioned behavioral rendering, with no reference data or generated biography."""
     if not persona.enabled:
         return ""
+    if persona.science_profile is not None:
+        return render_profile(persona.science_profile)
     p = persona
     seniority = {"junior": "Ask for explanations when a methodological choice is unclear.",
                  "mid": "Discuss methodological choices and ask for their rationale when needed.",
@@ -176,12 +181,25 @@ def render_persona(persona: Persona) -> str:
     ])
 
 
+def persona_preferences(persona: Persona) -> dict:
+    """Only the effective profile conditions the simulator's existing support check."""
+    if not persona.enabled:
+        return {}
+    if persona.science_profile is None:
+        return persona.model_dump(exclude={"science_profile"})
+    return {"enabled": True, "id": persona.id, "version": persona.version,
+            "science_profile": persona.science_profile.model_dump()}
+
+
 def persona_record(persona: Persona) -> dict:
     prompt = render_persona(persona)
-    payload = {"schema_version": "2", "renderer_version": "1", "profile": persona.model_dump(),
+    payload = {"schema_version": "2", "renderer_version": "1", "profile": persona_preferences(persona),
                "identity_prompt": prompt}
     if not persona.enabled:
         payload = {"schema_version": "3", "renderer_version": "2", "enabled": False,
                    "profile": None, "identity_prompt": ""}
+    elif persona.science_profile is not None:
+        payload.update(schema_version="science-persona-2.0", renderer_version="science-renderer-2.0",
+                       catalog_sha256=catalog_sha256())
     payload["sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return payload

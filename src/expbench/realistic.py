@@ -190,8 +190,8 @@ def prepare(tasks, repositories, output):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["prepare", "run"])
-    parser.add_argument("--tasks", type=Path, default=(ROOT / "data/realistic_pilot/tasks.jsonl"))
-    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/pilot-o3mini.toml"))
+    parser.add_argument("--tasks", type=Path, default=(ROOT / "data/conversion-v2-exp/tasks.jsonl"))
+    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/conversion-v2-two.toml"))
     parser.add_argument("--workspace-map", type=Path)
     parser.add_argument("--task")
     parser.add_argument("--parallel", type=int, default=1, help="Concurrent isolated episodes (1–25)")

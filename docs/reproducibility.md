@@ -7,6 +7,20 @@ No command below relies on the original cluster's absolute paths.
 
 ## 1. Controller environment
 
+The full offline suite runs on Linux and requires the Bubblewrap executable.
+On Ubuntu/Debian, install it before running the tests:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends bubblewrap
+```
+
+The runtime refuses to start without Bubblewrap. The runtime unit tests inspect
+sandbox construction and use fixed process fixtures; they do not launch an actor
+or establish that the host permits a real Bubblewrap sandbox. Use `check-runtime`
+below before running scientific actors. macOS does not provide this Linux runtime;
+run the full suite in Linux or a Linux container.
+
 ```bash
 uv sync --locked --extra test --extra api --extra annotations
 uv run --locked python -m pytest -q -rs
@@ -25,10 +39,34 @@ PERSONASCIENCEBENCH_SOURCE_ROOT="$PWD/external/sources" \
 ```
 
 Without external sources, DiscoveryBench/BixBench source tests skip. Synthetic
-ScienceAgentBench tests require the `annotations` extra. The scripted OpenHands
-integration test requires the `actor` extra; its first import may be slow on
-network filesystems. `-k 'not openhands_loop'` excludes that optional integration
-check for a lightweight suite; record the exclusion when reporting validation.
+ScienceAgentBench tests require the `annotations` extra. EXP-Bench control
+conversion and prompt-rendering unit tests use synthetic fixtures. Separate
+source-backed tests require the prepared `data/design_catalog/tasks.jsonl`, its raw
+upstream task, and/or `data/exp_bench/raw/upstream/prompts/eval_judge_prompt.txt`.
+They report explicit skips when their assets are absent; these paths are separate
+from `PERSONASCIENCEBENCH_SOURCE_ROOT`. Invalid assets still fail the tests.
+
+The [offline workflow](../.github/workflows/checks.yml) has two jobs: `test`
+installs Bubblewrap and runs the complete lightweight suite and repository
+checker; `actor-smoke` installs the locked `actor` extra and runs two scripted
+integrations in the real OpenHands SDK. Neither job needs model credentials or
+downloaded scientific task data. Installing dependencies requires network access;
+the test episodes use scripted responses and make no model API calls.
+
+To reproduce the SDK job independently:
+
+```bash
+uv sync --locked --extra test --extra api --extra actor
+LITELLM_LOCAL_MODEL_COST_MAP=True OPENHANDS_SUPPRESS_BANNER=1 \
+  uv run --locked python -m pytest -q -rs \
+  tests/expbench/test_original_control.py::test_static_actor_has_no_researcher_tool_or_calls \
+  tests/test_actor.py::test_openhands_loop_uses_only_public_input_and_controller_tools
+```
+
+In the lightweight suite these two integrations skip if the SDK is absent. The
+dedicated job installs it so they execute in CI. Their first import may be slow
+on network filesystems. Scripted smoke tests verify integration, not scientific
+quality, researcher realism, or model performance.
 
 ## 2. Pinned source acquisition
 

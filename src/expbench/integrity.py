@@ -99,7 +99,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grades-from", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/pilot-o3mini.toml"))
+    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/default.toml"))
     args = parser.parse_args(argv)
     prepared = load_inputs(args.grades_from)
     config = Config.load(args.config)

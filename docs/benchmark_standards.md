@@ -5,7 +5,7 @@ Version: development standard 0.2, 2026-09-25.
 These rules govern task conversions, researcher simulators, persona variants,
 actor integrations, and reporting in PersonaScienceBench. The source-specific
 implementation sequence is in
-[historical implementation plan](design/initial_plan.md).
+[current conversion implementation](design/conversion_revision_v2.md).
 
 MUST denotes a requirement for a conforming conversion. SHOULD denotes a default
 whose departure needs a recorded rationale. MAY denotes an optional extension.

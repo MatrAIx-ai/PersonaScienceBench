@@ -137,7 +137,8 @@ class ScienceAgentBenchTests(unittest.TestCase):
         with patch("subprocess.run", side_effect=AssertionError("Request construction must be offline")):
             request = self.adapter.evaluation_request(episode, submission, output)
         self.assertIn("grade", request.argv)
-        self.assertIn(str(self.assets / BUNDLE / "provisioning.json"), request.required_paths)
+        self.assertIn((self.assets / BUNDLE / "provisioning.json").resolve(),
+                      {Path(path).resolve() for path in request.required_paths})
         self.assertFalse(output.exists())
         self.assertEqual(self.adapter.evaluate(episode, submission).status, "blocked")
 

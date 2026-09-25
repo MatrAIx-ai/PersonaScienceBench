@@ -1,46 +1,31 @@
 # Researcher personas
 
+## Science attribute extension
+
+The [56-dimension catalog](science_personas/ATTRIBUTE_CATALOG.md) is an opt-in
+simulator profile through `persona.science_profile`. All 56 assignments are
+required and rendered. There is no task-specific attribute projection or added
+interaction controller. Legacy profile rendering is preserved. Persona off now uses the same common
+policy and grounding path as persona on, omitting only the private identity.
+See the authoritative [Phase 1 contract](science_personas/experiment_plan.md);
+historical experiments below are not the new 50-task controlled comparison.
+
+Read the [integration guide](science_personas/INTEGRATION_GUIDE.md),
+[profile selection guide](science_personas/PROFILE_SELECTION.md), and
+[ODE injection example](science_personas/ODE_INJECTION_EXAMPLE.md). Attribute
+anchors describe researcher behavior; they are not agent-scoring criteria.
+The supplied persona documentation follows.
+
 Personas condition the researcher simulator through its system message. They do
 not require a particular model or change model weights. Both `run` and `serve`
 use the same router. The actor receives researcher replies through the existing
 interface, not the hidden profile or private identity prompt.
 
-## Current experiment and persona off
+## Configuration and persona off
 
-The five-case comparison uses [the fixed CS-novice config](../configs/luna-cs-novice-five.json):
-`enabled=true`, `id=computer-science-novice`, `version=1`, and expertise domain
-`computer science` with `domain_level`, `statistics`, and `coding` all `novice`.
-Other fields retain the defaults in `src/personasciencebench/persona.py`.
-Expertise levels change behavioral instructions, not access to approved facts.
+The current [shared config](../configs/conversion-v2-two.json) and [EXP config](../configs/expbench/conversion-v2-two.toml) disable persona while retaining the simulator. To enable a profile, attach its `science_profile` using the [integration guide](science_personas/INTEGRATION_GUIDE.md), or supply a supported legacy `Persona` block.
 
-Set `"persona": {"enabled": false}` to remove persona instructions while keeping
-the approved-fact simulator and its memory. Top-level disable bypasses routing;
-the identity prompt is empty and shared grounded policy is
-`no-persona-grounded-v1`. Omitting the profile uses enabled neutral defaults and
-is not the disabled control.
-
-EXP-Bench accepts the same fixed profile schema through TOML:
-
-```toml
-[persona]
-enabled = true
-id = "computer-science-novice"
-version = "1"
-
-[persona.expertise]
-domain = "computer science"
-domain_level = "novice"
-statistics = "novice"
-coding = "novice"
-```
-
-See [the complete EXP configuration](../configs/expbench/luna-cs-novice.toml).
-Its scoped simulator appends the shared persona prompt but publishes only approved
-fact text. It does not use the shared router or grounded paraphrase/checking path.
-Omit `[persona]` or set `enabled=false` for its disabled condition. The shared
-`persona` preview command below applies to shared-adapter episodes, not EXP cards.
-
-The actor and judge prompts do not receive the private persona. The fixed profile combines several expertise and communication settings; comparing it against disabled persona does not isolate expertise alone. The current [integration trial](../reports/conversion_v2/README.md) uses persona off. Historical persona-comparison records are archived locally.
+Top-level `enabled=false` bypasses routing and omits the profile. The configured interaction protocol remains fixed: current reviews use `researcher-review-v2`; legacy optional questions use `persona-conditioning-only-v3`; SciConv uses native clarification. Persona never changes the scientific fact pool, task requirements or grader.
 
 ## Configuration
 
@@ -166,7 +151,7 @@ interpret an experiment. Keep these controller files outside the actor sandbox.
 This is an independent implementation of structured persona prompt conditioning.
 It does not import the MatrAIx population dataset or its full dimension schema.
 Compare personas on the same tasks and model settings; report question counts
-and grounding fallbacks along with scientific scores. Legacy configurations remain readable, but the new `persona-grounded-v2`
+and grounding fallbacks along with scientific scores. Legacy configurations remain readable, but the new `persona-conditioning-only-v3`
 prompt/checking policy is a distinct simulator condition from earlier runs.
 Offline tests verify
 routing and isolation; live persona fidelity requires a separate model study.

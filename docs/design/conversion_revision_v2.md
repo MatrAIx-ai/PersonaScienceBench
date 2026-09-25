@@ -62,3 +62,11 @@ Generated catalogs live under ignored `data/conversion_catalog/`; EXP task cards
 Validation consists of the requested actual benchmark runs, conversion checks, syntax checks, source hashes, and readable-trace inspection. No additional model benchmark suite was added. Successful model results were not required for accepting a conversion, and low scientific scores were not rerun.
 
 The researcher transport was strengthened after malformed responses: an explicit current-turn request and a forced single `researcher_decision` tool call prevent treating a generated future dialogue as a real exchange. Every accepted handoff still follows the same approach/result protocol. Historical attempts retain their original prompts and transport settings; this trial is not a homogeneous scientific comparison of protocol versions.
+
+## Merged persona and CHIP support
+
+The science-persona renderer is opt-in and shared by the current simulator paths. The Phase 1 planner accepts all seven tracks, freezes both reviewed and automated facts, preserves each configured interaction protocol, and records the runner/source task ID. It generates configs and integrity receipts only; no 50-task persona experiment has been executed. EXP arm configs use JSON, now supported alongside TOML.
+
+The two imported CHIP selections (`bix-7-q2`, `bix-2-q2`) are existing members of the 205-question BixBench catalog. Their pinned input inventories and native grading are retained. Simulator notes exclude computed aggregate statistics and cohort/join outcomes; source layout and label explanations remain. The historical two-case conversion trial predates this merge and retains its original implementation hashes and traces.
+
+The merged observation utility reports optional questions and required plan/result handoffs separately. Superseded standalone persona-only logs and scope snapshots are not included.

@@ -35,7 +35,7 @@ def offline(monkeypatch):
 
 @pytest.fixture
 def config():
-    return Config.load(ROOT / "configs/expbench/pilot-o3mini.toml")
+    return Config.load(ROOT / "tests/fixtures/expbench/pilot-o3mini.toml")
 
 
 @pytest.fixture

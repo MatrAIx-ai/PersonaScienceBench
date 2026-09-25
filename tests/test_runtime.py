@@ -30,8 +30,12 @@ def test_mounts_never_expose_parent_home_controller_or_credentials(sandbox, monk
     assert (str(sandbox.workspace), "/workspace") in mounts
     assert (str(sandbox.python_root), str(sandbox.python_root)) in mounts
     sources = {source for source, target in mounts}
-    for forbidden in ("/", "/home", str(Path.home()), str(sandbox.base_prefix),
-                      str(sandbox.workspace.parent)):
+    forbidden_paths = {"/", "/home", str(Path.home()), str(sandbox.workspace.parent)}
+    # A distro Python has /usr as its prefix; /usr already contains required
+    # system binaries/libraries. Non-system interpreter prefixes stay private.
+    if sandbox.base_prefix != Path("/usr"):
+        forbidden_paths.add(str(sandbox.base_prefix))
+    for forbidden in forbidden_paths:
         assert forbidden not in sources
     assert "/etc" not in sources
     assert "--clearenv" in argv and "--unshare-all" in argv and "--unshare-net" in argv

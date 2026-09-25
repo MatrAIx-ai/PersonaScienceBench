@@ -54,6 +54,8 @@ The [per-benchmark conversion document](docs/design/conversion_revision_v2.md) s
 
 ## Researcher personas
 
+The merged [science-persona profiles](docs/science_personas/README.md) add an opt-in 56-attribute schema and deterministic renderer. The [Phase 1 planner](docs/science_personas/experiment_plan.md) creates matched persona arms for the current seven tracks; the proposed 50-task experiment has not been run. Existing profiles remain supported.
+
 Persona is injected into the **simulator's private system prompt**. The actor
 experiences it through researcher replies; the profile is not added to actor or
 judge prompts. Approved knowledge stays fixed across conditions.
@@ -110,8 +112,8 @@ removes approved facts or permits invented study information.
 
 See the [persona guide](docs/personas.md) for allowed values, routing, prompt
 rendering, and audit records. Complete experiment configs are available for the
-[shared runners](configs/luna-cs-novice-five.json) and
-[EXP-Bench](configs/expbench/luna-cs-novice.toml).
+[shared runners](configs/conversion-v2-two.json) and
+[EXP-Bench](configs/expbench/conversion-v2-two.toml).
 
 ## Get started
 

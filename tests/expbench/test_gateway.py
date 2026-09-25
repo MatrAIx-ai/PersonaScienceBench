@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def config():
-    return Config.load(ROOT / "configs/expbench/pilot.toml")
+    return Config.load(ROOT / "tests/fixtures/expbench/pilot.toml")
 
 
 def transport_with_handler(handler):

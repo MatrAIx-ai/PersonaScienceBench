@@ -30,6 +30,41 @@ conclusion. Facts can also be discovered through data inspection. Asking questio
 is optional, and these two pilots alone do not establish that persona influences
 performance.
 
+## CHIP data-coding additions (2026-09-25)
+
+Two questions from the clonal-hematopoiesis (CHIP) capsules are reviewed and
+convertible. Both are range-graded, run in the provisioned Python runtime, and
+depend on data coding that the input metadata documents.
+
+| Native ID | Investigation | Offline key check | Researcher context | Inputs |
+| --- | --- | --- | --- | --- |
+| `bix-7-q2` | Mean CHIP variants per sample after removing intronic, intergenic and UTR variants (`range_verifier`, key 40-60) | 52.3 with reference calls removed; 300.9 if reference calls are kept | Workbook layout, Zygosity values including reference calls and blanks, Sequence Ontology terms | 86 exome workbooks in `CHIP_DP10_GQ20_PASS/`, CHIP gene list, trio sheet; capsule `a02b761a-02b6-46b5-9d5e-2964d5a74960` |
+| `bix-2-q2` | Percentage of Control Children CHIP variants with VAF 0.3-0.7 (`range_verifier`, key 60-70) | 61.7% on non-reference calls; 13.0% if every row is counted | As for `bix-7-q2` plus trio-sheet codings (Status and BLM status values, `'Mother '` trailing spaces, tab-suffixed IDs, one person without a workbook) and the between-group summary workbook | The same 88 inputs plus `CHIP VAF mean proportions.xlsx`; capsule `30b33e47-92d8-4372-a9f6-da32896493d0` |
+
+Facts come only from input headers, labels and value checks; the capsule
+notebooks and annotation `ideal`, `result`, `answer`, `hypothesis` and
+`distractors` fields were not used. The summary workbook reports between-group
+differences only, not the per-group proportion asked for. `bix-2`, `bix-7`,
+`bix-14`, `bix-20` and `bix-47` ship byte-identical exome inputs and are one
+study; keep them together in any split although their capsule identifiers differ.
+
+`prepare_assets` now creates native subfolders inside the capsule directory, as
+required by `CHIP_DP10_GQ20_PASS/`, and rejects any target that resolves outside it.
+Prepare with `--selection configs/bixbench-chip-selection.json`; the default two
+cases per benchmark match `configs/pilot.json`.
+
+Measured runs (local, `openai/gpt-6-luna`, reasoning `none`, three repeats per
+condition, 0 researcher questions in every episode):
+
+| Condition | `bix-7-q2` | `bix-2-q2` |
+| --- | --- | --- |
+| Researcher-only (standard) | 0/3 (300.9 each time) | 2/3 (15.8%, 61.6%, 61.6%) |
+| All approved facts in the public brief (standards section 8 control) | 3/3 (52.33) | 3/3 (61.7%) |
+
+The control shows the questions are solvable given the researcher's reviewed
+knowledge; the actor did not ask for it. These are small descriptive runs, not
+a persona comparison.
+
 ## Identity and provenance
 
 - Source: `Future-House/BixBench`, revision

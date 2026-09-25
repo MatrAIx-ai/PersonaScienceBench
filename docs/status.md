@@ -10,6 +10,10 @@ Updated 2026-09-23. This page is the current status; `docs/design/` contains
 historical proposals and `reports/construction_inventory.json` is a historical
 asset/conversion audit, not a live leaderboard.
 
+BixBench additionally has two reviewed CHIP conversions, `bix-7-q2` and `bix-2-q2`
+([adapter record](adapters/bixbench.md#chip-data-coding-additions-2026-09-25)), selected by
+`configs/bixbench-chip-selection.json`.
+
 ## Earlier release snapshot
 
 | Component | Implemented | Validated / remaining |

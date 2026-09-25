@@ -8,8 +8,9 @@ are kept by the author and not committed.
 
 - With the current actor configuration, the actor almost never consults the
   researcher. In 68 local episodes on `openai/gpt-6-luna` it asked **0**
-  researcher questions. Persona is injected only into researcher replies, so
-  these episodes cannot show a persona effect.
+  researcher questions. Persona sits in the researcher's private system prompt
+  and reaches the actor only through researcher replies, so these episodes
+  cannot show a persona effect.
 - The actor does ask when information is genuinely held only by the researcher.
   In the team's Luna baseline, EXP-Bench episodes asked 5, 4, 0, 6 and 0
   questions; HiL-Bench (external) reports about 1 to 7 questions per task on

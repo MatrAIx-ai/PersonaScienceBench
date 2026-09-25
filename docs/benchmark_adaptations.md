@@ -1,9 +1,13 @@
 # Current benchmark adaptations
 
-This is the implementation record for the five-case-per-benchmark Luna study.
+This is the historical implementation record for the five-case-per-benchmark Luna study. The [seven-track conversion revision](design/conversion_revision_v2.md) documents the current automatic conversion and subsequent two-case trials.
 The [modification standard](benchmark_standards.md) is normative; this document
 records how the current subset applies it and where experimental conditions
 change native execution. Earlier two-case adapter reports remain historical evidence.
+
+## Shared collaboration protocol
+
+The [approach and result review protocol](adapters/collaboration.md) is available across all five current tracks. It adds explicit intermediate handoffs while retaining the source task and grader. The per-benchmark records below describe the earlier passive-pilot settings unless stated otherwise.
 
 ## Common conversion contract
 
@@ -80,6 +84,8 @@ paper's separate trajectory-to-MCQ evaluation pipeline.
 
 Implementation: `src/personasciencebench/adapters/bixbench.py`.
 [Grader behavior and earlier pilot](adapters/bixbench.md).
+
+An [active researcher collaboration pilot](adapters/bixbench_collaboration.md) now lets the researcher initiate requests and review agent handoffs in a persistent OpenHands session. Its ten-case persona-off configuration is `configs/luna-bixbench-collaboration-ten.json`; the native answer grader is retained.
 
 ## ScienceAgentBench
 
@@ -185,16 +191,6 @@ Implementation: `src/expbench/realistic.py`, `scoped_researcher.py`, and `schema
 
 ## Reporting and recovery
 
-The [baseline](../reports/luna_no_persona_five.md) and
-[persona comparison](../reports/luna_cs_novice_comparison.md) retain per-case
-statuses, scores, question counts, and local record paths. Compare scores on the
-same task IDs and state paired denominators; never combine unlike metrics into
-one average. Infrastructure retries and the host-interruption restart are retained
-in ignored run directories and merged by task ID, not selected by highest score.
-Completed cases are not repeated; saved submissions can be regraded independently.
+The current [seven-track report](../reports/conversion_v2/README.md) records task IDs, statuses, native scores, interaction counts and local trace locators. Earlier five-track comparisons are archived locally. Compare matched tasks and state denominators; never combine unlike metrics into one average. Record infrastructure recovery separately from scientific failure and retain every attempt.
 
-A zero-question case does not exercise simulator persona. Fewer questions plus
-higher coverage is a descriptive efficiency signal, not a causal estimate. The
-current study lacks repeated runs, an all-approved-context control, and independent
-persona-fidelity assessment. Detailed standards describe those stronger controls;
-this small comparison does not claim to satisfy them all.
+The two-case-per-track integration trial is not a persona comparison. Establishing persona effects requires matched conditions, repeated runs, controls for available information, and persona-fidelity assessment.

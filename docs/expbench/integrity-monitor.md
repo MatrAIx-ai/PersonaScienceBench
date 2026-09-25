@@ -48,5 +48,5 @@ unchanged monitor rather than preassigned. No execution is fabricated and no
 design-only exception is added to the prompt.
 
 The monitor is optional. Ordinary design-only runs and the standalone design
-judge remain unchanged. See the [test report](../../reports/expbench/integrity_monitor_results.md)
+judge remain unchanged. See the test report (historical record archived locally)
 for the saved-run experiment.

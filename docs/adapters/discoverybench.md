@@ -6,7 +6,7 @@
 
 Status: two reviewed episodes have completed live actor execution and final
 Luna grading. Both received native `final_score=0.0`; neither actor asked the
-researcher. See the [pilot report](../../reports/pilot_report.md) for judge
+researcher. See the pilot report (historical record archived locally) for judge
 sensitivity and [current status](../status.md) for subsequent changes.
 
 Source: [allenai/discoverybench](https://github.com/allenai/discoverybench), revision

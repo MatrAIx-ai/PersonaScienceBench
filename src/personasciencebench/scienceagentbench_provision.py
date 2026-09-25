@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path, PurePosixPath
 import shutil
@@ -10,7 +11,7 @@ import tempfile
 import zipfile
 
 from personasciencebench.adapters.base import sha256
-from personasciencebench.adapters.scienceagentbench import DATASET_REVISION, PILOTS
+from personasciencebench.adapters.scienceagentbench import DATASET_REVISION, PILOTS, dataset_files
 
 
 SELECTED_PRIVATE_FILES = {
@@ -28,11 +29,53 @@ SELECTED_PRIVATE_FILES.update({'67': {'script': 'CogSci_pattern_high_sim_eval.py
         'reference': 'eval_programs/gold_results/polynomial_fit_gold.csv'},
  '92': {'script': 'eval_h_importances.py',
         'program': 'h_importances.py',
-        'reference': 'eval_programs/gold_results/jnmf_h_importances_gold.json'}})
+ 'reference': 'eval_programs/gold_results/jnmf_h_importances_gold.json'}})
+
+
+def _evaluator_dependencies(script: Path, gold_files: dict[str, str]) -> dict[str, str]:
+    """Find private gold files named by a pinned evaluator without executing it."""
+    text = script.read_text()
+    try:
+        tree = ast.parse(text, filename=str(script))
+    except SyntaxError:
+        # Synthetic boundary fixtures need not contain executable evaluators.
+        tree = ast.parse("")
+    strings = [node.value for node in ast.walk(tree)
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    dependencies = {
+        name: digest for name, digest in gold_files.items()
+        if any(name in value or PurePosixPath(name).name in value for value in strings)
+    }
+    # Two EEG evaluators build ``sub03.npy`` by string concatenation.
+    if "gold_results/sub' +" in text:
+        name = "eval_programs/gold_results/sub03.npy"
+        if name in gold_files:
+            dependencies[name] = gold_files[name]
+    return dependencies
+
+
+def refresh_evaluator_dependencies(destination: Path) -> dict:
+    """Narrow an existing full-bundle manifest to evaluator-specific references."""
+    manifest = destination / "provisioning.json"
+    record = json.loads(manifest.read_text())
+    gold = {name: digest for name, digest in record["files"].items()
+            if name.startswith("eval_programs/gold_results/")}
+    scripts = {sha256(path): path for path in (destination / "eval_programs").glob("*.py")}
+    for task_id, spec in record["reviewed_evaluators"].items():
+        script = scripts.get(spec["script_sha256"])
+        if script is None:
+            raise ValueError(f"Missing evaluator matching task {task_id}")
+        spec["dependencies"] = _evaluator_dependencies(script, gold)
+        known = SELECTED_PRIVATE_FILES.get(task_id, {}).get("reference")
+        if known in gold:
+            spec["dependencies"][known] = gold[known]
+        spec["dependency_discovery"] = "static literal-path extraction; dynamic EEG path handled explicitly"
+    manifest.write_text(json.dumps(record, indent=2) + "\n")
+    return record
 
 
 def provision_archive(archive: Path, destination: Path, annotations: Path) -> dict:
-    """Hash and selectively extract; no pickle or scientific code is executed.
+    """Extract verified inputs and private evaluator material without executing it.
 
     Provenance records the user-supplied archive, without claiming a comparison
     with an unpublished upstream archive checksum. Source-row contracts and ZIP
@@ -40,15 +83,18 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
     """
     import pyarrow.parquet as pq
     rows = {str(row["instance_id"]): row for row in pq.read_table(annotations).to_pylist()}
-    selected = []
-    for key, private in SELECTED_PRIVATE_FILES.items():
-        row = rows[key]
-        if (row["eval_script_name"] != private["script"] or row["gold_program_name"] != private["program"]
-                or row["output_fname"] != PILOTS[key]["output"]):
-            raise ValueError("Verified annotation task contract differs from the reviewed pilot")
-        selected.extend("datasets/" + file for file in PILOTS[key]["files"])
-        selected.extend(["eval_programs/" + private["script"], private["reference"],
-                         "gold_programs/" + private["program"]])
+    task_specs = {}
+    selected = set()
+    for key, row in rows.items():
+        files = PILOTS[key]["files"] if key in PILOTS else dataset_files(row["dataset_folder_tree"])
+        script = row["eval_script_name"]
+        program = row["gold_program_name"]
+        if (PurePosixPath(script).name != script or PurePosixPath(program).name != program):
+            raise ValueError(f"Unsafe native filename for verified task {key}")
+        task_specs[key] = {"files": files, "script": script, "program": program,
+                           "output": row["output_fname"]}
+        selected.update("datasets/" + file for file in files)
+        selected.update(["eval_programs/" + script, "gold_programs/" + program])
     archive_hash = sha256(archive)
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -64,14 +110,20 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
                     or not path.parts or path.parts[0] != "benchmark"
                     or stat.S_ISLNK(mode)):
                 raise ValueError("ZIP member violates the expected benchmark-root contract")
-        for relative in selected:
+        # Native evaluator references are controller-private. Extracting the
+        # complete gold-results subtree avoids guessing dynamic file accesses;
+        # it never enters actor or researcher packages.
+        selected.update(name.removeprefix("benchmark/") for name in names
+                        if name.startswith("benchmark/eval_programs/gold_results/")
+                        and not source.getinfo(name).is_dir())
+        for relative in sorted(selected):
             name = "benchmark/" + relative
             if name not in names or source.getinfo(name).is_dir():
                 raise ValueError(f"Required verified bundle member is missing: {relative}")
         with tempfile.TemporaryDirectory(prefix="sab-extract-", dir=destination.parent) as temp:
             staged = Path(temp)
             file_hashes = {}
-            for relative in selected:
+            for relative in sorted(selected):
                 target = staged / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with source.open("benchmark/" + relative, pwd=b"scienceagentbench") as incoming, target.open("xb") as outgoing:
@@ -82,13 +134,14 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
                 "annotation_sha256": sha256(annotations), "archive_sha256": archive_hash,
                 "acquisition": "User supplied benchmark_verified.zip; original archive retained privately.",
                 "release_match_evidence": "Archive name, expected benchmark/ layout, and native task filenames match the pinned verified annotations; no published upstream archive digest was available.",
-                "selected_task_ids": list(SELECTED_PRIVATE_FILES), "files": file_hashes,
+                "selected_task_ids": sorted(task_specs, key=int), "files": file_hashes,
                 "reviewed_evaluators": {
                     key: {"script_sha256": file_hashes["eval_programs/" + spec["script"]],
-                          "dependencies": {spec["reference"]: file_hashes[spec["reference"]]},
-                          "python_dependencies": (["pandas"] if key in {"22", "67"} else ["numpy"] if key == "92" else ["Python standard library csv"]),
-                          "judge_model_required": False}
-                    for key, spec in SELECTED_PRIVATE_FILES.items()},
+                          "dependencies": {},
+                          "dependency_discovery": "pending static literal-path extraction",
+                          "python_dependencies": [], "judge_model_required": False,
+                          "validation_method": "automated archive and annotation contract"}
+                    for key, spec in task_specs.items()},
                 "evaluator_runtime": "bubblewrap-separate-native-verifier-v1",
                 "evaluator_image": None,
                 "runtime_dependency_validation": "pending isolated check",
@@ -102,7 +155,7 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
                         raise ValueError(f"Existing extracted member differs: {relative}")
             destination.mkdir(mode=0o700, exist_ok=True)
             destination.chmod(0o700)
-            for relative in selected:
+            for relative in sorted(selected):
                 target = destination / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.exists():
@@ -116,4 +169,4 @@ def provision_archive(archive: Path, destination: Path, annotations: Path) -> di
                 record = {**prior, **record}
             manifest.write_text(json.dumps(record, indent=2) + "\n")
             manifest.chmod(0o600)
-    return record
+    return refresh_evaluator_dependencies(destination)

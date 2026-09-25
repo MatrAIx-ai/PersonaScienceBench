@@ -1,4 +1,4 @@
-"""Researcher overlays and native Harbor verification for scientific terminal tasks.
+"""Benchmark-wide conversion and native Harbor verification for terminal tasks.
 
 Task conversion and request construction never start containers or model calls.
 The optional Harbor replay agent uploads a sealed external actor submission; it
@@ -11,6 +11,7 @@ import argparse
 import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import json
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -145,6 +146,18 @@ def _submission_key(submission: Submission) -> str:
     return hashlib.sha256(submission.model_dump_json().encode()).hexdigest()
 
 
+def _artifact_roots(config: dict[str, Any]) -> list[str]:
+    roots = []
+    for item in config["artifacts"]:
+        value = item if isinstance(item, str) else item.get("source")
+        if not isinstance(value, str) or not value.startswith("/") or ".." in Path(value).parts:
+            raise ValueError("Native artifact source must be an absolute contained path")
+        roots.append(value.rstrip("/") or "/")
+    if len(set(roots)) != len(roots):
+        raise ValueError("Duplicate native artifact roots")
+    return roots
+
+
 class TerminalBenchScienceAdapter(Adapter):
     name = "terminal_bench_science"
 
@@ -170,12 +183,17 @@ class TerminalBenchScienceAdapter(Adapter):
         return tasks
 
     def convert(self, task_id: str) -> Episode:
-        if task_id not in PILOTS:
-            raise ValueError("This task has no reviewed researcher overlay")
         task = self.source.repository / "tasks" / task_id
+        if not task.is_dir() or not (task / "task.toml").is_file():
+            raise ValueError(f"Unknown Terminal-Bench-Science task: {task_id}")
         config = tomllib.loads((task / "task.toml").read_text())
         instruction = (task / "instruction.md").read_text()
-        selection = PILOTS[task_id]
+        reviewed_pilot = task_id in PILOTS
+        selection = PILOTS.get(task_id, {
+            "files": [], "outputs": _artifact_roots(config),
+            "facts": [("task.toml", "task.description", "scientific_scope", "context",
+                       config["task"]["description"])],
+        })
         if config["verifier"]["environment_mode"] != "separate":
             raise ValueError("This conversion requires the native separate verifier")
         if config["verifier"]["environment"].get("network_mode") != "no-network":
@@ -194,7 +212,25 @@ class TerminalBenchScienceAdapter(Adapter):
                 id=f"{task.name}.context_{index}", topic=topic, text=excerpt, kind=kind,
                 source=Provenance(source_path=f"tasks/{task_id}/{filename}",
                                   revision=self.source.revision, locator=locator,
-                                  sha256=sha256(task / filename)), review_status="reviewed"))
+                                  sha256=sha256(task / filename)),
+                review_status="reviewed" if reviewed_pilot else "automated"))
+        readme = task / "README.md"
+        if readme.is_file():
+            content = readme.read_text()
+            allowed_sections = {"background", "scientific background", "scientific context", "motivation", "difficulty"}
+            for match in re.finditer(r"(?m)^#{1,6} +([^\n]+)\n([^#]*(?=^#|\Z))", content):
+                heading, body = match.group(1).strip().lower(), match.group(2).strip()
+                if heading not in allowed_sections or not body:
+                    continue
+                # Outcome/solution-bearing passages are excluded even in allowed sections.
+                if re.search(r"\b(solution|oracle|ground.truth|expected (answer|result)|hidden test|verifier)\b", body, re.I):
+                    continue
+                if any(body == f.text for f in facts):
+                    continue
+                facts.append(Fact(id=f"{task.name}.readme_{len(facts)+1}", topic="scientific_background",
+                    text=body, kind="context", review_status="automated",
+                    source=Provenance(source_path=f"tasks/{task_id}/README.md", revision=self.source.revision,
+                        locator=f"heading={heading}/chars={match.start(2)}:{match.end(2)}", sha256=sha256(readme))))
         assets = []
         for index, name in enumerate(selection["files"]):
             path = task / "environment" / selection.get("input_base", "data") / name
@@ -235,38 +271,55 @@ class TerminalBenchScienceAdapter(Adapter):
                         "task_toml_sha256": sha256(task / "task.toml"),
                         "harbor_runtime": "0.21.0", "actor_framework": "independent"},
                 entrypoint="personasciencebench.adapters.terminal_bench_science:verify"),
-            conversion={"version": VERSION, "instruction_change": "none",
-                        "context_source": "reviewed source motivation and optional advice; references excluded",
+            conversion={"context_policy": "section_allowlist_v2", "version": VERSION, "instruction_change": "none",
+                        "context_review_statuses": sorted({f.review_status for f in facts}),
+                        "context_source": ("reviewed source motivation and optional advice; references excluded"
+                                           if reviewed_pilot else
+                                           "automated task.description context; solutions and tests excluded"),
+                        "validation_method": "human_reviewed" if reviewed_pilot else
+                            "automated_native_task_schema_boundary",
+                        "asset_strategy": "reviewed explicit inputs" if assets else
+                            "native Harbor environment image supplies task inputs",
                         "evaluation_change": "sealed external artifacts replayed into native Harbor separate verifier",
                         "native_budgets_preserved": True, "runtime_verified": False},
-            review_status="reviewed")
+            review_status="reviewed" if reviewed_pilot else "automated")
 
     def evaluation_request(self, episode: Episode, submission: Submission,
                            output: Path) -> EvaluationRequest:
         check_submission(episode, submission)
-        if episode.source_task_id not in PILOTS:
-            raise ValueError("Unsupported Terminal-Bench-Science episode")
-        expected = PILOTS[episode.source_task_id]["outputs"]
+        expected = episode.evaluator.config["submission_artifacts"]
         if set(submission.artifacts) != set(expected):
-            raise ValueError("Submission must contain exactly the native pilot artifact paths")
+            raise ValueError("Submission must contain exactly the native artifact roots")
         output = output.resolve()
         directory = output.with_suffix(".harbor")
         directory.mkdir(parents=True, exist_ok=False)
         directory.chmod(0o700)
         sealed = []
         for index, target in enumerate(expected):
-            source = _regular(Path(submission.artifacts[target]))
-            destination = directory / f"artifact_{index}"
-            shutil.copyfile(source, destination)
-            destination.chmod(0o400)
-            sealed.append({"source": str(destination), "target": target, "sha256": sha256(destination)})
+            submitted = Path(submission.artifacts[target])
+            if submitted.is_symlink() or not submitted.exists():
+                raise ValueError(f"Submitted artifact is missing or unsafe: {target}")
+            members = [submitted] if submitted.is_file() else [
+                path for path in sorted(submitted.rglob("*")) if path.is_file()]
+            if not members:
+                raise ValueError(f"Submitted artifact directory is empty: {target}")
+            for member_index, source in enumerate(members):
+                source = _regular(source)
+                relative = "" if submitted.is_file() else source.relative_to(submitted.resolve()).as_posix()
+                destination = directory / f"artifact_{index}_{member_index}"
+                shutil.copyfile(source, destination)
+                destination.chmod(0o400)
+                native_target = target if not relative else str(Path(target) / relative)
+                sealed.append({"source": str(destination), "target": native_target,
+                               "submission_root": target, "relative": relative,
+                               "sha256": sha256(destination)})
         manifest = directory / "submission.private.json"
         manifest.write_text(json.dumps({
             "episode_id": episode.id, "evaluator_version": VERSION, "task_id": episode.source_task_id,
             "source_revision": episode.source_revision,
             "task_path": episode.evaluator.reference["task_path"],
             "task_digest": episode.evaluator.reference["task_digest"],
-            "artifacts": sealed,
+            "expected_roots": expected, "artifacts": sealed,
         }, indent=2))
         job_name = "verify_" + hashlib.sha256(str(output).encode()).hexdigest()[:12]
         config = directory / "job.json"
@@ -294,7 +347,8 @@ class TerminalBenchScienceAdapter(Adapter):
     def evaluate(self, episode: Episode, submission: Submission,
                  judge: Judge | None = None) -> EvaluationResult:
         check_submission(episode, submission)
-        if set(submission.artifacts) != set(PILOTS[episode.source_task_id]["outputs"]):
+        expected = episode.evaluator.config["submission_artifacts"]
+        if set(submission.artifacts) != set(expected):
             return EvaluationResult(status="missing_submission", evaluator_version=VERSION,
                                     errors=["Required native artifact submission is incomplete"])
         registered = self._receipts.get(_submission_key(submission))
@@ -310,7 +364,10 @@ class TerminalBenchScienceAdapter(Adapter):
                     or result["manifest_sha256"] != sha256(manifest_path)):
                 raise ValueError("Native result identity or submission manifest mismatch")
             for item in manifest["artifacts"]:
-                if sha256(_regular(Path(submission.artifacts[item["target"]]))) != item["sha256"]:
+                current = Path(submission.artifacts[item["submission_root"]])
+                if item["relative"]:
+                    current = current / item["relative"]
+                if sha256(_regular(current)) != item["sha256"]:
                     raise ValueError("Submission artifacts changed after sealing")
             if result["status"] != "scored":
                 return EvaluationResult(status="error", evaluator_version=VERSION,
@@ -338,9 +395,11 @@ except ImportError:
 async def replay_submission(environment, manifest_path: Path) -> None:
     """Upload exact sealed artifacts; never execute candidate code on the controller."""
     manifest = read_json(_regular(manifest_path))
-    expected = PILOTS[manifest["task_id"]]["outputs"]
-    if sorted(item["target"] for item in manifest["artifacts"]) != sorted(expected):
-        raise ValueError("Replay targets differ from the native artifact allowlist")
+    expected = manifest["expected_roots"]
+    for item in manifest["artifacts"]:
+        if not any(item["target"] == root or item["target"].startswith(root.rstrip("/") + "/")
+                   for root in expected):
+            raise ValueError("Replay target differs from the native artifact roots")
     for item in manifest["artifacts"]:
         source = _regular(Path(item["source"]))
         if sha256(source) != item["sha256"]:

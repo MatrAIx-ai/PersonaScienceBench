@@ -11,7 +11,7 @@ import tomllib
 from uuid import uuid4
 
 from personasciencebench.adapters.base import sha256, check_submission
-from personasciencebench.adapters.terminal_bench_science import _task_digest, _regular, PILOTS
+from personasciencebench.adapters.terminal_bench_science import _task_digest, _regular
 from personasciencebench.packaging import write_json
 from personasciencebench.schema import Episode, Submission, EvaluationResult
 
@@ -20,15 +20,16 @@ VERSION = 'terminal-native-separate-docker-network-none-v1'
 
 def evaluate(episode, submission, output):
     check_submission(episode, submission)
-    if set(submission.artifacts) != set(PILOTS[episode.source_task_id]['outputs']):
-        raise ValueError('Native artifact set differs from the reviewed task contract')
+    expected = set(episode.evaluator.config['submission_artifacts'])
+    if not expected.issubset(submission.artifacts):
+        raise ValueError('Native submission is missing a required artifact')
     task = Path(episode.evaluator.reference['task_path'])
     if _task_digest(task) != episode.evaluator.reference['task_digest']:
         raise ValueError('Native task changed after preparation')
     config = tomllib.loads((task / 'task.toml').read_text())
     if config['verifier']['environment_mode'] != 'separate' or config['verifier']['environment']['network_mode'] != 'no-network':
         raise ValueError('Requires the native separate, networkless verifier policy')
-    hashes = {name: sha256(_regular(Path(path))) for name, path in submission.artifacts.items()}
+    hashes = {name: sha256(_regular(Path(submission.artifacts[name]))) for name in expected}
     output.mkdir(parents=True, exist_ok=False)
     output.chmod(0o700)
     container = 'psb-verifier-' + uuid4().hex
@@ -37,7 +38,8 @@ def evaluate(episode, submission, output):
                   'artifact_sha256': hashes, 'network_mode': 'none',
                   'native_verifier_script_sha256': sha256(task / 'tests/test.sh'),
                   'native_verifier_dockerfile_sha256': sha256(task / 'tests/Dockerfile'),
-                  'native_grader_modified': False, 'judge_model_used': False}
+                  'native_grader_modified': False, 'judge_model_used': False,
+                  'ignored_additional_artifacts': sorted(set(submission.artifacts) - expected)}
     started = False
     try:
         with (output / 'image-build.log').open('w') as log:
@@ -52,7 +54,8 @@ def evaluate(episode, submission, output):
                        capture_output=True, text=True, check=True)
         started = True
         subprocess.run(['docker', 'exec', container, 'mkdir', '-p', '/logs/verifier'], check=True)
-        for native, source in submission.artifacts.items():
+        for native in sorted(expected):
+            source = submission.artifacts[native]
             subprocess.run(['docker', 'exec', container, 'mkdir', '-p', str(Path(native).parent)], check=True)
             subprocess.run(['docker', 'cp', source, f'{container}:{native}'], check=True)
         timeout = int(config['verifier']['timeout_sec'])
@@ -70,7 +73,7 @@ def evaluate(episode, submission, output):
         reward = float((output / 'reward.txt').read_text().strip())
         if reward not in (0, 1):
             raise ValueError('Reviewed native task must return binary reward')
-        if hashes != {name: sha256(_regular(Path(path))) for name, path in submission.artifacts.items()}:
+        if hashes != {name: sha256(_regular(Path(submission.artifacts[name]))) for name in expected}:
             raise ValueError('Sealed artifacts changed during verification')
         result = EvaluationResult(status='scored', evaluator_version=VERSION,
                                   metrics={'reward': reward}, details={**provenance, 'score_denominator': 1})

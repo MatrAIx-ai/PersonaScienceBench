@@ -75,6 +75,8 @@ class DockerSandbox:
 
 
 def run(prepared, output, config, parallel, verifier_backend="harbor"):
+    from personasciencebench.collaboration import ActiveResearcher, validate_collaboration, POLICY
+    collaboration = validate_collaboration(config.get('collaboration'))
     manifest = json.loads((prepared / 'pilot_manifest.json').read_text())
     records = manifest['cases']
     expected = config['pilot_cases_per_benchmark']
@@ -117,11 +119,16 @@ def run(prepared, output, config, parallel, verifier_backend="harbor"):
             clients = {role: OpenRouterClient(**spec, role=role, record=log_api,
                         supported_parameters=catalog[role]['supported_parameters'])
                        for role, spec in config['models'].items()}
-            researcher = Researcher(episode, clients['researcher'], persona=resolve_persona(config, episode), **config['researcher'])
+            researcher_type = ActiveResearcher if collaboration is not None else Researcher
+            researcher = researcher_type(episode, clients['researcher'], persona=resolve_persona(config, episode), **config['researcher'])
             session = EpisodeSession(episode, researcher, case / 'controller', artifact_root=sandbox.workspace)
-            actor_result = run_actor(session, clients['actor'], sandbox, max_steps=config['actor_steps'])
+            actor_result = run_actor(session, clients['actor'], sandbox, max_steps=config['actor_steps'], collaboration=collaboration)
             write_json(case / 'actor_result.json', actor_result)
             result.update(actor=actor_result, researcher_questions=researcher.questions)
+            if collaboration is not None:
+                result.update(interaction_protocol=POLICY, researcher_requests=researcher.requests,
+                              researcher_followups=max(0, researcher.requests - 1),
+                              researcher_decisions=len(researcher.audit))
             if session.submission is None:
                 result['status'] = 'infrastructure_error' if actor_result.get('status') == 'error' else 'missing_submission'
                 if result['status'] == 'missing_submission':

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from personasciencebench.persona import Persona
+from personasciencebench.collaboration import CollaborationConfig
 
 
 class Record(BaseModel):
@@ -38,6 +39,7 @@ class Config(Record):
     models: Models
     limits: Limits
     persona: Persona | None = None
+    collaboration: CollaborationConfig | None = None
 
     @classmethod
     def load(cls, path: Path):
@@ -55,6 +57,9 @@ class Fact(Record):
     topic: str
     text: str
     source_field: str
+    kind: str = "context"
+    review_status: str = "reviewed"
+    provenance: dict = Field(default_factory=dict)
 
 
 class ResearcherContext(Record):

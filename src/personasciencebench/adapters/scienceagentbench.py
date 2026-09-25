@@ -1,4 +1,4 @@
-"""Verified ScienceAgentBench conversion and isolated native-artifact grading.
+"""Benchmark-wide verified ScienceAgentBench conversion and isolated grading.
 
 Importing, enumerating, converting, and constructing a grading request are offline.
 The ``grade`` CLI is a controller operation that starts Docker only when explicitly
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from functools import cache
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -19,6 +20,7 @@ from typing import Any
 from personasciencebench.adapters.base import (
     Adapter, Judge, check_submission, read_json, sha256,
 )
+from personasciencebench.context_conversion import field_facts, POLICY as CONTEXT_POLICY
 from personasciencebench.schema import (
     Asset, Episode, EvaluationRequest, EvaluationResult, EvaluatorSpec, Fact,
     Provenance, PublicContext, ResearcherContext, Submission, TaskSummary,
@@ -133,6 +135,28 @@ def _fingerprint(submission: Submission) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def dataset_files(folder_tree: str) -> list[str]:
+    """Parse the release's pipe-and-dash dataset tree into contained file paths."""
+    stack: list[str] = []
+    files: list[str] = []
+    for raw in (folder_tree or "").splitlines():
+        match = re.fullmatch(r"\|(-+)[ ]*(.+?)\s*", raw)
+        if not match or len(match.group(1)) % 2:
+            raise ValueError(f"Unsupported dataset tree line: {raw!r}")
+        depth = len(match.group(1)) // 2 - 1
+        name = match.group(2)
+        if depth < 0 or not name or "/" in name.rstrip("/") or "\\" in name:
+            raise ValueError(f"Unsafe dataset tree entry: {raw!r}")
+        stack = stack[:depth]
+        if name.endswith("/"):
+            stack.append(name[:-1])
+        else:
+            files.append(_relative("/".join([*stack, name])))
+    if not files:
+        raise ValueError("Verified task has no dataset files")
+    return files
+
+
 class ScienceAgentBenchAdapter(Adapter):
     name = "scienceagentbench"
 
@@ -141,6 +165,7 @@ class ScienceAgentBenchAdapter(Adapter):
         self._rows: dict[str, dict[str, Any]] | None = None
         self._receipts: dict[str, Path] = {}
 
+    @cache
     def _load_rows(self) -> dict[str, dict[str, Any]]:
         if self._rows is None:
             try:
@@ -168,10 +193,20 @@ class ScienceAgentBenchAdapter(Adapter):
 
     def convert(self, task_id: str) -> Episode:
         task_id = str(task_id)
-        if task_id not in PILOTS:
-            raise ValueError("This verified instance has no reviewed interactive conversion")
-        row = self._load_rows()[task_id]
-        selected = PILOTS[task_id]
+        rows = self._load_rows()
+        if task_id not in rows:
+            raise ValueError(f"Unknown verified ScienceAgentBench instance: {task_id}")
+        row = rows[task_id]
+        reviewed_pilot = task_id in PILOTS
+        if reviewed_pilot:
+            selected = PILOTS[task_id]
+        else:
+            selected = {
+                "study": f"repository:{row['github_name']}",
+                "files": dataset_files(row["dataset_folder_tree"]),
+                "facts": [], "output": row["output_fname"],
+                "unknowns": ["Expected results, gold implementation details, and undocumented analysis choices."],
+            }
         dataset_revision = self.source.dataset_revision or DATASET_REVISION
         if dataset_revision != DATASET_REVISION:
             raise ValueError("The researcher excerpts must be re-reviewed for this dataset revision")
@@ -193,6 +228,10 @@ class ScienceAgentBenchAdapter(Adapter):
                     sha256=annotation_hash,
                 ),
             ))
+        if not reviewed_pilot and knowledge.strip():
+            facts.extend(field_facts(knowledge, prefix=f"scienceagentbench.{task_id}",
+                path=PARQUET, revision=dataset_revision, locator=f"instance_id={task_id}/domain_knowledge",
+                digest=annotation_hash, default_kind="optional_advice"))
         assets = [Asset(
             id=f"input_{index}", source_path=str((self.source.assets / BUNDLE / "datasets" / name).resolve()),
             target_path=f"benchmark/datasets/{name}", acquisition=ACQUISITION,
@@ -230,7 +269,7 @@ class ScienceAgentBenchAdapter(Adapter):
                 context="Supply a standalone Python program and its executed output. "
                         "All native task requirements remain in the question. "
                         "Input files are listed below; previews are not substitutes for the files.",
-                documents={"dataset_preview": row["dataset_preview"], "canary": CANARY},
+                documents={"dataset_preview": row.get("dataset_preview") or "", "canary": CANARY},
                 submission={"program": "solution.py", "required_artifacts": [selected["output"]],
                             "stage": "final", "category": row["subtask_categories"]},
                 environment={"input_paths": [asset.target_path for asset in assets if asset.visibility == "actor"],
@@ -240,8 +279,9 @@ class ScienceAgentBenchAdapter(Adapter):
             ),
             researcher=ResearcherContext(
                 facts=facts, unknowns=selected["unknowns"],
-                notes=["These facts are reviewed excerpts of permitted native expert guidance.",
-                       "Interpret 'It' in the PSS construct fact as the Perceived Stress Scale.",
+                notes=[("These facts are reviewed excerpts of permitted native expert guidance."
+                        if reviewed_pilot else
+                        "The native domain_knowledge field is supplied as optional advice under an automated source boundary."),
                        "Do not invent task-specific facts or disclose an expected answer."],
             ),
             assets=assets,
@@ -259,14 +299,16 @@ class ScienceAgentBenchAdapter(Adapter):
                         "bundle_path": BUNDLE, "expected_output": selected["output"],
                         "verified_evaluator_inspection": "reviewed" if reviewed else "pending_bundle"},
             ),
-            conversion={"version": VERSION, "study_group_basis": "source_repository_plus_dataset_not_confirmed_paper",
-                        "moves": ["Reviewed domain_knowledge excerpts become researcher context/advice"],
-                        "omissions": ["Unreviewed expert guidance", "gold code", "solution source pointers from public input"],
+            conversion={"context_policy": CONTEXT_POLICY, "version": VERSION, "study_group_basis": "source_repository_plus_dataset_not_confirmed_paper",
+                        "moves": ["Native domain_knowledge becomes researcher context/advice"],
+                        "omissions": ["gold code", "solution source pointers from public input"],
+                        "validation_method": "human_reviewed" if reviewed_pilot else
+                            "automated_native_domain_knowledge_boundary",
                         "evaluation_change": "Separate program execution from native artifact verification; CodeBERTScore omitted",
                         "runtime_verified": False,
                         "runtime_dependencies_verified": provision.get("runtime_dependency_validation") == "passed_isolated_pickle_compatibility",
                         "runtime_adaptation": provision.get("evaluator_runtime")},
-            review_status="reviewed",
+            review_status="reviewed" if reviewed_pilot else "automated",
         )
 
     def evaluate_in_sandbox(self, episode: Episode, submission: Submission,
@@ -278,7 +320,7 @@ class ScienceAgentBenchAdapter(Adapter):
     def evaluation_request(self, episode: Episode, submission: Submission,
                            output: Path) -> EvaluationRequest:
         check_submission(episode, submission)
-        if episode.benchmark != self.name or episode.source_task_id not in PILOTS:
+        if episode.benchmark != self.name or episode.source_task_id not in self._load_rows():
             raise ValueError("Unsupported ScienceAgentBench episode")
         if not submission.artifacts.get("solution.py"):
             raise ValueError("A standalone solution.py submission is required")
@@ -305,7 +347,7 @@ class ScienceAgentBenchAdapter(Adapter):
             required_paths=[str(bundle / "provisioning.json"),
                             str(bundle / "eval_programs" / episode.evaluator.reference["native_eval_script"]),
                             program, artifact, receipt,
-                            *[str(bundle / "datasets" / name) for name in PILOTS[episode.source_task_id]["files"]]],
+                            *[asset.source_path for asset in episode.assets if asset.visibility == "actor"]],
             output_paths=[str(output)],
             environment={},
             notes=["Construction does not execute this command. It requires an installed PersonaScienceBench package.",
@@ -382,15 +424,18 @@ def grade(bundle: Path, task_id: str, program: Path, artifact: Path,
     provisioning.json records a pinned image plus reviewed evaluator-file hashes.
     No actor implementation or source data is automatically executed by conversion.
     """
-    if task_id not in PILOTS or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*\.py", eval_script):
-        raise ValueError("Unsupported pilot or evaluator filename")
+    if not re.fullmatch(r"[0-9]+", task_id) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*\.py", eval_script):
+        raise ValueError("Unsupported task or evaluator filename")
     bundle = bundle.resolve()
     program = _plain_file(program)
     artifact = _plain_file(artifact)
     receipt = read_json(_plain_file(execution_receipt))
     episode_id = f"scienceagentbench:verified:{task_id}"
     program_hash, artifact_hash = sha256(program), sha256(artifact)
-    expected = PILOTS[task_id]["output"]
+    expected = next((name for name, digest in receipt.get("artifacts", {}).items()
+                     if digest == artifact_hash), None)
+    if not expected or _relative(expected) != expected:
+        raise ValueError("Execution receipt does not identify a contained native output")
     if (receipt.get("episode_id") != episode_id or receipt.get("stage") != "final"
             or receipt.get("exit_code") != 0 or receipt.get("status") != "completed"
             or receipt.get("program_sha256") != program_hash
@@ -458,7 +503,7 @@ def main() -> None:
     command = commands.add_parser("grade", help="Execute the isolated native evaluator after controller approval")
     for field in ("bundle", "program", "artifact", "execution-receipt", "output"):
         command.add_argument(f"--{field}", type=Path, required=True)
-    command.add_argument("--task-id", choices=list(PILOTS), required=True)
+    command.add_argument("--task-id", required=True)
     command.add_argument("--eval-script", required=True)
     args = vars(parser.parse_args())
     args.pop("command")

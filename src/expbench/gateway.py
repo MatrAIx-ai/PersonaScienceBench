@@ -106,7 +106,7 @@ class Gateway:
         self.failed = False
 
     def complete(self, role: str, messages: list[dict], *, tools=None, schema=None,
-                 json_object=False):
+                 json_object=False, tool_choice=None):
         if schema is not None and json_object:
             raise ValueError("Choose JSON schema or JSON object mode, not both")
         if self.failed:
@@ -127,6 +127,8 @@ class Gateway:
             payload["reasoning"] = {"effort": spec.reasoning_effort}
         if tools:
             payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         if schema:
             payload["response_format"] = {
                 "type": "json_schema", "json_schema": {

@@ -41,7 +41,11 @@ class Researcher:
             raise ValueError("Question limit cannot be negative")
         self.episode_id, self.question = episode.id, episode.public.question
         self.public_context = episode.public.model_dump(mode="json")
-        self.facts = {f.id: f for f in episode.researcher.facts if f.review_status == "reviewed"}
+        # ``automated`` facts passed deterministic, source-specific boundary
+        # checks.  Keep that provenance distinct from human-reviewed pilot facts
+        # while making both eligible for the grounded researcher.
+        self.facts = {f.id: f for f in episode.researcher.facts
+                      if f.review_status in {"automated", "reviewed"}}
         self.unknowns = list(episode.researcher.unknowns)
         self.backend, self.persona = backend, (persona or Persona()).model_copy(deep=True)
         if self.persona.expertise.domain == "task":

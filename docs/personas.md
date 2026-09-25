@@ -40,10 +40,7 @@ fact text. It does not use the shared router or grounded paraphrase/checking pat
 Omit `[persona]` or set `enabled=false` for its disabled condition. The shared
 `persona` preview command below applies to shared-adapter episodes, not EXP cards.
 
-[README usage](../README.md#get-started) launches the selected 25 cases in parallel.
-The actor and judge prompts do not receive the private persona. This comparison
-is of the complete fixed profile against disabled persona, not an isolated test
-of expertise alone. See the [results](../reports/luna_cs_novice_comparison.md).
+The actor and judge prompts do not receive the private persona. The fixed profile combines several expertise and communication settings; comparing it against disabled persona does not isolate expertise alone. The current [integration trial](../reports/conversion_v2/README.md) uses persona off. Historical persona-comparison records are archived locally.
 
 ## Configuration
 

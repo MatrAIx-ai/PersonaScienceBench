@@ -35,7 +35,7 @@ class Adapter:
         raise NotImplementedError
 
     def pilot_task_ids(self) -> list[str]:
-        """Two curated candidates; adapters must select explicitly."""
+        """Small curated smoke-test selection; not the conversion boundary."""
         raise NotImplementedError
 
     def evaluate(self, episode: Episode, submission: Submission,

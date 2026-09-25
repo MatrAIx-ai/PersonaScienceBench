@@ -18,7 +18,7 @@ its scientific task or historical scores.
 | `tests/expbench/` | Migrated offline and isolation checks |
 | `manifests/expbench.json` | Pinned upstream annotation/prompt URLs, revisions and 59 file hashes |
 | `manifests/expbench_repositories.json` | Five fixed repository snapshot revisions used for preparation |
-| `reports/expbench/` | Existing measured comparisons, diagnostics, interaction example and submitted design |
+| `reports/conversion_v2/` | Current integration-trial summaries; full traces remain local |
 | `data/` | Local-only raw annotations, references, task cards and code snapshots; ignored |
 | `runs/expbench/` | Local-only original runs and traces; ignored |
 
@@ -120,8 +120,8 @@ must not be confused with the current reference-coverage condition.
 | o3-mini | Sonnet 5 | Sonnet 5 | 92.7/100 | 5 |
 
 These are previously measured results, not migration reruns. See the
-[comparison report](../../reports/expbench/sonnet5_actor_comparison_20260922.md)
-and [report with interaction trace and final design](../../reports/expbench/experiment_design_pilot_summary_20260922.md).
+comparison report (historical record archived locally)
+and report with interaction trace and final design (historical record archived locally).
 They remain separate from full-workflow scores in the other benchmarks.
 
 The existing local datasets and private runs were moved into this repository's

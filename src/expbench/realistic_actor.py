@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from typing import Literal
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
@@ -44,6 +45,14 @@ class FinishExperimentAction(Action):
     reproduction_command: str | None = Field(default=None, max_length=12000)
 
 
+class ReviewHandoffAction(Action):
+    stage: Literal["plan", "result"]
+    answer: str = Field(min_length=1, max_length=60000)
+    evidence: str = Field(min_length=1, max_length=24000)
+    assumptions: list[str] = Field(default_factory=list)
+    uncertainties: list[str] = Field(default_factory=list)
+
+
 class RealisticExecutor(ToolExecutor):
     def __init__(self, episode, operation):
         self.episode, self.operation = episode, operation
@@ -52,6 +61,17 @@ class RealisticExecutor(ToolExecutor):
         e = self.episode
         if e.design is not None:
             return BenchmarkObservation.from_text("The episode is complete.")
+        if e.config.collaboration is not None and e.turn_reply is not None:
+            return BenchmarkObservation.from_text("This turn was handed to the researcher; wait for its next request.")
+        if self.operation == "end_researcher_turn":
+            try:
+                e.turn_reply = e.researcher.validate_handoff(action.model_dump(exclude={"kind"}))
+            except ValueError as error:
+                return BenchmarkObservation.from_text(str(error))
+            e.review_session.event("agent_handoff", e.turn_reply)
+            if conversation:
+                conversation.state.execution_status = ConversationExecutionStatus.FINISHED
+            return BenchmarkObservation.from_text("Handoff recorded; waiting for researcher review.")
         if self.operation == "inspect_repository":
             text = e.inspect(action.path)
         elif self.operation == "execute_check":
@@ -97,7 +117,11 @@ class RealisticTools(ToolDefinition):
             ("execute_check", ExecuteCheckAction, "Run a shell command in the isolated task workspace. Use small exploratory checks before submitting your plan."),
             ("submit_plan", SubmitPlanAction, "Save your initial research plan in natural language."),
         ]
-        if episode.input_mode == "interactive":
+        if episode.config.collaboration is not None:
+            definitions = definitions[:2] + [
+                ("end_researcher_turn", ReviewHandoffAction,
+                 "Yield a proposed approach (stage=plan) or completed experiment design (stage=result), with evidence, assumptions and uncertainties. The researcher decides when to finish.")]
+        elif episode.input_mode == "interactive":
             definitions.append(("ask_researcher", AskScopedResearcherAction, "Ask a focused question about one available researcher topic."))
         if episode.workflow:
             definitions.append(("finish_experiment", FinishExperimentAction, "Save the final design, evidence-based conclusion and optional reproduction command."))
@@ -127,8 +151,12 @@ class FinishExperimentTool(RealisticTools):
     name = "finish_experiment"
 
 
+class ReviewHandoffTool(RealisticTools):
+    name = "end_researcher_turn"
+
+
 _TOOL_TYPES = {t.name: t for t in (InspectRepositoryTool, ExecuteCheckTool,
-                                  ScopedAskTool, SubmitPlanTool, FinishExperimentTool)}
+                                  ScopedAskTool, SubmitPlanTool, FinishExperimentTool, ReviewHandoffTool)}
 
 
 register_tool("RealisticTools", RealisticTools)
@@ -150,9 +178,23 @@ def run_actor(episode):
                        native_tool_calling=True, caching_prompt=False, num_retries=1,
                        log_completions=False)
     llm._episode = episode
+    system_prompt = prompts.ACTOR + (prompts.WORKFLOW if episode.workflow else prompts.DESIGN_END)
+    if episode.config.collaboration is not None:
+        system_prompt = (
+            "Collaborate with the researcher to develop an experiment design for the original task. "
+            "First inspect the masked repository and supplied inputs, then use end_researcher_turn "
+            "with stage=plan to propose an approach, consequential choices and uncertainties. "
+            "Wait for explicit researcher approval before developing the full design. "
+            "After approval, hand off stage=result with the complete design in answer, supported "
+            "by rationale, controls, feasible checks and repository observations in evidence. "
+            "State assumptions separately from fixed task requirements. No executed experiment "
+            "or invented outcome is required for this design-only task. Use inspect_repository "
+            "and execute_check for exploration. Share concrete findings: private tool output is "
+            "not automatically sent to the researcher. Revise when needed; do not invent "
+            "objections or ambiguities to extend the conversation. The researcher decides when to stop.")
     agent = Agent(llm=llm, tools=[Tool(name="RealisticTools", params={"episode_id": episode_id})],
                   include_default_tools=[], condenser=None,
-                  system_prompt=prompts.ACTOR + (prompts.WORKFLOW if episode.workflow else prompts.DESIGN_END),
+                  system_prompt=system_prompt,
                   agent_context=AgentContext(load_user_skills=False, load_public_skills=False,
                                              load_project_skills=False, load_memory=False))
     try:
@@ -162,8 +204,12 @@ def run_actor(episode):
                 visualizer=None, max_iteration_per_run=episode.config.limits.actor_steps,
                 profile_store_dir=Path(state) / ".profiles")
             try:
-                conversation.send_message(json.dumps(episode.actor_input(), ensure_ascii=False))
-                conversation.run()
+                if episode.config.collaboration is not None:
+                    from expbench.collaboration import drive
+                    drive(episode, conversation)
+                else:
+                    conversation.send_message(json.dumps(episode.actor_input(), ensure_ascii=False))
+                    conversation.run()
                 episode.actor_status = str(conversation.state.execution_status)
             finally:
                 conversation.close()

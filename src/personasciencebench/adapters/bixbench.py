@@ -1,4 +1,4 @@
-"""Reviewed BixBench v1.5 episodes and a dependency-light native grader bridge.
+"""Benchmark-wide BixBench v1.5 conversion and native grader bridge.
 
 Conversion never exposes an annotation row or capsule notebook. Asset acquisition
 and model execution are explicit operations; imports and conversion are offline.
@@ -17,6 +17,8 @@ import re
 from types import SimpleNamespace
 from typing import Any, Literal, Self
 import zipfile
+from functools import cache
+from personasciencebench.context_conversion import tabular_facts, POLICY as CONTEXT_POLICY
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -162,6 +164,7 @@ def _native_grader(repository: Path):
 class BixBenchAdapter(Adapter):
     name = "bixbench"
 
+    @cache
     def _rows(self) -> list[dict[str, Any]]:
         if self.source.revision != REPOSITORY_REVISION:
             raise ValueError("BixBench repository revision is not reviewed")
@@ -185,15 +188,78 @@ class BixBenchAdapter(Adapter):
     def pilot_task_ids(self) -> list[str]:
         return ["bix-10-q2", "bix-8-q2"]
 
-    def prepare_assets(self, task_id: str) -> list[Path]:
-        """Extract reviewed inputs from an already acquired pinned ZIP, offline."""
-        if task_id not in PILOTS:
-            raise ValueError("This BixBench question has no reviewed input allowlist")
-        capsule = PILOTS[task_id]
-        spec = CAPSULES[capsule]
+    def _row(self, task_id: str) -> dict[str, Any]:
+        matches = [row for row in self._rows() if row["question_id"] == task_id]
+        if len(matches) != 1:
+            raise ValueError(f"Unknown or duplicate BixBench question: {task_id}")
+        return matches[0]
+
+    @staticmethod
+    def _permitted_input(name):
+        path = PurePosixPath(name)
+        allowed = {".csv", ".tsv", ".txt", ".xlsx", ".xls", ".json", ".h5", ".h5ad", ".hdf5", ".mtx", ".gz", ".fastq", ".fasta", ".fa", ".fq", ".rds", ".rda", ".RData", ".parquet", ".bed", ".bam", ".bai", ".vcf", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".npy", ".npz", ".faa", ".fna", ".mafft", ".clipkit", ".treefile", ".nwk", ".newick", ".aln"}
+        if any(re.search(r"(?:^|[_-])(solution|answer|gold|notebook)(?:$|[_-])", p.rsplit(".",1)[0], re.I) for p in path.parts):
+            return False
+        if path.suffix.lower() == ".gz" and (len(path.suffixes) < 2 or path.suffixes[-2].lower() not in {".csv", ".tsv", ".txt", ".fastq", ".fq", ".fasta", ".fa", ".fna", ".faa", ".mtx", ".vcf"}):
+            return False
+        return path.suffix.lower() in {s.lower() for s in allowed}
+
+    @cache
+    def _unclassified_inputs(self, capsule):
         archive = self.source.assets / f"CapsuleFolder-{capsule}.zip"
-        if sha256(archive) != spec["archive_sha256"]:
+        if not archive.is_file():
+            return []
+        prefix = f"CapsuleData-{capsule}/"
+        with zipfile.ZipFile(archive) as bundle:
+            return [name[len(prefix):] for name in bundle.namelist()
+                if name.startswith(prefix) and not name.endswith("/")
+                and not self._permitted_input(name[len(prefix):])
+                and PurePosixPath(name).suffix.lower() != ".ipynb"
+                and not re.search(r"(?:^|[_/-])(solution|answer|gold)(?:$|[_/.-])", name, re.I)]
+
+    @cache
+    def _capsule_inventory(self, capsule: str) -> dict[str, str]:
+        """Return only data members, never notebooks or reference material."""
+        archive = self.source.assets / f"CapsuleFolder-{capsule}.zip"
+        if not archive.is_file():
+            return {}
+        known = CAPSULES.get(capsule)
+        if known and sha256(archive) != known["archive_sha256"]:
             raise ValueError("BixBench capsule archive hash mismatch")
+        prefix = f"CapsuleData-{capsule}/"
+        inventory: dict[str, str] = {}
+        with zipfile.ZipFile(archive) as bundle:
+            names = bundle.namelist()
+            if len(set(names)) != len(names):
+                raise ValueError("Duplicate ZIP members are not allowed")
+            for info in bundle.infolist():
+                path = PurePosixPath(info.filename)
+                if path.is_absolute() or ".." in path.parts or "\\" in info.filename:
+                    raise ValueError("Unsafe ZIP member path")
+                if info.is_dir() or not info.filename.startswith(prefix):
+                    continue
+                relative = info.filename[len(prefix):]
+                if not relative or PurePosixPath(relative).is_absolute():
+                    raise ValueError("Unsafe capsule data member")
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError("Symlink ZIP members are not allowed")
+                if not self._permitted_input(relative):
+                    continue
+                inventory[relative] = hashlib.sha256(bundle.read(info)).hexdigest()
+        if not inventory:
+            raise ValueError(f"Capsule contains no input data members: {capsule}")
+        if known and inventory != known["files"]:
+            raise ValueError("Reviewed BixBench input inventory changed")
+        return inventory
+
+    def prepare_assets(self, task_id: str) -> list[Path]:
+        """Extract input-only capsule members from an acquired ZIP, offline."""
+        capsule = self._row(task_id)["capsule_uuid"]
+        archive = self.source.assets / f"CapsuleFolder-{capsule}.zip"
+        if not archive.is_file():
+            raise FileNotFoundError(
+                f"Acquire CapsuleFolder-{capsule}.zip from pinned BixBench dataset revision")
+        inventory = self._capsule_inventory(capsule)
         output = self.source.assets / "prepared" / capsule
         if not output.resolve().is_relative_to(self.source.assets.resolve()):
             raise ValueError("Prepared input directory escapes the configured asset root")
@@ -206,7 +272,7 @@ class BixBenchAdapter(Adapter):
                 path = PurePosixPath(member)
                 if path.is_absolute() or ".." in path.parts or "\\" in member:
                     raise ValueError("Unsafe ZIP member path")
-            for name, expected in spec["files"].items():
+            for name, expected in inventory.items():
                 member = f"CapsuleData-{capsule}/{name}"
                 info = bundle.getinfo(member)
                 if (info.external_attr >> 16) & 0o170000 == 0o120000:
@@ -217,13 +283,37 @@ class BixBenchAdapter(Adapter):
                 target = output / name
                 if target.is_symlink() or output.is_symlink():
                     raise ValueError("Prepared inputs must not be symlinks")
-                output.mkdir(parents=True, exist_ok=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
                 written.append(target)
+        manifest = output / "input_manifest.json"
+        manifest.write_text(json.dumps({"capsule_uuid": capsule,
+                                        "archive_sha256": sha256(archive),
+                                        "files": inventory, "dataset_revision": DATASET_REVISION,
+                                        "conversion_policy": CONTEXT_POLICY,
+                                        "excluded_members": [n for n in members if not n.endswith("/") and
+                                            (not n.startswith(f"CapsuleData-{capsule}/") or not self._permitted_input(n))]}, indent=2) + "\n")
         return written
 
+    @cache
+    def _automatic_capsule_facts(self, capsule):
+        facts = []
+        for name, digest in self._capsule_inventory(capsule).items():
+            path = self.source.assets / "prepared" / capsule / name
+            if path.suffix.lower() not in {".csv", ".tsv", ".xlsx"}:
+                continue
+            if not path.is_file():
+                continue
+            if sha256(path) != digest:
+                raise ValueError("Prepared metadata source hash mismatch")
+            facts.extend(tabular_facts(path, prefix=f"{capsule}.{hashlib.sha256(name.encode()).hexdigest()[:12]}",
+                source_path=f"CapsuleFolder-{capsule}.zip#CapsuleData-{capsule}/{name}", revision=DATASET_REVISION))
+        return facts
+
     def _facts(self, task_id: str) -> list[Fact]:
-        capsule = PILOTS[task_id]
+        capsule = self._row(task_id)["capsule_uuid"]
+        if task_id not in PILOTS:
+            return self._automatic_capsule_facts(capsule)
         if task_id in ADDITIONAL_FACTS:
             items = ADDITIONAL_FACTS[task_id]
         elif task_id == "bix-10-q2":
@@ -254,14 +344,14 @@ class BixBenchAdapter(Adapter):
         ) for key, topic, filename, locator, text in items]
 
     def convert(self, task_id: str) -> Episode:
-        if task_id not in PILOTS:
-            raise ValueError("This BixBench question has no reviewed conversion")
-        row = next(row for row in self._rows() if row["question_id"] == task_id)
-        capsule = PILOTS[task_id]
-        if row["capsule_uuid"] != capsule or row["version"] != "1.5":
+        row = self._row(task_id)
+        capsule = row["capsule_uuid"]
+        if row["version"] != "1.5":
+            raise ValueError("Unsupported BixBench question version")
+        if task_id in PILOTS and PILOTS[task_id] != capsule:
             raise ValueError("Reviewed BixBench question identity changed")
         facts = self._facts(task_id)
-        files = CAPSULES[capsule]["files"]
+        files = self._capsule_inventory(capsule)
         archive = f"CapsuleFolder-{capsule}.zip"
         assets = [Asset(
             id=filename, source_path=str((self.source.assets / "prepared" / capsule / filename).resolve()),
@@ -269,10 +359,28 @@ class BixBenchAdapter(Adapter):
             acquisition=(f"https://huggingface.co/datasets/futurehouse/BixBench/resolve/"
                          f"{DATASET_REVISION}/{archive}; call BixBenchAdapter.prepare_assets"),
         ) for filename, digest in files.items()]
+        if not files:
+            # Preserve readiness information without ever mounting the complete
+            # capsule ZIP, which also contains answer-bearing notebooks.
+            assets = [Asset(
+                id="unprovisioned_capsule_inputs",
+                source_path=str((self.source.assets / "prepared" / capsule / ".inputs_ready").resolve()),
+                target_path="data/.inputs_ready", required=True,
+                acquisition=(f"Acquire {archive} from BixBench revision {DATASET_REVISION} "
+                             "and call BixBenchAdapter.prepare_assets."),
+            )]
+        unclassified = self._unclassified_inputs(capsule)
+        if unclassified:
+            assets.append(Asset(id="unclassified_input_roles", source_path=str((self.source.assets / "prepared" / capsule / ".file_roles_resolved").resolve()),
+                target_path="data/.file_roles_resolved", acquisition="Input roles unresolved; do not declare the partial input set runnable: " + ", ".join(unclassified[:20])))
+        categories = [part.strip() for part in str(row.get("categories") or "").split(",") if part.strip()]
+        domain = categories[0] if categories else "computational_biology"
+        automated = task_id not in PILOTS
         return Episode(
             id=f"bixbench:{task_id}", benchmark=self.name, source_task_id=task_id,
-            study_id=capsule, domain="computational_biology",
-            source_revision=self.source.revision, review_status="reviewed",
+            study_id=capsule, domain=domain,
+            source_revision=self.source.revision,
+            review_status="automated" if automated else "reviewed",
             public=PublicContext(
                 question=row["question"],
                 context=("Analyze the supplied capsule inputs to answer the question. "
@@ -307,16 +415,24 @@ class BixBenchAdapter(Adapter):
                         "judge_model": "configured_at_run_time", "denominator": 1},
             ),
             conversion={
-                "adapter_version": "0.1", "dataset_revision": DATASET_REVISION,
+                "adapter_version": CONTEXT_POLICY, "dataset_revision": DATASET_REVISION,
                 "annotations_sha256": ANNOTATIONS_SHA256,
                 "native_categories": row["categories"], "native_paper": row["paper"],
                 "annotation_locator": f"BixBench.jsonl#question_id={task_id}",
                 "question_preserved_verbatim": True,
                 "excluded_fields": ["ideal", "result", "answer", "hypothesis", "distractors"],
                 "excluded_assets": ["CapsuleNotebook-*", "*.ipynb"],
-                "archive": archive, "archive_sha256": CAPSULES[capsule]["archive_sha256"],
-                "selection_reason": "Distinct capsules; bounded statistical analysis; source-backed metadata clarification.",
-                "readiness": "Conversion/context reviewed; live actor and judge execution not yet tested.",
+                "archive": archive,
+                "archive_sha256": sha256(self.source.assets / archive) if (self.source.assets / archive).is_file() else None,
+                "selection_reason": ("Distinct capsules; bounded statistical analysis; source-backed metadata clarification."
+                                     if not automated else "Benchmark-wide pinned-annotation conversion."),
+                "validation_method": "human_reviewed" if not automated else
+                    "automated_annotation_boundary_and_input_only_archive_filter",
+                "context_status": ("automated_input_schema" if automated else "reviewed_schema_facts") if facts else "no_available_context",
+                "researcher_exclusive_information": False,
+                "asset_status": "unclassified_input_roles" if unclassified else "inventory_known" if files else "capsule_archive_not_acquired",
+                "unclassified_input_members": unclassified,
+                "readiness": "Live actor and judge execution not yet tested.",
                 "execution_evidence_policy": "Require an analysis artifact and explicit execution declaration before native answer scoring; this is a PSB submission gate, not scientific verification.",
             },
         )

@@ -12,6 +12,8 @@ from expbench.schema import Config, Design, Grade, Task
 
 class Episode:
     def __init__(self, task: Task, config: Config, transport, budget: Budget, output: Path):
+        if config.collaboration is not None:
+            raise ValueError("Use expbench-realistic in interactive design-only mode for shared collaboration")
         self.task, self.config, self.output = task, config, output
         output.mkdir(parents=True, exist_ok=False)
         self.gateway = Gateway(transport, {role: getattr(config.models, role)

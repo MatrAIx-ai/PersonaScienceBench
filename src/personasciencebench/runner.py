@@ -45,9 +45,11 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
         raise ValueError("parallel must be between one and 25")
     # ScienceAgentBench uses an explicitly versioned Bubblewrap environment
     # adaptation with unchanged native graders. Terminal still needs Harbor.
-    supported = {"discoverybench", "bixbench", "scienceagentbench"}
+    supported = {"discoverybench", "bixbench", "scienceagentbench", "asibench"}
     if set(benchmarks) - supported:
         raise ValueError("This runner executes DiscoveryBench, BixBench and the ScienceAgentBench sandbox adaptation; other sources need their runtime bridges")
+    from personasciencebench.collaboration import validate_collaboration, POLICY
+    collaboration = validate_collaboration(config.get("collaboration"))
     manifest = read_json(prepared / "pilot_manifest.json")
     selected = [r for r in manifest["cases"] if r["benchmark"] in benchmarks]
     expected = config.get("pilot_cases_per_benchmark", 2)
@@ -102,13 +104,22 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
             clients = {role: OpenRouterClient(**spec, role=role, record=record_api,
                                              supported_parameters=catalog[role]["supported_parameters"])
                        for role, spec in config["models"].items()}
-            researcher = Researcher(episode, clients["researcher"],
+            researcher_type = Researcher
+            if collaboration is not None:
+                from personasciencebench.collaboration import ActiveResearcher
+                researcher_type = ActiveResearcher
+            researcher = researcher_type(episode, clients["researcher"],
                                     persona=profiles[episode.id], **config["researcher"])
             session = EpisodeSession(episode, researcher, case / "controller", artifact_root=workspace)
-            actor_result = run_actor(session, clients["actor"], sandbox, max_steps=config["actor_steps"])
+            actor_result = run_actor(session, clients["actor"], sandbox, max_steps=config["actor_steps"], collaboration=collaboration)
             write_json(case / "actor_result.json", actor_result)
             result.update(actor=actor_result, researcher_questions=researcher.questions,
                           disclosed_facts=len(researcher.disclosed))
+            if collaboration is not None:
+                result.update(interaction_protocol=POLICY,
+                              researcher_requests=researcher.requests,
+                              researcher_followups=max(0, researcher.requests - 1),
+                              researcher_decisions=len(researcher.audit))
             if session.submission is None:
                 result["status"] = "infrastructure_error" if actor_result.get("status") == "error" else "missing_submission"
             else:

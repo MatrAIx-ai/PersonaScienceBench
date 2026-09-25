@@ -1,7 +1,8 @@
-"""Reviewed DiscoveryBench conversions and a dependency-free native grading bridge.
+"""Benchmark-wide DiscoveryBench conversion and native grading bridge.
 
-The upstream repository remains untouched.  Only two reviewed queries are
-exportable; enumeration does not imply that every source row is safe to export.
+Dedicated source fields provide a deterministic information boundary: questions,
+dataset metadata, and files are public; domain knowledge belongs to the simulated
+researcher; hypotheses, workflows, and answer keys remain evaluator-only.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from personasciencebench.adapters.base import Adapter, Judge, check_submission
+from personasciencebench.context_conversion import field_facts, POLICY as CONTEXT_POLICY
 from personasciencebench.schema import (
     Asset, Episode, EvaluationResult, EvaluatorSpec, Fact, Provenance,
     PublicContext, ResearcherContext, Submission, TaskSummary,
@@ -79,34 +81,43 @@ def _contained(root: Path, relative: str) -> Path:
     return path
 
 
-def _read_reviewed(source_root: Path, task_id: str) -> dict[str, Any]:
+def _read_task(source_root: Path, task_id: str) -> dict[str, Any]:
     """Return a controller-only record using exact, non-ambiguous source keys."""
     review = REVIEWED_TASKS.get(task_id)
-    if review is None:
-        raise ValueError(f"Task has no reviewed information boundary: {task_id}")
     split, study, metadata_file, group, qid = task_id.split("/")
     relative = f"discoverybench/real/{split}/{study}/{metadata_file}"
     path = _contained(source_root, relative)
-    if _sha256(path) != review["metadata_sha256"]:
+    metadata_hash = _sha256(path)
+    if review is not None and metadata_hash != review["metadata_sha256"]:
         raise ValueError(f"Reviewed metadata changed; re-curation required: {relative}")
     metadata = json.loads(path.read_text())
     queries = metadata["queries"][int(group)]
     matches = [q for q in queries if str(q["qid"]) == qid]
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one native query for {task_id}")
-    # Test references are in the answer key, not the placeholder hypotheses field.
-    key_path = _contained(source_root, "eval/answer_key_real.csv")
-    if _sha256(key_path) != ANSWER_KEY_SHA256:
-        raise ValueError("Pinned DiscoveryBench answer key changed")
-    with key_path.open(newline="") as stream:
-        references = [
-            row for row in csv.DictReader(stream)
-            if row["dataset"] == study
-            and row["metadataid"] == Path(metadata_file).stem.removeprefix("metadata_")
-            and row["query_id"] == qid
-        ]
-    if len(references) != 1 or not references[0]["gold_hypo"].strip():
-        raise ValueError(f"Expected one nonempty reference for {task_id}")
+    if split == "test":
+        # Test references are in the answer key, not the placeholder hypotheses field.
+        key_path = _contained(source_root, "eval/answer_key_real.csv")
+        if _sha256(key_path) != ANSWER_KEY_SHA256:
+            raise ValueError("Pinned DiscoveryBench answer key changed")
+        with key_path.open(newline="") as stream:
+            references = [
+                row for row in csv.DictReader(stream)
+                if row["dataset"] == study
+                and row["metadataid"] == Path(metadata_file).stem.removeprefix("metadata_")
+                and row["query_id"] == qid
+            ]
+        if len(references) != 1 or not references[0]["gold_hypo"].strip():
+            raise ValueError(f"Expected one nonempty reference for {task_id}")
+        gold_hypothesis = references[0]["gold_hypo"]
+        reference_path = "eval/answer_key_real.csv"
+        reference_hash = ANSWER_KEY_SHA256
+    else:
+        gold_hypothesis = matches[0].get("true_hypothesis", "").strip()
+        if not gold_hypothesis:
+            raise ValueError(f"Expected an embedded training reference for {task_id}")
+        reference_path = relative
+        reference_hash = metadata_hash
     # Do not copy query dictionaries: train queries embed true_hypothesis.
     question = matches[0]["question"]
     if not isinstance(question, str) or not question.strip():
@@ -114,7 +125,7 @@ def _read_reviewed(source_root: Path, task_id: str) -> dict[str, Any]:
     datasets = []
     for dataset in metadata["datasets"]:
         name = dataset["name"]
-        if Path(name).name != name or Path(name).suffix.lower() != ".csv":
+        if (Path(name).name != name or Path(name).suffix.lower() not in {".csv", ".txt", ".dta"}):
             raise ValueError(f"Unreviewed asset name: {name}")
         datasets.append({
             "name": name,
@@ -129,9 +140,10 @@ def _read_reviewed(source_root: Path, task_id: str) -> dict[str, Any]:
         "metadata_file": metadata_file, "query_group": int(group), "qid": int(qid),
         "relative_metadata": relative, "metadata_path": path,
         "question": question, "domain": metadata["domain"],
-        "datasets": datasets, "knowledge": metadata["domain_knowledge"].strip(),
-        "gold_hypothesis": references[0]["gold_hypo"],
-        "gold_workflow": metadata.get("workflow"), "review": review,
+        "datasets": datasets, "knowledge": (metadata.get("domain_knowledge") or "").strip(),
+        "gold_hypothesis": gold_hypothesis, "gold_workflow": metadata.get("workflow"),
+        "reference_path": reference_path, "reference_hash": reference_hash,
+        "metadata_hash": metadata_hash, "review": review,
     }
 
 
@@ -245,7 +257,7 @@ def run_native_evaluator(
 
 
 class DiscoveryBenchAdapter(Adapter):
-    """Convert two reviewed real-data tasks; keep all other queries inventory-only."""
+    """Convert all structurally valid real-data tasks at the pinned revision."""
 
     name = "discoverybench"
 
@@ -271,7 +283,7 @@ class DiscoveryBenchAdapter(Adapter):
     def convert(self, task_id: str) -> Episode:
         if self.source.revision != SOURCE_REVISION:
             raise ValueError("DiscoveryBench curation applies only to its pinned revision")
-        record = _read_reviewed(self.source.repository, task_id)
+        record = _read_task(self.source.repository, task_id)
         datasets = record["datasets"]
         assets = []
         for index, dataset in enumerate(datasets):
@@ -283,10 +295,16 @@ class DiscoveryBenchAdapter(Adapter):
                 sha256=_sha256(path) if path.is_file() else None,
                 acquisition=f"Restore {relative} from DiscoveryBench revision {SOURCE_REVISION}.",
             ))
-        topic = str(record["review"]["topic"])
-        metadata_hash = str(record["review"]["metadata_sha256"])
+        review = record["review"]
+        topic = str(review["topic"]) if review else "domain_knowledge"
+        metadata_hash = record["metadata_hash"]
         knowledge = record["knowledge"]
         reference_hash = hashlib.sha256(record["gold_hypothesis"].encode()).hexdigest()
+        facts = []
+        if knowledge:
+            facts = field_facts(knowledge, prefix=f"{record['study']}.{topic}",
+                path=record['relative_metadata'], revision=SOURCE_REVISION,
+                locator="/domain_knowledge", digest=metadata_hash)
         return Episode(
             id=f"discoverybench:{task_id}", benchmark=self.name,
             source_task_id=task_id, study_id=f"discoverybench:{record['study']}",
@@ -305,18 +323,12 @@ class DiscoveryBenchAdapter(Adapter):
                 environment={"data_paths": [asset.target_path for asset in assets],
                              "execution": "Independent actor runtime; only staged public assets are permitted.",
                              "resource_limits": "Supplied by the selected actor runtime; no common reduced budget is imposed."},
-                researcher_topics=[topic],
+                researcher_topics=sorted({fact.topic for fact in facts}),
             ),
             researcher=ResearcherContext(
-                facts=[Fact(
-                    id=f"{record['study']}.{topic}", topic=topic, text=knowledge,
-                    kind="context", review_status="reviewed",
-                    source=Provenance(source_path=record["relative_metadata"],
-                                      revision=SOURCE_REVISION, locator="/domain_knowledge",
-                                      sha256=metadata_hash),
-                )],
+                facts=facts,
                 unknowns=["Undocumented study details, intended findings, reference statistics, and unavailable runtime resources."],
-                notes=["Only the reviewed domain-knowledge statement is researcher-owned; dataset and column descriptions remain public. Preserve the source's uncertainty qualifiers."],
+                notes=["Only the source-attributed domain-knowledge field is researcher-owned; dataset and column descriptions remain public. Preserve the source's uncertainty qualifiers."],
             ),
             assets=assets,
             evaluator=EvaluatorSpec(
@@ -326,11 +338,11 @@ class DiscoveryBenchAdapter(Adapter):
                     "gold_hypothesis": record["gold_hypothesis"],
                     "gold_workflow": record["gold_workflow"],
                     "datasets": datasets, "reference_sha256": reference_hash,
-                    "source_path": "eval/answer_key_real.csv",
+                    "source_path": record["reference_path"],
                     "source_locator": {"dataset": record["study"],
                                        "metadataid": Path(record["metadata_file"]).stem.removeprefix("metadata_"),
                                        "query_id": record["qid"]},
-                    "source_sha256": ANSWER_KEY_SHA256,
+                    "source_sha256": record["reference_hash"],
                 },
                 config={
                     "model": None, "provider": None,
@@ -346,17 +358,20 @@ class DiscoveryBenchAdapter(Adapter):
                     "native_behavior_preserved": "Variable/relation comparisons receive full hypotheses for each matched context pair.",
                 },
             ),
-            conversion={
+            conversion={"context_policy": CONTEXT_POLICY,
                 "adapter_version": ADAPTER_VERSION, "split": record["split"],
                 "metadata_path": record["relative_metadata"], "query_group": record["query_group"],
                 "qid": record["qid"], "metadata_sha256": metadata_hash,
                 "public_allowlist": ["selected question", "datasets.name", "datasets.description", "datasets.columns.raw.name", "datasets.columns.raw.description"],
                 "excluded_fields": ["hypotheses", "true_hypothesis", "workflow", "workflow_tags", "intermediate", "answer_key"],
                 "fact_pack_sha256": hashlib.sha256(knowledge.encode()).hexdigest(),
-                "selection_rationale": record["review"]["rationale"],
+                "selection_rationale": review["rationale"] if review else
+                    "Benchmark-wide deterministic field-boundary conversion.",
+                "validation_method": "human_reviewed" if review else
+                    "automated_pinned_schema_and_information_boundary",
                 "runtime_validation": "not_run", "model_testing": "awaiting_user_confirmation",
             },
-            review_status="reviewed",
+            review_status="reviewed" if review else "automated",
         )
 
     def evaluate(self, episode: Episode, submission: Submission,

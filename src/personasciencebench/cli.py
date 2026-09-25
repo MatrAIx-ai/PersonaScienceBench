@@ -30,15 +30,11 @@ def prepare(args):
         tasks = selection[name] if selection is not None else adapter.pilot_task_ids()
         if not isinstance(tasks, list) or len(tasks) != expected or len(set(tasks)) != expected:
             raise ValueError(f"{name} must supply exactly {expected} distinct reviewed candidates")
-        studies = set()
         for task_id in tasks:
             if hasattr(adapter, "prepare_assets"):
                 adapter.prepare_assets(task_id)
             episode = adapter.convert(task_id)
-            studies.add(episode.study_id)
             records.append(export_episode(episode, args.output / safe_component(episode.id)))
-        if len(studies) != expected:
-            raise ValueError(f"{name}: pilot candidates must use different study groups")
     manifest = {"schema_version": "0.1", "source_root": str(args.source_root.resolve()),
                 "source_manifest": str(args.manifest.resolve()), "cases": records,
                 "cases_per_benchmark": expected,

@@ -40,7 +40,8 @@ class ProvisionTests(unittest.TestCase):
     def test_extracts_exact_allowlist_and_records_measured_provenance(self):
         destination = self.root / "extracted"
         result = provision_archive(self.archive, destination, self.annotations)
-        self.assertEqual(len(result["files"]), 9)
+        self.assertEqual(len(result["files"]), 32)
+        self.assertEqual(len(result["selected_task_ids"]), len(SELECTED_PRIVATE_FILES))
         self.assertEqual(result["archive_sha256"], sha256(self.archive))
         self.assertFalse((destination / "unreviewed_secret.txt").exists())
         self.assertIsNone(result["evaluator_image"])

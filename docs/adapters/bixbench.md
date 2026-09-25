@@ -6,7 +6,7 @@
 
 Status: two reviewed episodes have completed live isolated analysis and final
 Luna grading. Both received native grade zero; neither actor asked the researcher.
-See the [pilot report](../../reports/pilot_report.md) and
+See the pilot report (historical record archived locally) and
 [reproduction guide](../reproducibility.md).
 
 ## Selected episodes

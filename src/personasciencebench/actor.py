@@ -13,7 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from personasciencebench.schema import Submission
@@ -39,6 +39,28 @@ an actual nonempty analysis script/notebook is required under artifacts.analysis
 For ScienceAgentBench, include artifacts["solution.py"] and an artifact entry
 whose key exactly matches each required output path in the public task.
 Final text outside submit_result does not count as a submitted result.
+"""
+
+
+COLLABORATION_PROMPT = """You are a research agent collaborating with a researcher on the supplied benchmark.
+Keep its original question, fixed methods, constraints and required outputs unchanged.
+First inspect inputs/repository and propose an approach. Before the main analysis or
+implementation, yield a stage=plan handoff: describe observations, proposed choices,
+assumptions and important uncertainties. Wait for explicit researcher approval.
+Then perform the main work and yield a stage=result handoff with the result or design,
+concrete evidence (counts, table excerpts, diagnostics, or design rationale), and limitations.
+Use end_researcher_turn for every handoff. The same conversation and workspace persist.
+Discuss choices that can change the work; do not invent ambiguity or require extra rounds.
+Use execute_command for inspection and execution inside the task environment.
+Follow the public submission contract exactly. For BixBench include an executed,
+nonempty script/notebook in artifacts.analysis and payload.executed_analysis=true.
+For ScienceAgentBench include solution.py and all required output keys. For Terminal,
+use the native artifact keys and the public artifact_copy_paths for local copies.
+Never claim execution on the basis of a plan. Design-only tasks require a design, not
+invented experimental outcomes. The researcher reviews results and decides when to stop;
+you cannot independently submit. A plan handoff cannot count as the final deliverable.
+Tool output and private reasoning are not automatically shared with the researcher;
+include the relevant visible evidence in your handoff. Distinguish assumptions from facts.
 """
 
 
@@ -76,6 +98,9 @@ class ActorController:
     client: Any
     sandbox: Any
     calls: int = 0
+    collaborative: bool = False
+    turn_reply: dict[str, Any] | None = None
+    termination: str = "not_started"
     failure: BaseException | None = None
     actor_error: str | None = None
     executions: list[dict[str, Any]] = field(default_factory=list)
@@ -94,6 +119,19 @@ class ActorController:
             return {"error": "The episode has already been submitted."}
         if self.failure is not None:
             raise RuntimeError("Actor run has already failed") from self.failure
+        if self.collaborative and self.turn_reply is not None and operation != "submit_result":
+            return {"error": "This turn was handed to the researcher; wait for its next request."}
+        if operation == "end_researcher_turn":
+            if not self.collaborative:
+                raise ValueError("Researcher handoffs are only available in collaboration mode")
+            answer = arguments.get("answer", "")
+            if not isinstance(answer, str) or not answer.strip():
+                raise ValueError("A handoff requires a nonempty report")
+            handoff = self.session.researcher.validate_handoff(arguments)
+            artifacts = _relative_artifacts(handoff["artifacts"], Path(self.sandbox.workspace).resolve())
+            self.turn_reply = {**handoff, "artifacts": artifacts}
+            self.session.event("agent_handoff", self.turn_reply)
+            return {"handed_to_researcher": True, "submitted": False}
         if operation == "execute_command":
             command = arguments["command"]
             timeout = arguments.get("timeout_seconds", 120)
@@ -247,6 +285,12 @@ def _load_sdk() -> dict[str, Any]:
             artifacts: dict[str, str] = Field(default_factory=dict,
                 description="Artifact name to workspace-relative path. For BixBench include analysis: path to executed script/notebook.")
 
+        class HandoffAction(ResultAction):
+            stage: Literal["plan", "result"]
+            evidence: str = Field(min_length=1, max_length=24000)
+            assumptions: list[str] = Field(default_factory=list)
+            uncertainties: list[str] = Field(default_factory=list)
+
         class ActorObservation(Observation):
             pass
 
@@ -256,7 +300,7 @@ def _load_sdk() -> dict[str, Any]:
 
             def __call__(self, action, conversation=None):
                 try:
-                    result = self.controller.dispatch(self.operation, action.model_dump())
+                    result = self.controller.dispatch(self.operation, action.model_dump(exclude={"kind"}))
                 except (ValueError, FileExistsError, KeyError) as error:
                     # Invalid actor arguments are visible correction feedback.
                     # Provider/sandbox runtime failures do not fall through here.
@@ -271,7 +315,7 @@ def _load_sdk() -> dict[str, Any]:
                     if conversation:
                         conversation.state.execution_status = ConversationExecutionStatus.FINISHED
                     raise
-                if self.controller.session.closed and conversation:
+                if (self.controller.session.closed or self.controller.turn_reply is not None) and conversation:
                     conversation.state.execution_status = ConversationExecutionStatus.FINISHED
                 return ActorObservation.from_text(json.dumps(result, ensure_ascii=False))
 
@@ -286,6 +330,10 @@ def _load_sdk() -> dict[str, Any]:
                     ("submit_plan", PlanAction, "Save an immutable initial plan. Full-workflow tasks continue after this checkpoint."),
                     ("submit_result", ResultAction, "Submit the final scientific answer and supporting artifacts; this immediately ends the episode."),
                 ]
+                if controller.collaborative:
+                    definitions = [definitions[0],
+                        ("end_researcher_turn", HandoffAction,
+                         "Yield a plan for approach approval, or a result for evidence review. Include observations, assumptions and uncertainties; final candidates must satisfy the public submission contract.")]
                 return [tool_types[name](description=description, action_type=action,
                             observation_type=ActorObservation,
                             executor=ControllerExecutor(controller, name))
@@ -306,18 +354,22 @@ def _load_sdk() -> dict[str, Any]:
         class ResultTool(ActorTools):
             name = "submit_result"
 
-        tool_types = {tool.name: tool for tool in (CommandTool, ResearcherTool, ProgressTool, PlanTool, ResultTool)}
+        class HandoffTool(ActorTools):
+            name = "end_researcher_turn"
+
+        tool_types = {tool.name: tool for tool in (CommandTool, ResearcherTool, ProgressTool, PlanTool, ResultTool, HandoffTool)}
         register_tool("PersonaScienceBenchTools", ActorTools)
         _SDK = {"LLM": ControllerLLM, "Agent": Agent, "AgentContext": AgentContext,
                 "LocalConversation": LocalConversation, "Tool": Tool}
         return _SDK
 
 
-def run_actor(session, client, sandbox, max_steps: int = 20) -> dict[str, Any]:
+def run_actor(session, client, sandbox, max_steps: int = 20, *, collaboration: dict | None = None) -> dict[str, Any]:
     """Run the selected client through OpenHands; never select another model."""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
     controller = ActorController(session, client, sandbox)
+    controller.collaborative = collaboration is not None
     sdk = _load_sdk()
     run_id = str(uuid4())
     _RUNS[run_id] = controller
@@ -333,7 +385,7 @@ def run_actor(session, client, sandbox, max_steps: int = 20) -> dict[str, Any]:
         llm._controller = controller
         agent = sdk["Agent"](
             llm=llm, tools=[sdk["Tool"](name="PersonaScienceBenchTools", params={"run_id": run_id})],
-            include_default_tools=[], condenser=None, system_prompt=SYSTEM_PROMPT,
+            include_default_tools=[], condenser=None, system_prompt=COLLABORATION_PROMPT if controller.collaborative else SYSTEM_PROMPT,
             agent_context=sdk["AgentContext"](load_user_skills=False, load_public_skills=False,
                                               load_project_skills=False, load_memory=False),
         )
@@ -351,8 +403,11 @@ def run_actor(session, client, sandbox, max_steps: int = 20) -> dict[str, Any]:
                 profile_store_dir=Path(state) / ".profiles",
             )
             try:
-                conversation.send_message(json.dumps(session.episode.actor_input(), ensure_ascii=False))
-                conversation.run()
+                if collaboration is None:
+                    conversation.send_message(json.dumps(session.episode.actor_input(), ensure_ascii=False))
+                    conversation.run()
+                else:
+                    _run_collaboration(conversation, controller, collaboration, max_steps)
                 status = str(conversation.state.execution_status)
             finally:
                 conversation.close()
@@ -372,5 +427,65 @@ def run_actor(session, client, sandbox, max_steps: int = 20) -> dict[str, Any]:
               "execution_successes": sum(r.get("exit_code") == 0 for r in controller.executions),
               "scientific_execution_verified": False,
               "error": failure, "sdk_error": controller.actor_error}
+    if collaboration is not None:
+        result["collaboration"] = {
+            "policy": session.researcher.persona_metadata["researcher_policy_version"],
+            "plan_reviews": session.researcher.plan_reviews,
+            "result_reviews": session.researcher.result_reviews,
+            "researcher_requests": session.researcher.requests,
+            "researcher_decisions": len(session.researcher.audit),
+            "termination": "error" if failure else controller.termination,
+            "max_requests": collaboration["max_requests"],
+        }
     session.event("actor_finished", result)
     return result
+
+
+def _run_collaboration(conversation, controller, config, max_steps):
+    """Keep one OpenHands conversation; only the controller seals a final candidate."""
+    session = controller.session
+    handoff = None
+    candidate = None
+    limit = config["max_requests"]
+    for turn in range(limit + 1):
+        decision = session.researcher.decide(session, handoff, limit - turn)
+        if decision.action == "stop":
+            controller.termination = "researcher_selected"
+            break
+        if turn == limit or controller.calls >= max_steps:
+            controller.termination = "researcher_request_limit" if turn == limit else "actor_call_limit"
+            session.event("collaboration_budget_exhausted", {"reason": controller.termination})
+            break
+        controller.turn_reply = None
+        message = {"researcher_request": decision.message,
+                   "required_handoff_stage": "result" if session.researcher.approach_approved else "plan",
+                   "approach_approved": session.researcher.approach_approved}
+        if turn == 0:
+            message["public_task"] = session.episode.actor_input()
+        conversation.send_message(json.dumps(message, ensure_ascii=False))
+        conversation.max_iteration_per_run = max_steps - controller.calls
+        conversation.run()
+        if controller.failure is not None or controller.actor_error is not None:
+            controller.termination = "actor_error"
+            return
+        handoff = controller.turn_reply
+        if handoff is not None and handoff["stage"] == "result":
+            contract = session.episode.public.submission
+            required = list(contract.get("required_artifacts", []))
+            if session.episode.benchmark == "scienceagentbench":
+                required.append(contract["program"])
+            if session.episode.benchmark == "bixbench":
+                required.append("analysis")
+            if all(key in handoff["artifacts"] for key in required) and (
+                session.episode.benchmark != "bixbench" or handoff["payload"].get("executed_analysis") is True
+            ):
+                candidate = {key: handoff[key] for key in ("answer", "payload", "artifacts")}
+        if handoff is None:
+            controller.termination = "actor_did_not_handoff"
+            session.event("collaboration_stopped", {"reason": controller.termination})
+            return
+    if candidate is not None and controller.termination == "researcher_selected":
+        session.event("collaboration_candidate_selected", {"answer": candidate["answer"], "artifacts": candidate["artifacts"], "termination": controller.termination})
+        controller.dispatch("submit_result", candidate)
+    else:
+        session.event("collaboration_missing_submission", {"reason": "No complete, researcher-reviewed final candidate at termination"})

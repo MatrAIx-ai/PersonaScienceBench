@@ -23,7 +23,7 @@ class Fact(Record):
     kind: Literal["context", "fixed_requirement", "optional_advice"] = "context"
     source: Provenance
     disclosure: Literal["on_relevant_question", "on_shared_progress"] = "on_relevant_question"
-    review_status: Literal["candidate", "reviewed"] = "candidate"
+    review_status: Literal["candidate", "automated", "reviewed"] = "candidate"
 
 
 class Asset(Record):
@@ -74,13 +74,13 @@ class Episode(Record):
     study_id: str
     domain: str
     source_revision: str
-    track: Literal["design_only", "full_workflow"] = "full_workflow"
+    track: Literal["design_only", "full_workflow", "specification"] = "full_workflow"
     public: PublicContext
     researcher: ResearcherContext = Field(default_factory=ResearcherContext, repr=False)
     assets: list[Asset] = Field(default_factory=list, repr=False)
     evaluator: EvaluatorSpec = Field(repr=False)
     conversion: dict[str, Any] = Field(default_factory=dict)
-    review_status: Literal["candidate", "reviewed"] = "candidate"
+    review_status: Literal["candidate", "automated", "reviewed"] = "candidate"
 
     @model_validator(mode="after")
     def unique_assets(self):

@@ -30,6 +30,17 @@ class OpenRouterClient:
         raw = self.completion(messages, json_mode=json_mode, settings=settings)["choices"][0]["message"]["content"]
         return self.normalize_text(raw, json_mode=json_mode)
 
+    def complete_decision(self, messages, schema):
+        """One typed researcher decision, without a generated multi-turn transcript."""
+        name = "researcher_decision"
+        response = self.completion(messages, tools=[{"type":"function", "function":{
+            "name":name, "description":"Return the single researcher decision for the current turn.",
+            "parameters":schema}}], tool_choice={"type":"function", "function":{"name":name}})
+        calls = response["choices"][0]["message"].get("tool_calls", [])
+        if len(calls) != 1 or calls[0]["function"]["name"] != name:
+            raise ValueError("Expected exactly one researcher_decision tool call")
+        return calls[0]["function"]["arguments"]
+
     def normalize_text(self, raw, *, json_mode=False):
         normalized = canonical_json_object(raw) if json_mode else raw
         if normalized != raw:
@@ -37,7 +48,7 @@ class OpenRouterClient:
                                             "json_value_unchanged": True})
         return normalized
 
-    def completion(self, messages, tools=None, *, json_mode=False, settings=None):
+    def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None):
         import httpx
 
         key = os.environ.get("OPENROUTER_API_KEY")
@@ -64,6 +75,8 @@ class OpenRouterClient:
             payload["reasoning"] = {"effort": self.reasoning_effort}
         if tools:
             payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         try:

@@ -1,6 +1,6 @@
 # Benchmark modification standards
 
-Version: development standard 0.1, 2026-09-23.
+Version: development standard 0.2, 2026-09-25.
 
 These rules govern task conversions, researcher simulators, persona variants,
 actor integrations, and reporting in PersonaScienceBench. The source-specific
@@ -105,8 +105,12 @@ Each approved fact MUST contain at least:
 
 **5. Define conversation and memory behavior**
 
-- The actor chooses when to ask. A conversion MUST NOT require a minimum number of
-  questions or award performance credit for longer conversations by default.
+- Execution/design collaboration MAY require an approach review and a result
+  review under the declared protocol. These checkpoints MUST be counted separately
+  from optional clarification or revision rounds. No minimum number of additional
+  questions or performance reward for longer conversations is permitted.
+- A native clarification benchmark MAY retain its original dialogue and final
+  specification boundary rather than adding artificial approval exchanges.
 - Actor tool calls and researcher–actor messages MUST be recorded as distinct
   event types. Tool use alone does not count as researcher interaction.
 - Researcher memory MUST persist within an episode and reset between independent
@@ -121,6 +125,12 @@ Each approved fact MUST contain at least:
   context. Later facts or results MUST NOT be added retroactively to that checkpoint.
 
 **6. Use a common contract with independent runtimes**
+
+Each adapter MUST automate catalog conversion without per-case editing. It MUST
+produce either a versioned package or a recorded exclusion, and distinguish asset
+readiness from successful execution. Exact-source model classification MAY be used
+when field/section rules are insufficient; preserve the extraction trace, cache key,
+and automated review status. Unknown file roles MUST block readiness.
 
 Every adapter MUST expose these capabilities, though implementation details may
 differ:

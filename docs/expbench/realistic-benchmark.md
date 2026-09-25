@@ -162,7 +162,7 @@ not equal token budgets. The researcher still selects the relevance of a single
 approved fact; it does not generate the published answer freely. Episodes that
 never ask the researcher do not test the simulator model.
 
-The [completed o3-mini comparison](../../reports/expbench/o3mini_simulator_comparison_20260922.md)
+The completed o3-mini comparison (historical record archived locally)
 contains all five task results and five matched answer comparisons. Four of the
 five new actor episodes never queried the researcher, so the mean coverage
 difference is not evidence of a simulator capability difference.

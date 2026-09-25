@@ -85,7 +85,7 @@ class ScienceAgentBenchTests(unittest.TestCase):
         }))
         return bundle
 
-    def test_conversion_is_allowlisted_and_separates_private_fields(self):
+    def test_conversion_separates_private_fields(self):
         self.assertEqual(self.adapter.pilot_task_ids(), ["22", "45"])
         self.assertEqual(len(self.adapter.enumerate_tasks()), 2)
         episode = self.adapter.convert("22")
@@ -107,8 +107,8 @@ class ScienceAgentBenchTests(unittest.TestCase):
         self.assertEqual([fact.kind for fact in episode.researcher.facts], ["context", "optional_advice"])
         self.assertNotEqual(episode.study_id, self.adapter.convert("22").study_id)
 
-    def test_unreviewed_task_revision_and_changed_excerpt_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "reviewed interactive"):
+    def test_unknown_task_revision_and_changed_excerpt_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown verified"):
             self.adapter.convert("1")
         self.adapter._load_rows()["22"]["domain_knowledge"] = "Changed scientific facts"
         with self.assertRaisesRegex(ValueError, "excerpt changed"):

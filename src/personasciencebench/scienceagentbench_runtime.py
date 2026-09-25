@@ -13,7 +13,7 @@ import shlex
 import shutil
 
 from personasciencebench.adapters.base import check_submission, read_json, sha256
-from personasciencebench.adapters.scienceagentbench import DATASET_REVISION, PILOTS, _plain_file
+from personasciencebench.adapters.scienceagentbench import DATASET_REVISION, _plain_file
 from personasciencebench.runtime import Sandbox
 from personasciencebench.schema import Episode, EvaluationResult, Submission
 
@@ -76,9 +76,9 @@ def evaluate_in_sandbox(episode: Episode, submission: Submission, bundle: Path,
                         python_root: Path, output: Path) -> EvaluationResult:
     check_submission(episode, submission)
     key = episode.source_task_id
-    if episode.benchmark != "scienceagentbench" or key not in PILOTS:
+    if episode.benchmark != "scienceagentbench":
         raise ValueError("Unsupported verified ScienceAgentBench episode")
-    expected = PILOTS[key]["output"]
+    expected = episode.evaluator.config["expected_output"]
     if not submission.artifacts.get("solution.py") or not submission.artifacts.get(expected):
         return EvaluationResult(status="missing_submission", evaluator_version=RUNTIME_VERSION,
                                 errors=["A standalone program and its native output are required"])
@@ -90,17 +90,20 @@ def evaluate_in_sandbox(episode: Episode, submission: Submission, bundle: Path,
         provision = read_json(_plain_file(bundle / "provisioning.json"))
         if provision.get("split") != "verified" or provision.get("dataset_revision") != DATASET_REVISION:
             raise ValueError("Verified-bundle provenance differs from the annotation split")
-        for relative, digest in provision.get("files", {}).items():
-            if relative.startswith("datasets/") and relative.removeprefix("datasets/") in PILOTS[key]["files"]:
-                if sha256(_plain_file(bundle / relative)) != digest:
-                    raise ValueError("Verified actor input changed after archive provisioning")
+        actor_inputs = {Path(asset.source_path).relative_to(bundle).as_posix(): asset.sha256
+                        for asset in episode.assets if asset.visibility == "actor"
+                        and Path(asset.source_path).is_relative_to(bundle)}
+        for relative, episode_digest in actor_inputs.items():
+            digest = provision.get("files", {}).get(relative, episode_digest)
+            if digest is None or sha256(_plain_file(bundle / relative)) != digest:
+                raise ValueError("Verified actor input changed after archive provisioning")
         reviewed = provision.get("reviewed_evaluators", {}).get(key, {})
         script = episode.evaluator.reference["native_eval_script"]
         verifier_source = _plain_file(bundle / "eval_programs" / script)
         if reviewed.get("script_sha256") != sha256(verifier_source):
             raise ValueError("Native evaluator source changed or lacks reviewed provenance")
-        if not reviewed.get("dependencies"):
-            raise ValueError("Native evaluator reference dependencies have not been reviewed")
+        if "dependencies" not in reviewed:
+            raise ValueError("Native evaluator dependency discovery has not been recorded")
         for relative, digest in reviewed["dependencies"].items():
             source = _plain_file(bundle / relative)
             if not source.is_relative_to(bundle) or sha256(source) != digest:

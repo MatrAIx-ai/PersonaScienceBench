@@ -80,8 +80,8 @@ class TerminalBenchScienceTests(unittest.TestCase):
             self.assertTrue(all("/environment/data/" in asset.source_path for asset in episode.assets))
         self.assertEqual(self.adapter.convert(ODE).researcher.facts[1].kind, "optional_advice")
 
-    def test_source_changes_and_unreviewed_tasks_require_review(self):
-        with self.assertRaisesRegex(ValueError, "reviewed pilot"):
+    def test_source_changes_and_unknown_tasks_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown Terminal-Bench-Science"):
             self.adapter.convert("another/task/name")
         path = self.repo / "tasks" / ODE / "README.md"
         path.write_text(path.read_text().replace("## Difficulty", "## Reference solution"))

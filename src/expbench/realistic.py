@@ -28,6 +28,8 @@ class RealisticEpisode:
     def __init__(self, task, config, transport, budget, output, source, *,
                  input_mode="interactive", workflow=False, repeats=3, seconds=2400,
                  runtime_factory=Sandbox):
+        if config.collaboration is not None and (workflow or input_mode != "interactive"):
+            raise ValueError("Shared collaboration supports the interactive EXP design-only track")
         self.task, self.config, self.output = task, config, Path(output)
         self.input_mode, self.workflow, self.repeats = input_mode, workflow, repeats
         self.output.mkdir(parents=True, exist_ok=False)
@@ -43,8 +45,12 @@ class RealisticEpisode:
         self.researcher = ScopedResearcher(task.researcher, task.public.question, self.gateway,
             config.limits.researcher_questions, self.output / "researcher_history.json",
             persona=config.persona)
+        if config.collaboration is not None:
+            from expbench.collaboration import initialize
+            initialize(self)
         write_json(self.output / "persona.private.json",
-                   persona_record(config.persona or Persona(enabled=False)))
+                   self.researcher.persona_metadata if config.collaboration is not None
+                   else persona_record(config.persona or Persona(enabled=False)))
         self.initial = self.final = self.design = self.failure = self.actor_status = None
         self.actor_calls = 0
         self.reproduction_command = None
@@ -133,6 +139,14 @@ def run_episode(episode, *, validate_execution=False):
             actor_status=episode.actor_status,
             reproduction_command=episode.reproduction_command,
             budget_charge_usd=round(episode.gateway.ledger.episode.charged, 7))
+        if episode.config.collaboration is not None:
+            from personasciencebench.collaboration import POLICY
+            result.update(interaction_protocol=POLICY,
+                          researcher_requests=episode.researcher.requests,
+                          researcher_followups=max(0, episode.researcher.requests - 1),
+                          plan_reviews=episode.researcher.plan_reviews,
+                          result_reviews=episode.researcher.result_reviews,
+                          collaboration_termination=episode.collaboration_termination)
         write_json(episode.output / "usage.json", episode.gateway.ledger.summary())
         write_json(episode.output / "result.json", result)
     return result
@@ -210,6 +224,21 @@ def main(argv=None):
             return 0
         config = Config.load(args.config)
         if args.mode == "live":
+            if not sources and not args.continue_workflow and args.input_mode == "interactive":
+                prepared = args.output.parent / (args.output.name + "-prepared")
+                prepared.mkdir(parents=True, exist_ok=False)
+                for task in tasks:
+                    directory = prepared / task.task_id.replace("/", "__")
+                    workspace = directory / "workspace"
+                    workspace.mkdir(parents=True)
+                    public_file = workspace / "task.json"
+                    write_json(public_file, task.public.model_dump())
+                    staging = directory / "staging.json"
+                    write_json(staging, {"staging_policy": "automated-public-design-only-v2",
+                        "files_sha256": {"task.json": file_digest(public_file)}})
+                    sources[task.task_id] = {"repository": str(workspace.resolve()),
+                        "staging_manifest": str(staging.resolve()), "design_only": True}
+                write_json(prepared / "workspaces.json", sources)
             if any(t.task_id not in sources for t in tasks):
                 raise ValueError("Live runs require a prepared workspace mapping for every task")
             for task in tasks:

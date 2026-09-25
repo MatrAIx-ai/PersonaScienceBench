@@ -40,7 +40,18 @@ class ProvisionTests(unittest.TestCase):
     def test_extracts_exact_allowlist_and_records_measured_provenance(self):
         destination = self.root / "extracted"
         result = provision_archive(self.archive, destination, self.annotations)
-        self.assertEqual(len(result["files"]), 9)
+        expected = set()
+        for key, spec in SELECTED_PRIVATE_FILES.items():
+            expected.update("datasets/" + name for name in PILOTS[key]["files"])
+            expected.update({"eval_programs/" + spec["script"],
+                             "gold_programs/" + spec["program"], spec["reference"]})
+        self.assertEqual(set(result["files"]), expected)
+        extracted = {path.relative_to(destination).as_posix()
+                     for path in destination.rglob("*") if path.is_file()}
+        self.assertEqual(extracted, expected | {"provisioning.json"})
+        for relative, digest in result["files"].items():
+            self.assertEqual(digest, sha256(destination / relative))
+            self.assertEqual((destination / relative).read_bytes(), b"synthetic bytes: not a pickle")
         self.assertEqual(result["archive_sha256"], sha256(self.archive))
         self.assertFalse((destination / "unreviewed_secret.txt").exists())
         self.assertIsNone(result["evaluator_image"])

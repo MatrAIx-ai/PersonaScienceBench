@@ -1,25 +1,27 @@
 # Researcher personas
 
-## Science catalog extension
+## Science attribute extension
 
-The new [56-attribute catalog](collaboration/ATTRIBUTE_CATALOG.md) can be enabled with
-`persona.science_profile`; see [the complete config overlay](../examples/ode_collaboration/shared_runner_persona.json).
-Merge this persona block into an existing run configuration. A science profile must assign all 56 attributes;
-`active_attributes` optionally projects a nonempty subset into the simulator prompt. When enabled, the science
-profile supplies the persona rendering; legacy group defaults do not additionally condition it. Existing
-profiles and explicit `enabled=false` keep their prior behavior. A router entry containing `science_profile`
-must supply a complete valid profile, not a partial attribute patch.
+The [56-dimension catalog](science_personas/ATTRIBUTE_CATALOG.md) is an opt-in
+simulator profile through `persona.science_profile`. All 56 assignments are
+required and rendered. There is no task-specific attribute projection or added
+interaction controller. Legacy profile rendering is preserved. Persona off now uses the same common
+policy and grounding path as persona on, omitting only the private identity.
+See the authoritative [Phase 1 contract](science_personas/experiment_plan.md);
+historical experiments below are not the new 50-task controlled comparison.
 
-This renderer integration does not automatically add the new task disclosure state machine to every runner.
-The [worked ODE session and live entry point](collaboration/ODE_WORKED_EXAMPLE.md) provide that complete
-integration for one task. Original persona documentation follows below.
+Read the [integration guide](science_personas/INTEGRATION_GUIDE.md),
+[profile selection guide](science_personas/PROFILE_SELECTION.md), and
+[ODE injection example](science_personas/ODE_INJECTION_EXAMPLE.md). Attribute
+anchors describe researcher behavior; they are not agent-scoring criteria.
+The supplied persona documentation follows.
 
 Personas condition the researcher simulator through its system message. They do
 not require a particular model or change model weights. Both `run` and `serve`
 use the same router. The actor receives researcher replies through the existing
 interface, not the hidden profile or private identity prompt.
 
-## Current experiment and persona off
+## Historical five-case experiment and current persona-off setting
 
 The five-case comparison uses [the fixed CS-novice config](../configs/luna-cs-novice-five.json):
 `enabled=true`, `id=computer-science-novice`, `version=1`, and expertise domain
@@ -30,7 +32,7 @@ Expertise levels change behavioral instructions, not access to approved facts.
 Set `"persona": {"enabled": false}` to remove persona instructions while keeping
 the approved-fact simulator and its memory. Top-level disable bypasses routing;
 the identity prompt is empty and shared grounded policy is
-`no-persona-grounded-v1`. Omitting the profile uses enabled neutral defaults and
+`persona-conditioning-only-v3`. Omitting the profile uses enabled neutral defaults and
 is not the disabled control.
 
 EXP-Bench accepts the same fixed profile schema through TOML:
@@ -183,7 +185,7 @@ interpret an experiment. Keep these controller files outside the actor sandbox.
 This is an independent implementation of structured persona prompt conditioning.
 It does not import the MatrAIx population dataset or its full dimension schema.
 Compare personas on the same tasks and model settings; report question counts
-and grounding fallbacks along with scientific scores. Legacy configurations remain readable, but the new `persona-grounded-v2`
+and grounding fallbacks along with scientific scores. Legacy configurations remain readable, but the new `persona-conditioning-only-v3`
 prompt/checking policy is a distinct simulator condition from earlier runs.
 Offline tests verify
 routing and isolation; live persona fidelity requires a separate model study.

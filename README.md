@@ -1,10 +1,12 @@
 # PersonaScienceBench
 
-> **New science collaboration extension:** [56 rubric-anchored attributes](docs/collaboration/ATTRIBUTE_CATALOG.md),
-> [a complete ODE task adaptation](docs/collaboration/ODE_WORKED_EXAMPLE.md), and
-> [a team adaptation playbook](docs/collaboration/TASK_ADAPTATION_PLAYBOOK.md).
-> See the [extension index](docs/collaboration/README.md) and [executed validation](reports/collaboration/VALIDATION.md).
-> The historical results below belong to the supplied repository; they are not results for the new protocol.
+> **Phase 1 — persona as the only treatment:** [experiment plan](docs/science_personas/experiment_plan.md).
+> The 50-task cohort remains to be filled; the proposed 600 episodes have not been run.
+> **Simulator-only science personas:** [56 behavior-anchored attributes](docs/science_personas/ATTRIBUTE_CATALOG.md),
+> [existing-simulator integration](docs/science_personas/INTEGRATION_GUIDE.md), and
+> [the team handoff](docs/TEAM_HANDOFF.md).
+> The [ODE example](docs/science_personas/ODE_INJECTION_EXAMPLE.md) changes only persona configuration.
+> See [revision validation](reports/persona_only/VALIDATION.md). The task/eval implementation and historical results below are retained from the supplied repository.
 
 **Scientific agents working with simulated researchers.**
 

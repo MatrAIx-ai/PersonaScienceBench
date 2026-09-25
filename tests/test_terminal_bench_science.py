@@ -81,7 +81,7 @@ class TerminalBenchScienceTests(unittest.TestCase):
         self.assertEqual(self.adapter.convert(ODE).researcher.facts[1].kind, "optional_advice")
 
     def test_source_changes_and_unreviewed_tasks_require_review(self):
-        with self.assertRaisesRegex(ValueError, "reviewed pilot"):
+        with self.assertRaisesRegex(ValueError, "reviewed researcher overlay"):
             self.adapter.convert("another/task/name")
         path = self.repo / "tasks" / ODE / "README.md"
         path.write_text(path.read_text().replace("## Difficulty", "## Reference solution"))
@@ -118,7 +118,9 @@ class TerminalBenchScienceTests(unittest.TestCase):
 
         asyncio.run(replay_submission(FakeEnvironment(), manifest))
         self.assertEqual([target for _, target in uploads], PILOTS[ODE]["outputs"])
-        self.assertTrue(all(str(source).startswith(str(output.with_suffix(".harbor"))) for source, _ in uploads))
+        sealed_root = output.with_suffix(".harbor").resolve()
+        self.assertTrue(all(Path(source).resolve().is_relative_to(sealed_root)
+                            for source, _ in uploads))
         original = Path(next(iter(submission.artifacts.values())))
         original.write_text("later actor modification")
         self.assertNotEqual(original.read_text(), uploads[0][0].read_text())

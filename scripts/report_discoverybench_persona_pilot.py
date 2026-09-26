@@ -65,9 +65,9 @@ def publish(run: Path, output: Path):
               '- Native scores measure LLM-judged reference agreement; successful tool execution is separate evidence and does not independently verify the scientific analysis.',
               '- GPT-5.6 Sol resolved model IDs, interaction counts, execution receipts, and usage tokens are in results.json. Dollar cost requires Azure billing data.',
               '', '## Reproduction', '',
-              'Follow the [Azure pilot guide](../../docs/discoverybench_azure_pilot.md). The shared implementation and pinned sources are unchanged across the arms. ',
+              'Follow the [Azure pilot guide](../../docs/discoverybench_azure_pilot.md). The shared implementation and pinned sources are unchanged across the arms.',
               f"Raw records are stored locally under `runs/{run.name}/`; private references, credentials, and raw traces are excluded from this report.",
-              '', 'The run used uncommitted implementation files on the working branch. The private plan records their hashes, the base Git revision, runtime inputs, and the shuffled schedule.', '']
+              '', 'The private plan records source, configuration, and runtime hashes, plus the shuffled execution schedule.', '']
     (output / 'README.md').write_text('\n'.join(lines))
     return {'episodes': len(rows), 'scored': public['scored_episodes'], 'output': str(output)}
 

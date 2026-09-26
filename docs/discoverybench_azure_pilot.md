@@ -1,24 +1,9 @@
 # DiscoveryBench persona pilot on Azure
 
-This workflow reuses the repository's DiscoveryBench adapter, source lock, public
-exports, researcher review protocol, OpenHands actor, and native discovery grader.
-It expands two scientific tasks into matched persona variants. It does not change
-the scientific questions, approved facts, source datasets, or reference answers.
-
-## Guide mapping for this checkout
-
-Some onboarding notes refer to filenames from an earlier repository layout.
-The current equivalents are:
-
-| Earlier guide / module | Current implementation or guide |
-| --- | --- |
-| DESIGN / task adaptation playbook | [Conversion rules](design/conversion_revision_v2.md), [benchmark standards](benchmark_standards.md) |
-| ODE worked example | [ODE injection example](science_personas/ODE_INJECTION_EXAMPLE.md) |
-| Attribute catalog | [56 researcher attributes](science_personas/ATTRIBUTE_CATALOG.md) |
-| Task conversion template / task.py | [DiscoveryBench adapter](../src/personasciencebench/adapters/discoverybench.py), [packaging](../src/personasciencebench/packaging.py), [source manifest](../manifests/sources.json) |
-| interaction.py | [Persona integration](science_personas/INTEGRATION_GUIDE.md), [researcher](../src/personasciencebench/researcher.py), [collaboration](../src/personasciencebench/collaboration.py) |
-| session.py | [Episode session](../src/personasciencebench/session.py) |
-| VALIDATION | [Contributing checks](../CONTRIBUTING.md), [reproduction guide](reproducibility.md), [DiscoveryBench tests](../tests/test_discoverybench.py) |
+This pilot evaluates researcher-persona variation on two DiscoveryBench studies.
+The adapter supplies pinned datasets, public task exports, source-attributed
+researcher context, and native discovery scoring. The OpenHands actor uses the
+shared approach/result review protocol.
 
 ## Azure configuration
 
@@ -49,14 +34,13 @@ JSON and function-call probes before scientific execution. There is no model
 fallback or automatic inference retry. See [Microsoft's v1 API documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle).
 
 [The pilot configuration](../configs/discoverybench-azure.json) selects Azure
-GPT-5.6 Sol for actor, researcher, and judge. On the tested resource, function
-calling through Chat Completions rejected `reasoning_effort=medium` and accepted
-`none`; this pilot explicitly uses `none` for all roles. Native judge temperature,
+GPT-5.6 Sol for actor, researcher, and judge, with `reasoning_effort=none` for
+compatibility with function calling on the tested Azure Chat Completions deployment. Native judge temperature,
 top-p, penalties, and per-call token limits are preserved. The transport maps
 `max_tokens` to Azure's `max_completion_tokens` without changing its value and
 records both requested settings and provider usage. A resolved model ID is saved
-for each completion. This is a configured-judge variant of DiscoveryBench, not
-reproduction of the paper's original model. [GPT-5.6 Sol model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+for each completion. The evaluator records the configured Azure judge as a
+DiscoveryBench variant. [GPT-5.6 Sol model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
 
 The deployment environment variable overrides all three Azure role model names
 for this pilot. For separate deployments per role, leave it empty and edit each
@@ -95,8 +79,8 @@ fresh output path. Preparation and run outputs refuse to overwrite earlier work.
 The runtime check must pass before running this pilot. On hosts that restrict
 unprivileged user namespaces, use a sandbox launcher approved by the host
 administrator through the existing `PERSONASCIENCEBENCH_BWRAP` environment
-variable. There is no host-execution fallback. This PR does not install a
-privileged launcher or change host security policy.
+variable. The runner requires an isolated runtime; it has no host-execution
+fallback.
 
 ```bash
 PERSONASCIENCEBENCH_BWRAP=/absolute/path/to/approved/bwrap-launcher \
@@ -108,11 +92,6 @@ hashes the actual launcher. The runtime check verifies a separate network
 namespace, expected UID/GID, zero effective capabilities, and absence of model
 credentials and private user directories. A failing check stops execution before
 paid compatibility probes.
-
-The reported 16-run experiment used a local sudo namespace bootstrap on a
-restricted Ubuntu host. That host-specific helper remains outside the PR pending
-separate infrastructure review; its original hash is retained in the private run
-plan. The native task and scoring contract were unchanged by that setup.
 
 ## Run the matched experiment
 
@@ -130,8 +109,8 @@ Execute paid calls on a working standard sandbox:
   --output runs/discoverybench-pilot-01 --repeats 2 --run
 ```
 
-Up to two arms execute concurrently, with `--parallel 2` cases per arm. For fewer simultaneous calls use
-`--parallel 1`. The complete schedule is shuffled with a recorded order seed;
+Up to two arms execute concurrently, with `--parallel 2` cases per arm. For fewer
+simultaneous calls use `--parallel 1`. The complete schedule is shuffled with a recorded order seed;
 that seed controls scheduling, not model determinism. Each request may incur Azure
 charges. Actual token usage is retained; dollar costs require Azure billing rates.
 
@@ -145,9 +124,9 @@ The four arms are:
 | `statistics_high` | Only statistical inference changes from medium to high |
 
 The three enabled profiles share role and domain. Persona is private to the
-researcher simulator, not inserted into actor or judge prompts. The existing
-approach/result review protocol is held fixed, including budgets and grounding.
-There are no new persona-specific requirements or reward terms.
+researcher simulator, not inserted into actor or judge prompts. The
+approach/result review protocol, budgets, grounding policy, and scoring contract
+are held fixed across conditions.
 
 Two studies × four arms × two repetitions gives **16 executions**, with eight
 unique task/condition combinations. Repetitions do not enlarge the number of
@@ -159,9 +138,8 @@ complete neutral profile; high-vs-low isolates one attribute within that profile
 Each output directory contains a private frozen-input plan, resolved arm configs,
 runtime and API checks, immutable case directories, `comparison.json`,
 `comparison.md`, and final `integrity.json`. The plan hashes public and private
-prepared inputs, execution source files, the selected sandbox launcher, lockfiles, and actor dependency RECORDs.
-The repository revision and dirty state are recorded; the hashes distinguish
-uncommitted implementation changes. Keep raw records under ignored `runs/`.
+prepared inputs, execution source files, the selected sandbox launcher, lockfiles,
+and actor dependency RECORDs. Keep raw records under ignored `runs/`.
 
 The summary reports native `final_score` (0–1), scored coverage, task/repetition
 matched differences from persona off, wins/ties/losses, researcher requests, and

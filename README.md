@@ -129,8 +129,6 @@ uv sync --locked --extra api --extra annotations --extra actor --extra conversio
 .venv/bin/python -m personasciencebench --help
 ```
 
-For a matched DiscoveryBench experiment using Azure GPT-5.6 Sol, see the [Azure persona pilot](docs/discoverybench_azure_pilot.md) and its [16-run results](reports/discoverybench_azure_pilot/README.md).
-
 Follow the [setup guide](docs/reproducibility.md), then the [conversion and runtime commands](docs/design/conversion_revision_v2.md#commands). Source revisions and checksums are pinned in `manifests/`. Install ASI from the pinned local source as described in the conversion guide. The setup guide retains historical instructions for the two discarded tracks.
 
 Run independent cases concurrently and use a fresh output directory for every attempt. Raw model/tool records and readable conversations live under ignored `runs/`; published reports contain summary outcomes and local record locators.
@@ -152,14 +150,6 @@ persona effects.
 
 [Persona score ranking](reports/persona_action_case_study/benchmark_score_ranking.md) · [Selected extreme profiles](reports/persona_action_case_study/extreme_personas.md) · [Conversion pilot history](reports/conversion_v2/README.md)
 
-A separate [DiscoveryBench Azure pilot](reports/discoverybench_azure_pilot/README.md)
-ran two studies across persona off, a neutral profile, and low/high statistical
-expertise, with two repetitions (**16 scored runs**). Using GPT-5.6 Sol for all
-three roles, mean native scores were **0.500, 0.250, 0.500, and 0.833**, respectively.
-The high-expertise gains occurred in the engineering study in both repetitions.
-The small study count and observed native-grader context sensitivity limit these
-results to exploratory evidence; they do not establish a general persona benefit.
-
 ## Repository guide
 
 | Path | Contents |
@@ -170,7 +160,6 @@ results to exploratory evidence; they do not establish a general persona benefit
 | `docs/` | Conversion standards, setup and research plans |
 | `reports/conversion_v2/` | Current result summaries and catalog readiness |
 | `reports/persona_action_case_study/` | Persona selection, retained-benchmark ranking and extreme profiles |
-| `reports/discoverybench_azure_pilot/` | Matched Azure DiscoveryBench pilot outcomes and limitations |
 | `external/`, `data/`, `prepared/`, `runs/` | Ignored local sources, assets, task packages and raw records |
 
 Older generated reports and local runs were archived outside the repository during cleanup. The latest raw records remain local and are not redistributed. Implementation code is MIT licensed; upstream data retain their own licenses. See [CONTRIBUTING.md](CONTRIBUTING.md).

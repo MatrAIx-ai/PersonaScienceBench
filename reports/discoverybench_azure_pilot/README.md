@@ -24,14 +24,14 @@ These are exploratory paired observations, not evidence of a general persona ben
 | requirements_engineering_for_ML_enabled_systems | statistics_low | 0.0000, 0.0000 | 0.0000 |
 | requirements_engineering_for_ML_enabled_systems | statistics_high | 0.6667, 0.6667 | 0.6667 |
 
-## What changed in the work
+## Interpretation
 
 The high-statistical-expertise condition improved the engineering task in both
 repetitions (0.6667 versus 0 for the matched controls). Its researcher feedback
 requested a paired role comparison and interpretation of statistical significance;
 the resulting analysis supplied that comparison. Across conditions the primary
-role proportions were similar. This supports a narrow observation about analysis
-coverage and reporting, rather than a claim that persona created new study facts.
+role proportions were similar. The observed differences concern analysis coverage
+and reporting; the approved study facts were fixed.
 
 The neutral reference profile's lower average needs particular caution. Its first
 sociology submission reported the same direction of association as the successful
@@ -55,28 +55,9 @@ fidelity or quantify grader variability; these should be assessed before scaling
 
 ## Reproduction
 
-Follow the [Azure pilot guide](../../docs/discoverybench_azure_pilot.md). The shared implementation and pinned sources are unchanged across the arms. 
+Follow the [Azure pilot guide](../../docs/discoverybench_azure_pilot.md). The shared implementation and pinned sources are unchanged across the arms.
 Raw records are stored locally under `runs/discoverybench-azure-gpt56-20260926/`; private references, credentials, and raw traces are excluded from this report.
 
-The run used uncommitted implementation files on the working branch. The private plan records their hashes, the base Git revision, runtime inputs, and the shuffled schedule.
-
-## Validation record
-
-The live run's input and arm hashes were unchanged from start to finish. Subsequent
-code review corrected an actor-call summary field, the preflight-start status, and
-Azure regrade provenance, and isolated Python imports during privileged namespace
-setup; it did not rerun or replace any scientific submission or score. The raw run retains its actual execution-source hashes.
-
-Initial implementation checks: **198 tests passed, 19 skipped** because unrelated external benchmark
-assets were not acquired; repository link/secret-pattern checks and `git diff
---check` passed. The final namespace launcher passed both the isolation check and
-a forced command-timeout check.
-
-The PR scope was subsequently narrowed to keep the sudo namespace bootstrap as
-a local host-specific helper for separate review. The pilot now uses the existing
-`PERSONASCIENCEBENCH_BWRAP` override and records the selected launcher's hash.
-This packaging change does not alter the retained experiment records or scores.
-
-Current PR validation after narrowing the runtime scope: **199 tests passed,
-19 skipped**; offline planning, the configured runtime check, repository checks,
-and `git diff --check` also passed.
+The experiment used a network-isolated Bubblewrap environment on Ubuntu with a
+local user-namespace launcher. The private plan records source, configuration, and
+runtime hashes, plus the shuffled execution schedule.

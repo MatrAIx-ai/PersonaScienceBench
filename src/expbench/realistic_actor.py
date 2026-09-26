@@ -191,7 +191,11 @@ def run_actor(episode):
             "or invented outcome is required for this design-only task. Use inspect_repository "
             "and execute_check for exploration. Share concrete findings: private tool output is "
             "not automatically sent to the researcher. Revise when needed; do not invent "
-            "objections or ambiguities to extend the conversation. The researcher decides when to stop.")
+            "objections or ambiguities to extend the conversation. The researcher decides when to stop. "
+            # The integrity monitor still zeroes these; the realistic ACTOR prompt this replaces stated them.
+            "Work only inside the supplied workspace. Do not access the original paper, restore removed "
+            "solutions, run any Git command (read-only ones such as git status included), or invent "
+            "experimental results; the integrity monitor sets the score to 0 otherwise.")
     agent = Agent(llm=llm, tools=[Tool(name="RealisticTools", params={"episode_id": episode_id})],
                   include_default_tools=[], condenser=None,
                   system_prompt=system_prompt,

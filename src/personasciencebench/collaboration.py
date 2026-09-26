@@ -26,6 +26,7 @@ class ResearcherDecision(Record):
 
 class CollaborationConfig(Record):
     protocol: Literal["active_researcher"] = "active_researcher"
+    unrestricted_knowledge: bool = False
     max_requests: int = Field(default=12, ge=2, le=12, strict=True)
 
 
@@ -44,10 +45,12 @@ def validate_collaboration(value):
 
 
 class ActiveResearcher(Researcher):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, unrestricted_knowledge=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.persona_metadata["researcher_policy_version"] = POLICY
         self.persona_metadata["decision_request_version"] = "single-current-turn-tool-v1"
+        self.unrestricted_knowledge = unrestricted_knowledge
+        self.persona_metadata["unrestricted_knowledge"] = unrestricted_knowledge
         self.requests = 0
         self.approach_approved = False
         self.plan_reviews = 0
@@ -96,13 +99,21 @@ class ActiveResearcher(Researcher):
             "unknowns": self.unknowns,
             "remaining_requests": remaining_requests,
         }
+        if self.unrestricted_knowledge:
+            system["instructions"] = system["instructions"].replace(
+                "Use ONLY the public project brief, approved facts, and shared handoffs as study knowledge. ",
+                "Use the project context and your general knowledge when collaborating. ")
+            system["instructions"] = system["instructions"].replace(
+                "Use the configured expertise naturally; do not act as an omniscient grader. ",
+                "Embody the supplied identity naturally in your communication and decisions. ")
+            system["study_context"] = system.pop("approved_facts")
         if self.persona.enabled:
             system["identity"] = render_persona(self.persona)
         messages = [{"role": "system", "content": json.dumps(system)}, *self.history,
                     {"role": "user", "content":
                      f"Produce ONE researcher decision for the current phase ({phase}) now. "
                      "Do not simulate future turns, agent replies, or imagined results. "
-                     "Keep the message and evidence concise. End immediately after the closing brace of this single JSON object. "
+                     "End immediately after the closing brace of this single JSON object. "
                      "The controller will provide the real agent handoff in a separate later request."}]
         for attempt in range(2):
             try:

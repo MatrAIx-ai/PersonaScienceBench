@@ -21,28 +21,17 @@ not require a particular model or change model weights. Both `run` and `serve`
 use the same router. The actor receives researcher replies through the existing
 interface, not the hidden profile or private identity prompt.
 
-### Action-profile case study
+### Retired action-profile experiment
 
-`persona.action_rules` accepts 1–12 concrete preference instructions as an
-alternative identity representation. It cannot be combined with `science_profile`.
-The action renderer replaces the legacy identity; it does not add its default
-expertise or style instructions. The same private renderer is used by shared
-reviews, EXP, and native SciConv. Persona off omits it through the
-existing `enabled=false` switch. Scientific facts, task requirements, interaction
-policy, actor inputs, and native grading remain fixed across comparison arms.
+The previous `persona.action_rules` experiment injected selected action preferences,
+rather than the original full persona profiles. Its diagnostic results, benchmark
+scores, rankings, and raw runs have been withdrawn and deleted from the current
+worktree. See the [retirement record](../reports/persona_action_case_study/README.md).
 
-`scripts/run_persona_benchmarks.py` runs 30 profiles sampled with seed `20260930`
-from the 73 that qualified in the one-response diagnostic. It uses two fixed
-cases from each of five retained benchmarks plus ten shared persona-off controls,
-for 310 records. ScienceAgentBench and Terminal-Bench-Science were piloted and
-then discarded because their storage and execution requirements were too heavy
-for this persona study. This is a separate, exploratory whole-profile study, not
-the proposed one-dimension-at-a-time Phase 1 experiment. The 30-profile cohort is
-enriched using the earlier diagnostic; conclusions do
-not generalize to all 131 statically selected profiles or the source population.
-Each off result is reused across its task's 30 contrasts and is not 30 independent
-control observations. Full traces and per-task performance and behavioral deltas
-are saved locally in the run directory.
+The source sample, static selection records, and historical 30-candidate IDs remain
+local. Replacement injection and simulator behavior are pending discussion; the
+old approved-facts boundary is not a requirement for the redesign. The code and
+configuration documentation below still describe the existing implementation.
 
 ## Configuration and persona off
 

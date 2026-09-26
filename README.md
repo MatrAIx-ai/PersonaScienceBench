@@ -152,6 +152,14 @@ persona effects.
 
 [Persona score ranking](reports/persona_action_case_study/benchmark_score_ranking.md) · [Selected extreme profiles](reports/persona_action_case_study/extreme_personas.md) · [Conversion pilot history](reports/conversion_v2/README.md)
 
+A separate [DiscoveryBench Azure pilot](reports/discoverybench_azure_pilot/README.md)
+ran two studies across persona off, a neutral profile, and low/high statistical
+expertise, with two repetitions (**16 scored runs**). Using GPT-5.6 Sol for all
+three roles, mean native scores were **0.500, 0.250, 0.500, and 0.833**, respectively.
+The high-expertise gains occurred in the engineering study in both repetitions.
+The small study count and observed native-grader context sensitivity limit these
+results to exploratory evidence; they do not establish a general persona benefit.
+
 ## Repository guide
 
 | Path | Contents |
@@ -162,6 +170,7 @@ persona effects.
 | `docs/` | Conversion standards, setup and research plans |
 | `reports/conversion_v2/` | Current result summaries and catalog readiness |
 | `reports/persona_action_case_study/` | Persona selection, retained-benchmark ranking and extreme profiles |
+| `reports/discoverybench_azure_pilot/` | Matched Azure DiscoveryBench pilot outcomes and limitations |
 | `external/`, `data/`, `prepared/`, `runs/` | Ignored local sources, assets, task packages and raw records |
 
 Older generated reports and local runs were archived outside the repository during cleanup. The latest raw records remain local and are not redistributed. Implementation code is MIT licensed; upstream data retain their own licenses. See [CONTRIBUTING.md](CONTRIBUTING.md).

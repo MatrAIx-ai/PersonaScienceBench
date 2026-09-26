@@ -67,7 +67,16 @@ code review corrected an actor-call summary field, the preflight-start status, a
 Azure regrade provenance, and isolated Python imports during privileged namespace
 setup; it did not rerun or replace any scientific submission or score. The raw run retains its actual execution-source hashes.
 
-Final checks: **198 tests passed, 19 skipped** because unrelated external benchmark
+Initial implementation checks: **198 tests passed, 19 skipped** because unrelated external benchmark
 assets were not acquired; repository link/secret-pattern checks and `git diff
 --check` passed. The final namespace launcher passed both the isolation check and
 a forced command-timeout check.
+
+The PR scope was subsequently narrowed to keep the sudo namespace bootstrap as
+a local host-specific helper for separate review. The pilot now uses the existing
+`PERSONASCIENCEBENCH_BWRAP` override and records the selected launcher's hash.
+This packaging change does not alter the retained experiment records or scores.
+
+Current PR validation after narrowing the runtime scope: **199 tests passed,
+19 skipped**; offline planning, the configured runtime check, repository checks,
+and `git diff --check` also passed.

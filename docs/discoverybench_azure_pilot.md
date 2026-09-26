@@ -90,28 +90,29 @@ actor. The upstream corpus stays under ignored `external/` with its licenses.
 If preparation already exists, use it after checking its manifest or choose a
 fresh output path. Preparation and run outputs refuse to overwrite earlier work.
 
-### Restricted Ubuntu user namespaces
+### Host runtime requirements
 
-Some Ubuntu hosts prevent unprivileged Bubblewrap from creating its isolated
-network. The optional [namespace launcher](../scripts/bwrap_userns_launcher.py)
-uses an existing noninteractive sudo permission for transient namespace setup.
-It does **not** change AppArmor, sysctl settings, host file permissions, or the
-system Bubblewrap binary. Its privileged parent maps only the invoking user's
-UID/GID into a fresh namespace; Bubblewrap then performs its normal isolation,
-uses that user's identity, disables nested user namespaces, and drops capabilities.
-The actor gets neither sudo credentials nor access to the controller workspace.
-
-Use this only on a host where this sudo bootstrap is authorized:
+The runtime check must pass before running this pilot. On hosts that restrict
+unprivileged user namespaces, use a sandbox launcher approved by the host
+administrator through the existing `PERSONASCIENCEBENCH_BWRAP` environment
+variable. There is no host-execution fallback. This PR does not install a
+privileged launcher or change host security policy.
 
 ```bash
-PERSONASCIENCEBENCH_BWRAP="$PWD/scripts/bwrap_userns_launcher.py" \
+PERSONASCIENCEBENCH_BWRAP=/absolute/path/to/approved/bwrap-launcher \
   .venv/bin/python -m personasciencebench check-runtime --actor-python .actor-venv
 ```
 
-The check verifies a separate network namespace, expected UID/GID, zero effective
-capabilities, and absence of model credentials and private user directories.
-There is no host-execution fallback. A failing runtime check stops the pilot
-before paid compatibility probes. On normal hosts, omit the bootstrap option.
+Set the same environment variable when invoking the pilot. Its plan records and
+hashes the actual launcher. The runtime check verifies a separate network
+namespace, expected UID/GID, zero effective capabilities, and absence of model
+credentials and private user directories. A failing check stops execution before
+paid compatibility probes.
+
+The reported 16-run experiment used a local sudo namespace bootstrap on a
+restricted Ubuntu host. That host-specific helper remains outside the PR pending
+separate infrastructure review; its original hash is retained in the private run
+plan. The native task and scoring contract were unchanged by that setup.
 
 ## Run the matched experiment
 
@@ -129,8 +130,7 @@ Execute paid calls on a working standard sandbox:
   --output runs/discoverybench-pilot-01 --repeats 2 --run
 ```
 
-On the restricted host above, add `--bootstrap-userns`. Up to two arms execute
-concurrently, with `--parallel 2` cases per arm. For fewer simultaneous calls use
+Up to two arms execute concurrently, with `--parallel 2` cases per arm. For fewer simultaneous calls use
 `--parallel 1`. The complete schedule is shuffled with a recorded order seed;
 that seed controls scheduling, not model determinism. Each request may incur Azure
 charges. Actual token usage is retained; dollar costs require Azure billing rates.
@@ -159,7 +159,7 @@ complete neutral profile; high-vs-low isolates one attribute within that profile
 Each output directory contains a private frozen-input plan, resolved arm configs,
 runtime and API checks, immutable case directories, `comparison.json`,
 `comparison.md`, and final `integrity.json`. The plan hashes public and private
-prepared inputs, execution source files, lockfiles, and actor dependency RECORDs.
+prepared inputs, execution source files, the selected sandbox launcher, lockfiles, and actor dependency RECORDs.
 The repository revision and dirty state are recorded; the hashes distinguish
 uncommitted implementation changes. Keep raw records under ignored `runs/`.
 

@@ -35,3 +35,18 @@ def test_missing_scores_stay_missing_and_pairs_use_task_and_repeat():
     assert ref['scored'] == 2 and ref['wins_ties_losses'] == [1, 0, 0]
     assert low['mean_native_score'] is None and low['paired_n'] == 0
     assert result['distinct_studies'] == 1
+
+
+def test_frozen_inventory_detects_external_launcher_changes(tmp_path, monkeypatch):
+    launcher = tmp_path / 'approved-launcher'
+    launcher.write_text('#!/bin/sh\nexit 0\n')
+    launcher.chmod(0o755)
+    monkeypatch.setenv('PERSONASCIENCEBENCH_BWRAP', str(launcher))
+    prepared = tmp_path / 'prepared'
+    prepared.mkdir()
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    before = pilot.inventory(prepared, runtime)
+    assert str(launcher.resolve()) in before
+    launcher.write_text('#!/bin/sh\nexit 1\n')
+    assert pilot.inventory(prepared, runtime) != before

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -48,10 +49,18 @@ def arm_configs(base, reference):
     return configs
 
 
+def sandbox_launcher():
+    configured = os.environ.get('PERSONASCIENCEBENCH_BWRAP')
+    return shutil.which(configured) if configured else shutil.which('bwrap', path='/usr/bin:/bin')
+
+
 def inventory(prepared, python_root):
     paths = list(prepared.rglob('*')) + list((ROOT / 'src').rglob('*.py'))
-    paths += [Path(__file__), ROOT / 'scripts/bwrap_userns_launcher.py', ROOT / 'uv.lock',
+    paths += [Path(__file__), ROOT / 'uv.lock',
               ROOT / 'configs/actor-requirements.lock.txt', python_root / 'pyvenv.cfg']
+    launcher = sandbox_launcher()
+    if launcher:
+        paths.append(Path(launcher))
     paths += list((python_root / 'lib').rglob('*.dist-info/RECORD'))
     return {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(paths) if p.is_file()}
@@ -131,7 +140,6 @@ def main(argv=None):
     p.add_argument('--repeats', type=int, default=2)
     p.add_argument('--parallel', type=int, default=2, help='Concurrent cases per arm; at most two arms run at once')
     p.add_argument('--order-seed', type=int, default=20260926)
-    p.add_argument('--bootstrap-userns', action='store_true', help='Opt in to sudo namespace setup; no host policy changes')
     p.add_argument('--run', action='store_true', help='Execute paid model calls; otherwise write an offline plan only')
     args = p.parse_args(argv)
     if args.repeats < 1 or not 1 <= args.parallel <= 2:
@@ -153,8 +161,6 @@ def main(argv=None):
         episode = Episode.model_validate_json((Path(case['package']) / 'controller/episode.private.json').read_text())
         for config in configs.values():
             resolve_persona(config, episode)
-    if args.bootstrap_userns:
-        os.environ['PERSONASCIENCEBENCH_BWRAP'] = str(ROOT / 'scripts/bwrap_userns_launcher.py')
     frozen = inventory(prepared, args.actor_python.resolve())
     jobs = [(repeat, arm) for repeat in range(1, args.repeats + 1) for arm in ARMS]
     random.Random(args.order_seed).shuffle(jobs)
@@ -169,7 +175,7 @@ def main(argv=None):
             'frozen_inputs': frozen, 'arm_config_sha256': {arm: digest(c) for arm, c in configs.items()},
             'git_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
             'git_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT)),
-            'bootstrap_userns': args.bootstrap_userns, 'scientific_runs_started': False}
+            'sandbox_launcher': sandbox_launcher(), 'scientific_runs_started': False}
     write_json(output / 'plan.private.json', plan)
     if not args.run:
         print(json.dumps({'output': str(output), 'episodes_planned': len(jobs) * 2, 'model_calls': 0}))

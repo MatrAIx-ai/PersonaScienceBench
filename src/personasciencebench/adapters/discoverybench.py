@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from personasciencebench.adapters.base import Adapter, Judge, check_submission
-from personasciencebench.context_conversion import field_facts, POLICY as CONTEXT_POLICY
+from personasciencebench.context_conversion import field_facts, tabular_facts, POLICY as CONTEXT_POLICY
 from personasciencebench.schema import (
     Asset, Episode, EvaluationResult, EvaluatorSpec, Fact, Provenance,
     PublicContext, ResearcherContext, Submission, TaskSummary,
@@ -28,9 +28,9 @@ EVALUATOR_VERSION = "discoverybench-native-prompts-settings-strict-errors-v1"
 EVALUATOR_SHA256 = "83406ddbe6894429cc5012b17cb82a209d5397aa7863b0aba1bb51edf1dd6c65"
 ANSWER_KEY_SHA256 = "67504136becc97f4b4b3c698489bf2222d2a55f75aaa5cf033d6dd62ef5537e0"
 
-# Explicit review records: the entire domain_knowledge field is safe for these
-# two queries.  Other source records are NOT automatically approved.
-REVIEWED_TASKS: dict[str, dict[str, str | int]] = {
+# Explicit source reviews complement the benchmark-wide schema conversion.
+# Reviewed files are hash-locked; other tasks retain automated review status.
+REVIEWED_TASKS: dict[str, dict[str, Any]] = {
     "test/requirements_engineering_for_ML_enabled_systems/metadata_1.json/0/0": {
         "metadata_sha256": "adae7b01f3018b9c3689bff15e10888bad1cf8b1a915255c1d17bc92f30d77f1",
         "topic": "missing_values",
@@ -68,6 +68,54 @@ REVIEWED_TASKS.update({'test/meta_regression/metadata_1.json/0/0': {'metadata_sh
                                                                               'interpretation; no '
                                                                               'gold hypothesis or '
                                                                               'workflow included.'}})
+
+
+# Three distinct questions from one ecology study; keep this study together in splits.
+ECOLOGY_INPUT_SHA256 = {
+    "temporal_trends_contingency_table.csv": "f81f68033c9706b44a06c6f46395d2c8c67accdf321707e430f388d9d7400dba",
+    "phylogenetic_tree.txt": "5b691dc9bd82ade93ee5b61a5b1d249a37239884363786c438e0724c8ab36d55",
+    "invasion_success_pathways.csv": "6efaae2fd0a5020535b92dacce3f82d4f471f0bd19d877d40bc13cf087d16540",
+    "invaded_niche_pathways.csv": "f75e971107e81d37519358976ecaaab26806c5808799ef1c5db98315d0d3e58c"
+}
+ECOLOGY_TASKS = {
+    "test/introduction_pathways_non-native_plants/metadata_0.json/0/0": {
+        "metadata_sha256": "90890531821829d3e5b461e2762bf103465529f2e5d8caf42bab47316d278c21",
+        "topic": "input_schema",
+        "kind": "context",
+        "rationale": (
+            "Temporal changes in introduction pathways, with native time bins and pathway "
+            "labels preserved. Input-format notes contain no trend or target period."
+        ),
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+    "test/introduction_pathways_non-native_plants/metadata_1.json/0/1": {
+        "metadata_sha256": "0c47b2c847194b856c302495c94a723abc56edad21a48d0e1cc7aa5693894949",
+        "topic": "input_schema",
+        "kind": "context",
+        "rationale": (
+            "Urban land use and the gardening-introduced share. Native counts, spatial "
+            "scales and descriptions remain public; no fitted relationship is supplied."
+        ),
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+    "test/introduction_pathways_non-native_plants/metadata_2.json/0/0": {
+        "metadata_sha256": "843092b9425530ddbd9cb647f62522964dcda93c6c65b92aaa5f9790ea5613c6",
+        "topic": "input_schema",
+        "kind": "context",
+        "rationale": (
+            "Habitat differences in gardening-introduced prevalence. Native habitat "
+            "categories and counts remain public; no group comparison is supplied."
+        ),
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+}
+for _review in ECOLOGY_TASKS.values():
+    _review["input_sha256"] = ECOLOGY_INPUT_SHA256
+    _review["schema_fact_files"] = [name for name in ECOLOGY_INPUT_SHA256 if name.endswith(".csv")]
+REVIEWED_TASKS.update(ECOLOGY_TASKS)
 
 
 def _sha256(path: Path) -> str:
@@ -286,16 +334,22 @@ class DiscoveryBenchAdapter(Adapter):
         record = _read_task(self.source.repository, task_id)
         datasets = record["datasets"]
         assets = []
+        review = record["review"]
+        input_locks = review.get("input_sha256", {}) if review else {}
+        if input_locks and set(input_locks) != {dataset["name"] for dataset in datasets}:
+            raise ValueError("Reviewed input inventory changed; re-curation required")
         for index, dataset in enumerate(datasets):
             relative = f"discoverybench/real/{record['split']}/{record['study']}/{dataset['name']}"
             path = _contained(self.source.repository, relative)
+            expected_hash = input_locks.get(dataset["name"])
+            if expected_hash and path.is_file() and _sha256(path) != expected_hash:
+                raise ValueError(f"Reviewed input changed; re-curation required: {relative}")
             assets.append(Asset(
                 id=f"dataset-{index}", source_path=str(path),
                 target_path=f"data/{dataset['name']}",
-                sha256=_sha256(path) if path.is_file() else None,
+                sha256=expected_hash or (_sha256(path) if path.is_file() else None),
                 acquisition=f"Restore {relative} from DiscoveryBench revision {SOURCE_REVISION}.",
             ))
-        review = record["review"]
         topic = str(review["topic"]) if review else "domain_knowledge"
         metadata_hash = record["metadata_hash"]
         knowledge = record["knowledge"]
@@ -305,6 +359,20 @@ class DiscoveryBenchAdapter(Adapter):
             facts = field_facts(knowledge, prefix=f"{record['study']}.{topic}",
                 path=record['relative_metadata'], revision=SOURCE_REVISION,
                 locator="/domain_knowledge", digest=metadata_hash)
+        if review:
+            for name in review.get("schema_fact_files", []):
+                relative = f"discoverybench/real/{record['split']}/{record['study']}/{name}"
+                path = _contained(self.source.repository, relative)
+                if not path.is_file():
+                    raise ValueError(f"Reviewed schema fact input is missing: {relative}")
+                for fact in tabular_facts(path, prefix=f"{record['study']}.{Path(name).stem}",
+                        source_path=relative, revision=SOURCE_REVISION):
+                    fact.review_status = "reviewed"
+                    facts.append(fact)
+        fact_pack_hash = hashlib.sha256(knowledge.encode()).hexdigest()
+        if review and review.get("schema_fact_files"):
+            fact_pack_hash = hashlib.sha256(json.dumps(
+                [fact.model_dump(mode="json") for fact in facts], sort_keys=True).encode()).hexdigest()
         return Episode(
             id=f"discoverybench:{task_id}", benchmark=self.name,
             source_task_id=task_id, study_id=f"discoverybench:{record['study']}",
@@ -328,7 +396,7 @@ class DiscoveryBenchAdapter(Adapter):
             researcher=ResearcherContext(
                 facts=facts,
                 unknowns=["Undocumented study details, intended findings, reference statistics, and unavailable runtime resources."],
-                notes=["Only the source-attributed domain-knowledge field is researcher-owned; dataset and column descriptions remain public. Preserve the source's uncertainty qualifiers."],
+                notes=["Researcher context consists of source-attributed domain knowledge and, where reviewed, input-header/format observations. Dataset and column descriptions remain public. Preserve uncertainty qualifiers; do not invent missing domain knowledge."],
             ),
             assets=assets,
             evaluator=EvaluatorSpec(
@@ -359,15 +427,15 @@ class DiscoveryBenchAdapter(Adapter):
                 },
             ),
             conversion={"context_policy": CONTEXT_POLICY,
-                "adapter_version": ADAPTER_VERSION, "split": record["split"],
+                "adapter_version": review.get("adapter_version", ADAPTER_VERSION) if review else ADAPTER_VERSION, "split": record["split"],
                 "metadata_path": record["relative_metadata"], "query_group": record["query_group"],
                 "qid": record["qid"], "metadata_sha256": metadata_hash,
                 "public_allowlist": ["selected question", "datasets.name", "datasets.description", "datasets.columns.raw.name", "datasets.columns.raw.description"],
                 "excluded_fields": ["hypotheses", "true_hypothesis", "workflow", "workflow_tags", "intermediate", "answer_key"],
-                "fact_pack_sha256": hashlib.sha256(knowledge.encode()).hexdigest(),
+                "fact_pack_sha256": fact_pack_hash,
                 "selection_rationale": review["rationale"] if review else
                     "Benchmark-wide deterministic field-boundary conversion.",
-                "validation_method": "human_reviewed" if review else
+                "validation_method": review.get("validation_method", "human_reviewed") if review else
                     "automated_pinned_schema_and_information_boundary",
                 "runtime_validation": "not_run", "model_testing": "awaiting_user_confirmation",
             },

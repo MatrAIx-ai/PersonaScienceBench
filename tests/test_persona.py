@@ -135,3 +135,15 @@ def test_malformed_grounding_fails_closed(check):
     reply = researcher.ask("What do you prefer?", topic="preferences")
     assert reply["answer"] == UNKNOWN
     assert reply["fallback"] == "invalid_reply_or_grounding_result"
+
+
+def test_full_profile_identity_is_preserved_in_private_records():
+    from personasciencebench.persona import persona_record
+
+    prompt = 'Research identity\nUse the supplied evidence and state uncertainties.\n'
+    profile = Persona(id='full-example', system_prompt=prompt)
+    record = persona_record(profile)
+    assert record['schema_version'] == 'full-persona-v2'
+    assert record['identity_prompt'] == prompt
+    assert record['profile']['system_prompt'] == prompt
+    assert persona_record(Persona(enabled=False, system_prompt=prompt))['profile'] is None

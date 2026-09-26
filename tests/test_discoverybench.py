@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from personasciencebench.adapters.base import SourceConfig
-from personasciencebench.adapters.discoverybench import DiscoveryBenchAdapter, SOURCE_REVISION
+from personasciencebench.adapters.discoverybench import DiscoveryBenchAdapter, SOURCE_REVISION, ECOLOGY_TASKS
 from personasciencebench.schema import Submission
 
 
@@ -161,3 +161,104 @@ def test_changed_native_evaluator_is_rejected_before_judging(adapter, tmp_path):
     assert result.status == "error"
     assert "Native evaluator source changed" in result.errors[0]
     assert judge.calls == []
+
+
+@pytest.mark.parametrize('task_id', ECOLOGY_TASKS)
+def test_ecology_packages_preserve_native_question_inputs_and_private_reference(adapter, tmp_path, task_id):
+    from personasciencebench.packaging import export_episode
+    from personasciencebench.runner import stage_workspace
+    from personasciencebench.adapters.base import sha256
+
+    episode = adapter.convert(task_id)
+    metadata = json.loads((SOURCE / episode.conversion['metadata_path']).read_text())
+    group, qid = map(int, task_id.split('/')[-2:])
+    query = next(q for q in metadata['queries'][group] if q['qid'] == qid)
+    assert episode.public.question == query['question']
+    assert episode.review_status == 'reviewed'
+    assert episode.conversion['validation_method'] == 'source_review'
+    assert episode.study_id == 'discoverybench:introduction_pathways_non-native_plants'
+    assert not metadata['domain_knowledge']
+    assert len(episode.assets) == 4
+    assert len(episode.researcher.facts) == 3
+    for fact in episode.researcher.facts:
+        assert fact.review_status == 'reviewed'
+        assert fact.topic == 'input_schema'
+        assert fact.source.locator == 'row=1'
+        assert sha256(SOURCE / fact.source.source_path) == fact.source.sha256
+        assert 'Header fields' in fact.text
+    for asset in episode.assets:
+        assert asset.sha256 == ECOLOGY_TASKS[task_id]['input_sha256'][Path(asset.source_path).name]
+    package = tmp_path / 'package'
+    receipt = export_episode(episode, package)
+    assert receipt['assets_ready']
+    stage_workspace(package, tmp_path / 'workspace')
+    public = (tmp_path / 'workspace/task.json').read_text()
+    researcher = episode.researcher.model_dump_json()
+    reference = episode.evaluator.reference['gold_hypothesis']
+    assert reference and reference not in public and reference not in researcher
+    assert {p.name for p in (tmp_path / 'workspace').iterdir()} == {'data', 'task.json'}
+    for asset in episode.assets:
+        assert sha256(tmp_path / 'workspace' / asset.target_path) == asset.sha256
+    for field in ('true_hypothesis', 'workflow_tags', 'answer_key', 'intermediate'):
+        assert field not in public and field not in researcher
+    assert episode.evaluator.version == 'discoverybench-native-prompts-settings-strict-errors-v1'
+
+
+@pytest.mark.parametrize('filename', ['invaded_niche_pathways.csv', 'phylogenetic_tree.txt'])
+def test_ecology_review_rejects_modified_inputs(adapter, tmp_path, filename):
+    import shutil
+    task = next(iter(ECOLOGY_TASKS))
+    episode = adapter.convert(task)
+    metadata_parent = Path(episode.conversion['metadata_path']).parent
+    shutil.copytree(SOURCE / metadata_parent, tmp_path / metadata_parent)
+    (tmp_path / 'eval').mkdir()
+    shutil.copy2(SOURCE / 'eval/answer_key_real.csv', tmp_path / 'eval/answer_key_real.csv')
+    path = tmp_path / metadata_parent / filename
+    path.write_bytes(path.read_bytes() + b'\nchanged')
+    changed = DiscoveryBenchAdapter(SourceConfig(tmp_path, tmp_path, SOURCE_REVISION))
+    with pytest.raises(ValueError, match='Reviewed input changed'):
+        changed.convert(task)
+
+
+@pytest.mark.parametrize('task_id', ECOLOGY_TASKS)
+def test_ecology_personas_only_change_private_identity(adapter, tmp_path, task_id):
+    from personasciencebench.collaboration import ActiveResearcher
+    from personasciencebench.persona import resolve_persona, render_persona
+    from personasciencebench.science_personas.config import attach_profile
+    from personasciencebench.science_personas.profiles import SciencePersona
+    from personasciencebench.session import EpisodeSession
+
+    class Capture:
+        def complete_decision(self, messages, schema):
+            self.system = json.loads(messages[0]['content'])
+            return json.dumps(dict(action='continue', interaction='initial_request',
+                message='Inspect inputs and propose an approach.', evidence='The task requires data analysis.',
+                objectives_open=['analysis'], fact_ids=[], approve_approach=False))
+
+    root = Path(__file__).resolve().parents[1]
+    config = json.loads((root / 'configs/discoverybench-azure.json').read_text())
+    configs = [config]
+    for name in ('pi_cautious', 'pi_delegating'):
+        profile = SciencePersona.model_validate_json(
+            (root / f'examples/science_personas/profiles/{name}.json').read_text())
+        attached = attach_profile(config, profile)
+        assert {k: v for k, v in attached.items() if k != 'persona'} == {
+            k: v for k, v in config.items() if k != 'persona'}
+        configs.append(attached)
+    configs.append({**config, 'persona': {'enabled': True,
+        'system_prompt': 'A researcher who requests evidence and explains uncertainty.'}})
+    episode = adapter.convert(task_id)
+    systems = []
+    for index, cfg in enumerate(configs):
+        backend = Capture()
+        persona = resolve_persona(cfg, episode)
+        researcher = ActiveResearcher(episode, backend, persona=persona, **cfg['researcher'])
+        session = EpisodeSession(episode, researcher, tmp_path / str(index))
+        researcher.decide(session, None, 12)
+        identity = backend.system.pop('identity', None)
+        assert identity == (render_persona(persona) if persona.enabled else None)
+        public = (session.output / 'public_input.json').read_text()
+        assert not identity or identity not in public
+        assert episode.evaluator.reference['gold_hypothesis'] not in json.dumps(backend.system)
+        systems.append(backend.system)
+    assert systems == [systems[0]] * len(systems)

@@ -21,15 +21,26 @@ def score(row):
     if row['status'] not in {'scored','completed'}: return None
     return normalized(row)
 
+def ungated(row):
+    if row is None: return None
+    if row['status']=='missing_submission': return 0.0
+    if row['status'] not in {'scored','completed'} or 'coverage_mean' not in row['metrics']: return None
+    return float(row['metrics']['coverage_mean'])/100.0
+
+def is_control(arm): return arm=='persona_off' or arm.startswith('persona_off_r')
+def control_mean(rows,fn=None):
+    vals=[v for v in ((fn or score)(r) for r in rows) if v is not None]
+    return mean(vals) if vals else None
+
 def link(path,parent): return os.path.relpath(path,parent)
 def fmt(v): return '—' if v is None else f'{v:.2f}'
 def behavior_pairs(pairs,key):
     vals=[]
     for on,off in pairs:
-        if key=='turns': a,b=on['behavior']['exchanges'],off['behavior']['exchanges']
+        if key=='turns': a,b=on['behavior']['exchanges'],control_mean(off,lambda c:c['behavior']['exchanges'])
         else:
             a=simulator_behavior(on['trace'],on['benchmark'])[key]
-            b=simulator_behavior(off['trace'],off['benchmark'])[key]
+            b=control_mean(off,lambda c:simulator_behavior(c['trace'],c['benchmark'])[key])
         if a is not None and b is not None: vals.append((a,b))
     return (mean(x[0] for x in vals),mean(x[1] for x in vals)) if vals else (None,None)
 
@@ -92,15 +103,17 @@ def main():
     for name in ['profiles','traces']: (OUT/name).mkdir(exist_ok=True)
     data=json.loads((RUN/'comparison.json').read_text())
     manifest=json.loads((RUN/'manifest.json').read_text())
-    rows=data['episodes']; tasks=manifest['tasks']; arms=sorted({j['arm'] for j in manifest['jobs']} - {'persona_off'})
+    rows=data['episodes']; tasks=manifest['tasks']; arms=sorted(a for a in {j['arm'] for j in manifest['jobs']} if not is_control(a))
     lookup={(r['arm'],r['task']):r for r in rows}
-    controls={r['task']:r for r in rows if r['arm']=='persona_off'}
-    common=[t['id'] for t in tasks if all(score(lookup.get((a,t['id']))) is not None for a in ['persona_off',*arms])]
+    controls={t['id']:[] for t in tasks}
+    for r in rows:
+        if is_control(r['arm']): controls[r['task']].append(r)
+    common=[t['id'] for t in tasks if control_mean(controls[t['id']]) is not None and all(score(lookup.get((a,t['id']))) is not None for a in arms)]
     assert common,'No common scored tasks for ranking'
     rankings=[]
     for arm in arms:
         pairs=[(lookup[arm,t],controls[t]) for t in common]
-        on=mean(score(a) for a,b in pairs);off=mean(score(b) for a,b in pairs)
+        on=mean(score(a) for a,b in pairs);off=mean(control_mean(b) for a,b in pairs)
         rankings.append({'persona':arm,'on':on,'off':off,'delta':on-off,'pairs':pairs})
     rankings.sort(key=lambda r:(-abs(r['delta']),r['persona']))
     now=datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -109,18 +122,24 @@ def main():
     lines=[f'# Full-persona experiment: {state.lower()}','',f'Snapshot: {now}. **{len(rows)}/310 episodes finished**. ' + ('The batch is complete.' if complete else 'The batch continues; this report is a fixed snapshot.'),'',
         '30 source-balanced, behaviorally diverse profiles; two fixed questions per benchmark; one fresh shared persona-off baseline per question. Actor, simulator and judge use GPT-6 Luna with reasoning effort `none`. Full persona text is injected only into the simulator system prompt. Both conditions can use general knowledge; evaluator references remain private.','',
         'Scores use ASI score/max score, Bix grade, Discovery final score, EXP gated coverage/100 and SciConv FRR. **Missing submissions count as zero for both persona and baseline** in this report (an explicit analysis convention, not a fabricated native grade). Infrastructure failures and pending episodes are excluded. All comparisons are task-matched; these single-run descriptive results do not establish causality or statistical significance.','',
-        '| Benchmark | Finished / 62 | Missing submissions: on / off | Infrastructure failures | Paired cases | Persona mean | Matched off mean | Difference |','|---|---:|---:|---:|---:|---:|---:|---:|']
+        '| Benchmark | Finished / 62 | Missing submissions: on / off | Infrastructure failures | Paired cases | Persona mean | Matched off mean | Difference | Ungated persona / off |','|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     stats=[]
     for benchmark in sorted({t['benchmark'] for t in tasks}):
         rr=[r for r in rows if r['benchmark']==benchmark]
-        pairs=[(r,controls[r['task']]) for r in rr if r['arm']!='persona_off' and score(r) is not None and score(controls[r['task']]) is not None]
-        on=mean(score(a) for a,b in pairs) if pairs else None;off=mean(score(b) for a,b in pairs) if pairs else None
+        pairs=[(r,controls[r['task']]) for r in rr if not is_control(r['arm']) and score(r) is not None and control_mean(controls[r['task']]) is not None]
+        on=mean(score(a) for a,b in pairs) if pairs else None;off=mean(control_mean(b) for a,b in pairs) if pairs else None
         record={'benchmark':benchmark,'finished':len(rr),'pairs':len(pairs),'on':on,'off':off,'delta':on-off if pairs else None}
+        ungated_text='—'
+        if benchmark=='expbench':
+            upairs=[(ungated(a),control_mean(b,ungated)) for a,b in pairs]
+            upairs=[(a,b) for a,b in upairs if a is not None and b is not None]
+            record.update(ungated_on=mean(a for a,b in upairs) if upairs else None,ungated_off=mean(b for a,b in upairs) if upairs else None,ungated_pairs=len(upairs))
+            if upairs: ungated_text=f'{fmt(100*record["ungated_on"])}% / {fmt(100*record["ungated_off"])}% (n={len(upairs)})'
         stats.append(record)
-        missing=[sum(r['status']=='missing_submission' and (r['arm']=='persona_off')==control for r in rr) for control in [False,True]]
+        missing=[sum(r['status']=='missing_submission' and is_control(r['arm'])==control for r in rr) for control in [False,True]]
         failures=sum(r['status'] not in {'scored','completed','missing_submission'} for r in rr)
         delta=f'{100*(on-off):+.2f} pp' if pairs else '—'
-        lines.append(f'| {benchmark} | {len(rr)}/62 | {missing[0]} / {missing[1]} | {failures} | {len(pairs)} | {fmt(100*on) if on is not None else "—"}% | {fmt(100*off) if off is not None else "—"}% | {delta} |')
+        lines.append(f'| {benchmark} | {len(rr)}/62 | {missing[0]} / {missing[1]} | {failures} | {len(pairs)} | {fmt(100*on) if on is not None else "—"}% | {fmt(100*off) if off is not None else "—"}% | {delta} | {ungated_text} |')
     lines += ['', 'Benchmark means use available comparable outcomes; infrastructure failures are excluded. Matched off means can differ by task mix; no baseline is regenerated. BixBench comparisons use the explicit missing-submission convention because both baseline runs produced no submission.','',
               '## Ten largest absolute persona deviations','',
               f'Ranking uses **the same {len(common)} questions for all 30 profiles**, with complete comparable outcomes: '+', '.join('`'+t+'`' for t in common)+'. Questions with an infrastructure or evaluator error in any arm are excluded from this common-task ranking. Missing submissions remain zero in both arms. No candidate is excluded by identity. Ties use candidate ID.','',
@@ -135,11 +154,15 @@ def main():
         for task in tasks:
             tid=task['id'];a=lookup.get((arm,tid));b=controls[tid]
             links=[]
-            for item in [a,b]:
-                path=Path(item['trace']) if item and item.get('trace') else None
-                links.append(f'[Read]({link(path,OUT/"traces")})' if path and path.is_file() else 'Pending/unavailable')
-            sa,sb=score(a),score(b)
-            detail.append(f'| `{tid}` | {a["status"] if a else "pending"} | {fmt(sa)} / {fmt(sb)} | {links[0]} | {links[1]} | {a["behavior"]["exchanges"] if a else "—"} / {b["behavior"]["exchanges"]} |')
+            for items in [[a],b]:
+                cells=[]
+                for item in items:
+                    path=Path(item['trace']) if item and item.get('trace') else None
+                    cells.append(f'[Read]({link(path,OUT/"traces")})' if path and path.is_file() else 'Pending/unavailable')
+                links.append(', '.join(cells) or 'Pending/unavailable')
+            sa,sb=score(a),control_mean(b)
+            tb=control_mean(b,lambda c:c['behavior']['exchanges'])
+            detail.append(f'| `{tid}` | {a["status"] if a else "pending"} | {fmt(sa)} / {fmt(sb)} | {links[0]} | {links[1]} | {a["behavior"]["exchanges"] if a else "—"} / {fmt(tb)} |')
         (OUT/'traces'/f'{arm}.md').write_text('\n'.join(detail)+'\n')
     table = top_tables(rankings, common)
     lines += table

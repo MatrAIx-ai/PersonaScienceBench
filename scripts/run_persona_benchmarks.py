@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import random
+import statistics
 import subprocess
 import sys
 import time
@@ -42,25 +43,46 @@ def jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
 
 
-def build(output):
+def is_control(arm):
+    return arm == 'persona_off' or arm.startswith('persona_off_r')
+
+
+def control_summary(rows):
+    """Per-key mean and sample SD (None below two values) over numeric control metrics and behavior."""
+    means, sds = {}, {}
+    for group in ['metrics', 'behavior']:
+        values = defaultdict(list)
+        for row in rows:
+            for k, v in row[group].items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    values[k].append(v)
+        means[group] = {k: sum(v)/len(v) for k, v in values.items()}
+        sds[group] = {k: statistics.stdev(v) if len(v) > 1 else None for k, v in values.items()}
+    return means, sds
+
+
+def build(output, control_reps=1):
     from personasciencebench.persona import Persona, persona_record
     cohort = ROOT / 'data/persona_case_study/full_persona_v2'
     cohort_manifest = read(cohort / 'manifest.json')
     profiles = {'persona_off': {'enabled': False}}
+    for rep in range(2, control_reps+1):
+        profiles[f'persona_off_r{rep}'] = {'enabled': False}
     for row in cohort_manifest['profiles']:
         prompt = (cohort / row['prompt']).read_text()
         assert hashlib.sha256(prompt.encode()).hexdigest() == row['prompt_sha256']
         profiles[row['candidate_id']] = {'enabled': True, 'id': row['candidate_id'],
             'version': 'full-persona-v2', 'system_prompt': prompt}
-    assert len(profiles) == 31
+    assert len(profiles) == 30 + control_reps
     shared = read(ROOT / 'configs/conversion-v2-two.json')
     shared['pilot_cases_per_benchmark'] = 1
-    shared['collaboration']['unrestricted_knowledge'] = True
+    # full_persona_v2 settings, now as separate switches: general knowledge, persona-set style, volunteering (SciConv).
+    shared['collaboration'].update(unrestricted_knowledge=True, embody_identity=True, volunteer_information=True)
     shared['notes'] = ['Full MatrAIx profile in simulator system prompt; unrestricted general knowledge for all arms.',
-        'Five fixed tasks per benchmark; 30 personas and one fresh shared baseline; native scoring unchanged.']
+        f'Five fixed tasks per benchmark; 30 personas and {control_reps} fresh shared baseline run(s) per task; native scoring unchanged.']
     shared.pop('actor_python_overrides', None)
     exp = tomllib.loads((ROOT / 'configs/expbench/conversion-v2-two.toml').read_text())
-    exp['collaboration']['unrestricted_knowledge'] = True
+    exp['collaboration'].update(unrestricted_knowledge=True, embody_identity=True)
     for config in [shared, exp]:
         for model in config['models'].values():
             assert model['model'] == 'openai/gpt-6-luna' and model['reasoning_effort'] == 'none'
@@ -100,8 +122,8 @@ def build(output):
         random.Random(arm).shuffle(arm_tasks)
         for task in arm_tasks:
             jobs.append({**task, 'arm': arm, 'key': arm + '-' + task['slug']})
-    baseline = [j for j in jobs if j['arm']=='persona_off']
-    persona_jobs = [j for j in jobs if j['arm']!='persona_off']
+    baseline = [j for j in jobs if is_control(j['arm'])]
+    persona_jobs = [j for j in jobs if not is_control(j['arm'])]
     random.Random(20260926).shuffle(persona_jobs)
     jobs = baseline + persona_jobs
     hashes = {}
@@ -111,7 +133,8 @@ def build(output):
         'tasks': tasks, 'jobs': jobs, 'source_sha256': hashes,
         'selection': cohort_manifest['selection'], 'persona_diversity': cohort_manifest['diversity'],
         'task_selection': 'Seed 20260926 shuffle of asset-ready catalogs with distinct studies; ASI three existing ready instances plus astronomy and biology public CPU instances; EXP five distinct papers.',
-        'controls': 'One fresh persona-off run per task, shared across all 30 profile comparisons; not independent replicates',
+        'controls': (f'{control_reps} fresh persona-off runs per task; their mean is' if control_reps > 1 else 'One fresh persona-off run per task,')
+            + ' shared across all 30 profile comparisons; not independent replicates',
         'injection': 'Exact full profile in simulator system prompt only; general knowledge allowed in both conditions; evaluator references remain private',
         'models': shared['models']}
     write(output / 'manifest.json', manifest)
@@ -221,12 +244,17 @@ def report(output):
         decisions = [e['payload'] for e in events if e['type'] == 'researcher_decision']
         metrics = record.get('evaluation', {}).get('metrics', {})
         if job['kind'] == 'exp':
-            metrics = {k: v for k, v in (record.get('initial') or {}).items()
-                       if k in {'coverage_mean', 'gated_coverage_mean'}}
+            initial = record.get('initial') or {}
+            metrics = {k: v for k, v in initial.items() if k in {'coverage_mean', 'gated_coverage_mean'}}
+            if initial.get('monitor_passed') is not None:
+                metrics['monitor_passed'] = int(initial['monitor_passed'])
         behavior = {'exchanges': counts['researcher_reply'] if job['kind']=='sciconv' else counts['agent_handoff'],
                     'plan_handoffs': stages['plan'], 'result_handoffs': stages['result'],
                     'revision_requests': sum(d.get('phase')=='result_review' and d.get('action')=='continue' for d in decisions),
-                    'researcher_words': sum(len(str(d.get('message', '')).split()) for d in decisions),
+                    'researcher_words': sum(len(str(e['payload'].get('answer', '')).split()) for e in events if e['type'] == 'researcher_reply')
+                        if job['kind']=='sciconv' else sum(len(str(d.get('message', '')).split()) for d in decisions),
+                    'approach_approved': None if job['kind']=='sciconv' else int(any(d.get('approve_approach') for d in decisions)),
+                    'result_rejections': None if job['kind']=='sciconv' else counts['result_handoff_rejected'],
                     'actor_calls': record.get('actor_calls', record.get('actor', {}).get('actor_calls')),
                     'execution_calls': record.get('actor', {}).get('execution_calls'),
                     'execution_successes': record.get('actor', {}).get('execution_successes'),
@@ -250,23 +278,33 @@ def report(output):
         rows.append({'arm': job['arm'], 'task': job['id'], 'benchmark': job['benchmark'],
                      'status': job['status'], 'metrics': metrics, 'behavior': behavior,
                      'trace': str(case / 'trace.md') if case else None})
-    controls = {r['task']: r for r in rows if r['arm']=='persona_off'}
+    controls = defaultdict(list)
+    for r in rows:
+        if is_control(r['arm']):
+            controls[r['task']].append(r)
+    summaries = {task: control_summary(group) for task, group in controls.items()}
     comparisons = []
     for row in rows:
-        if row['arm']=='persona_off' or row['task'] not in controls:
+        if is_control(row['arm']) or row['task'] not in controls:
             continue
-        base = controls[row['task']]
+        base, sd = summaries[row['task']]
         diff = {}
         for group in ['metrics', 'behavior']:
             diff[group] = {k: v-base[group][k] for k, v in row[group].items()
-                           if isinstance(v, (int, float)) and not isinstance(v, bool)
-                           and isinstance(base[group].get(k), (int, float))}
+                           if isinstance(v, (int, float)) and not isinstance(v, bool) and k in base[group]}
+        diff['control_sd'] = {group: {k: sd[group][k] for k in diff[group]} for group in ['metrics', 'behavior']}
+        statuses = [c['status'] for c in controls[row['task']]]
         comparisons.append({'arm': row['arm'], 'task': row['task'], 'benchmark': row['benchmark'],
-                            'persona_status': row['status'], 'control_status': base['status'], 'delta': diff})
+                            'persona_status': row['status'], 'n_controls': len(statuses),
+                            'control_status': statuses[0] if len(set(statuses)) == 1 else 'mixed',
+                            'control_statuses': statuses, 'delta': diff})
+    control_counts = sorted(set(len(v) for v in controls.values()))
+    control_text = ('no' if not control_counts else str(control_counts[0]) if len(control_counts) == 1
+                    else f'{control_counts[0]}–{control_counts[-1]}')
     write(output / 'comparison.json', {'episodes': rows, 'paired_differences': comparisons, 'attempts': attempts})
     lines = ['# Persona benchmark comparison', '',
              f"Completed records: {len(rows)} / {len(manifest['jobs'])}. Statuses: {dict(Counter(r['status'] for r in rows))}.", '',
-             '30 source-balanced, behaviorally diverse full profiles; five fixed tasks for each of five benchmarks; one fresh shared off control per task.',
+             f'30 source-balanced, behaviorally diverse full profiles; five fixed tasks for each of five benchmarks; {control_text} fresh shared off control run(s) per task; each persona is compared with the per-task control mean.',
              'ScienceAgentBench and Terminal-Bench-Science were discarded after pilot execution because their storage and execution requirements were too heavy for this persona study.',
              'Paired differences are descriptive. Shared controls and repeated tasks are not independent observations.', '',
              'Concurrency was adjusted to observed host capacity while per-episode limits stayed fixed. Elapsed time is an operational diagnostic, not an isolated persona effect.', '',
@@ -284,11 +322,11 @@ def report(output):
                      if p['persona_status'] in {'scored','completed','missing_submission'}
                      and p['control_status'] in {'scored','completed','missing_submission'}]
         exchange_text = f'{sum(exchanges)/len(exchanges):+.2f}' if exchanges else 'pending'
-        lines.append(f"| {benchmark} | {sum(r['arm']!='persona_off' for r in selected)} | {sum(r['arm']=='persona_off' for r in selected)} | {mean_metrics or 'pending'} | {exchange_text} |")
+        lines.append(f"| {benchmark} | {sum(not is_control(r['arm']) for r in selected)} | {sum(is_control(r['arm']) for r in selected)} | {mean_metrics or 'pending'} | {exchange_text} |")
     primary = {'asibench': 'score', 'bixbench': 'grade', 'discoverybench': 'final_score',
                'expbench': 'gated_coverage_mean', 'sciconvbench': 'FRR'}
     lines += ['', '## Native score distributions', '',
-              'Each entry is a profile/task contrast with its shared off control. Higher/lower counts describe observed outcomes, not statistically significant effects.', '',
+              'Each entry is a profile/task contrast with the mean of its shared off control run(s). Higher/lower counts describe observed outcomes, not statistically significant effects.', '',
               '| Benchmark | Metric | Higher / equal / lower | Minimum delta | Maximum delta |', '|---|---|---:|---:|---:|']
     for benchmark, metric in sorted(primary.items()):
         values = [p['delta']['metrics'][metric] for p in comparisons
@@ -311,14 +349,14 @@ def report(output):
               'Missing submissions and infrastructure errors remain explicit. Native score changes are computed only where both arms have a score; no missing result is imputed as zero unless the native runner already applies that policy.', '',
               '| Task | Control status | Persona status counts | Native score changes |', '|---|---|---|---|']
     for task in sorted({r['task'] for r in rows}):
-        task_rows = [r for r in rows if r['task']==task and r['arm']!='persona_off']
+        task_rows = [r for r in rows if r['task']==task and not is_control(r['arm'])]
         task_values = defaultdict(list)
         for pair in comparisons:
             if pair['task']==task:
                 for key, value in pair['delta']['metrics'].items():
                     task_values[key].append(value)
         changes = '; '.join(f'{k}: {sum(v)/len(v):+.4f} (n={len(v)})' for k,v in sorted(task_values.items()))
-        control_status = controls.get(task, {}).get('status', 'pending')
+        control_status = ', '.join(c['status'] for c in controls[task]) if task in controls else 'pending'
         lines.append(f"| {task} | {control_status} | {dict(Counter(r['status'] for r in task_rows))} | {changes or 'unavailable'} |")
     lines += ['', '## Individual episodes', '', '| Profile | Task | Status | Trace |', '|---|---|---|---|']
     for row in rows:
@@ -336,6 +374,8 @@ def main():
     parser.add_argument('--parallel', type=int, default=6)
     parser.add_argument('--python-slots', type=int, default=2)
     parser.add_argument('--terminal-slots', type=int, default=1)
+    parser.add_argument('--control-reps', type=int, default=1,
+                        help='Persona-off runs per task for a fresh build (persona_off, persona_off_r2, ...)')
     parser.add_argument('--after-pid', type=int, help='Wait for an earlier draining scheduler before resuming')
     args = parser.parse_args()
     if args.after_pid:
@@ -355,7 +395,7 @@ def main():
         return
     output.mkdir(parents=True, exist_ok=True)
     output.chmod(0o700)
-    manifest = read(output/'manifest.json') if (output/'manifest.json').exists() else build(output)
+    manifest = read(output/'manifest.json') if (output/'manifest.json').exists() else build(output, args.control_reps)
     pending = [j for j in manifest['jobs'] if not (output/'finished'/(j['key']+'.json')).exists()]
     completed_original = len(manifest['jobs']) - len(pending)
     if args.retry_errors:

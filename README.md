@@ -4,7 +4,7 @@
 
 PersonaScienceBench studies how researcher expertise and communication affect an AI agent’s scientific work. The actor inspects inputs, runs tools, consults a simulator, and submits its work. The simulator uses source-grounded context, with optional persona instructions. Each benchmark retains its own evaluation contract.
 
-[Conversion rules](docs/design/conversion_revision_v2.md) · [Personas](docs/personas.md) · [Setup](docs/reproducibility.md) · [Results](reports/persona_action_case_study/benchmark_score_ranking.md) · [Conversion history](reports/conversion_v2/README.md)
+[Conversion rules](docs/design/conversion_revision_v2.md) · [Personas](docs/personas.md) · [Setup](docs/reproducibility.md) · [Experiment status](reports/persona_action_case_study/README.md) · [Conversion history](reports/conversion_v2/README.md)
 
 ## Benchmarks and conversion
 
@@ -47,6 +47,8 @@ The [original candidate list](docs/design/parent_benchmark_candidates.md) remain
 
 ## How conversion works
 
+The rules below describe the existing implementation. Persona injection and the simulator knowledge policy are under redesign.
+
 1. Preserve the scientific objective, required inputs, outputs and native scoring contract; label every adaptation.
 2. Separate public task information, source-attributed simulator context and evaluator-private references. Never infer missing study facts.
 3. Keep persona separate from knowledge: styling cannot alter task requirements or the fact pool.
@@ -59,7 +61,7 @@ The [per-benchmark conversion document](docs/design/conversion_revision_v2.md) s
 
 ## Researcher personas
 
-The merged [science-persona profiles](docs/science_personas/README.md) add an opt-in 56-attribute schema and deterministic renderer. The [Phase 1 planner](docs/science_personas/experiment_plan.md) creates matched persona arms for the five retained tracks; the proposed 50-task experiment has not been run. Existing profiles remain supported. A separate [action-persona case study](reports/persona_action_case_study/README.md) screens a reproducible sample of 300 MatrAIx records using three static rules, then measures whether the selected action instructions visibly change one controlled model response.
+The merged [science-persona profiles](docs/science_personas/README.md) add an opt-in 56-attribute schema and deterministic renderer. The [Phase 1 planner](docs/science_personas/experiment_plan.md) creates matched persona arms for the five retained tracks; the proposed 50-task experiment has not been run. Existing profiles remain supported. The [action-persona case study](reports/persona_action_case_study/README.md) has been retired pending a redesign using broader original profiles.
 
 Persona is injected into the **simulator's private system prompt**. The actor
 experiences it through researcher replies; the profile is not added to actor or
@@ -133,22 +135,95 @@ Follow the [setup guide](docs/reproducibility.md), then the [conversion and runt
 
 Run independent cases concurrently and use a fresh output directory for every attempt. Raw model/tool records and readable conversations live under ignored `runs/`; published reports contain summary outcomes and local record locators.
 
-## Current results
+## Experiment status
 
-**September 26, 2026: 30 action personas and persona off were run on two fixed
-cases from each of the five retained benchmarks, using GPT-6 Luna for actor,
-simulator, and LLM judges.** This leaves 310 final experiment records. Independent
-episodes ran concurrently and each task reused one persona-off result across its
-30 paired comparisons.
+The replacement full-persona experiment has completed locally in
+[runs/full-persona-v2-two-20260926](runs/full-persona-v2-two-20260926): 30 personas
+plus a fresh persona-off baseline, two fixed questions per retained benchmark
+(**310 episodes**). All model roles use GPT-6 Luna with reasoning effort `none`.
+The batch began with eight episode slots and three Python workers; Python concurrency later increased to six.
+Full persona text is injected into the simulator system prompt only. Both arms
+can use general knowledge; native scoring references remain private. Exact
+configs, API traces, readable episode traces, and completion records are retained.
 
-Nine of ten retained control tasks had a native score. Their normalized persona-
-off average was **0.4685**. Among the 24 personas with complete 9-task score
-coverage, deviations ranged from **+0.1911** (`candidate_259`) to **-0.1432**
-(`candidate_019`). These are descriptive single-run differences from an enriched
-profile sample, without uncertainty estimates; they do not establish general
-persona effects.
 
-[Persona score ranking](reports/persona_action_case_study/benchmark_score_ranking.md) · [Selected extreme profiles](reports/persona_action_case_study/extreme_personas.md) · [Conversion pilot history](reports/conversion_v2/README.md)
+The previous action-rule persona experiment has been withdrawn. Its injection
+used a narrow subset of the original profiles, so its results do not answer the
+intended full-persona research question. Raw runs, score tables, rankings, and
+generated displays have been removed from the current worktree.
+
+Original persona data and benchmark inputs are retained. We are redesigning the
+persona injection and simulator interaction; preserving the old approved-facts
+boundary is not a requirement. The replacement runtime now supports full-profile system injection and general
+knowledge in the simulator. All 310 episodes have finished; the final tables distinguish scored outcomes, missing submissions, and errors.
+
+The original 300 profiles have been rescreened: **180 are eligible**, including
+the previous 131 and 49 additional profiles. The three static rules require at
+least four concrete behavioral attributes, three directional preferences or
+habits, and evidence across two behavioral areas. Communication, interaction,
+decisions, workflow, and tool collaboration count; there is no domain filter
+or model-score selection. Eligibility does not guarantee a behavioral effect.
+
+Inspect the local [pool and all 300 decisions](data/persona_case_study/full_profile_selection_v2/README.md),
+generated by `scripts/reselect_persona_pool.py`. The earlier 30-profile sample
+from the old pool is superseded. The [replacement 30 and full prompts](data/persona_case_study/full_persona_v2/README.md)
+are now ready: 8 synthetic, 8 Wikipedia-derived, 8 Stack Overflow, 4 survey,
+1 PRISM, and 1 Amazon profile. Selection balances available sources and greedily
+covers different directional behavioral preferences across the five areas;
+it uses no model scores. This is a diversity-oriented sample, not a population
+estimate. `scripts/build_full_persona_cohort.py` records the selection method,
+coverage, original profiles, exact prompts, and field audits.
+The planned injection uses the broader profile with the pinned MatrAIx renderer,
+without domain or knowledge-boundary restrictions. Selection evidence does not
+limit which persona attributes are injected. These artifacts are local and
+ignored by Git; the updated runners now consume these prompts.
+
+[Retirement record](reports/persona_action_case_study/README.md)
+
+<!-- FULL_PERSONA_RESULTS_START -->
+
+## Current persona results
+
+Final results: **310/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).
+
+Top deviations below use the same **8 completed questions** for every persona; questions with infrastructure or evaluator errors are excluded for every persona. Differences are normalized score percentage points.
+
+**Shared baseline: 26.01%.** All personas are compared on the same 8 questions. Sorted by absolute score change; positive means higher performance. Profile links show the exact injected identity.
+
+| Rank | Persona | Score | Change vs off | Traces |
+|---:|---|---:|---:|---|
+| 1 | [046](reports/full_persona_v2/profiles/candidate_046.md) | 4.54% | **-21.47 pp** | [Read](reports/full_persona_v2/traces/candidate_046.md) |
+| 2 | [003](reports/full_persona_v2/profiles/candidate_003.md) | 6.14% | **-19.87 pp** | [Read](reports/full_persona_v2/traces/candidate_003.md) |
+| 3 | [004](reports/full_persona_v2/profiles/candidate_004.md) | 9.33% | **-16.68 pp** | [Read](reports/full_persona_v2/traces/candidate_004.md) |
+| 4 | [089](reports/full_persona_v2/profiles/candidate_089.md) | 9.79% | **-16.22 pp** | [Read](reports/full_persona_v2/traces/candidate_089.md) |
+| 5 | [001](reports/full_persona_v2/profiles/candidate_001.md) | 9.91% | **-16.10 pp** | [Read](reports/full_persona_v2/traces/candidate_001.md) |
+| 6 | [127](reports/full_persona_v2/profiles/candidate_127.md) | 10.51% | **-15.50 pp** | [Read](reports/full_persona_v2/traces/candidate_127.md) |
+| 7 | [262](reports/full_persona_v2/profiles/candidate_262.md) | 11.33% | **-14.68 pp** | [Read](reports/full_persona_v2/traces/candidate_262.md) |
+| 8 | [224](reports/full_persona_v2/profiles/candidate_224.md) | 12.20% | **-13.81 pp** | [Read](reports/full_persona_v2/traces/candidate_224.md) |
+| 9 | [148](reports/full_persona_v2/profiles/candidate_148.md) | 39.37% | **+13.36 pp** | [Read](reports/full_persona_v2/traces/candidate_148.md) |
+| 10 | [026](reports/full_persona_v2/profiles/candidate_026.md) | 12.66% | **-13.35 pp** | [Read](reports/full_persona_v2/traces/candidate_026.md) |
+
+**Behavior on the same questions**
+
+Each cell shows **persona on / baseline**. Rows follow the performance ranking.
+
+| Persona | Turns per question | Words per simulator reply | Revisions per question¹ |
+|---|---:|---:|---:|
+| [046](reports/full_persona_v2/profiles/candidate_046.md) | 2.38 / 3.38 | 70.76 / 65.99 | 0.17 / 0.33 |
+| [003](reports/full_persona_v2/profiles/candidate_003.md) | 3.88 / 3.38 | 66.73 / 65.99 | 0.00 / 0.33 |
+| [004](reports/full_persona_v2/profiles/candidate_004.md) | 3.88 / 3.38 | 69.05 / 65.99 | 0.00 / 0.33 |
+| [089](reports/full_persona_v2/profiles/candidate_089.md) | 4.25 / 3.38 | 69.53 / 65.99 | 0.00 / 0.33 |
+| [001](reports/full_persona_v2/profiles/candidate_001.md) | 4.25 / 3.38 | 70.60 / 65.99 | 0.00 / 0.33 |
+| [127](reports/full_persona_v2/profiles/candidate_127.md) | 4.50 / 3.38 | 70.49 / 65.99 | 0.50 / 0.33 |
+| [262](reports/full_persona_v2/profiles/candidate_262.md) | 2.25 / 3.38 | 68.95 / 65.99 | 0.00 / 0.33 |
+| [224](reports/full_persona_v2/profiles/candidate_224.md) | 4.38 / 3.38 | 65.12 / 65.99 | 0.00 / 0.33 |
+| [148](reports/full_persona_v2/profiles/candidate_148.md) | 3.88 / 3.38 | 72.61 / 65.99 | 0.00 / 0.33 |
+| [026](reports/full_persona_v2/profiles/candidate_026.md) | 3.50 / 3.38 | 74.09 / 65.99 | 0.33 / 0.33 |
+
+Turns exclude tool calls. Reply lengths exclude initial requests and private evidence. ¹ Revisions cover result-review benchmarks only; SciConv has no such stage. Trace indexes list all ten scheduled questions, while the tables use only the shared completed questions.
+
+
+<!-- FULL_PERSONA_RESULTS_END -->
 
 ## Repository guide
 
@@ -159,7 +234,7 @@ persona effects.
 | `configs/`, `manifests/` | Experiment settings and pinned sources |
 | `docs/` | Conversion standards, setup and research plans |
 | `reports/conversion_v2/` | Current result summaries and catalog readiness |
-| `reports/persona_action_case_study/` | Persona selection, retained-benchmark ranking and extreme profiles |
+| `reports/persona_action_case_study/` | Retirement record and redesign status |
 | `external/`, `data/`, `prepared/`, `runs/` | Ignored local sources, assets, task packages and raw records |
 
-Older generated reports and local runs were archived outside the repository during cleanup. The latest raw records remain local and are not redistributed. Implementation code is MIT licensed; upstream data retain their own licenses. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Old raw runs and persona comparison outputs were deleted during cleanup. Previously committed summaries remain in Git history. Implementation code is MIT licensed; upstream data retain their own licenses. See [CONTRIBUTING.md](CONTRIBUTING.md).

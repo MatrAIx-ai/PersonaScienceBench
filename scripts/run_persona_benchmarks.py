@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run paired action-persona episodes through the five retained benchmarks.
+"""Run paired full-persona episodes through the five retained benchmarks.
 
 One task per subprocess preserves SDK/global-state isolation. Resource slots
 limit concurrency without changing any task's execution budget or protocol.
@@ -44,61 +44,76 @@ def jsonl(path):
 
 def build(output):
     from personasciencebench.persona import Persona, persona_record
-    selections = ROOT / 'data/persona_case_study/action_selection_v1/selected.jsonl'
-    diagnostic = ROOT / 'runs/action-persona-case-study-20260926/results.jsonl'
-    qualified = sorted(r['candidate_id'] for r in jsonl(diagnostic) if r['prominent_behavioral_effect'])
-    included = set(random.Random(20260930).sample(qualified, 30))
+    cohort = ROOT / 'data/persona_case_study/full_persona_v2'
+    cohort_manifest = read(cohort / 'manifest.json')
     profiles = {'persona_off': {'enabled': False}}
-    for row in jsonl(selections):
-        if row['candidate_id'] in included:
-            profiles[row['candidate_id']] = {'enabled': True, 'id': row['candidate_id'],
-                'version': 'action-persona-1.0', 'action_rules': [r['instruction'] for r in row['rules'] if r['directional']]}
-    if len(profiles) != 31:
-        raise ValueError('Expected 30 diagnostic-qualified profiles and one off control')
+    for row in cohort_manifest['profiles']:
+        prompt = (cohort / row['prompt']).read_text()
+        assert hashlib.sha256(prompt.encode()).hexdigest() == row['prompt_sha256']
+        profiles[row['candidate_id']] = {'enabled': True, 'id': row['candidate_id'],
+            'version': 'full-persona-v2', 'system_prompt': prompt}
+    assert len(profiles) == 31
     shared = read(ROOT / 'configs/conversion-v2-two.json')
     shared['pilot_cases_per_benchmark'] = 1
+    shared['collaboration']['unrestricted_knowledge'] = True
+    shared['notes'] = ['Full MatrAIx profile in simulator system prompt; unrestricted general knowledge for all arms.',
+        'Five fixed tasks per benchmark; 30 personas and one fresh shared baseline; native scoring unchanged.']
+    shared.pop('actor_python_overrides', None)
     exp = tomllib.loads((ROOT / 'configs/expbench/conversion-v2-two.toml').read_text())
+    exp['collaboration']['unrestricted_knowledge'] = True
+    for config in [shared, exp]:
+        for model in config['models'].values():
+            assert model['model'] == 'openai/gpt-6-luna' and model['reasoning_effort'] == 'none'
     tasks = []
-    for folder, kind in [('conversion-v2-two-python', 'python'),
-                         ('conversion-v2-two-asi-ready', 'python'),
-                         ('conversion-v2-two-sciconv-ready', 'sciconv')]:
-        manifest = read(ROOT / 'prepared' / folder / 'pilot_manifest.json')
-        for record in manifest['cases']:
-            if record['benchmark'] in {'scienceagentbench', 'terminal_bench_science'}:
-                continue
-            tid = record['episode_id']
-            slug = hashlib.sha256(tid.encode()).hexdigest()[:12]
-            prepared = output / 'inputs' / slug
-            write(prepared / 'pilot_manifest.json', {**manifest, 'cases': [record]})
-            tasks.append({'id': tid, 'slug': slug, 'kind': kind,
-                          'benchmark': record['benchmark'], 'prepared': str(prepared)})
-    for tid in ['neurips2024/94328/5', 'neurips2024/97649/0']:
+    prepared_manifest = read(ROOT / 'prepared/full-persona-v2-five/pilot_manifest.json')
+    for record in prepared_manifest['cases']:
+        assert record['assets_ready'], record['episode_id']
+        tid = record['episode_id']
+        slug = hashlib.sha256(tid.encode()).hexdigest()[:12]
+        prepared = output / 'inputs' / slug
+        write(prepared / 'pilot_manifest.json', {**prepared_manifest, 'cases': [record]})
+        tasks.append({'id': tid, 'slug': slug, 'kind': 'sciconv' if record['benchmark']=='sciconvbench' else 'python',
+                      'benchmark': record['benchmark'], 'prepared': str(prepared)})
+    exp_rows = jsonl(ROOT / 'data/design_catalog/tasks.jsonl')
+    random.Random(20260926).shuffle(exp_rows)
+    papers = set()
+    for row in exp_rows:
+        tid = row['task_id']
+        paper = tid.rsplit('/',1)[0]
+        if paper in papers:
+            continue
+        papers.add(paper)
         tasks.append({'id': 'expbench:' + tid, 'slug': hashlib.sha256(tid.encode()).hexdigest()[:12],
                       'kind': 'exp', 'benchmark': 'expbench', 'task_id': tid})
-    assert len(tasks) == 10 and len({t['id'] for t in tasks}) == 10
+        if len(papers)==5:
+            break
+    assert len(tasks) == 25 and len({t['id'] for t in tasks}) == 25
+    assert set(Counter(t['benchmark'] for t in tasks).values()) == {5}
     for arm, profile in profiles.items():
         write(output / 'configs' / arm / 'shared.json', {**deepcopy(shared), 'persona': profile})
         write(output / 'configs' / arm / 'exp.json', {**deepcopy(exp), 'persona': profile})
         write(output / 'configs' / arm / 'persona.private.json', persona_record(Persona.model_validate(profile)))
+    # Baselines start first; randomize the remaining work to interleave profiles.
     jobs = []
     for arm in profiles:
         arm_tasks = list(tasks)
         random.Random(arm).shuffle(arm_tasks)
         for task in arm_tasks:
             jobs.append({**task, 'arm': arm, 'key': arm + '-' + task['slug']})
+    baseline = [j for j in jobs if j['arm']=='persona_off']
+    persona_jobs = [j for j in jobs if j['arm']!='persona_off']
+    random.Random(20260926).shuffle(persona_jobs)
+    jobs = baseline + persona_jobs
     hashes = {}
-    for path in [selections, diagnostic, *sorted((ROOT / 'src').rglob('*.py'))]:
+    for path in [cohort/'manifest.json', Path(__file__), *sorted((ROOT / 'src').rglob('*.py'))]:
         hashes[str(path.relative_to(ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    manifest = {'version': 'action-persona-benchmark-v1', 'profiles': len(profiles)-1,
+    manifest = {'version': 'full-persona-benchmark-v2', 'profiles': 30,
         'tasks': tasks, 'jobs': jobs, 'source_sha256': hashes,
-        'selection': '30 profiles sampled with seed 20260930 from the 73 diagnostic-qualified profiles; exploratory enriched cohort, not population estimate',
-        'controls': 'One fresh persona-off run per task, reused across profile contrasts; not independent replicates',
-        'resources': {'logical_cpus': os.cpu_count(), 'parallel': 6, 'python_slots': 2},
-        'discarded_benchmarks': {
-            'scienceagentbench': 'retired from persona experiments because assets and evaluator workspaces are too heavy',
-            'terminal_bench_science': 'retired from persona experiments because Docker execution and retained traces are too heavy',
-        },
-        'injection': 'Only private simulator identity; existing facts, actor inputs, review policy and graders unchanged'}
+        'selection': cohort_manifest['selection'], 'persona_diversity': cohort_manifest['diversity'],
+        'task_selection': 'Seed 20260926 shuffle of asset-ready catalogs with distinct studies; ASI three existing ready instances plus astronomy and biology public CPU instances; EXP five distinct papers.',
+        'controls': 'One fresh persona-off run per task, shared across all 30 profile comparisons; not independent replicates',
+        'injection': 'Exact full profile in simulator system prompt only; general knowledge allowed in both conditions; evaluator references remain private',
+        'models': shared['models']}
     write(output / 'manifest.json', manifest)
     return manifest
 
@@ -116,13 +131,13 @@ def command(output, job):
     if job['kind'] == 'sciconv':
         return [PYTHON, '-m', 'personasciencebench.sciconv_runner', '--prepared', job['prepared'], *common]
     return [PYTHON, '-m', 'expbench.realistic', 'run', '--mode', 'live', '--task', job['task_id'],
-            '--tasks', str(ROOT / 'data/conversion-v2-exp/tasks.jsonl'), '--env-file', str(ROOT / '.env'),
+            '--tasks', str(ROOT / 'data/design_catalog/tasks.jsonl'), '--env-file', str(ROOT / '.env'),
             '--config', str(config.with_name('exp.json')), '--output', str(result), '--parallel', '1']
 
 
 def execute(output, job):
     started = time.monotonic()
-    env = dict(os.environ, PERSONASCIENCEBENCH_BWRAP=str(ROOT / 'external/runtime/bubblewrap-local/usr/bin/bwrap'))
+    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1', PERSONASCIENCEBENCH_BWRAP=str(ROOT / 'external/runtime/bubblewrap-local/usr/bin/bwrap'))
     log = output / 'logs' / (job['key'] + '.log')
     log.parent.mkdir(exist_ok=True)
     with log.open('w') as stream:
@@ -251,7 +266,7 @@ def report(output):
     write(output / 'comparison.json', {'episodes': rows, 'paired_differences': comparisons, 'attempts': attempts})
     lines = ['# Persona benchmark comparison', '',
              f"Completed records: {len(rows)} / {len(manifest['jobs'])}. Statuses: {dict(Counter(r['status'] for r in rows))}.", '',
-             '30 diagnostically enriched profiles; two fixed tasks for each of five retained benchmarks; one shared off control per task.',
+             '30 source-balanced, behaviorally diverse full profiles; five fixed tasks for each of five benchmarks; one fresh shared off control per task.',
              'ScienceAgentBench and Terminal-Bench-Science were discarded after pilot execution because their storage and execution requirements were too heavy for this persona study.',
              'Paired differences are descriptive. Shared controls and repeated tasks are not independent observations.', '',
              'Concurrency was adjusted to observed host capacity while per-episode limits stayed fixed. Elapsed time is an operational diagnostic, not an isolated persona effect.', '',

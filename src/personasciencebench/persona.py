@@ -64,10 +64,13 @@ class Persona(Record):
     interaction: Interaction = Field(default_factory=Interaction)
     # Explicit opt-in; existing profiles keep the original renderer.
     science_profile: SciencePersona | None = None
+    system_prompt: str | None = Field(default=None, min_length=1)
     action_rules: list[str] | None = Field(default=None, min_length=1, max_length=12)
 
     @model_validator(mode="after")
     def validate_action_rules(self):
+        if self.system_prompt is not None and (self.action_rules is not None or self.science_profile is not None):
+            raise ValueError("Choose one persona identity representation")
         if self.action_rules is not None:
             if self.science_profile is not None:
                 raise ValueError("Choose one identity representation: science_profile or action_rules")
@@ -145,6 +148,8 @@ def render_persona(persona: Persona) -> str:
     """Versioned behavioral rendering, with no reference data or generated biography."""
     if not persona.enabled:
         return ""
+    if persona.system_prompt is not None:
+        return persona.system_prompt
     if persona.action_rules is not None:
         return "\n".join([
             "You are a researcher collaborating on the supplied scientific task.",
@@ -204,6 +209,8 @@ def persona_preferences(persona: Persona) -> dict:
     """Only the effective profile conditions the simulator's existing support check."""
     if not persona.enabled:
         return {}
+    if persona.system_prompt is not None:
+        return {"enabled": True, "id": persona.id, "version": persona.version, "system_prompt": persona.system_prompt}
     if persona.action_rules is not None:
         return {"enabled": True, "id": persona.id, "version": persona.version,
                 "action_rules": persona.action_rules}
@@ -220,6 +227,8 @@ def persona_record(persona: Persona) -> dict:
     if not persona.enabled:
         payload = {"schema_version": "3", "renderer_version": "2", "enabled": False,
                    "profile": None, "identity_prompt": ""}
+    elif persona.system_prompt is not None:
+        payload.update(schema_version="full-persona-v2", renderer_version="pinned-matraix-verbatim")
     elif persona.science_profile is not None:
         payload.update(schema_version="science-persona-2.0", renderer_version="science-renderer-2.0",
                        catalog_sha256=catalog_sha256())

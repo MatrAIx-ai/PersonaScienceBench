@@ -11,10 +11,16 @@ from personasciencebench.persona import resolve_persona,persona_record,render_pe
 from personasciencebench.adapters.sciconvbench import POLICY
 
 class Service:
-    def __init__(self,client,persona_text=''):
-        self.client=client;self.persona_text=persona_text
+    def __init__(self,client,persona_text='',unrestricted=False):
+        self.client=client;self.persona_text=persona_text;self.unrestricted=unrestricted
         self.stats={k:0 for k in ['prompt_tokens','completion_tokens','total_tokens','total_calls','failed_calls','total_retries']}
     def invoke(self,user_prompt,system_prompt):
+        if self.unrestricted:
+            system_prompt = system_prompt.replace("should answer based strictly on that.", "may also use your general knowledge.")
+            system_prompt = system_prompt.replace("3. If the complete requirement doesn\'t specify something, tell the agent: \"Make a reasonable assumption based on best practices.\"", '3. You may offer your own suggestions; distinguish them from stated task requirements.')
+            system_prompt = system_prompt.replace("- Be concise.", "- Respond naturally as the supplied identity, if any.")
+            system_prompt = system_prompt.replace("- Do not explain your reasoning.", "")
+            system_prompt = system_prompt.replace("- Do not provide information not asked for.", "")
         self.stats['total_calls']+=1
         try:
             r=self.client.completion([{'role':'system','content':system_prompt+self.persona_text},{'role':'user','content':user_prompt}])
@@ -56,6 +62,7 @@ def run(prepared,output,config,parallel):
         def log(call):
             with (controller/'api_calls.private.jsonl').open('a') as f:f.write(json.dumps(call)+'\n')
         services={r:Service(OpenRouterClient(**c,role=r,record=log,supported_parameters=catalog[r]['supported_parameters'])) for r,c in config['models'].items()}
+        services['researcher'].unrestricted=config.get('collaboration',{}).get('unrestricted_knowledge',False)
         if profile.enabled:services['researcher'].persona_text='\n'+render_persona(profile)
         result={'episode_id':ep.id,'benchmark':'sciconvbench','source_task_id':ep.source_task_id,'status':'infrastructure_error','case_directory':str(case.resolve()),'interaction_protocol':POLICY,'framework':'native ConvAgent'}
         try:

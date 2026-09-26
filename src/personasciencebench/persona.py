@@ -64,6 +64,16 @@ class Persona(Record):
     interaction: Interaction = Field(default_factory=Interaction)
     # Explicit opt-in; existing profiles keep the original renderer.
     science_profile: SciencePersona | None = None
+    action_rules: list[str] | None = Field(default=None, min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_action_rules(self):
+        if self.action_rules is not None:
+            if self.science_profile is not None:
+                raise ValueError("Choose one identity representation: science_profile or action_rules")
+            if any(not rule.strip() or len(rule) > 1000 for rule in self.action_rules):
+                raise ValueError("Action rules must contain 1–1000 characters")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -135,6 +145,15 @@ def render_persona(persona: Persona) -> str:
     """Versioned behavioral rendering, with no reference data or generated biography."""
     if not persona.enabled:
         return ""
+    if persona.action_rules is not None:
+        return "\n".join([
+            "You are a researcher collaborating on the supplied scientific task.",
+            "Apply these personal preferences when relevant:",
+            *["- " + rule for rule in persona.action_rules],
+            "These are optional preferences, not additional task requirements. "
+            "Never invent study facts, results, resources, deadlines, or personal history. "
+            "Preferences do not expand your approved knowledge or change the submission contract.",
+        ])
     if persona.science_profile is not None:
         return render_profile(persona.science_profile)
     p = persona
@@ -185,8 +204,11 @@ def persona_preferences(persona: Persona) -> dict:
     """Only the effective profile conditions the simulator's existing support check."""
     if not persona.enabled:
         return {}
+    if persona.action_rules is not None:
+        return {"enabled": True, "id": persona.id, "version": persona.version,
+                "action_rules": persona.action_rules}
     if persona.science_profile is None:
-        return persona.model_dump(exclude={"science_profile"})
+        return persona.model_dump(exclude={"science_profile", "action_rules"})
     return {"enabled": True, "id": persona.id, "version": persona.version,
             "science_profile": persona.science_profile.model_dump()}
 
@@ -201,5 +223,7 @@ def persona_record(persona: Persona) -> dict:
     elif persona.science_profile is not None:
         payload.update(schema_version="science-persona-2.0", renderer_version="science-renderer-2.0",
                        catalog_sha256=catalog_sha256())
+    elif persona.action_rules is not None:
+        payload.update(schema_version="action-persona-1.0", renderer_version="action-renderer-1.0")
     payload["sha256"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     return payload

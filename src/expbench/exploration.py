@@ -81,7 +81,7 @@ class Sandbox:
         self.datasets = {k: Path(v).resolve() for k, v in (datasets or {}).items()}
         self.gpu = gpu
         self.calls = 0
-        self.bwrap = shutil.which("bwrap")
+        self.bwrap = shutil.which(os.environ.get("PERSONASCIENCEBENCH_BWRAP", "bwrap"))
         if not self.bwrap:
             raise ValueError("Bubblewrap is required; host execution is disabled")
         if not self.workspace.is_dir():

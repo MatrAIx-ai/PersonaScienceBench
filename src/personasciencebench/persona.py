@@ -215,7 +215,7 @@ def persona_preferences(persona: Persona) -> dict:
         return {"enabled": True, "id": persona.id, "version": persona.version,
                 "action_rules": persona.action_rules}
     if persona.science_profile is None:
-        return persona.model_dump(exclude={"science_profile", "action_rules"})
+        return persona.model_dump(exclude={"science_profile", "action_rules", "system_prompt"})
     return {"enabled": True, "id": persona.id, "version": persona.version,
             "science_profile": persona.science_profile.model_dump()}
 

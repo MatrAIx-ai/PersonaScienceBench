@@ -110,7 +110,8 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                 researcher_type = ActiveResearcher
             researcher = researcher_type(episode, clients["researcher"],
                                     persona=profiles[episode.id], **config["researcher"],
-                                    **({"unrestricted_knowledge": collaboration["unrestricted_knowledge"]} if collaboration else {}))
+                                    **({key: collaboration[key] for key in ("unrestricted_knowledge", "embody_identity")}
+                                       if collaboration else {}))
             session = EpisodeSession(episode, researcher, case / "controller", artifact_root=workspace)
             actor_result = run_actor(session, clients["actor"], sandbox, max_steps=config["actor_steps"], collaboration=collaboration)
             write_json(case / "actor_result.json", actor_result)

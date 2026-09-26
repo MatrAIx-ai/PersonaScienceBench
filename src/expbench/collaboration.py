@@ -49,7 +49,8 @@ def initialize(episode):
         evaluator=EvaluatorSpec(kind="external_design_grader", version="unchanged"))
     episode.researcher = ActiveResearcher(converted, ResearcherBackend(episode.gateway),
                                           persona=episode.config.persona or Persona(enabled=False),
-                                          unrestricted_knowledge=episode.config.collaboration.unrestricted_knowledge)
+                                          unrestricted_knowledge=episode.config.collaboration.unrestricted_knowledge,
+                                          embody_identity=episode.config.collaboration.embody_identity)
     episode.review_session = SimpleNamespace(output=episode.output, event=lambda kind, value:
         append_jsonl(episode.output / "events.jsonl", {
             "time": datetime.now(timezone.utc).isoformat(), "type": kind,

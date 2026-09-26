@@ -1,4 +1,4 @@
-"""Optional OpenRouter transport; no inference at import or preparation time."""
+"""Optional model transports; no inference at import or preparation time."""
 
 import json
 import os
@@ -8,6 +8,9 @@ from typing import Callable
 
 
 class OpenRouterClient:
+    provider_name = "OpenRouter"
+    key_variable = "OPENROUTER_API_KEY"
+
     def __init__(self, model: str, *, role: str, max_tokens: int = 2048,
                  temperature: float | None = None, reasoning_effort: str | None = None,
                  timeout: float = 180,
@@ -25,6 +28,15 @@ class OpenRouterClient:
         self.parameter_adaptations: list[dict] = []
         self.format_adaptations: list[dict] = []
         self.record = record
+
+    def _transport(self, key):
+        return "https://openrouter.ai/api/v1/chat/completions", {"Authorization": f"Bearer {key}"}
+
+    def _provider_payload(self, payload):
+        payload["provider"] = {"require_parameters": True, "allow_fallbacks": False}
+        if self.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        return payload
 
     def complete(self, messages, *, json_mode=False, settings=None):
         raw = self.completion(messages, json_mode=json_mode, settings=settings)["choices"][0]["message"]["content"]
@@ -51,9 +63,9 @@ class OpenRouterClient:
     def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None):
         import httpx
 
-        key = os.environ.get("OPENROUTER_API_KEY")
+        key = os.environ.get(self.key_variable)
         if not key:
-            raise ValueError("OPENROUTER_API_KEY is not configured")
+            raise ValueError(f"{self.key_variable} is not configured")
         allowed = {"temperature", "max_tokens", "top_p", "seed", "logprobs", "top_logprobs",
                    "frequency_penalty", "presence_penalty"}
         settings = dict(settings or {})
@@ -69,10 +81,8 @@ class OpenRouterClient:
             if omitted:
                 self.parameter_adaptations.append({"omitted_native_settings": omitted,
                                                    "replacement": "provider_defaults"})
-        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens,
-                   "provider": {"require_parameters": True, "allow_fallbacks": False}, **settings}
-        if self.reasoning_effort is not None:
-            payload["reasoning"] = {"effort": self.reasoning_effort}
+        payload = self._provider_payload({"model": self.model, "messages": messages,
+                                          "max_tokens": self.max_tokens, **settings})
         if tools:
             payload["tools"] = tools
             if tool_choice is not None:
@@ -80,23 +90,24 @@ class OpenRouterClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         try:
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions",
-                                  headers={"Authorization": f"Bearer {key}"},
+            url, headers = self._transport(key)
+            response = httpx.post(url, headers=headers,
                                   json=payload, timeout=self.timeout)
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"{self.role}: OpenRouter transport failed ({type(exc).__name__})") from None
+            raise RuntimeError(f"{self.role}: {self.provider_name} transport failed ({type(exc).__name__})") from None
         if response.status_code != 200:
-            raise RuntimeError(f"{self.role}: OpenRouter HTTP {response.status_code}")
+            raise RuntimeError(f"{self.role}: {self.provider_name} HTTP {response.status_code}")
         data = response.json()
         if self.record:
             self.record({"role": self.role, "model": self.model,
                          "resolved_model": data.get("model"), "provider": data.get("provider"),
+                         "transport_provider": self.provider_name,
                          "request": payload, "response": data,
                          "requested_native_settings": requested_settings,
                          "omitted_native_settings": omitted,
                          "usage": data.get("usage", {}), "automatic_retries": 0})
         if data.get("error"):
-            raise RuntimeError(f"{self.role}: OpenRouter returned an error response")
+            raise RuntimeError(f"{self.role}: {self.provider_name} returned an error response")
         try:
             choice = data["choices"][0]
             content = choice["message"].get("content")
@@ -112,6 +123,44 @@ class OpenRouterClient:
         return data
 
 
+def azure_base_url() -> str:
+    """Require the explicit v1 inference endpoint, never the Foundry project URL."""
+    from urllib.parse import urlsplit
+    raw = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
+    url = urlsplit(raw)
+    if (url.scheme != "https" or not url.hostname or url.username or url.password
+            or url.query or url.fragment or url.path != "/openai/v1"):
+        raise ValueError("AZURE_OPENAI_ENDPOINT must be https://<resource>.services.ai.azure.com/openai/v1/ "
+                         "(or the resource's openai.azure.com host), not a project endpoint")
+    if not url.hostname.endswith((".services.ai.azure.com", ".openai.azure.com")):
+        raise ValueError("AZURE_OPENAI_ENDPOINT must use an Azure OpenAI resource host")
+    return raw
+
+
+class AzureOpenAIClient(OpenRouterClient):
+    """Azure v1 chat transport with the same strict completion and audit contract."""
+
+    provider_name = "Azure OpenAI"
+    key_variable = "AZURE_OPENAI_API_KEY"
+
+    def _transport(self, key):
+        return azure_base_url() + "/chat/completions", {"api-key": key}
+
+    def _provider_payload(self, payload):
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        return payload
+
+
+def model_client(*, provider="openrouter", **kwargs):
+    """Explicit per-role provider selection; existing configs keep OpenRouter."""
+    clients = {"openrouter": OpenRouterClient, "azure": AzureOpenAIClient}
+    if provider not in clients:
+        raise ValueError(f"Unknown model provider: {provider}")
+    return clients[provider](**kwargs)
+
+
 def load_env(path: Path):
     """Read a local ignored dotenv file without shell evaluation or printing values."""
     if not path.is_file():
@@ -122,7 +171,8 @@ def load_env(path: Path):
             continue
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
-        if key != "OPENROUTER_API_KEY":
+        if key not in {"OPENROUTER_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT",
+                       "AZURE_OPENAI_DEPLOYMENT", "AZURE_FOUNDRY_PROJECT_ENDPOINT"}:
             continue
         if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
@@ -130,6 +180,45 @@ def load_env(path: Path):
 
 
 def preflight(models: dict, *, timeout=45) -> dict:
+    """Check authenticated catalogs without inference; Azure deployments need a probe.
+
+    Azure /models is not an inventory of deployed names. Record deployment access
+    as unverified, rather than rejecting custom names or claiming catalog access
+    proves that a particular model is deployed.
+    """
+    selected, router_models = {}, {}
+    for role, spec in models.items():
+        provider = spec.get("provider", "openrouter")
+        if provider == "openrouter":
+            router_models[role] = spec
+        elif provider != "azure":
+            raise ValueError(f"Unknown model provider: {provider}")
+    azure_models = {role: spec for role, spec in models.items() if spec.get("provider") == "azure"}
+    if azure_models:
+        import httpx
+        key = os.environ.get("AZURE_OPENAI_API_KEY")
+        if not key:
+            raise ValueError("AZURE_OPENAI_API_KEY is not configured; no inference requested")
+        endpoint = azure_base_url()
+        try:
+            response = httpx.get(endpoint + "/models", headers={"api-key": key}, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Azure preflight transport failed ({type(exc).__name__})") from None
+        if response.status_code != 200:
+            raise RuntimeError(f"Azure preflight /models HTTP {response.status_code}")
+        for role, spec in azure_models.items():
+            if not isinstance(spec.get("model"), str) or not spec["model"].strip():
+                raise ValueError(f"Select an exact Azure deployment for {role}")
+            selected[role] = {"id": spec["model"], "provider": "azure", "endpoint": endpoint,
+                              "pricing": None, "supported_parameters": None,
+                              "reasoning_effort": spec.get("reasoning_effort"),
+                              "deployment_verified": False, "authenticated_catalog_access": True}
+    if router_models:
+        selected.update(_openrouter_preflight(router_models, timeout=timeout))
+    return selected
+
+
+def _openrouter_preflight(models: dict, *, timeout=45) -> dict:
     """Check authenticated access and exact model names without requesting inference."""
     import httpx
     key = os.environ.get("OPENROUTER_API_KEY")
@@ -204,7 +293,9 @@ class ReplayJudge:
         same = (request["messages"] == messages and request["model"] == self.client.model
                 and entry.get("requested_native_settings", {}) == (settings or {})
                 and bool(request.get("response_format")) == json_mode
-                and request.get("reasoning", {}).get("effort") == self.client.reasoning_effort)
+                and request.get("reasoning_effort", request.get("reasoning", {}).get("effort"))
+                == self.client.reasoning_effort
+                and entry.get("transport_provider", "OpenRouter") == self.client.provider_name)
         if not same:
             raise ValueError("Cached judge request differs; refusing to substitute a judgement")
         choice = entry["response"]["choices"][0]

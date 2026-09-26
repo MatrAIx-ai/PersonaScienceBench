@@ -129,6 +129,8 @@ uv sync --locked --extra api --extra annotations --extra actor --extra conversio
 .venv/bin/python -m personasciencebench --help
 ```
 
+For a matched DiscoveryBench experiment using Azure GPT-5.6 Sol, see the [Azure persona pilot](docs/discoverybench_azure_pilot.md) and its [16-run results](reports/discoverybench_azure_pilot/README.md).
+
 Follow the [setup guide](docs/reproducibility.md), then the [conversion and runtime commands](docs/design/conversion_revision_v2.md#commands). Source revisions and checksums are pinned in `manifests/`. Install ASI from the pinned local source as described in the conversion guide. The setup guide retains historical instructions for the two discarded tracks.
 
 Run independent cases concurrently and use a fresh output directory for every attempt. Raw model/tool records and readable conversations live under ignored `runs/`; published reports contain summary outcomes and local record locators.

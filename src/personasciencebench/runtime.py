@@ -195,8 +195,11 @@ class Sandbox:
         script = (
             "import json, os, pathlib, sys; "
             "assert os.getcwd() == '/workspace'; "
+            f"assert os.getuid() == {os.getuid()} and os.getgid() == {os.getgid()}; "
+            "assert int(next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('CapEff:')), 16) == 0; "
             "assert os.environ.get('HOME') == '/home/actor'; "
             "assert 'OPENROUTER_API_KEY' not in os.environ; "
+            "assert 'AZURE_OPENAI_API_KEY' not in os.environ; "
             "assert 'GITHUB_TOKEN' not in os.environ; "
             f"assert os.readlink('/proc/self/ns/net') != {namespace!r}; "
             f"assert not pathlib.Path({private_ssh!r}).exists(); "

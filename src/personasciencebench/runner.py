@@ -7,7 +7,7 @@ import shutil
 import time
 
 from personasciencebench.adapters.base import read_json, sha256
-from personasciencebench.inference import OpenRouterClient, ReplayJudge, preflight
+from personasciencebench.inference import model_client, ReplayJudge, preflight
 from personasciencebench.packaging import safe_component, write_json
 from personasciencebench.registry import load_adapter
 from personasciencebench.researcher import Researcher
@@ -101,7 +101,7 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
             def record_api(value):
                 with (case / "controller/api_calls.private.jsonl").open("a") as stream:
                     stream.write(json.dumps(value, ensure_ascii=False) + "\n")
-            clients = {role: OpenRouterClient(**spec, role=role, record=record_api,
+            clients = {role: model_client(**spec, role=role, record=record_api,
                                              supported_parameters=catalog[role]["supported_parameters"])
                        for role, spec in config["models"].items()}
             researcher_type = Researcher
@@ -131,6 +131,9 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                 else:
                     evaluation = adapter.evaluate(episode, session.submission, clients["judge"])
                     evaluation.details["judge_model"] = clients["judge"].model
+                    evaluation.details["judge_provider"] = clients["judge"].provider_name
+                    if config["models"]["judge"].get("provider") == "azure":
+                        evaluation.evaluator_version += "+azure-configured-judge-v1"
                     evaluation.details["judge_reasoning_effort"] = clients["judge"].reasoning_effort
                 if clients["judge"].parameter_adaptations:
                     evaluation.evaluator_version += "+openrouter-provider-defaults-v1"
@@ -190,7 +193,7 @@ def regrade(run: Path, source_root: Path, manifest: Path, output: Path, config: 
         def record_api(value):
             with (destination / "api_calls.private.jsonl").open("a") as stream:
                 stream.write(json.dumps(value, ensure_ascii=False) + "\n")
-        judge = OpenRouterClient(**spec, role="judge", record=record_api,
+        judge = model_client(**spec, role="judge", record=record_api,
                                  supported_parameters=catalog["judge"]["supported_parameters"])
         if replay_from:
             def record_replay(value):
@@ -201,6 +204,9 @@ def regrade(run: Path, source_root: Path, manifest: Path, output: Path, config: 
         evaluation = adapter.evaluate(episode, submission, judge)
         evaluation.evaluator_version += "+configured-judge-v1"
         evaluation.details["judge_model"] = spec["model"]
+        evaluation.details["judge_provider"] = spec.get("provider", "openrouter")
+        if spec.get("provider") == "azure":
+            evaluation.evaluator_version += "+azure-configured-judge-v1"
         evaluation.details["judge_reasoning_effort"] = spec.get("reasoning_effort")
         if judge.parameter_adaptations:
             evaluation.evaluator_version += "+openrouter-provider-defaults-v1"

@@ -65,10 +65,22 @@ def test_exports_keep_references_private_and_knowledge_qualified(adapter):
     assert "could" in engineering.researcher.facts[0].text
 
 
-def test_unreviewed_task_and_changed_metadata_fail_closed(adapter, tmp_path):
-    unreviewed = next(task.id for task in adapter.enumerate_tasks() if task.id not in adapter.pilot_task_ids())
-    with pytest.raises(ValueError, match="no reviewed information boundary"):
-        adapter.convert(unreviewed)
+def test_automated_nonpilot_conversion_preserves_private_reference_boundary(adapter):
+    from personasciencebench.adapters.discoverybench import REVIEWED_TASKS
+    task = next(task.id for task in adapter.enumerate_tasks() if task.id not in REVIEWED_TASKS)
+    episode = adapter.convert(task)
+    assert episode.evaluator.reference['gold_hypothesis']
+    public = json.dumps(episode.actor_input())
+    researcher = episode.researcher.model_dump_json()
+    assert episode.evaluator.reference['gold_hypothesis'] not in public
+    assert episode.evaluator.reference['gold_hypothesis'] not in researcher
+    metadata = json.loads((SOURCE / episode.conversion['metadata_path']).read_text())
+    assert episode.public.question == metadata['queries'][episode.conversion['query_group']][0]['question']
+    for fact in episode.researcher.facts:
+        assert fact.text in metadata['domain_knowledge']
+
+
+def test_changed_reviewed_metadata_fails_closed(adapter, tmp_path):
     task = adapter.pilot_task_ids()[0]
     original = adapter.convert(task)
     relative = original.conversion["metadata_path"]

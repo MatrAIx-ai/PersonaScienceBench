@@ -6,6 +6,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from statistics import mean
 import os
+import shutil
+import hashlib
 from summarize_persona_benchmark_scores import normalized
 from report_top_persona_deviations import simulator_behavior
 
@@ -53,6 +55,38 @@ def top_tables(rankings, common):
     return lines
 
 
+def publish_traces(rows):
+    destination = OUT / 'recorded_traces'
+    destination.mkdir(exist_ok=True)
+    mapping, inventory = {}, {}
+    for row in rows:
+        if not row.get('trace'):
+            continue
+        source = Path(row['trace'])
+        if not source.is_file():
+            continue
+        name = source.parent.parent.name + '.md'
+        target = destination / name
+        content = source.read_bytes()
+        if not target.exists() or target.read_bytes() != content:
+            temporary = target.with_suffix(".md.tmp")
+            temporary.write_bytes(content)
+            temporary.replace(target)
+        mapping[source.resolve()] = '../recorded_traces/' + name
+        inventory[name] = {'sha256': hashlib.sha256(target.read_bytes()).hexdigest(), 'bytes': target.stat().st_size}
+    import re
+    for index in (OUT / 'traces').glob('*.md'):
+        text = index.read_text()
+        def replace(match):
+            target = mapping.get((index.parent / match.group(1)).resolve())
+            return '[Read](' + target + ')' if target else match.group(0)
+        text = re.sub(r'\[Read\]\(([^)]+)\)', replace, text)
+        text = text.replace('raw traces require the local run directory.', 'recorded Markdown traces are included in the repository. Links inside them to raw JSON logs and execution artifacts remain local.')
+        index.write_text(text)
+    (destination / 'manifest.json').write_text(json.dumps(inventory, indent=2) + '\n')
+    (destination / 'README.md').write_text(f'# Recorded interaction traces\n\n{len(inventory)} exact recorded Markdown traces accompany the current report. They include recorded prompts, responses, tool activity and grading records. Raw JSON logs and execution artifacts linked inside them remain local. Browse the [report and persona indexes](../README.md).\n')
+
+
 def main():
     OUT.mkdir(parents=True,exist_ok=True)
     for name in ['profiles','traces']: (OUT/name).mkdir(exist_ok=True)
@@ -70,7 +104,9 @@ def main():
         rankings.append({'persona':arm,'on':on,'off':off,'delta':on-off,'pairs':pairs})
     rankings.sort(key=lambda r:(-abs(r['delta']),r['persona']))
     now=datetime.now(timezone.utc).isoformat(timespec='seconds')
-    lines=['# Full-persona experiment: partial results','',f'Snapshot: {now}. **{len(rows)}/310 episodes finished**. The batch continues; this report is a fixed snapshot, not a live counter.','',
+    complete = len(rows) == len(manifest['jobs'])
+    state = 'Final results' if complete else 'Partial results'
+    lines=[f'# Full-persona experiment: {state.lower()}','',f'Snapshot: {now}. **{len(rows)}/310 episodes finished**. ' + ('The batch is complete.' if complete else 'The batch continues; this report is a fixed snapshot.'),'',
         '30 source-balanced, behaviorally diverse profiles; two fixed questions per benchmark; one fresh shared persona-off baseline per question. Actor, simulator and judge use GPT-6 Luna with reasoning effort `none`. Full persona text is injected only into the simulator system prompt. Both conditions can use general knowledge; evaluator references remain private.','',
         'Scores use ASI score/max score, Bix grade, Discovery final score, EXP gated coverage/100 and SciConv FRR. **Missing submissions count as zero for both persona and baseline** in this report (an explicit analysis convention, not a fabricated native grade). Infrastructure failures and pending episodes are excluded. All comparisons are task-matched; these single-run descriptive results do not establish causality or statistical significance.','',
         '| Benchmark | Finished / 62 | Missing submissions: on / off | Infrastructure failures | Paired cases | Persona mean | Matched off mean | Difference |','|---|---:|---:|---:|---:|---:|---:|---:|']
@@ -85,9 +121,9 @@ def main():
         failures=sum(r['status'] not in {'scored','completed','missing_submission'} for r in rr)
         delta=f'{100*(on-off):+.2f} pp' if pairs else '—'
         lines.append(f'| {benchmark} | {len(rr)}/62 | {missing[0]} / {missing[1]} | {failures} | {len(pairs)} | {fmt(100*on) if on is not None else "—"}% | {fmt(100*off) if off is not None else "—"}% | {delta} |')
-    lines += ['', 'Partial benchmark means reflect the profiles that finished so far. Matched off means can differ by task mix; no baseline is regenerated. BixBench comparisons use the explicit missing-submission convention because both baseline runs produced no submission.','',
+    lines += ['', 'Benchmark means use available comparable outcomes; infrastructure failures are excluded. Matched off means can differ by task mix; no baseline is regenerated. BixBench comparisons use the explicit missing-submission convention because both baseline runs produced no submission.','',
               '## Ten largest absolute persona deviations','',
-              f'Ranking uses **the same {len(common)} questions for all 30 profiles**, with complete comparable outcomes: '+', '.join('`'+t+'`' for t in common)+'. Other benchmarks are excluded from this ranking until comparable coverage is available. No candidate is excluded by identity. Ties use candidate ID.','',
+              f'Ranking uses **the same {len(common)} questions for all 30 profiles**, with complete comparable outcomes: '+', '.join('`'+t+'`' for t in common)+'. Questions with an infrastructure or evaluator error in any arm are excluded from this common-task ranking. Missing submissions remain zero in both arms. No candidate is excluded by identity. Ties use candidate ID.','',
               'Turns are actor–simulator handoffs (native clarification Q&A for SciConv), excluding tool calls. Words/reply uses visible simulator replies, excluding initial requests and private evidence, averaged per task. Revisions count result-review requests for more work; SciConv has no such stage and is omitted. All behavioral columns use the same ranked questions and show persona on / matched off.','',
               ]
     for r in rankings:
@@ -114,12 +150,13 @@ def main():
     snapshot={'timestamp':now,'finished':len(rows),'total':310,'statuses':dict(Counter(r['status'] for r in rows)),'common_tasks':common,'benchmarks':stats,'rankings':[{k:v for k,v in r.items() if k!='pairs'} for r in rankings],'episodes':rows}
     (OUT/'snapshot.json').write_text(json.dumps(snapshot,indent=2)+'\n')
     readme=ROOT/'README.md';s=readme.read_text();start='<!-- FULL_PERSONA_RESULTS_START -->';end='<!-- FULL_PERSONA_RESULTS_END -->'
-    block=start+'\n\n## Current persona results\n\n'+f'Partial snapshot: **{len(rows)}/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).\n\n'
-    block+=f'Top deviations below use the same **{len(common)} completed questions** for every persona; they are not a five-benchmark final ranking. Differences are normalized score percentage points.\n\n'
+    block=start+'\n\n## Current persona results\n\n'+f'{state}: **{len(rows)}/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).\n\n'
+    block+=f'Top deviations below use the same **{len(common)} completed questions** for every persona; questions with infrastructure or evaluator errors are excluded for every persona. Differences are normalized score percentage points.\n\n'
     block+='\n'.join(x.replace('](profiles/','](reports/full_persona_v2/profiles/').replace('](traces/','](reports/full_persona_v2/traces/') for x in table)+'\n\n'+end
     if start in s:s=s[:s.index(start)]+block+s[s.index(end)+len(end):]
     else:s=s.replace('## Repository guide',block+'\n\n## Repository guide')
     readme.write_text(s)
+    publish_traces(rows)
     print(json.dumps({k:snapshot[k] for k in ['finished','statuses','common_tasks','benchmarks','rankings']},indent=2))
 
 if __name__=='__main__': main()

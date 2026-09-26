@@ -2,7 +2,7 @@
 
 [Exact persona](../profiles/candidate_244.md) · [Results](../README.md)
 
-Snapshot statuses; the recorded Markdown traces are included in this repository. Raw JSON logs and execution artifacts referenced inside them remain local. All ten questions are listed, including pending and unscored cases.
+Snapshot statuses; recorded Markdown traces are included in the repository. Links inside them to raw JSON logs and execution artifacts remain local. All ten questions are listed, including pending and unscored cases.
 
 | Task | Persona status | Score: on / off | Persona trace | Baseline trace | Turns: on / off |
 |---|---|---:|---|---|---:|

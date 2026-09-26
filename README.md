@@ -137,11 +137,11 @@ Run independent cases concurrently and use a fresh output directory for every at
 
 ## Experiment status
 
-The replacement full-persona experiment is running locally in
+The replacement full-persona experiment has completed locally in
 [runs/full-persona-v2-two-20260926](runs/full-persona-v2-two-20260926): 30 personas
 plus a fresh persona-off baseline, two fixed questions per retained benchmark
 (**310 episodes**). All model roles use GPT-6 Luna with reasoning effort `none`.
-Eight episodes run concurrently, with at most three Python execution workers.
+The batch began with eight episode slots and three Python workers; Python concurrency later increased to six.
 Full persona text is injected into the simulator system prompt only. Both arms
 can use general knowledge; native scoring references remain private. Exact
 configs, API traces, readable episode traces, and completion records are retained.
@@ -155,7 +155,7 @@ generated displays have been removed from the current worktree.
 Original persona data and benchmark inputs are retained. We are redesigning the
 persona injection and simulator interaction; preserving the old approved-facts
 boundary is not a requirement. The replacement runtime now supports full-profile system injection and general
-knowledge in the simulator. Results remain preliminary while the batch runs.
+knowledge in the simulator. All 310 episodes have finished; the final tables distinguish scored outcomes, missing submissions, and errors.
 
 The original 300 profiles have been rescreened: **180 are eligible**, including
 the previous 131 and 49 additional profiles. The three static rules require at
@@ -184,24 +184,24 @@ ignored by Git; the updated runners now consume these prompts.
 
 ## Current persona results
 
-Partial snapshot: **225/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).
+Final results: **310/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).
 
-Top deviations below use the same **4 completed questions** for every persona; they are not a five-benchmark final ranking. Differences are normalized score percentage points.
+Top deviations below use the same **8 completed questions** for every persona; questions with infrastructure or evaluator errors are excluded for every persona. Differences are normalized score percentage points.
 
-**Shared baseline: 48.33%.** All personas are compared on the same 4 questions. Sorted by absolute score change; positive means higher performance. Profile links show the exact injected identity.
+**Shared baseline: 26.01%.** All personas are compared on the same 8 questions. Sorted by absolute score change; positive means higher performance. Profile links show the exact injected identity.
 
 | Rank | Persona | Score | Change vs off | Traces |
 |---:|---|---:|---:|---|
-| 1 | [046](reports/full_persona_v2/profiles/candidate_046.md) | 5.42% | **-42.92 pp** | [Read](reports/full_persona_v2/traces/candidate_046.md) |
-| 2 | [003](reports/full_persona_v2/profiles/candidate_003.md) | 10.83% | **-37.50 pp** | [Read](reports/full_persona_v2/traces/candidate_003.md) |
-| 3 | [001](reports/full_persona_v2/profiles/candidate_001.md) | 16.17% | **-32.17 pp** | [Read](reports/full_persona_v2/traces/candidate_001.md) |
-| 4 | [132](reports/full_persona_v2/profiles/candidate_132.md) | 16.42% | **-31.92 pp** | [Read](reports/full_persona_v2/traces/candidate_132.md) |
-| 5 | [004](reports/full_persona_v2/profiles/candidate_004.md) | 16.92% | **-31.42 pp** | [Read](reports/full_persona_v2/traces/candidate_004.md) |
-| 6 | [127](reports/full_persona_v2/profiles/candidate_127.md) | 17.33% | **-31.00 pp** | [Read](reports/full_persona_v2/traces/candidate_127.md) |
-| 7 | [262](reports/full_persona_v2/profiles/candidate_262.md) | 19.00% | **-29.33 pp** | [Read](reports/full_persona_v2/traces/candidate_262.md) |
-| 8 | [089](reports/full_persona_v2/profiles/candidate_089.md) | 19.58% | **-28.75 pp** | [Read](reports/full_persona_v2/traces/candidate_089.md) |
-| 9 | [155](reports/full_persona_v2/profiles/candidate_155.md) | 76.00% | **+27.67 pp** | [Read](reports/full_persona_v2/traces/candidate_155.md) |
-| 10 | [224](reports/full_persona_v2/profiles/candidate_224.md) | 20.75% | **-27.58 pp** | [Read](reports/full_persona_v2/traces/candidate_224.md) |
+| 1 | [046](reports/full_persona_v2/profiles/candidate_046.md) | 4.54% | **-21.47 pp** | [Read](reports/full_persona_v2/traces/candidate_046.md) |
+| 2 | [003](reports/full_persona_v2/profiles/candidate_003.md) | 6.14% | **-19.87 pp** | [Read](reports/full_persona_v2/traces/candidate_003.md) |
+| 3 | [004](reports/full_persona_v2/profiles/candidate_004.md) | 9.33% | **-16.68 pp** | [Read](reports/full_persona_v2/traces/candidate_004.md) |
+| 4 | [089](reports/full_persona_v2/profiles/candidate_089.md) | 9.79% | **-16.22 pp** | [Read](reports/full_persona_v2/traces/candidate_089.md) |
+| 5 | [001](reports/full_persona_v2/profiles/candidate_001.md) | 9.91% | **-16.10 pp** | [Read](reports/full_persona_v2/traces/candidate_001.md) |
+| 6 | [127](reports/full_persona_v2/profiles/candidate_127.md) | 10.51% | **-15.50 pp** | [Read](reports/full_persona_v2/traces/candidate_127.md) |
+| 7 | [262](reports/full_persona_v2/profiles/candidate_262.md) | 11.33% | **-14.68 pp** | [Read](reports/full_persona_v2/traces/candidate_262.md) |
+| 8 | [224](reports/full_persona_v2/profiles/candidate_224.md) | 12.20% | **-13.81 pp** | [Read](reports/full_persona_v2/traces/candidate_224.md) |
+| 9 | [148](reports/full_persona_v2/profiles/candidate_148.md) | 39.37% | **+13.36 pp** | [Read](reports/full_persona_v2/traces/candidate_148.md) |
+| 10 | [026](reports/full_persona_v2/profiles/candidate_026.md) | 12.66% | **-13.35 pp** | [Read](reports/full_persona_v2/traces/candidate_026.md) |
 
 **Behavior on the same questions**
 
@@ -209,16 +209,16 @@ Each cell shows **persona on / baseline**. Rows follow the performance ranking.
 
 | Persona | Turns per question | Words per simulator reply | Revisions per question¹ |
 |---|---:|---:|---:|
-| [046](reports/full_persona_v2/profiles/candidate_046.md) | 2.50 / 4.00 | 45.90 / 40.02 | 0.00 / 0.00 |
-| [003](reports/full_persona_v2/profiles/candidate_003.md) | 3.25 / 4.00 | 45.91 / 40.02 | 0.00 / 0.00 |
-| [001](reports/full_persona_v2/profiles/candidate_001.md) | 4.00 / 4.00 | 50.48 / 40.02 | 0.00 / 0.00 |
-| [132](reports/full_persona_v2/profiles/candidate_132.md) | 3.75 / 4.00 | 53.98 / 40.02 | 0.00 / 0.00 |
-| [004](reports/full_persona_v2/profiles/candidate_004.md) | 3.25 / 4.00 | 51.25 / 40.02 | 0.00 / 0.00 |
-| [127](reports/full_persona_v2/profiles/candidate_127.md) | 3.75 / 4.00 | 46.38 / 40.02 | 0.00 / 0.00 |
-| [262](reports/full_persona_v2/profiles/candidate_262.md) | 1.75 / 4.00 | 44.25 / 40.02 | 0.00 / 0.00 |
-| [089](reports/full_persona_v2/profiles/candidate_089.md) | 4.00 / 4.00 | 54.33 / 40.02 | 0.00 / 0.00 |
-| [155](reports/full_persona_v2/profiles/candidate_155.md) | 3.50 / 4.00 | 20.77 / 40.02 | 0.00 / 0.00 |
-| [224](reports/full_persona_v2/profiles/candidate_224.md) | 4.25 / 4.00 | 51.53 / 40.02 | 0.00 / 0.00 |
+| [046](reports/full_persona_v2/profiles/candidate_046.md) | 2.38 / 3.38 | 70.76 / 65.99 | 0.17 / 0.33 |
+| [003](reports/full_persona_v2/profiles/candidate_003.md) | 3.88 / 3.38 | 66.73 / 65.99 | 0.00 / 0.33 |
+| [004](reports/full_persona_v2/profiles/candidate_004.md) | 3.88 / 3.38 | 69.05 / 65.99 | 0.00 / 0.33 |
+| [089](reports/full_persona_v2/profiles/candidate_089.md) | 4.25 / 3.38 | 69.53 / 65.99 | 0.00 / 0.33 |
+| [001](reports/full_persona_v2/profiles/candidate_001.md) | 4.25 / 3.38 | 70.60 / 65.99 | 0.00 / 0.33 |
+| [127](reports/full_persona_v2/profiles/candidate_127.md) | 4.50 / 3.38 | 70.49 / 65.99 | 0.50 / 0.33 |
+| [262](reports/full_persona_v2/profiles/candidate_262.md) | 2.25 / 3.38 | 68.95 / 65.99 | 0.00 / 0.33 |
+| [224](reports/full_persona_v2/profiles/candidate_224.md) | 4.38 / 3.38 | 65.12 / 65.99 | 0.00 / 0.33 |
+| [148](reports/full_persona_v2/profiles/candidate_148.md) | 3.88 / 3.38 | 72.61 / 65.99 | 0.00 / 0.33 |
+| [026](reports/full_persona_v2/profiles/candidate_026.md) | 3.50 / 3.38 | 74.09 / 65.99 | 0.33 / 0.33 |
 
 Turns exclude tool calls. Reply lengths exclude initial requests and private evidence. ¹ Revisions cover result-review benchmarks only; SciConv has no such stage. Trace indexes list all ten scheduled questions, while the tables use only the shared completed questions.
 

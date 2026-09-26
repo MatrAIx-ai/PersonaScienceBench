@@ -2,14 +2,14 @@
 
 [Exact persona](../profiles/candidate_132.md) · [Results](../README.md)
 
-Snapshot statuses; the recorded Markdown traces are included in this repository. Raw JSON logs and execution artifacts referenced inside them remain local. All ten questions are listed, including pending and unscored cases.
+Snapshot statuses; recorded Markdown traces are included in the repository. Links inside them to raw JSON logs and execution artifacts remain local. All ten questions are listed, including pending and unscored cases.
 
 | Task | Persona status | Score: on / off | Persona trace | Baseline trace | Turns: on / off |
 |---|---|---:|---|---|---:|
 | `discoverybench:test/archaeology/metadata_21.json/0/0` | scored | 0.00 / 0.00 | [Read](../recorded_traces/candidate_132-5636a4f47387.md) | [Read](../recorded_traces/persona_off-5636a4f47387.md) | 2 / 3 |
-| `discoverybench:train/nls_bmi_raw/metadata_1.json/0/0` | pending | — / 0.00 | Pending/unavailable | [Read](../recorded_traces/persona_off-65d11254c3ec.md) | — / 2 |
-| `bixbench:bix-30-q3` | pending | — / 0.00 | Pending/unavailable | [Read](../recorded_traces/persona_off-66391609ed85.md) | — / 3 |
-| `bixbench:bix-9-q5` | pending | — / 0.00 | Pending/unavailable | [Read](../recorded_traces/persona_off-dedb31fc5cc4.md) | — / 2 |
+| `discoverybench:train/nls_bmi_raw/metadata_1.json/0/0` | scored | 0.00 / 0.00 | [Read](../recorded_traces/candidate_132-65d11254c3ec.md) | [Read](../recorded_traces/persona_off-65d11254c3ec.md) | 2 / 2 |
+| `bixbench:bix-30-q3` | scored | 1.00 / 0.00 | [Read](../recorded_traces/candidate_132-66391609ed85.md) | [Read](../recorded_traces/persona_off-66391609ed85.md) | 7 / 3 |
+| `bixbench:bix-9-q5` | scored | 1.00 / 0.00 | [Read](../recorded_traces/candidate_132-dedb31fc5cc4.md) | [Read](../recorded_traces/persona_off-dedb31fc5cc4.md) | 2 / 2 |
 | `asibench:materials.relaxation_mode_recovery` | scored | 0.15 / 0.15 | [Read](../recorded_traces/candidate_132-ad80481c261e.md) | [Read](../recorded_traces/persona_off-ad80481c261e.md) | 2 / 2 |
 | `asibench:math.nnls_modulus_deblur` | scored | 0.00 / 0.00 | [Read](../recorded_traces/candidate_132-bdb8b6dd4a8c.md) | [Read](../recorded_traces/persona_off-bdb8b6dd4a8c.md) | 2 / 3 |
 | `sciconvbench:solMech/disambiguation/case_104` | scored | 0.00 / 1.00 | [Read](../recorded_traces/candidate_132-b5331aa3b9ba.md) | [Read](../recorded_traces/persona_off-b5331aa3b9ba.md) | 1 / 2 |

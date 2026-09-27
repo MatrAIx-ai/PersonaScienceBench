@@ -233,6 +233,13 @@ class ScriptedResearcher(ActiveResearcher):
             decision = ResearcherDecision(action="continue", interaction="next_task",
                 message="Approach approved. Carry out the main work and hand off the result.",
                 evidence=evidence, objectives_open=[], approve_approach=True)
+        elif handoff["payload"].get("controller_contract_check") and remaining_requests > 1:
+            # A script that stopped on a contract-rejected result would end the bound arm without a submission.
+            missing = ", ".join(handoff["payload"]["controller_contract_check"].get("missing", []))
+            decision = ResearcherDecision(action="continue", interaction="refine_analysis",
+                message=f"The result does not satisfy the submission contract; missing: {missing}. "
+                        "Revise and hand off a complete result.",
+                evidence=evidence, objectives_open=[missing])
         else:
             decision = ResearcherDecision(action="stop", interaction="conclude", message="Thank you; this concludes the work.",
                                           evidence=evidence, objectives_open=[])

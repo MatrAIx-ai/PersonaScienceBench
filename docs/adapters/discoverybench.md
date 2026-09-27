@@ -95,6 +95,18 @@ researcher identity changes. They do not establish persona fidelity or an effect
 on scientific performance. Full-profile identities use the existing
 `persona.system_prompt` path and the same task boundary.
 
+### Focused attribute pilot
+
+The [ecology persona pilot](../../reports/discoverybench_ecology_persona_pilot/README.md)
+examines behavioral diversity in six episodes on the urban-land-use question:
+persona off, medium reference, and low/high contrasts for assumption visibility
+and sensitivity scope. Sensitivity breadth differed between the low/high
+conditions; assumption visibility was less clearly expressed. All six submitted
+and received native scores of zero, reported separately from the behavioral
+observations. The report includes configurations, recorded profiles, readable
+traces and limitations. It is a descriptive pilot on one question from one study;
+a native-score increase is not required for a useful persona contrast.
+
 ### Prepare and validate
 
 ```bash

@@ -9,6 +9,7 @@ from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 
+from personasciencebench.arms import PERSONA, arm_kind, is_control
 from summarize_persona_benchmark_scores import normalized
 
 
@@ -41,10 +42,6 @@ def simulator_behavior(trace, benchmark):
             "revision_requests": revisions}
 
 
-def is_control(arm):
-    return arm == "persona_off" or arm.startswith("persona_off_r")
-
-
 def mean_or_none(values):
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
@@ -57,6 +54,7 @@ def persona_score(row):
 
 def benchmark_rankings(episodes, personas):
     """Rank personas separately per benchmark over the tasks that every persona and the control mean can score."""
+    personas = [p for p in personas if arm_kind(p) == PERSONA]
     controls, lookup = defaultdict(list), {}
     for r in episodes:
         if is_control(r["arm"]):

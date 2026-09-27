@@ -24,7 +24,7 @@ import time
 import tokenize
 import tomllib
 
-from personasciencebench.arms import CONTROL, PERSONA, arm_kind, is_control, twin_of, TWIN_SUFFIX
+from personasciencebench.arms import CEILING, CONTROL, FLOOR, PERSONA, TWIN, arm_kind, is_control, twin_of, TWIN_SUFFIX
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = str(ROOT / '.venv/bin/python')
@@ -121,6 +121,8 @@ def build(output, control_reps=1, twins=0, neutral_arms=False, bound_arms=False,
     shared.pop('actor_python_overrides', None)
     exp = tomllib.loads((ROOT / 'configs/expbench/conversion-v2-two.toml').read_text())
     exp['collaboration'].update(unrestricted_knowledge=True, embody_identity=True)
+    if truthful_history:
+        exp['collaboration']['truthful_history'] = True
     for config in [shared, exp]:
         for model in config['models'].values():
             assert model['model'] == 'openai/gpt-6-luna' and model['reasoning_effort'] == 'none'
@@ -182,11 +184,8 @@ def build(output, control_reps=1, twins=0, neutral_arms=False, bound_arms=False,
         'models': shared['models']}
     if twins:
         manifest['twins'] = twin_sources
-    exp_ignores = 'src/expbench/collaboration.py constructs ActiveResearcher directly and forwards only unrestricted_knowledge and embody_identity, so an EXP config cannot select {}'
     if bound_arms:
-        manifest['bounds_skipped'] = {'expbench': exp_ignores.format('the scripted researcher_policy') + '; floor/ceiling arms have no EXP jobs'}
-    if truthful_history:
-        manifest['truthful_history_skipped'] = {'expbench': exp_ignores.format('truthful_history') + '; EXP configs leave it unset'}
+        manifest['bounds_skipped'] = {'expbench': 'ExpBench has no scripted researcher and rejects researcher_policy other than llm; floor/ceiling arms have no EXP jobs'}
     write(output / 'manifest.json', manifest)
     return manifest
 
@@ -227,6 +226,49 @@ def execute(output, job):
                                       cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
         result['trace_render_returncode'] = rendering.returncode
     write(output / 'finished' / (job['key'] + '.json'), result)
+    return result
+
+
+def spread(values):
+    return {'mean': sum(values)/len(values), 'min': min(values), 'max': max(values), 'n': len(values)} if values else None
+
+
+def noise_floor(rows, comparisons, primary):
+    """Per benchmark primary metric: control SD, placebo contrasts, bound means and personas outside the placebo band."""
+    result = {}
+    for benchmark, metric in sorted(primary.items()):
+        selected = [r for r in rows if r['benchmark'] == benchmark]
+        if not selected:
+            continue
+        value = {(r['arm'], r['task']): r['metrics'][metric] for r in selected
+                 if isinstance(r['metrics'].get(metric), (int, float)) and not isinstance(r['metrics'][metric], bool)}
+        tasks = sorted({r['task'] for r in selected})
+        arms = sorted({r['arm'] for r in selected})
+        def contrast(a, b):
+            return [value[a, t] - value[b, t] for t in tasks if (a, t) in value and (b, t) in value]
+        sds = []
+        for task in tasks:
+            reps = [value[a, task] for a in arms if is_control(a) and (a, task) in value]
+            if len(reps) > 1:
+                sds.append(statistics.stdev(reps))
+        twins = {arm: contrast(arm, twin_of(arm)) for arm in arms if arm_kind(arm) == TWIN}
+        neutral = contrast('neutral_b', 'neutral_a')
+        per_arm = [sum(v)/len(v) for v in [*twins.values(), neutral] if v]
+        band = [min(per_arm), max(per_arm)] if per_arm else None
+        deltas = defaultdict(list)
+        for pair in comparisons:
+            if pair['benchmark'] == benchmark and metric in pair['delta']['metrics']:
+                deltas[pair['arm']].append(pair['delta']['metrics'][metric])
+        means = [sum(v)/len(v) for v in deltas.values()]
+        bound = lambda kind: [v for (a, _), v in value.items() if arm_kind(a) == kind]
+        result[benchmark] = {'metric': metric,
+            'control_sd': sum(sds)/len(sds) if sds else None, 'control_sd_tasks': len(sds),
+            'twin_minus_source': spread([d for v in twins.values() for d in v]),
+            'neutral_b_minus_a': spread(neutral),
+            'floor_mean': spread(bound(FLOOR))['mean'] if bound(FLOOR) else None,
+            'ceiling_mean': spread(bound(CEILING))['mean'] if bound(CEILING) else None,
+            'placebo_band': band, 'personas': len(means),
+            'personas_outside_band': sum(not band[0] <= m <= band[1] for m in means) if band else None}
     return result
 
 
@@ -333,7 +375,7 @@ def report(output):
         if is_control(r['arm']):
             controls[r['task']].append(r)
     summaries = {task: control_summary(group) for task, group in controls.items()}
-    comparisons = []
+    comparisons, references = [], []
     for row in rows:
         if is_control(row['arm']) or row['task'] not in controls:
             continue
@@ -344,14 +386,18 @@ def report(output):
                            if isinstance(v, (int, float)) and not isinstance(v, bool) and k in base[group]}
         diff['control_sd'] = {group: {k: sd[group][k] for k in diff[group]} for group in ['metrics', 'behavior']}
         statuses = [c['status'] for c in controls[row['task']]]
-        comparisons.append({'arm': row['arm'], 'task': row['task'], 'benchmark': row['benchmark'],
+        (comparisons if arm_kind(row['arm']) == PERSONA else references).append({'arm': row['arm'], 'task': row['task'], 'benchmark': row['benchmark'],
                             'persona_status': row['status'], 'n_controls': len(statuses),
                             'control_status': statuses[0] if len(set(statuses)) == 1 else 'mixed',
                             'control_statuses': statuses, 'delta': diff})
     control_counts = sorted(set(len(v) for v in controls.values()))
     control_text = ('no' if not control_counts else str(control_counts[0]) if len(control_counts) == 1
                     else f'{control_counts[0]}–{control_counts[-1]}')
-    write(output / 'comparison.json', {'episodes': rows, 'paired_differences': comparisons, 'attempts': attempts})
+    primary = {'asibench': 'score', 'bixbench': 'grade', 'discoverybench': 'final_score',
+               'expbench': 'gated_coverage_mean', 'sciconvbench': 'FRR'}
+    noise = noise_floor(rows, comparisons, primary)
+    write(output / 'comparison.json', {'episodes': rows, 'paired_differences': comparisons,
+                                       'reference_differences': references, 'noise_floor': noise, 'attempts': attempts})
     lines = ['# Persona benchmark comparison', '',
              f"Completed records: {len(rows)} / {len(manifest['jobs'])}. Statuses: {dict(Counter(r['status'] for r in rows))}.", '',
              f'30 source-balanced, behaviorally diverse full profiles; five fixed tasks for each of five benchmarks; {control_text} fresh shared off control run(s) per task; each persona is compared with the per-task control mean.',
@@ -372,9 +418,7 @@ def report(output):
                      if p['persona_status'] in {'scored','completed','missing_submission'}
                      and p['control_status'] in {'scored','completed','missing_submission'}]
         exchange_text = f'{sum(exchanges)/len(exchanges):+.2f}' if exchanges else 'pending'
-        lines.append(f"| {benchmark} | {sum(not is_control(r['arm']) for r in selected)} | {sum(is_control(r['arm']) for r in selected)} | {mean_metrics or 'pending'} | {exchange_text} |")
-    primary = {'asibench': 'score', 'bixbench': 'grade', 'discoverybench': 'final_score',
-               'expbench': 'gated_coverage_mean', 'sciconvbench': 'FRR'}
+        lines.append(f"| {benchmark} | {sum(arm_kind(r['arm']) == PERSONA for r in selected)} | {sum(is_control(r['arm']) for r in selected)} | {mean_metrics or 'pending'} | {exchange_text} |")
     lines += ['', '## Native score distributions', '',
               'Each entry is a profile/task contrast with the mean of its shared off control run(s). Higher/lower counts describe observed outcomes, not statistically significant effects.', '',
               '| Benchmark | Metric | Higher / equal / lower | Minimum delta | Maximum delta |', '|---|---|---:|---:|---:|']
@@ -384,6 +428,21 @@ def report(output):
         if values:
             counts = f'{sum(v>0 for v in values)} / {sum(v==0 for v in values)} / {sum(v<0 for v in values)}'
             lines.append(f'| {benchmark} | {metric} | {counts} | {min(values):+.4f} | {max(values):+.4f} |')
+    lines += ['', '## Noise floor', '',
+              'Spread expected without a persona effect, on each benchmark\'s primary metric. Control SD is the per-task SD over control reps, averaged over tasks with two or more. '
+              'Twin − source and neutral_b − neutral_a are per-task differences between arms that carry the same content or no distinctive identity. '
+              'The placebo band is [min, max] of the per-arm mean twin and neutral contrasts; personas outside it are counted by their mean delta vs control. '
+              'The band is descriptive, not a significance test.', '',
+              '| Benchmark | Metric | Control SD | Twin − source: mean [min, max] (n) | neutral_b − neutral_a: mean [min, max] (n) | Floor mean | Ceiling mean | Placebo band | Personas outside band |',
+              '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+    number = lambda v: '—' if v is None else f'{v:+.4f}'
+    spread_text = lambda d: '—' if d is None else f"{d['mean']:+.4f} [{d['min']:+.4f}, {d['max']:+.4f}] (n={d['n']})"
+    for benchmark, floor in noise.items():
+        band = floor['placebo_band']
+        lines.append(f"| {benchmark} | {floor['metric']} | {number(floor['control_sd'])} | {spread_text(floor['twin_minus_source'])} | "
+                     f"{spread_text(floor['neutral_b_minus_a'])} | {number(floor['floor_mean'])} | {number(floor['ceiling_mean'])} | "
+                     + ('—' if band is None else f'[{band[0]:+.4f}, {band[1]:+.4f}]')
+                     + f" | {'—' if floor['personas_outside_band'] is None else floor['personas_outside_band']} / {floor['personas']} |")
     lines += ['', '## Behavioral differences', '',
               'Mean persona-minus-control changes among completed pairs. Code measures cover only sealed Python deliverables present in both arms; they are descriptive proxies, not persona-fidelity scores.', '',
               '| Benchmark | Measure | Mean change | Paired observations |', '|---|---|---:|---:|']
@@ -399,7 +458,7 @@ def report(output):
               'Missing submissions and infrastructure errors remain explicit. Native score changes are computed only where both arms have a score; no missing result is imputed as zero unless the native runner already applies that policy.', '',
               '| Task | Control status | Persona status counts | Native score changes |', '|---|---|---|---|']
     for task in sorted({r['task'] for r in rows}):
-        task_rows = [r for r in rows if r['task']==task and not is_control(r['arm'])]
+        task_rows = [r for r in rows if r['task']==task and arm_kind(r['arm']) == PERSONA]
         task_values = defaultdict(list)
         for pair in comparisons:
             if pair['task']==task:

@@ -8,6 +8,7 @@ from statistics import mean
 import os
 import shutil
 import hashlib
+from personasciencebench.arms import CONTROL, PERSONA, arm_kind, is_control
 from summarize_persona_benchmark_scores import normalized
 from report_top_persona_deviations import simulator_behavior
 
@@ -27,7 +28,6 @@ def ungated(row):
     if row['status'] not in {'scored','completed'} or 'coverage_mean' not in row['metrics']: return None
     return float(row['metrics']['coverage_mean'])/100.0
 
-def is_control(arm): return arm=='persona_off' or arm.startswith('persona_off_r')
 def control_mean(rows,fn=None):
     vals=[v for v in ((fn or score)(r) for r in rows) if v is not None]
     return mean(vals) if vals else None
@@ -103,7 +103,7 @@ def main():
     for name in ['profiles','traces']: (OUT/name).mkdir(exist_ok=True)
     data=json.loads((RUN/'comparison.json').read_text())
     manifest=json.loads((RUN/'manifest.json').read_text())
-    rows=data['episodes']; tasks=manifest['tasks']; arms=sorted(a for a in {j['arm'] for j in manifest['jobs']} if not is_control(a))
+    rows=data['episodes']; tasks=manifest['tasks']; arms=sorted(a for a in {j['arm'] for j in manifest['jobs']} if arm_kind(a)==PERSONA)
     lookup={(r['arm'],r['task']):r for r in rows}
     controls={t['id']:[] for t in tasks}
     for r in rows:
@@ -126,7 +126,7 @@ def main():
     stats=[]
     for benchmark in sorted({t['benchmark'] for t in tasks}):
         rr=[r for r in rows if r['benchmark']==benchmark]
-        pairs=[(r,controls[r['task']]) for r in rr if not is_control(r['arm']) and score(r) is not None and control_mean(controls[r['task']]) is not None]
+        pairs=[(r,controls[r['task']]) for r in rr if arm_kind(r['arm'])==PERSONA and score(r) is not None and control_mean(controls[r['task']]) is not None]
         on=mean(score(a) for a,b in pairs) if pairs else None;off=mean(control_mean(b) for a,b in pairs) if pairs else None
         record={'benchmark':benchmark,'finished':len(rr),'pairs':len(pairs),'on':on,'off':off,'delta':on-off if pairs else None}
         ungated_text='—'
@@ -136,7 +136,7 @@ def main():
             record.update(ungated_on=mean(a for a,b in upairs) if upairs else None,ungated_off=mean(b for a,b in upairs) if upairs else None,ungated_pairs=len(upairs))
             if upairs: ungated_text=f'{fmt(100*record["ungated_on"])}% / {fmt(100*record["ungated_off"])}% (n={len(upairs)})'
         stats.append(record)
-        missing=[sum(r['status']=='missing_submission' and is_control(r['arm'])==control for r in rr) for control in [False,True]]
+        missing=[sum(r['status']=='missing_submission' and arm_kind(r['arm'])==kind for r in rr) for kind in [PERSONA,CONTROL]]
         failures=sum(r['status'] not in {'scored','completed','missing_submission'} for r in rr)
         delta=f'{100*(on-off):+.2f} pp' if pairs else '—'
         lines.append(f'| {benchmark} | {len(rr)}/62 | {missing[0]} / {missing[1]} | {failures} | {len(pairs)} | {fmt(100*on) if on is not None else "—"}% | {fmt(100*off) if off is not None else "—"}% | {delta} | {ungated_text} |')

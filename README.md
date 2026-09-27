@@ -37,6 +37,7 @@ Follow the [Linux setup and migration guide](docs/reproducibility.md). The [pers
 | `reports/full_persona_v2/` | Preserved experiment results, profiles, trace indexes, full traces and case studies |
 | `configs/full_persona_v2/` | Frozen cohort, task selection and model/protocol settings |
 | `docs/design/benchmark_paper_plan.md` | Authoritative future study and paper plan |
+| `docs/persona_controls.md` | Calibration arms (placebo twins, neutral identities, floor/ceiling) and post-hoc checks (persona visibility, SciConv per-item scores, fixed-agent replay) |
 | `src/`, `scripts/`, `tests/` | Runners, conversion/analysis tools and offline checks |
 | `manifests/` | Pinned upstream sources and checksums |
 | `data/`, `external/`, `prepared/`, `runs/` | Ignored local inputs and runtime artifacts; transfer or regenerate explicitly |

@@ -172,15 +172,16 @@ def markdown(summary):
 
 def run(args, client=None):
     run_dir = args.run.resolve()
-    out = run_dir / OUTPUT
-    records = load_run(run_dir)
+    base = run_dir / 'replay' if args.replay else run_dir
+    out = base / OUTPUT
+    records = load_run(run_dir, replay=args.replay)
     profiles = cohort(run_dir, records)
     if len(profiles) < args.k:
         raise ValueError(f'Only {len(profiles)} cohort profiles for k={args.k}')
     results_path = out / 'results.jsonl'
     done = set() if args.force else {r['key'] for r in jsonl(results_path)}
     todo = [r for r in records if r['kind'] in (PERSONA, TWIN, NEUTRAL) and r['key'] not in done]
-    caller = JudgeCaller(run_dir, NAME, model_spec(run_dir, args.model), budget_usd=args.budget_usd,
+    caller = JudgeCaller(base, NAME, model_spec(run_dir, args.model), budget_usd=args.budget_usd,
                          dry_run=args.dry_run, price_in=args.price_in, price_out=args.price_out, client=client)
     if args.force and results_path.exists() and not args.dry_run:
         results_path.unlink()
@@ -213,6 +214,7 @@ def run(args, client=None):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', type=Path, required=True)
+    p.add_argument('--replay', action='store_true', help='Score the replayed replies under <run>/replay/ instead of the run')
     p.add_argument('--model', help='Judge model; default: the judge in configs/persona_off/shared.json')
     p.add_argument('--budget-usd', type=float, required=True)
     p.add_argument('--k', type=int, default=4)

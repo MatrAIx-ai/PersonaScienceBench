@@ -39,11 +39,11 @@ def find_case(run, job, finished):
     return found[0].parent.parent if len(found) == 1 else None
 
 
-def load_run(run):
+def load_run(run, replay=False):
     """One record per (arm, task), latest attempt, as the benchmark report counts them.
 
     Replay-only case dirs (controller/events.jsonl and controller/episode.private.json) load the same way;
-    fields they lack are None.
+    fields they lack are None. replay=True reads replay_fixed_agent.py's <run>/replay/<arm>/<task slug>/ instead.
     """
     run = Path(run)
     manifest = read_json(run / 'manifest.json')
@@ -55,7 +55,7 @@ def load_run(run):
             if record.get('arm') == job['arm'] and record.get('id') == job['id'] \
                     and record.get('attempt', 1) >= finished.get('attempt', 1):
                 finished = record
-        case = find_case(run, job, finished)
+        case = (run / 'replay' / job['arm'] / job['slug']) if replay else find_case(run, job, finished)
         if case is None or not (case / 'controller/episode.private.json').exists():
             continue
         episode = read_json(case / 'controller/episode.private.json')

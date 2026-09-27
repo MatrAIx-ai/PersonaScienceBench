@@ -236,3 +236,14 @@ def test_failed_prompt_edit_is_a_failed_unit(tmp_path):
     assert summary["units"] == {"completed": 1, "failed": 1}
     assert not (run / "replay/persona_off/sc1").exists()
     assert not [p for p in fake.payloads if not p.get("tools")]
+
+
+def test_replayed_sciconv_units_load_for_the_post_hoc_scorers(tmp_path):
+    from personasciencebench.run_io import load_run, sciconv_turns
+    run, native, _ = build_run(tmp_path)
+    make(run, native, Fake()).execute()
+    records = {r["arm"]: r for r in load_run(run, replay=True) if r["benchmark"] == "sciconvbench"}
+    assert set(records) == {"persona_off", "p1"}
+    for record in records.values():
+        assert record["case"].parent.parent == run / "replay"
+        assert [t["question"] for t in sciconv_turns(record["events"])] == ["Q1?", "Q2?"]

@@ -271,9 +271,10 @@ def markdown(summary):
 
 def run(args, client=None):
     run_dir = args.run.resolve()
-    records = [r for r in load_run(run_dir) if r['benchmark'] == 'sciconvbench']
+    base = run_dir / 'replay' if args.replay else run_dir
+    records = [r for r in load_run(run_dir, replay=args.replay) if r['benchmark'] == 'sciconvbench']
     todo = [r for r in records if args.force or not (r['case'] / 'item_scores.json').exists()]
-    caller = JudgeCaller(run_dir, NAME, model_spec(run_dir, args.model), budget_usd=args.budget_usd,
+    caller = JudgeCaller(base, NAME, model_spec(run_dir, args.model), budget_usd=args.budget_usd,
                          dry_run=args.dry_run, price_in=args.price_in, price_out=args.price_out, client=client)
     stopped = []
 
@@ -293,14 +294,15 @@ def run(args, client=None):
     if not args.dry_run:
         scores = [read_json(r['case'] / 'item_scores.json') for r in records if (r['case'] / 'item_scores.json').exists()]
         summary = summarize(scores)
-        write_json(run_dir / OUTPUT / 'summary.json', {**summary, 'calls': report})
-        (run_dir / OUTPUT / 'SUMMARY.md').write_text(markdown(summary))
+        write_json(base / OUTPUT / 'summary.json', {**summary, 'calls': report})
+        (base / OUTPUT / 'SUMMARY.md').write_text(markdown(summary))
     return report
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', type=Path, required=True)
+    p.add_argument('--replay', action='store_true', help='Score the replayed replies under <run>/replay/ instead of the run')
     p.add_argument('--model', help='Judge model; default: the judge in configs/persona_off/shared.json')
     p.add_argument('--budget-usd', type=float, required=True)
     p.add_argument('--dry-run', action='store_true')

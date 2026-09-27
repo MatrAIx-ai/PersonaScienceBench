@@ -24,6 +24,8 @@ import time
 import tokenize
 import tomllib
 
+from personasciencebench.arms import CONTROL, PERSONA, arm_kind, is_control, twin_of, TWIN_SUFFIX
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = str(ROOT / '.venv/bin/python')
 
@@ -43,10 +45,6 @@ def jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
 
 
-def is_control(arm):
-    return arm == 'persona_off' or arm.startswith('persona_off_r')
-
-
 def control_summary(rows):
     """Per-key mean and sample SD (None below two values) over numeric control metrics and behavior."""
     means, sds = {}, {}
@@ -61,7 +59,29 @@ def control_summary(rows):
     return means, sds
 
 
-def build(output, control_reps=1):
+def reorder_bullets(text, seed):
+    """Shuffle '- ' bullet lines within each '#' section; headers and all other lines keep their positions."""
+    rng = random.Random(seed)
+    lines = text.split('\n')
+    sections = [[]]
+    for i, line in enumerate(lines):
+        if line.startswith('#'):
+            sections.append([])
+        elif line.startswith('- '):
+            sections[-1].append(i)
+    for positions in sections:
+        bullets = [lines[i] for i in positions]
+        rng.shuffle(bullets)
+        for i, bullet in zip(positions, bullets):
+            lines[i] = bullet
+    return '\n'.join(lines)
+
+
+# Scripted researcher policy of each bound arm (CollaborationConfig.researcher_policy).
+BOUND_POLICIES = {'floor_mute': 'mute', 'ceiling_oracle': 'oracle'}
+
+
+def build(output, control_reps=1, twins=0, neutral_arms=False, bound_arms=False, truthful_history=False):
     from personasciencebench.persona import Persona, persona_record
     cohort = ROOT / 'data/persona_case_study/full_persona_v2'
     cohort_manifest = read(cohort / 'manifest.json')
@@ -73,11 +93,29 @@ def build(output, control_reps=1):
         assert hashlib.sha256(prompt.encode()).hexdigest() == row['prompt_sha256']
         profiles[row['candidate_id']] = {'enabled': True, 'id': row['candidate_id'],
             'version': 'full-persona-v2', 'system_prompt': prompt}
-    assert len(profiles) == 30 + control_reps
+    twin_sources = {}
+    for source in random.Random(20260927).sample(sorted(r['candidate_id'] for r in cohort_manifest['profiles']), twins):
+        prompt = profiles[source]['system_prompt']
+        reordered = reorder_bullets(prompt, source)
+        assert sorted(reordered.split('\n')) == sorted(prompt.split('\n')) and reordered != prompt, source
+        arm = source + TWIN_SUFFIX
+        profiles[arm] = {'enabled': True, 'id': arm, 'version': 'full-persona-v2', 'system_prompt': reordered}
+        twin_sources[arm] = source
+    if neutral_arms:
+        for arm in ['neutral_a', 'neutral_b']:
+            profiles[arm] = {'enabled': True, 'id': arm, 'version': 'neutral-v1',
+                             'system_prompt': (ROOT / 'configs/persona_controls' / f'{arm}.txt').read_text()}
+    if bound_arms:
+        for arm in BOUND_POLICIES:
+            profiles[arm] = {'enabled': False}
+    kinds = Counter(arm_kind(arm) for arm in profiles)
+    assert kinds[CONTROL] == control_reps and kinds[PERSONA] == 30
     shared = read(ROOT / 'configs/conversion-v2-two.json')
     shared['pilot_cases_per_benchmark'] = 1
     # full_persona_v2 settings, now as separate switches: general knowledge, persona-set style, volunteering (SciConv).
     shared['collaboration'].update(unrestricted_knowledge=True, embody_identity=True, volunteer_information=True)
+    if truthful_history:
+        shared['collaboration']['truthful_history'] = True
     shared['notes'] = ['Full MatrAIx profile in simulator system prompt; unrestricted general knowledge for all arms.',
         f'Five fixed tasks per benchmark; 30 personas and {control_reps} fresh shared baseline run(s) per task; native scoring unchanged.']
     shared.pop('actor_python_overrides', None)
@@ -112,13 +150,16 @@ def build(output, control_reps=1):
     assert len(tasks) == 25 and len({t['id'] for t in tasks}) == 25
     assert set(Counter(t['benchmark'] for t in tasks).values()) == {5}
     for arm, profile in profiles.items():
-        write(output / 'configs' / arm / 'shared.json', {**deepcopy(shared), 'persona': profile})
+        arm_shared = deepcopy(shared)
+        if arm in BOUND_POLICIES:
+            arm_shared['collaboration']['researcher_policy'] = BOUND_POLICIES[arm]
+        write(output / 'configs' / arm / 'shared.json', {**arm_shared, 'persona': profile})
         write(output / 'configs' / arm / 'exp.json', {**deepcopy(exp), 'persona': profile})
         write(output / 'configs' / arm / 'persona.private.json', persona_record(Persona.model_validate(profile)))
     # Baselines start first; randomize the remaining work to interleave profiles.
     jobs = []
     for arm in profiles:
-        arm_tasks = list(tasks)
+        arm_tasks = [t for t in tasks if not (arm in BOUND_POLICIES and t['kind'] == 'exp')]
         random.Random(arm).shuffle(arm_tasks)
         for task in arm_tasks:
             jobs.append({**task, 'arm': arm, 'key': arm + '-' + task['slug']})
@@ -134,9 +175,18 @@ def build(output, control_reps=1):
         'selection': cohort_manifest['selection'], 'persona_diversity': cohort_manifest['diversity'],
         'task_selection': 'Seed 20260926 shuffle of asset-ready catalogs with distinct studies; ASI three existing ready instances plus astronomy and biology public CPU instances; EXP five distinct papers.',
         'controls': (f'{control_reps} fresh persona-off runs per task; their mean is' if control_reps > 1 else 'One fresh persona-off run per task,')
-            + ' shared across all 30 profile comparisons; not independent replicates',
+            + ' shared across all 30 profile comparisons; not independent replicates'
+            + ('. Reference arms (reordered twins, neutral identities, floor/ceiling researchers) calibrate noise and are never ranked'
+               if len(profiles) > 30 + control_reps else ''),
         'injection': 'Exact full profile in simulator system prompt only; general knowledge allowed in both conditions; evaluator references remain private',
         'models': shared['models']}
+    if twins:
+        manifest['twins'] = twin_sources
+    exp_ignores = 'src/expbench/collaboration.py constructs ActiveResearcher directly and forwards only unrestricted_knowledge and embody_identity, so an EXP config cannot select {}'
+    if bound_arms:
+        manifest['bounds_skipped'] = {'expbench': exp_ignores.format('the scripted researcher_policy') + '; floor/ceiling arms have no EXP jobs'}
+    if truthful_history:
+        manifest['truthful_history_skipped'] = {'expbench': exp_ignores.format('truthful_history') + '; EXP configs leave it unset'}
     write(output / 'manifest.json', manifest)
     return manifest
 
@@ -376,6 +426,13 @@ def main():
     parser.add_argument('--terminal-slots', type=int, default=1)
     parser.add_argument('--control-reps', type=int, default=1,
                         help='Persona-off runs per task for a fresh build (persona_off, persona_off_r2, ...)')
+    parser.add_argument('--twins', type=int, default=0,
+                        help='Cohort profiles that also run as a bullet-reordered twin (<id>__reordered) for a fresh build')
+    parser.add_argument('--neutral-arms', action='store_true', help='Add the neutral_a and neutral_b identity arms to a fresh build')
+    parser.add_argument('--bound-arms', action='store_true',
+                        help='Add floor_mute and ceiling_oracle scripted-researcher arms to a fresh build')
+    parser.add_argument('--truthful-history', action='store_true',
+                        help='Instruct the simulated researcher in every arm not to claim disclosures that did not happen')
     parser.add_argument('--after-pid', type=int, help='Wait for an earlier draining scheduler before resuming')
     args = parser.parse_args()
     if args.after_pid:
@@ -395,7 +452,8 @@ def main():
         return
     output.mkdir(parents=True, exist_ok=True)
     output.chmod(0o700)
-    manifest = read(output/'manifest.json') if (output/'manifest.json').exists() else build(output, args.control_reps)
+    manifest = (read(output/'manifest.json') if (output/'manifest.json').exists()
+                else build(output, args.control_reps, args.twins, args.neutral_arms, args.bound_arms, args.truthful_history))
     pending = [j for j in manifest['jobs'] if not (output/'finished'/(j['key']+'.json')).exists()]
     completed_original = len(manifest['jobs']) - len(pending)
     if args.retry_errors:

@@ -8,7 +8,7 @@ ROOT=Path(__file__).resolve().parents[1]
 # Explicit import-to-distribution mapping, never install an arbitrary source string.
 PACKAGES={'numpy':'numpy','pandas':'pandas','scipy':'scipy','sklearn':'scikit-learn','matplotlib':'matplotlib','seaborn':'seaborn','xarray':'xarray','netCDF4':'netCDF4','h5py':'h5py','PIL':'Pillow','networkx':'networkx','torch':'torch','tensorflow':'tensorflow','statsmodels':'statsmodels','biopsykit':'biopsykit','rdkit':'rdkit','mne':'mne','cv2':'opencv-python','skimage':'scikit-image','nibabel':'nibabel','anndata':'anndata','scanpy':'scanpy','openpyxl':'openpyxl','sympy':'sympy','tqdm':'tqdm','joblib':'joblib'}
 def main():
- p=argparse.ArgumentParser();p.add_argument('--benchmarks',nargs='+',default=['scienceagentbench','asibench']);p.add_argument('--tasks',nargs='+');p.add_argument('--install',action='store_true');p.add_argument('--existing-python',type=Path,default=ROOT/'.actor-venv');a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--benchmarks',nargs='+',default=['asibench']);p.add_argument('--tasks',nargs='+');p.add_argument('--install',action='store_true');p.add_argument('--existing-python',type=Path,default=ROOT/'.actor-venv');a=p.parse_args()
  output=ROOT/'data/conversion_catalog/runtime';output.mkdir(parents=True,exist_ok=True)
  versions={d.metadata['Name'].lower().replace('_','-'):d.version for d in distributions(path=[str(a.existing_python/'lib'/f'python{sys.version_info.major}.{sys.version_info.minor}'/'site-packages')])}
  records=[]

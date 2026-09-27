@@ -10,6 +10,27 @@ ROOT = Path(__file__).resolve().parents[1]
 SECRET = re.compile(r"(?:sk-or-v1-|ghp_)[A-Za-z0-9]{20,}")
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 LOCAL_ONLY = {"runs", "prepared", "external", "data"}
+# Frozen trace exports retain raw-log locators relative to the original run.
+TRACE_RAW_LINKS = {
+    "controller/events.jsonl", "controller/actor_events.jsonl",
+    "controller/researcher_history.private.json", "controller/api_calls.private.jsonl",
+    "events.jsonl", "actor_events.jsonl", "researcher_history.private.json",
+    "api_calls.jsonl",
+}
+
+
+def prose_only(text):
+    """Exclude fenced API/code payloads from Markdown link checks only."""
+    fence = None
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence:
+            if match and match[1][0] == fence[0] and len(match[1]) >= len(fence) and not match[2].strip():
+                fence = None
+        elif match:
+            fence = match[1]
+        else:
+            yield line
 
 
 def main():
@@ -30,11 +51,13 @@ def main():
         if SECRET.search(text):
             errors.append(f"{relative}: possible credential (value withheld)")
         if path.suffix == ".md":
-            for raw in LINK.findall(text):
+            for raw in LINK.findall("".join(prose_only(text))):
                 target = raw.strip().strip("<>")
                 if target.startswith(("http:", "https:", "mailto:", "#")):
                     continue
                 target = unquote(target.split("#", 1)[0])
+                if relative.startswith("reports/full_persona_v2/recorded_traces/") and target in TRACE_RAW_LINKS:
+                    continue  # Raw files are transferred separately; preserve frozen exports.
                 resolved = (path.parent / target).resolve()
                 if not resolved.is_relative_to(ROOT):
                     errors.append(f"{relative}: link outside repository: {target}")

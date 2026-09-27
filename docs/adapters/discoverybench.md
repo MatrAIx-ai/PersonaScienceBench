@@ -1,81 +1,19 @@
 # DiscoveryBench adapter
 
-> The current five-case subset and runtime changes are documented in the
-> [current adaptation record](../benchmark_adaptations.md). The two-case
-> construction/pilot account below describes the earlier implementation.
+The adapter converts all 264 native real-data questions from the pinned `allenai/discoverybench` source. Composite IDs include the metadata path, query-group index and native question ID. Keep related source-study questions together in dataset splits.
 
-Status: two reviewed episodes have completed live actor execution and final
-Luna grading. Both received native `final_score=0.0`; neither actor asked the
-researcher. See the pilot report (historical record archived locally) for judge
-sensitivity and [current status](../status.md) for subsequent changes.
+## Conversion and collaboration
 
-Source: [allenai/discoverybench](https://github.com/allenai/discoverybench), revision
-`c31fcf011e070f021a5f5b906896d0821f6880e8`. The upstream checkout is external and
-unmodified. The adapter consumes the source's real-data tasks and retains its
-domain labels. It enumerates 264 queries using composite IDs; only the two
-explicitly reviewed IDs below are exportable in this version.
+Public packages retain the question, dataset/column descriptions, staged inputs and submission contract. Automated extraction retains source-attributed context and distinguishes explanatory context from methodological advice. The private answer-key join uses dataset, metadata suffix and question ID; missing or ambiguous references block conversion. Reference hypotheses, workflows and evaluator records remain private.
 
-## Selected episodes
+The current protocol reviews the proposed approach and the resulting discovery/evidence. Full persona identity enters the simulator system prompt; both persona-on and persona-off conditions permit general knowledge. See [conversion rules](../design/conversion_revision_v2.md) and [the interaction protocol](../interaction_protocol.md).
 
-| Native composite ID | Domain | Scientific objective | Researcher context |
-| --- | --- | --- | --- |
-| `test/requirements_engineering_for_ML_enabled_systems/metadata_1.json/0/0` | engineering | Estimate the proportions and bootstrapped 95% confidence intervals for Business Analysts and Developers associated with requirements in ML-enabled systems. | The source's qualified statement about negative values and `-99` potentially representing missing responses. |
-| `test/nls_incarceration/metadata_1.json/0/0` | sociology | Compare 1996 wealth for respondents with and without incarceration histories. | The source's explanation of residence information as a way to ascertain incarceration. |
+## Submission
 
-The last two ID components are query-group index and native `qid`; the metadata
-filename is essential because top-level metadata `id` values are not unique.
-Study groups are distinct and must remain intact across future dataset splits.
-
-Both source CSVs are already present in the pinned checkout. They are roughly
-507 KB and 343 KB respectively. The incarceration data are already processed
-and include `ever_jailed`; the researcher fact is background, not an instruction
-to reconstruct that column. Its marginal usefulness is an empirical question.
-Neither episode requires asking a question to complete the task.
-
-## Information boundary and conversion
-
-The public package contains the selected question unchanged, the dataset names
-and descriptions, raw-column names and descriptions, the submission contract,
-and two logical interfaces: staged `data/<filename>.csv` and the researcher
-endpoint. No metadata directory, answer-key file, or source repository is mounted
-into the actor runtime. Asset hashes are recorded at conversion and checked by
-the shared staging layer.
-
-The researcher receives one explicitly reviewed source statement for each task,
-with its original uncertainty qualifiers, a stable fact ID, revision, metadata
-hash, and `/domain_knowledge` provenance. Persona and conversation state remain
-external to this fixed knowledge pack. The data descriptions remain public;
-they are not hidden merely to force interaction.
-
-The converter does not copy a full query, metadata object, or paper. It excludes
-`hypotheses`, nested `true_hypothesis`, `workflow`, `workflow_tags`, `intermediate`,
-and answer keys from actor and researcher exports. The selected test metadata
-contain placeholder `hypotheses.main` values; the actual reference must be joined
-from `eval/answer_key_real.csv` on dataset, metadata filename suffix, and `qid`.
-An ambiguous or missing join is an error. The answer key, reference hypothesis,
-and evaluator records are controller/evaluator-only.
-
-The two metadata files and answer key must match reviewed hashes. A changed file
-requires re-curation; inventory membership never implies an approved boundary.
-The source license and dataset license remain in the upstream checkout. The
-adapter links to them rather than redistributing the original corpus.
-
-## Execution and submission
-
-An independent actor can use a terminal or notebook runtime with the staged
-CSV. The adapter imposes neither a model choice nor a common monetary cap or
-20-step EXP design budget. The runner records actual tools, resources, and
-execution evidence.
-
-Submit `Submission(stage="final", answer="...")`, or place the finding in
-`payload["hypothesis"]`. An optional `payload["workflow"]` describes the executed
-analysis; supporting code/notebook/files can be included in `artifacts`.
-A `stage="plan"` submission cannot receive the native completed-analysis score.
-Native DiscoveryBench grading measures reference agreement of the finding;
-it does **not** independently prove that an analysis was executed correctly.
-The run record must keep execution evidence separate from the scientific score.
+Submit `Submission(stage="final", answer="...")` or provide the finding through `payload["hypothesis"]`. Supporting workflow/code artifacts remain separate execution evidence. A plan alone cannot receive the completed-analysis score. Native grading measures reference agreement; it does not prove that the analysis was executed correctly.
 
 ## Native evaluation bridge
+
 
 The bridge extracts only eight named function definitions from the pinned
 `eval/new_eval.py` AST. It verifies SHA-256
@@ -117,15 +55,6 @@ negative scores. Exact prompts, source hash, requested generation settings,
 responses, and intermediate grades stay in the private evaluation result.
 The configured provider and resolved judge model must accompany a real run.
 
-## Checks and remaining work
+## Records and checks
 
-`tests/test_discoverybench.py` checks composite identities, both information
-boundaries, source/reference availability, changed-source rejection, missing
-results, plan rejection, native context denominators and relation scores,
-per-call settings, private stdout suppression, and malformed-judge behavior.
-
-Before the requested pilot: select the simulator and actor configurations,
-configure a compatible judge, prepare the isolated actor runtime using only the
-public export, obtain the user's testing confirmation, and run the two episodes
-with immutable interaction and submission records. These checks have not been
-replaced by claims of successful scientific execution.
+The [completed report](../../reports/full_persona_v2/README.md) contains current study results and traces. `tests/test_discoverybench.py` covers identities, source/private boundaries, missing results, plan rejection, native scoring, settings and malformed judge responses. Use the [setup guide](../reproducibility.md) to prepare a new host.

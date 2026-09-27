@@ -78,8 +78,9 @@ Each approved fact MUST contain at least:
   scientific explanation or suggestions must be identified as such and enabled by
   the declared policy; they cannot introduce unsupported task-specific facts.
 - Fact IDs alone MUST NOT be treated as proof that every sentence is grounded.
-  Implement and record checks for unsupported additions; use approved wording or
-  an explicit unknown response when support cannot be established.
+  Record the declared knowledge policy. Source-specific assertions need provenance;
+  general explanations and proposed methods are permitted under the current full-profile
+  policy and must remain distinguishable from fixed study requirements.
 - Researcher statements about hardware, installed packages, or file availability
   MUST agree with the actual runtime manifest. A source paper's hardware is not
   evidence of resources available to the actor.
@@ -100,8 +101,10 @@ Each approved fact MUST contain at least:
 - External persona sources MAY be mapped into the common schema. Keep relevant
   researcher behavior explicit; do not infer scientific competence from unrelated
   demographic attributes. Record the mapping/version when using MatrAIx profiles.
-- Maintain an extractive or otherwise tightly grounded neutral control alongside
-  more expressive persona conditions. Grounding remains required in every mode.
+- Persona off MUST retain the same common simulator instructions and knowledge
+  permissions as persona on. In the current full-profile study, both conditions
+  allow general knowledge and suggestions; evaluator references remain private.
+  An extractive-only control is a separate experimental condition, not persona off.
 
 **5. Define conversation and memory behavior**
 

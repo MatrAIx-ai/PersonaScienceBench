@@ -86,6 +86,16 @@ def test_service_sends_the_composed_prompt_once():
     assert untouched.messages[0]["content"] == NATIVE
 
 
+def test_failed_prompt_edit_is_counted_as_a_failed_call():
+    class Client:
+        def completion(self, messages):
+            raise AssertionError("no model call expected")
+    service = Service(Client(), prompt_options={"volunteer_information": True})
+    with pytest.raises(ValueError):
+        service.invoke("What is the width?", NATIVE.replace("- Do not provide information not asked for.", ""))
+    assert service.stats["failed_calls"] == 1
+
+
 def test_collaboration_switches_are_independent_and_strict():
     assert CollaborationConfig().model_dump() == {"protocol": "active_researcher", "unrestricted_knowledge": False,
         "embody_identity": False, "volunteer_information": False, "truthful_history": False,

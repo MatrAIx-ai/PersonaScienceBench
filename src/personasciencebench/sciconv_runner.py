@@ -41,10 +41,12 @@ class Service:
     def invoke(self,user_prompt,system_prompt):
         if self.scripted_reply is not None:
             self.stats['scripted_replies']+=1;return self.scripted_reply
-        if self.prompt_options or self.persona_text:
-            system_prompt=researcher_system_prompt(system_prompt,persona_text=self.persona_text,**self.prompt_options)
         self.stats['total_calls']+=1
+        # The native user class swallows every exception into a canned reply, so a failed prompt edit must be
+        # counted here, where the runner's failed_calls check sees it.
         try:
+            if self.prompt_options or self.persona_text:
+                system_prompt=researcher_system_prompt(system_prompt,persona_text=self.persona_text,**self.prompt_options)
             r=self.client.completion([{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}])
         except Exception:
             self.stats['failed_calls']+=1;raise

@@ -18,22 +18,29 @@ KNOWLEDGE_EDITS=[("should answer based strictly on that.","may also use your gen
      '3. You may offer your own suggestions; distinguish them from stated task requirements.')]
 STYLE_EDITS=[("- Be concise.","- Respond naturally as the supplied identity, if any."),("- Do not explain your reasoning.","")]
 DISCLOSURE_EDITS=[("- Do not provide information not asked for.","")]
+TRUTH_EDITS=[("- Answer like a human user would.","- Answer like a human user would.\n        - What you say about this conversation must be true: never claim you already told the agent something that is not in the incomplete requirement or in your earlier answers.")]
+# The native instruction for unspecified details, returned verbatim by the floor ('mute') researcher.
+MUTE_REPLY="Make a reasonable assumption based on best practices."
 # Mirrors the core researcher's knowledge boundary: persona text never adds task facts.
 PERSONA_BOUNDARY=("\n\nIDENTITY. The identity below sets how you communicate. It does not change the task: "
     "values you give as requirements come only from the COMPLETE requirement.\n")
 
-def researcher_system_prompt(native,*,unrestricted_knowledge=False,embody_identity=False,volunteer_information=False,persona_text=''):
+def researcher_system_prompt(native,*,unrestricted_knowledge=False,embody_identity=False,volunteer_information=False,truthful_history=False,persona_text=''):
     """Native SciConv user system prompt plus the configured edits; the identity only when a persona is on.
     Edits apply in every arm, so persona and control differ only by the identity text."""
-    edits=(KNOWLEDGE_EDITS if unrestricted_knowledge else [])+(STYLE_EDITS if embody_identity else [])+(DISCLOSURE_EDITS if volunteer_information else [])
+    edits=(KNOWLEDGE_EDITS if unrestricted_knowledge else [])+(STYLE_EDITS if embody_identity else [])+(DISCLOSURE_EDITS if volunteer_information else [])+(TRUTH_EDITS if truthful_history else [])
     for old,new in edits:native=replace_once(native,old,new)
     return native+(PERSONA_BOUNDARY+persona_text if persona_text else '')
 
 class Service:
     def __init__(self,client,persona_text='',prompt_options=None):
-        self.client=client;self.persona_text=persona_text;self.prompt_options=prompt_options or {}
+        self.client=client;self.persona_text=persona_text;self.prompt_options=prompt_options or {};self.scripted_reply=None
         self.stats={k:0 for k in ['prompt_tokens','completion_tokens','total_tokens','total_calls','failed_calls','total_retries']}
+    def script(self,reply):
+        self.scripted_reply=reply;self.stats['scripted_replies']=0
     def invoke(self,user_prompt,system_prompt):
+        if self.scripted_reply is not None:
+            self.stats['scripted_replies']+=1;return self.scripted_reply
         if self.prompt_options or self.persona_text:
             system_prompt=researcher_system_prompt(system_prompt,persona_text=self.persona_text,**self.prompt_options)
         self.stats['total_calls']+=1
@@ -78,15 +85,18 @@ def run(prepared,output,config,parallel):
             with (controller/'api_calls.private.jsonl').open('a') as f:f.write(json.dumps(call)+'\n')
         services={r:Service(OpenRouterClient(**c,role=r,record=log,supported_parameters=catalog[r]['supported_parameters'])) for r,c in config['models'].items()}
         collab=config.get('collaboration') or {}
-        prompt_options={k:bool(collab.get(k,False)) for k in ('unrestricted_knowledge','embody_identity','volunteer_information')}
+        prompt_options={k:bool(collab.get(k,False)) for k in ('unrestricted_knowledge','embody_identity','volunteer_information','truthful_history')}
         services['researcher'].prompt_options=prompt_options
         if profile.enabled:services['researcher'].persona_text=render_persona(profile)
-        result={'episode_id':ep.id,'benchmark':'sciconvbench','source_task_id':ep.source_task_id,'status':'infrastructure_error','case_directory':str(case.resolve()),'interaction_protocol':POLICY,'user_prompt_policy':USER_PROMPT_POLICY,'user_prompt_options':prompt_options,'framework':'native ConvAgent'}
+        policy=collab.get('researcher_policy','llm')
+        if policy=='mute':services['researcher'].script(MUTE_REPLY)
+        result={'episode_id':ep.id,'benchmark':'sciconvbench','source_task_id':ep.source_task_id,'status':'infrastructure_error','case_directory':str(case.resolve()),'interaction_protocol':POLICY,'user_prompt_policy':USER_PROMPT_POLICY,'user_prompt_options':prompt_options,'researcher_policy':policy,'framework':'native ConvAgent'}
         try:
             Actor=native_class(adapter.source.repository,'main.py','ConvAgent',services['actor'])
             User=native_class(adapter.source.repository,'llm_user_interface.py','LLMUserInterface',services['researcher'])
             actor=Actor(SimpleNamespace());user=User(services['researcher'],ep.public.question,ep.researcher.facts[0].text,log_file=str(case/'conversation_log.txt'))
-            current=ep.public.question;final=None;limit_reached=False
+            # The oracle agent starts from the complete requirement; the user still holds the native incomplete/complete pair.
+            current=ep.researcher.facts[0].text if policy=='oracle' else ep.public.question;final=None;limit_reached=False
             event('initial_request',{'message':current})
             for turn in range(10):
                 answer=actor.chat(current)
@@ -127,6 +137,7 @@ def run(prepared,output,config,parallel):
             write_json(case/'evaluation.json',evaluation);result.update(status='scored',evaluation=evaluation,researcher_questions=len(parsed),actor_calls=services['actor'].stats['total_calls'])
         except Exception as exc:result.update(error_type=type(exc).__name__,error=str(exc))
         result['researcher_questions']=sum(e['type']=='researcher_question' for e in events)
+        if 'scripted_replies' in services['researcher'].stats:result['scripted_replies']=services['researcher'].stats['scripted_replies']
         write_json(case/'result.json',result)
         lines=['# SciConvBench interaction trace','',f"Task: {ep.source_task_id}",'',f"Status: {result['status']}",'']
         for e in events:

@@ -105,13 +105,16 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                                              supported_parameters=catalog[role]["supported_parameters"])
                        for role, spec in config["models"].items()}
             researcher_type = Researcher
+            options = {}
             if collaboration is not None:
-                from personasciencebench.collaboration import ActiveResearcher
+                from personasciencebench.collaboration import ActiveResearcher, ScriptedResearcher
                 researcher_type = ActiveResearcher
+                options = {key: collaboration[key] for key in ("unrestricted_knowledge", "embody_identity", "truthful_history")}
+                if collaboration["researcher_policy"] != "llm":
+                    researcher_type = ScriptedResearcher
+                    options["policy"] = collaboration["researcher_policy"]
             researcher = researcher_type(episode, clients["researcher"],
-                                    persona=profiles[episode.id], **config["researcher"],
-                                    **({key: collaboration[key] for key in ("unrestricted_knowledge", "embody_identity")}
-                                       if collaboration else {}))
+                                    persona=profiles[episode.id], **config["researcher"], **options)
             session = EpisodeSession(episode, researcher, case / "controller", artifact_root=workspace)
             actor_result = run_actor(session, clients["actor"], sandbox, max_steps=config["actor_steps"], collaboration=collaboration)
             write_json(case / "actor_result.json", actor_result)

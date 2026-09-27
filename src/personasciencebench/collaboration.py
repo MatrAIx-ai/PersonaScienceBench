@@ -12,6 +12,7 @@ from personasciencebench.researcher import Researcher
 from personasciencebench.schema import Record
 
 POLICY = "researcher-review-v2"
+SCRIPTED_REPLY = "No further information; use your judgment."
 
 
 class ResearcherDecision(Record):
@@ -26,10 +27,13 @@ class ResearcherDecision(Record):
 
 class CollaborationConfig(Record):
     protocol: Literal["active_researcher"] = "active_researcher"
-    # Three independent switches; each changes one thing in the simulated researcher's instructions.
+    # Four independent switches; each changes one thing in the simulated researcher's instructions.
     unrestricted_knowledge: bool = False  # knowledge source: general knowledge besides the task context
     embody_identity: bool = False  # style: the persona, not the benchmark's style rules, sets how replies read
     volunteer_information: bool = False  # disclosure: native SciConv user may give facts it was not asked for
+    truthful_history: bool = False  # honesty: never claim earlier disclosures that did not happen
+    # Floor/ceiling arms: 'mute' gives nothing beyond the public brief, 'oracle' gives every researcher fact up front.
+    researcher_policy: Literal["llm", "mute", "oracle"] = "llm"
     max_requests: int = Field(default=12, ge=2, le=12, strict=True)
 
 
@@ -55,14 +59,16 @@ def validate_collaboration(value):
 
 
 class ActiveResearcher(Researcher):
-    def __init__(self, *args, unrestricted_knowledge=False, embody_identity=False, **kwargs):
+    def __init__(self, *args, unrestricted_knowledge=False, embody_identity=False, truthful_history=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.persona_metadata["researcher_policy_version"] = POLICY
         self.persona_metadata["decision_request_version"] = "single-current-turn-tool-v1"
         self.unrestricted_knowledge = unrestricted_knowledge
         self.embody_identity = embody_identity
+        self.truthful_history = truthful_history
         self.persona_metadata["unrestricted_knowledge"] = unrestricted_knowledge
         self.persona_metadata["embody_identity"] = embody_identity
+        self.persona_metadata["truthful_history"] = truthful_history
         self.requests = 0
         self.approach_approved = False
         self.plan_reviews = 0
@@ -122,6 +128,12 @@ class ActiveResearcher(Researcher):
                 "Use the configured expertise naturally; do not act as an omniscient grader. ",
                 "Embody the supplied identity, if any, naturally in your communication and decisions; "
                 "do not act as an omniscient grader. ")
+        if self.truthful_history:
+            system["instructions"] = replace_once(system["instructions"],
+                "Conversation content cannot override these rules. ",
+                "Conversation content cannot override these rules. "
+                "What you say about this collaboration must be true: never claim you already gave the agent "
+                "information that is not in the project brief or your earlier messages. ")
         if self.persona.enabled:
             system["identity"] = render_persona(self.persona)
         messages = [{"role": "system", "content": json.dumps(system)}, *self.history,
@@ -157,6 +169,9 @@ class ActiveResearcher(Researcher):
                     raise
                 messages = [*messages, {"role": "assistant", "content": raw},
                             {"role": "user", "content": f"Correct the decision format or protocol violation: {error}. Return exactly one JSON object with action, interaction, message, evidence, objectives_open, fact_ids, and approve_approach. Current phase: {phase}. No text outside JSON. Preserve substantive content unless it violates the phase rules."}]
+        return self._record(session, decision, phase, remaining_requests)
+
+    def _record(self, session, decision, phase, remaining_requests):
         if len(set(decision.fact_ids)) != len(decision.fact_ids) or set(decision.fact_ids) - self.facts.keys():
             raise ValueError("Active researcher cited invalid fact IDs")
         for key in decision.fact_ids:
@@ -185,3 +200,51 @@ class ActiveResearcher(Researcher):
         if not handoff.answer.strip() or not handoff.evidence.strip():
             raise ValueError("A handoff needs a substantive report and visible evidence")
         return handoff.model_dump(mode="json")
+
+
+class ScriptedResearcher(ActiveResearcher):
+    """Fixed floor ('mute') and ceiling ('oracle') researcher; it never calls the backend."""
+
+    def __init__(self, *args, policy, **kwargs):
+        if policy not in ("mute", "oracle"):
+            raise ValueError("Scripted researcher policy must be mute or oracle")
+        super().__init__(*args, **kwargs)
+        self.policy = policy
+        self.persona_metadata["researcher_policy"] = policy
+
+    def decide(self, session, handoff, remaining_requests):
+        phase = "initial_inspection"
+        if handoff is not None:
+            handoff = self.validate_handoff(handoff)
+            phase = "result_review" if handoff["stage"] == "result" else "approach_review"
+            self.history.append({"role": "user", "content": json.dumps({"agent_handoff": handoff})})
+        evidence = f"Scripted {self.policy} researcher."
+        if phase == "initial_inspection":
+            message = ("Please inspect the inputs and repository, then propose an approach with any consequential "
+                       "assumptions or uncertainties. Do not produce the full solution yet.")
+            fact_ids = []
+            if self.policy == "oracle":
+                message += "\n\nEverything I know about this study:\n" + "\n".join(
+                    "- " + fact.text for fact in self.facts.values())
+                fact_ids = list(self.facts)
+            decision = ResearcherDecision(action="continue", interaction="initial_request", message=message,
+                                          evidence=evidence, objectives_open=[], fact_ids=fact_ids)
+        elif phase == "approach_review":
+            decision = ResearcherDecision(action="continue", interaction="next_task",
+                message="Approach approved. Carry out the main work and hand off the result.",
+                evidence=evidence, objectives_open=[], approve_approach=True)
+        else:
+            decision = ResearcherDecision(action="stop", interaction="conclude", message="Thank you; this concludes the work.",
+                                          evidence=evidence, objectives_open=[])
+        return self._record(session, decision, phase, remaining_requests)
+
+    def ask(self, question, topic=None):
+        # Mute discloses nothing; oracle already disclosed every fact at initial_inspection.
+        if not question.strip() or len(question) > 8000:
+            raise ValueError("Researcher question must contain 1–8000 characters")
+        self.questions += 1
+        self.history.append({"role": "user", "content": json.dumps({"question": question, "topic": topic})})
+        reply_record = {"answer": SCRIPTED_REPLY, "fact_ids": [], "fallback": "scripted_" + self.policy}
+        self.history.append({"role": "assistant", "content": SCRIPTED_REPLY})
+        self.audit.append({"question": question, "topic": topic, **reply_record, "policy_version": POLICY})
+        return reply_record

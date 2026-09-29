@@ -70,7 +70,7 @@ REVIEWED_TASKS.update({'test/meta_regression/metadata_1.json/0/0': {'metadata_sh
                                                                               'workflow included.'}})
 
 
-# Three distinct questions from one ecology study; keep this study together in splits.
+# Six distinct questions from one ecology study; keep this study together in splits.
 ECOLOGY_INPUT_SHA256 = {
     "temporal_trends_contingency_table.csv": "f81f68033c9706b44a06c6f46395d2c8c67accdf321707e430f388d9d7400dba",
     "phylogenetic_tree.txt": "5b691dc9bd82ade93ee5b61a5b1d249a37239884363786c438e0724c8ab36d55",
@@ -112,6 +112,30 @@ ECOLOGY_TASKS = {
         "adapter_version": "discoverybench-ecology-v1",
     },
 }
+# Source review of the three follow-up questions; native metadata stay unchanged.
+ECOLOGY_TASKS.update({
+    'test/introduction_pathways_non-native_plants/metadata_3.json/0/0': {
+        "metadata_sha256": '391ff7c223ac86cbd84eed1aaf2eedfd545d4db41c1a2daf204a1353bccde913',
+        "topic": "input_schema", "kind": "context",
+        "rationale": 'Interacting covariates and gardening-introduced share. Preserve native predictor descriptions and denominator ambiguity; no significant factor or fitted interaction is supplied.',
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+    'test/introduction_pathways_non-native_plants/metadata_4.json/0/0': {
+        "metadata_sha256": '1d1c9db987c7e6d8df05d75454fcd11241672daf5f7791a5fa470cf3727ec349',
+        "topic": "input_schema", "kind": "context",
+        "rationale": 'Introduction pathway, residence time and invasion success. Preserve the minimum-versus-mean residence-time wording discrepancy and alternative success measures; no reference-derived resolution is supplied.',
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+    'test/introduction_pathways_non-native_plants/metadata_5.json/0/2': {
+        "metadata_sha256": '6bd987ced29f925f334b710d71e111193b8f57c43388a43fee578544b9e081a9',
+        "topic": "input_schema", "kind": "context",
+        "rationale": 'Urban effects across introduction pathways. Preserve native pathway counts and year/buffer descriptions; no pathway-specific direction or expected conclusion is supplied.',
+        "validation_method": "source_review",
+        "adapter_version": "discoverybench-ecology-v1",
+    },
+})
 for _review in ECOLOGY_TASKS.values():
     _review["input_sha256"] = ECOLOGY_INPUT_SHA256
     _review["schema_fact_files"] = [name for name in ECOLOGY_INPUT_SHA256 if name.endswith(".csv")]

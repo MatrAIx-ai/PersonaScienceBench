@@ -262,3 +262,26 @@ def test_ecology_personas_only_change_private_identity(adapter, tmp_path, task_i
         assert episode.evaluator.reference['gold_hypothesis'] not in json.dumps(backend.system)
         systems.append(backend.system)
     assert systems == [systems[0]] * len(systems)
+
+
+
+
+@pytest.mark.parametrize('task_id', list(ECOLOGY_TASKS)[3:])
+def test_followup_metadata_locks_reject_changed_questions(adapter, tmp_path, task_id):
+    ep = adapter.convert(task_id)
+    source = SOURCE / ep.conversion['metadata_path']
+    changed_path = tmp_path / ep.conversion['metadata_path']
+    changed_path.parent.mkdir(parents=True)
+    changed_path.write_text(source.read_text() + '\n')
+    changed = DiscoveryBenchAdapter(SourceConfig(tmp_path, tmp_path, SOURCE_REVISION))
+    with pytest.raises(ValueError, match='re-curation'):
+        changed.convert(task_id)
+
+
+def test_residence_time_review_preserves_native_ambiguity(adapter):
+    task = 'test/introduction_pathways_non-native_plants/metadata_4.json/0/0'
+    ep = adapter.convert(task)
+    assert 'minimum residence time' in ep.public.question
+    public = ep.public.documents['datasets.json']
+    assert 'mean residence time' in public
+    assert all(f.topic == 'input_schema' for f in ep.researcher.facts)

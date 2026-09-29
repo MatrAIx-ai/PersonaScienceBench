@@ -4,13 +4,13 @@ from pathlib import Path
 from personasciencebench.inference import OpenRouterClient
 POLICY='setup-source-classification-v2'
 
-def extract(row, root):
+def extract(row, root, model_settings=None):
     field='method' if row.get('method') else 'agent_instructions'
     source=row.get(field) or ''
     if not isinstance(source,str): source=json.dumps(source)
     spans=[{'id':i,'text':m.group().strip(),'start':m.start(),'end':m.end()} for i,m in enumerate(re.finditer(r'[^\n]+',source))]
     if not spans: return []
-    payload={'policy':POLICY,'question':row['question'],'field':field,'spans':spans}
+    payload={'model_settings':model_settings,'policy':POLICY,'question':row['question'],'field':field,'spans':spans}
     digest=hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
     directory=root/'data/design_catalog/extraction_cache';directory.mkdir(parents=True,exist_ok=True)
     cache=directory/(digest+'.json')
@@ -18,7 +18,7 @@ def extract(row, root):
     else:
         def record(call):
             with (directory/(digest+'.api.jsonl')).open('a') as f:f.write(json.dumps(call)+'\n')
-        client=OpenRouterClient('openai/gpt-6-luna',role='conversion',reasoning_effort='none',max_tokens=2048,record=record)
+        client=OpenRouterClient(**(model_settings or {'model':'openai/gpt-6-luna','reasoning_effort':'none','max_tokens':2048}),role='conversion',record=record)
         prompt=('Return JSON {"approved":[{"id":0,"kind":"context"}],"reason":"..."}. '
             'Select ONLY unambiguous background or fixed setup requirements for this experimental DESIGN question. '
             'Kinds: context or fixed_requirement. Reject expected outcomes, procedures/recipes, and experimental '

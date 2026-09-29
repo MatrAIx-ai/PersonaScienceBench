@@ -243,7 +243,10 @@ def main(argv=None):
                 raise ValueError("Live runs require a prepared workspace mapping for every task")
             for task in tasks:
                 sources[task.task_id]["verified_staging_sha256"] = verify_staged(sources[task.task_id])
-            key = read_key_file(args.env_file) if args.env_file else os.environ.get("OPENROUTER_API_KEY", "")
+            from personasciencebench.inference import load_env
+            if args.env_file:
+                load_env(args.env_file)
+            key = os.environ.get("OPENAI_API_KEY" if config.models.actor.provider == "openai" else "OPENROUTER_API_KEY", "")
             if not key:
                 raise ValueError("Set OPENROUTER_API_KEY or supply --env-file; no requests made")
         args.output.mkdir(parents=True, exist_ok=False)
@@ -268,7 +271,9 @@ def main(argv=None):
         write_json(args.output / "manifest.json", manifest)
         budget, results = Budget(config.limits.run_usd), []
         if args.mode == "live":
-            transport = OpenRouterTransport(key, config.limits.request_timeout_seconds)
+            from expbench.gateway import OpenAITransport
+            transport_class = OpenAITransport if config.models.actor.provider == "openai" else OpenRouterTransport
+            transport = transport_class(key, config.limits.request_timeout_seconds)
             roles = ["actor", "judge"] + (["researcher"] if args.input_mode == "interactive" else [])
             catalog = transport.preflight({r: getattr(config.models, r) for r in roles},
                 enforce_price_caps=config.limits.run_usd is not None or config.limits.episode_usd is not None)

@@ -96,6 +96,27 @@ class OpenRouterTransport:
         self.client.close()
 
 
+class OpenAITransport:
+    mock = False
+
+    def __init__(self, key, timeout):
+        from personasciencebench.openai_transport import ResponsesTransport
+        self.transports = {r: ResponsesTransport(timeout) for r in ('actor', 'researcher', 'judge')}
+
+    def preflight(self, models, *, enforce_price_caps=True):
+        from personasciencebench.openai_transport import preflight
+        return preflight({r: s.model_dump() for r, s in models.items()})
+
+    def complete(self, role, payload):
+        try:
+            return self.transports[role].complete(payload)
+        except Exception as exc:
+            raise ModelError(str(exc)) from None
+
+    def close(self):
+        pass
+
+
 class Gateway:
     def __init__(self, transport, models: dict[str, ModelSettings], ledger: Ledger,
                  log_path: Path):

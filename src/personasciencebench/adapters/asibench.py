@@ -1,6 +1,6 @@
 """Pinned ASI B3 + researcher-held B2 guidance; native isolated local scoring."""
 from functools import cache
-import json,re,shutil,subprocess
+import json,re,shutil,subprocess,tempfile
 from pathlib import Path,PurePosixPath
 import yaml
 from personasciencebench.adapters.base import Adapter,sha256,check_submission
@@ -59,7 +59,7 @@ class ASIBenchAdapter(Adapter):
         if not submission.artifacts:return EvaluationResult(status='missing_submission',evaluator_version=POLICY)
         # Separate evaluator process/workspace; it cannot alter the sealed originals.
         sealed=Path(next(iter(submission.artifacts.values()))).parent
-        work=sealed.parent/'asi_native_evaluation';work.mkdir(exist_ok=False)
+        work=Path(tempfile.mkdtemp(prefix='asi_native_evaluation-',dir=sealed.parent))
         pred=work/'prediction';pred.mkdir()
         for name,source in submission.artifacts.items():
             rel=PurePosixPath(name)
@@ -74,15 +74,18 @@ class ASIBenchAdapter(Adapter):
         native_result={'task_id':episode.source_task_id,'instance_id':instance.name,'prompt_level':'b3','status':'completed','agent_output':{'status':'completed','persisted_outputs':{'dir':'prediction'}}}
         (work/'run_result.json').write_text(json.dumps(native_result))
         manifest={'schema_version':2,'benchmark':'ASI-Bench','seed':31415,'task_id':episode.source_task_id,'instance_id':instance.name,'prompt_level':'b3',
-            'run_result':'/workspace/run_result.json','prediction_dir':'/workspace/prediction','instance_dir':'/workspace/'+instance.name,'tasks_dir':'/workspace/native/tasks','task_bundle_revision':self.source.revision,'harness':POLICY,'model':getattr(judge,'model',None),'sandbox':'bubblewrap-separated-evaluator'}
+            'run_result':'/workspace/run_result.json','prediction_dir':'/workspace/prediction','instance_dir':'/workspace/'+instance.name,'tasks_dir':'/workspace/native/tasks','task_bundle_revision':self.source.revision,'harness':POLICY,'model':getattr(judge,'model',None),'effort':getattr(judge,'reasoning_effort',None),'sandbox':'bubblewrap-separated-evaluator'}
         (work/'manifest.json').write_text(json.dumps(manifest))
-        (work/'evaluate.py').write_text('import json\nfrom ai4sci_bench.benchflow import score_seed31415_manifest\nr=score_seed31415_manifest(json.load(open("manifest.json")))\njson.dump(r,open("native_score.json","w"),indent=2)\n')
+        from personasciencebench import asi_judge_bridge
+        shutil.copyfile(Path(asi_judge_bridge.__file__),work/'asi_judge_bridge.py')
+        (work/'evaluate.py').write_text('import json\nfrom asi_judge_bridge import install_sandbox_bridge\ninstall_sandbox_bridge("/workspace/judge_bridge")\nfrom ai4sci_bench.benchflow import score_seed31415_manifest\nr=score_seed31415_manifest(json.load(open("manifest.json")))\njson.dump(r,open("native_score.json","w"),indent=2)\n')
         from personasciencebench.runtime import Sandbox
         runtime=Path(__file__).resolve().parents[3]/'.venv'
-        receipt=Sandbox(work,runtime).execute('PYTHONPATH=/workspace python evaluate.py',timeout_seconds=1800)
+        receipt,judge_config=asi_judge_bridge.execute_with_judge(Sandbox(work,runtime),work,judge)
+        evaluator_version=POLICY+'+'+asi_judge_bridge.BRIDGE_VERSION
         (work/'execution.json').write_text(json.dumps(receipt,indent=2))
         output=work/'native_score.json'
-        if not output.exists():return EvaluationResult(status='error',evaluator_version=POLICY,errors=['Native ASI evaluator failed'],details={'receipt':receipt})
+        if not output.exists():return EvaluationResult(status='error',evaluator_version=evaluator_version,errors=['Native ASI evaluator failed'],details={'receipt':receipt})
         result=json.loads(output.read_text())
-        return EvaluationResult(status='error' if result['scorer_internal_error'] else 'scored',evaluator_version=POLICY,
-            metrics={'score':result['score'],'max_score':result['max_score']},details={'official':False,'native_result':result,'evaluator_directory':str(work)})
+        return EvaluationResult(status='error' if result['scorer_internal_error'] else 'scored',evaluator_version=evaluator_version,
+            metrics={'score':result['score'],'max_score':result['max_score']},details={'official':False,'native_result':result,'evaluator_directory':str(work),'configured_judge':judge_config,'native_scoring_rules_preserved':True,'native_judge_transport_overridden':True})

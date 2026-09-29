@@ -33,6 +33,40 @@ def setup_facts(row):
     return extract(row, ROOT)
 
 
+def build_card(row, facts, source_hash):
+    flags = list(row.get("quality_flags") or [])
+    if row.get("question_match") not in (None, "exact", "normalized_equal", "markdown_only"):
+        flags.append("question_reference_alignment_requires_analysis")
+    card = {
+        "task_id": row["task_id"],
+        "domain": f"{row['conference']} / {row['paper_title']}",
+        "public": {
+            "question": row["question"],
+            "context": ("Design an experiment that answers the question. The researcher can clarify "
+                        "source-supported setup details by topic. Do not claim that an experiment was run."),
+            "documents": {"track.md": "Design-only task; repositories and compute are not required."},
+        },
+        "researcher": {
+            "facts": facts,
+            "unspecified": ["Expected empirical outcome", "Unstated resources and runtime budget",
+                            "Any setup detail not present in the available topics"],
+        },
+        "reference_design": row["reference_design"],
+        "provenance": {
+            "source_file": "data/exp_bench/tasks.jsonl", "source_sha256": source_hash,
+            "source_task_id": row["task_id"], "upstream": row["provenance"],
+            "validation_method": POLICY,
+        },
+        "review_notes": [
+            "Context uses exact source spans classified as background or question-established requirements. Automated classification does not guarantee absence of leakage.",
+            "Automatically extracted setup facts are source-attributed but not human reviewed.",
+            *( ["Source audit flags: " + ", ".join(map(str, flags))] if flags else []),
+        ],
+    }
+    Task.model_validate(card)
+    return card
+
+
 def main() -> None:
     rows = [json.loads(line) for line in SOURCE.read_text().splitlines() if line.strip()]
     source_hash = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
@@ -59,36 +93,7 @@ def main() -> None:
         if error:
             excluded.append({"task_id":row["task_id"], "reason":error})
             continue
-        flags = list(row.get("quality_flags") or [])
-        if row.get("question_match") not in (None, "exact", "normalized_equal", "markdown_only"):
-            flags.append("question_reference_alignment_requires_analysis")
-        card = {
-            "task_id": row["task_id"],
-            "domain": f"{row['conference']} / {row['paper_title']}",
-            "public": {
-                "question": row["question"],
-                "context": ("Design an experiment that answers the question. The researcher can clarify "
-                            "source-supported setup details by topic. Do not claim that an experiment was run."),
-                "documents": {"track.md": "Design-only task; repositories and compute are not required."},
-            },
-            "researcher": {
-                "facts": facts,
-                "unspecified": ["Expected empirical outcome", "Unstated resources and runtime budget",
-                                "Any setup detail not present in the available topics"],
-            },
-            "reference_design": row["reference_design"],
-            "provenance": {
-                "source_file": "data/exp_bench/tasks.jsonl", "source_sha256": source_hash,
-                "source_task_id": row["task_id"], "upstream": row["provenance"],
-                "validation_method": POLICY,
-            },
-            "review_notes": [
-                "Context uses exact source spans classified as background or question-established requirements. Automated classification does not guarantee absence of leakage.",
-                "Automatically extracted setup facts are source-attributed but not human reviewed.",
-                *( ["Source audit flags: " + ", ".join(map(str, flags))] if flags else []),
-            ],
-        }
-        Task.model_validate(card)
+        card = build_card(row, facts, source_hash)
         cards.append(card)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text("".join(json.dumps(card, ensure_ascii=False) + "\n" for card in cards))

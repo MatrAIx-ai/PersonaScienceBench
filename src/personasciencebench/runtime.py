@@ -112,6 +112,7 @@ class Sandbox:
             "PYTHONNOUSERSITE": "1", "PYTHONUNBUFFERED": "1",
             "XDG_CACHE_HOME": "/tmp/cache", "MPLBACKEND": "Agg",
         }
+        environment.update({k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")})
         for key, value in environment.items():
             args.extend(("--setenv", key, value))
         return args + ["/bin/bash", "--noprofile", "--norc", "-c", command]

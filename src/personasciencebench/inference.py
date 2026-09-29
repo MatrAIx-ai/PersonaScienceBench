@@ -10,12 +10,18 @@ from typing import Callable
 class OpenRouterClient:
     def __init__(self, model: str, *, role: str, max_tokens: int = 2048,
                  temperature: float | None = None, reasoning_effort: str | None = None,
-                 timeout: float = 180,
+                 timeout: float = 180, provider: str = "openrouter",
                  unsupported_parameters: str = "reject", supported_parameters: list[str] | None = None,
                  record: Callable[[dict], None] | None = None):
         if not model or not isinstance(model, str):
             raise ValueError(f"Select a model for the {role} role before inference")
         self.model, self.role = model, role
+        self.provider = provider
+        if provider not in ("openrouter", "openai"):
+            raise ValueError("Unknown API provider")
+        if provider == "openai":
+            from personasciencebench.openai_transport import ResponsesTransport
+            self.openai = ResponsesTransport(timeout)
         self.max_tokens, self.temperature, self.timeout = max_tokens, temperature, timeout
         self.reasoning_effort = reasoning_effort
         if unsupported_parameters not in ("reject", "omit_and_record"):
@@ -51,7 +57,7 @@ class OpenRouterClient:
     def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None):
         import httpx
 
-        key = os.environ.get("OPENROUTER_API_KEY")
+        key = os.environ.get("OPENAI_API_KEY" if self.provider == "openai" else "OPENROUTER_API_KEY")
         if not key:
             raise ValueError("OPENROUTER_API_KEY is not configured")
         allowed = {"temperature", "max_tokens", "top_p", "seed", "logprobs", "top_logprobs",
@@ -79,15 +85,18 @@ class OpenRouterClient:
                 payload["tool_choice"] = tool_choice
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        try:
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions",
-                                  headers={"Authorization": f"Bearer {key}"},
-                                  json=payload, timeout=self.timeout)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"{self.role}: OpenRouter transport failed ({type(exc).__name__})") from None
-        if response.status_code != 200:
-            raise RuntimeError(f"{self.role}: OpenRouter HTTP {response.status_code}")
-        data = response.json()
+        if self.provider == "openai":
+            data = self.openai.complete(payload)
+        else:
+            try:
+                response = httpx.post("https://openrouter.ai/api/v1/chat/completions",
+                                      headers={"Authorization": f"Bearer {key}"},
+                                      json=payload, timeout=self.timeout)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"{self.role}: OpenRouter transport failed ({type(exc).__name__})") from None
+            if response.status_code != 200:
+                raise RuntimeError(f"{self.role}: OpenRouter HTTP {response.status_code}")
+            data = response.json()
         if self.record:
             self.record({"role": self.role, "model": self.model,
                          "resolved_model": data.get("model"), "provider": data.get("provider"),
@@ -122,7 +131,7 @@ def load_env(path: Path):
             continue
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
-        if key != "OPENROUTER_API_KEY":
+        if key not in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
             continue
         if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
@@ -131,6 +140,9 @@ def load_env(path: Path):
 
 def preflight(models: dict, *, timeout=45) -> dict:
     """Check authenticated access and exact model names without requesting inference."""
+    if all(s.get("provider") == "openai" for s in models.values()):
+        from personasciencebench.openai_transport import preflight as openai_preflight
+        return openai_preflight(models, timeout)
     import httpx
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:

@@ -6,6 +6,11 @@ from pathlib import Path
 import json
 import httpx
 
+# Responses that carry no completion and mean "try again": rate limiting and transient
+# server/gateway failures. Resending the identical request cannot select a better answer;
+# the retry count is recorded with the call. Client errors (4xx other than 429) never retry.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 
 def preflight(models, timeout=45):
     key = os.environ.get('OPENAI_API_KEY')
@@ -94,7 +99,7 @@ class ResponsesTransport:
             raise RuntimeError('Run stopped after a fatal API configuration error; see fatal_api.json')
         for retry in range(6):
             response = httpx.post('https://api.openai.com/v1/responses', headers={'Authorization': 'Bearer '+key}, json=request, timeout=self.timeout)
-            if response.status_code != 429 or retry == 5:
+            if response.status_code not in RETRYABLE_STATUS or retry == 5:
                 break
             time.sleep(min(60, float(response.headers.get('retry-after', 2**retry))) + random.random())
         if response.status_code != 200:

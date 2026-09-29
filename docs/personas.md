@@ -26,7 +26,7 @@ config["persona"] = {
 # Save this operator-side configuration for a fresh run.
 ```
 
-Use `{"enabled": false}` for persona off. Keep `collaboration.unrestricted_knowledge=true` in both arms. Do not truncate, summarize or project the identity by task domain. Changing which profiles are selected does not change their prompt contents.
+Use `{"enabled": false}` for persona off. Keep the same `collaboration` switches (`unrestricted_knowledge`, `embody_identity`, `volunteer_information`) in both arms. Do not truncate, summarize or project the identity by task domain. Changing which profiles are selected does not change their prompt contents.
 
 `src/personasciencebench/persona.py` returns a supplied `system_prompt` verbatim. `collaboration.py` places it in the researcher's system identity; SciConv appends it to the native simulated-user system prompt. Episode records retain the resolved persona and full API messages.
 

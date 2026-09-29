@@ -32,6 +32,8 @@ Important reading notes: some frozen trace headers incorrectly say persona disab
 - Account for its host-specific Bubblewrap path, `external/runtime/bubblewrap-local/usr/bin/bwrap`, before using that scheduler on a different machine. The scientific runtime requires Bubblewrap isolation and has no host-execution fallback. Cleanup did not change sandbox behavior.
 - Start by preparing the paper diagrams/tables and analyzing existing traces. The expanded experiment is 4,200 episodes per actor, 12,600 across three actors, plus 30 if the optional static reference is run. No expanded jobs are running.
 
+- DiscoveryBench persona pilots ([guide](persona_pilots.md), [results](../reports/discoverybench_persona_pilot/README.md)): 474 recorded episodes (a smoke run, a 24-episode task screen, the 125-episode pilot, a 25-episode neutral replication and 300 counterfactual episodes). No persona, neutral, gender-swap or single-attribute effect exceeded wording noise; any identity shortened the submitted hypothesis.
+
 ## Cleanup validation
 
 All 375 pre-existing report/profile/trace files were checked byte-for-byte, and the README results tables and future paper plan are unchanged. All 30 prompt hashes and restoration overwrite protection passed; the distributable-file/link check passed.

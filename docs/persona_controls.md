@@ -1,7 +1,7 @@
 # Persona controls
 
 A gap between a persona run and the persona-off run is only a persona effect if it is larger than the
-gap you get from rewording the prompt alone. The arms below measure that noise. All are off by default;
+gap you get from rewording the prompt alone. The arms below measure that noise; the post-hoc scripts check a finished run. All are off by default;
 default builds and prompts are unchanged.
 
 ## Arms (`scripts/run_persona_benchmarks.py`, fresh build only)
@@ -24,3 +24,30 @@ Traps:
   `researcher_policy`, and gets no mute/oracle jobs (`bounds_skipped` in the manifest).
 - The scripted researcher stops at the first result review, unless the result failed the submission
   contract; then it asks for a revision while requests remain.
+
+## Post-hoc scripts (read a finished run; every one needs `--budget-usd`)
+
+```
+python scripts/judge_persona_visibility.py --run runs/<run> --budget-usd 2 [--k 4] [--dry-run]
+python scripts/score_sciconv_items.py      --run runs/<run> --budget-usd 2 [--dry-run]
+python scripts/replay_fixed_agent.py       --run runs/<run> --budget-usd 5 [--reference persona_off] [--dry-run]
+python scripts/score_sciconv_items.py      --run runs/<run> --budget-usd 2 --replay
+```
+
+- **Visibility judge**: sees only what the researcher wrote and k profiles (the episode's own plus
+  k−1 seeded distractors, and "none fits better"), picks one. Hit rate vs 1/k with an exact binomial p,
+  per persona and benchmark. A persona the judge cannot pick out cannot be the cause of a gap.
+  Output: `<run>/persona_visibility/`.
+- **SciConv per-item scores**: per missing entity, whether the agent asked for it, whether the
+  researcher gave it (full or partial, verbatim evidence required), whether it was given unasked, and
+  whether the final specification recovered it (from the native judge's `recovered_entities`).
+  Output: `<case>/item_scores.json`, `<run>/sciconv_items/`.
+- **Replay**: every arm answers the exact agent messages of one reference episode. SciConv replays the
+  whole question sequence (each arm's own replies form its history); active-researcher tasks replay
+  each decision point as a one-step counterfactual with the reference history. The reference arm is
+  replayed too, so its self-replay is the noise baseline. ExpBench and terminal tasks are skipped.
+  Output: `<run>/replay/`. `--replay` points the two scorers at it.
+
+Budget: calls stop once the summed `usage.cost` reaches the budget; a response without cost fails
+unless `--price-in/--price-out` (USD per M tokens) are given. With several workers, spend can pass the
+budget by the calls already in flight. `--dry-run` counts calls and estimates tokens without calling.

@@ -1,16 +1,10 @@
-# Simulator persona examples
+# Structured-persona compatibility fixtures
 
-- `profiles/`: six full, authored science profiles. The two PI files form a
-  one-attribute decision-delegation contrast.
-- `persona_overlay.json`: the complete opt-in persona block for an existing
-  shared JSON run configuration.
-- `profile.schema.json`: the exact 56-field profile contract for external clients.
-- `simulator_prompt.example.txt`: the rendered PI identity for operator review.
-- `inspect_injection.py`: a capture-only preview through the original simulator;
-  requires an already prepared episode and existing run config.
-- `simulator_review_template.json`: a separate human researcher-fidelity note.
+These authored profiles, schema examples and Phase 1 design fixtures support the optional structured-persona API and its offline tests. They are not the current experiment's personas or task plan.
 
-See the [ODE injection example](../../docs/science_personas/ODE_INJECTION_EXAMPLE.md)
-and [team handoff](../../docs/TEAM_HANDOFF.md). These files do not define a new
-scientific task, evaluator, disclosure schedule, or actor score. Profiles and
-prompt previews are private operator/simulator inputs.
+- `profiles/`: six authored profiles used by renderer tests.
+- `phase1/`: fixed planner fixtures, including single-attribute contrasts.
+- `inspect_injection.py`: offline prompt preview for this compatibility API.
+- Other JSON/text files: schema, overlay and rendering fixtures.
+
+Use the [current full-profile guide](../../docs/personas.md) and [paper plan](../../docs/design/benchmark_paper_plan.md) for the active study. Exact current prompts are in [the preserved report](../../reports/full_persona_v2/profiles).

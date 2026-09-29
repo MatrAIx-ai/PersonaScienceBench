@@ -1,3 +1,5 @@
+> Compatibility API only. The current study uses [full-profile injection](../personas.md).
+
 # Integrating a science persona into the existing simulator
 
 ## Current protocol integration
@@ -93,5 +95,5 @@ do not add questions or reward conditions to manufacture one.
 
 The Phase 1 planner accepts EXP TOML or JSON configs and emits JSON arm configs that the EXP runner can load. For an EXP JSONL task catalog, set `task_id` in the cohort entry. The standalone attachment CLI still reads JSON; use the planner for TOML input. Plan generation freezes settings but does not verify live persona fidelity or model behavior.
 
-Use the [Phase 1 planner](experiment_plan.md) to generate and freeze the complete
+Use the legacy Phase 1 planner (see [compatibility scope](README.md)) to generate and freeze the complete
 controlled comparison. An attachment or preview alone is not runtime verification.

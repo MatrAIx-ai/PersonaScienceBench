@@ -1,6 +1,6 @@
 # Shared researcher collaboration
 
-Protocol `researcher-review-v2` uses the same loop across DiscoveryBench, BixBench, ScienceAgentBench, Terminal-Bench-Science, ASI-Bench, and the current EXP-Bench design-only track:
+Protocol `researcher-review-v2` uses the same loop across DiscoveryBench, BixBench, ASI-Bench, and the current EXP-Bench design-only track:
 
 **Inspect → discuss the approach → execute or develop the design → review evidence → revise or finish.**
 
@@ -27,21 +27,21 @@ A complete candidate is retained through clarification-only replies. The researc
 
 SciConvBench retains its native clarification dialogue and final specification instead of adding approach/result approval turns. It shares information boundaries, persona isolation, native grading, and trace recording.
 
-The researcher now returns one typed `researcher_decision` tool call per request. This prevents accepting a generated multi-turn conversation as a real decision. Request-format changes and recovery attempts are recorded in the [fourteen-case revision report](../../reports/conversion_v2/README.md).
+The researcher now returns one typed `researcher_decision` tool call per request. This prevents accepting a generated multi-turn conversation as a real decision. See the [current conversion rules](../design/conversion_revision_v2.md) for the maintained protocol.
 
 ## Enable it
 
-For the shared Python runner and Terminal runner, use `configs/conversion-v2-two.json`. The relevant configuration is:
+For the current shared Python runner settings, see `configs/full_persona_v2/shared.json`. The relevant configuration is:
 
 ```json
 "collaboration": {"protocol": "active_researcher", "max_requests": 12}
 ```
 
-In active mode, `max_requests` controls dialogue; the passive simulator’s `max_questions` and `max_facts_per_reply` settings do not control active reviews. Approved facts remain the knowledge boundary.
+In active mode, `max_requests` controls dialogue; the passive simulator’s `max_questions` and `max_facts_per_reply` settings do not control active reviews. Source-specific facts remain attributed; the current full-profile configs set `unrestricted_knowledge=true` for both persona-on and persona-off conditions, allowing general knowledge and suggestions.
 
 The shipped persona-off configurations use GPT-6 Luna for actor, researcher and LLM judges, with 60 total actor calls per case. Native programmatic graders remain programmatic. Use a fresh output directory and set the selected case count and parallelism through the existing runner options. Omitting `collaboration` preserves the earlier passive simulator behavior for historical configurations.
 
-For the EXP realistic runner, use `configs/expbench/conversion-v2-two.toml` with interactive input and design-only mode. Collaboration deliberately rejects the original-input control and experimental full-workflow mode. The legacy EXP runner is unchanged.
+For the EXP realistic runner, use `configs/full_persona_v2/exp.json` with interactive input and design-only mode. Collaboration deliberately rejects the original-input control and experimental full-workflow mode. The legacy EXP runner is unchanged.
 
 ## Interpret the traces
 
@@ -49,8 +49,6 @@ Readable traces show the review phase, approach approval, handoff stage, evidenc
 
 Two exchanges are normal for the simplest complete task: inspection/approach, then result/design. Extra rounds should resolve an uncertainty, change a consequential choice, correct a discrepancy, or improve the explanation. Do not interpret a mechanical increase in turns as a demonstrated improvement in collaboration quality.
 
-The earlier ten BixBench traces used `bixbench-active-researcher-v1`, before the required approach handoff. They remain historical results and are not evidence of this v2 protocol's behavior.
-
 ## Live verification
 
-The [seven-track conversion trial](../../reports/conversion_v2/README.md) is the current execution record. Earlier BixBench trial records are archived outside the repository. Full current traces remain local under ignored `runs/`.
+The [completed 30-persona report](../../reports/full_persona_v2/README.md) contains the current execution record and all 310 published Markdown traces. Original raw logs remain local under ignored `runs/`.

@@ -1,7 +1,7 @@
 # Contributing
 
 Use Python 3.12 and the checked-in lockfiles. Start with the
-[README](README.md), [current status](docs/status.md), and
+[README](README.md), [handoff](docs/TEAM_HANDOFF.md), and
 [reproduction guide](docs/reproducibility.md). The implementation is under
 `src/personasciencebench/`; upstream checkouts and generated runs are external
 inputs, not code to edit or vendor into this repository. EXP-Bench is retained
@@ -27,15 +27,14 @@ CI runs synthetic/offline checks with no credentials or benchmark datasets.
 1. Pin the upstream revision, annotation/data hashes and acquisition paths in
    `manifests/sources.json`; retain upstream licensing and access conditions.
 2. Implement the adapter contract in `adapters/base.py` and register it in
-   `registry.py`. Enumeration is not permission to convert every task: explicitly
-   review the public brief, permitted researcher facts and evaluator references.
+   `registry.py`. Automated conversion must preserve the public brief, source-attributed researcher context and evaluator references.
 3. Follow the [benchmark standards](docs/benchmark_standards.md). Essential task
    requirements remain public; simulator facts require provenance. Persona never
    grants reference-answer access.
 4. Preserve the native evaluation contract. Label environment, prompt, parser,
    sampling and scoring changes as variants. Add appropriate synthetic boundary
    tests; source-backed checks must skip clearly when inputs are unavailable.
-5. Update the adapter guide and `docs/status.md`. Add a report only after measured
+5. Update the adapter guide and `docs/TEAM_HANDOFF.md`. Add a report only after measured
    runs; do not convert missing infrastructure into zero scientific scores.
 
 Preparation defaults to the original two tasks per benchmark. Larger runs use
@@ -57,8 +56,9 @@ Preparation defaults to the original two tasks per benchmark. Larger runs use
   links to subsequent evidence.
 
 Do not commit `.env`, model credentials, raw archives, prepared controller state,
-private traces, virtual environments or upstream checkouts. Preserve existing
-local work/results during cleanup. The repository checker catches common secret
+virtual environments or upstream checkouts. Published traces under `reports/full_persona_v2/`
+are an intentional part of this repository; preserve them and their original scores.
+Keep the completed raw run intact during cleanup. The repository checker catches common secret
 formats and local-link mistakes in distributable text; it is not a comprehensive
 security scanner.
 

@@ -1,184 +1,45 @@
 # PersonaScienceBench
 
-**Scientific agents working with simulated researchers.**
+Scientific agents collaborating with diverse simulated researchers.
 
-PersonaScienceBench studies how researcher expertise and communication affect an AI agent’s scientific work. The actor inspects inputs, runs tools, consults a simulator, and submits its work. The simulator uses source-grounded context, with optional persona instructions. Each benchmark retains its own evaluation contract.
+**Start here:** [remote-agent handoff](docs/TEAM_HANDOFF.md) · [paper and experiment plan](docs/design/benchmark_paper_plan.md) · [completed 30-persona results](reports/full_persona_v2/README.md) · [interaction case studies](reports/full_persona_v2/case_studies.md)
 
-[Conversion rules](docs/design/conversion_revision_v2.md) · [Personas](docs/personas.md) · [Setup](docs/reproducibility.md) · [Experiment status](reports/persona_action_case_study/README.md) · [Conversion history](reports/conversion_v2/README.md)
+## Current study
 
-## Benchmarks and conversion
+The completed experiment contains **30 full personas plus persona off, two questions from each of five benchmarks, and 310 recorded episodes**. Actor, simulator and judge used GPT-6 Luna with reasoning effort `none`. Full profiles enter only the simulator system prompt; both conditions allow general knowledge, while evaluator references remain private.
 
-Five retained benchmark tracks provide **2,108 converted cases from 2,132 source cases**. Conversion is automated; invalid cases are recorded as exclusions. Conversion and asset readiness do not establish that every runtime works.
+The [results report](reports/full_persona_v2/README.md) preserves all scores, persona indexes, exact injected profiles, and **310 full Markdown traces**, including failed and missing-submission episodes. [Frozen experiment metadata](reports/full_persona_v2/experiment.json) and [configuration snapshots](configs/full_persona_v2) accompany them. Raw JSON logs and execution artifacts remain local; see the handoff for transfer instructions.
 
-| Benchmark | Source | Converted | Main domains | Evaluation |
-|---|---:|---:|---|---|
-| DiscoveryBench | 264 | 264 | Biology, humanities, sociology, economics, engineering, meta science | Native discovery scoring |
-| BixBench | 205 | 205 | Computational biology | Native open-answer grading |
-| EXP-Bench | 461 | 440 | Machine learning research | Design coverage and integrity gate; design-only |
-| ASI-Bench | 60 | 60 | Scientific computing across disciplines | Native local gates and weighted scores |
-| SciConvBench | 1,142 | 1,139 | Fluids, PDEs, materials and solid mechanics | Native clarification and specification metrics |
+## Five retained benchmarks
 
-See [asset readiness and exclusions](reports/conversion_v2/conversion_summary.md) before scheduling a larger batch. In particular, 60 BixBench cases have unresolved input-file roles, and only three ASI instances currently have all required local assets.
+| Benchmark | Converted cases | Scientific coverage | Native evaluation |
+|---|---:|---|---|
+| DiscoveryBench | 264 | Biology, humanities, sociology, economics, engineering, meta-science | Discovery scoring |
+| BixBench | 205 | Computational biology | Open-answer grading with executed-analysis submission |
+| EXP-Bench | 440 | ML and scientific experiment design | Design coverage and integrity gate; design only |
+| ASI-Bench | 60 | Scientific computing across disciplines | Local gates and weighted scores |
+| SciConvBench | 1,139 | Fluids, PDEs, materials, solid mechanics | Clarification and specification metrics |
 
-ScienceAgentBench and Terminal-Bench-Science were converted and piloted, then
-discarded from the active benchmark set. ScienceAgentBench required a multi-GB
-verified archive and duplicated evaluator workspaces in each run. Terminal-Bench-
-Science required large source assets, Docker images, and long-lived containers.
-Their adapters remain as historical conversion records, but current persona
-experiments do not schedule them and their local assets and traces are not kept.
+There are **2,108 converted cases**. Conversion does not guarantee that every input or runtime is ready. [Conversion inventory](reports/conversion_v2/conversion_summary.md). ScienceAgentBench and Terminal-Bench-Science were discarded from the active study because of their heavier data/runtime requirements; compatibility code remains for existing interfaces and tests.
 
-### Conversion checklist
+Conversion is automated per benchmark. Preserve the scientific question, inputs, deliverables and native grading; separate public context from simulator context and evaluator references; record exclusions and source provenance. Execution/design tasks use approach and result reviews, while SciConv retains native clarification. See the [conversion rules](docs/design/conversion_revision_v2.md) and [benchmark standards](docs/benchmark_standards.md).
 
-The [original candidate list](docs/design/parent_benchmark_candidates.md) remains available. A check indicates an implemented conversion and live trial, not runtime validation of every case.
+## Next experiment
 
-- [x] BixBench
-- [x] DiscoveryBench
-- [x] ScienceAgentBench — converted and piloted; discarded as too heavy
-- [x] Terminal-Bench-Science — converted and piloted; discarded as too heavy
-- [x] EXP-Bench — added later; design-only
-- [x] ASI-Bench — added later
-- [x] SciConvBench — added later
-- [ ] BixBench3
-- [ ] sc-HeurekaBench
-- [ ] AstaBench: E2E-Bench / E2E-Bench-Hard
-- [ ] PaperBench
-- [ ] MLRC-Bench
-- [ ] SciAgentArena
+The [paper plan](docs/design/benchmark_paper_plan.md) proposes **200 nonvisual questions, six selected personas plus persona off, and three independent complete episodes per condition**. That is 4,200 episodes per actor or 12,600 for three actors. Task selection and the expanded launcher are still to be implemented; the future batch has not been launched. The plan contains the task mixture, behavioral metrics, and figure/table dependencies.
 
-## How conversion works
+## Setup and navigation
 
-The rules below describe the existing implementation. Persona injection and the simulator knowledge policy are under redesign.
+Follow the [Linux setup and migration guide](docs/reproducibility.md). The [persona guide](docs/personas.md) explains the full-profile injection used in the completed study; the [interaction protocol](docs/interaction_protocol.md) explains the shared review workflow.
 
-1. Preserve the scientific objective, required inputs, outputs and native scoring contract; label every adaptation.
-2. Separate public task information, source-attributed simulator context and evaluator-private references. Never infer missing study facts.
-3. Keep persona separate from knowledge: styling cannot alter task requirements or the fact pool.
-4. Record preparation failures, unresolved assets and runtime limits explicitly.
-5. Save actor–simulator interactions, submissions, evaluation results and recovery attempts locally.
-
-Execution and design tracks use approach and result reviews; additional questions are optional. SciConvBench keeps its native clarification dialogue. BixBench’s automatically extracted schema facts are also observable from public inputs. ASI uses B3 tasks with optional B2 methodological guidance, an explicit adaptation of autonomous B3.
-
-The [per-benchmark conversion document](docs/design/conversion_revision_v2.md) specifies extraction, access boundaries, scoring and commands. The [conversion standard](docs/benchmark_standards.md) defines acceptance criteria.
-
-## Researcher personas
-
-The merged [science-persona profiles](docs/science_personas/README.md) add an opt-in 56-attribute schema and deterministic renderer. The [Phase 1 planner](docs/science_personas/experiment_plan.md) creates matched persona arms for the five retained tracks; the proposed 50-task experiment has not been run. Existing profiles remain supported. The [action-persona case study](reports/persona_action_case_study/README.md) has been retired pending a redesign using broader original profiles.
-
-Persona is injected into the **simulator's private system prompt**. The actor
-experiences it through researcher replies; the profile is not added to actor or
-judge prompts. Approved knowledge stays fixed across conditions.
-
-An example configuration uses a **computer-science novice** profile, with novice
-domain knowledge, statistics, and coding. Computer science remains the configured
-domain for every task; other persona fields use neutral defaults.
-
-```json
-{
-  "persona": {
-    "enabled": true,
-    "id": "computer-science-novice",
-    "version": "1",
-    "expertise": {
-      "domain": "computer science",
-      "domain_level": "novice",
-      "statistics": "novice",
-      "coding": "novice"
-    }
-  }
-}
-```
-
-For the control condition, set `"persona": {"enabled": false}`. **The simulator
-stays available**, with the same approved facts and no persona instructions.
-Omitting `persona` in the shared runner instead selects an enabled neutral profile.
-
-<details>
-<summary>Schema and injection behavior</summary>
-
-| Field group | Controls |
-| --- | --- |
-| `enabled`, `id`, `version` | Activation and profile identity |
-| `role` | Title and seniority |
-| `expertise` | Domain; independent domain, statistics, and coding levels |
-| `research_style` | Research approach and method preference |
-| `evidence` | Evidence standard and risk tolerance |
-| `communication` | Verbosity, technical level, and tone |
-| `workflow` | Speed/thoroughness and compute preference |
-| `interaction` | Initiative within replies and feedback style |
-
-Shared adapters resolve overrides in order: base profile → router defaults →
-exact domain → full episode ID. In grounded mode, styled replies undergo a
-model-based grounding check; rejected prose falls back to approved fact text or
-an unknown response.
-
-EXP-Bench accepts the same fixed profile through TOML, without the shared router.
-It publishes approved fact text verbatim, so persona can influence fact selection
-and relevance but cannot produce freely styled replies. Low expertise never
-removes approved facts or permits invented study information.
-
-</details>
-
-See the [persona guide](docs/personas.md) for allowed values, routing, prompt
-rendering, and audit records. Complete experiment configs are available for the
-[shared runners](configs/conversion-v2-two.json) and
-[EXP-Bench](configs/expbench/conversion-v2-two.toml).
-
-## Get started
-
-Use Python 3.12 and uv. Python execution requires Linux and Bubblewrap. Place credentials in the ignored `.env` file.
-
-```bash
-uv sync --locked --extra api --extra annotations --extra actor --extra conversion --extra scientific-evaluation
-.venv/bin/python -m personasciencebench --help
-```
-
-Follow the [setup guide](docs/reproducibility.md), then the [conversion and runtime commands](docs/design/conversion_revision_v2.md#commands). Source revisions and checksums are pinned in `manifests/`. Install ASI from the pinned local source as described in the conversion guide. The setup guide retains historical instructions for the two discarded tracks.
-
-Run independent cases concurrently and use a fresh output directory for every attempt. Raw model/tool records and readable conversations live under ignored `runs/`; published reports contain summary outcomes and local record locators.
-
-## Experiment status
-
-The replacement full-persona experiment has completed locally in
-[runs/full-persona-v2-two-20260926](runs/full-persona-v2-two-20260926): 30 personas
-plus a fresh persona-off baseline, two fixed questions per retained benchmark
-(**310 episodes**). All model roles use GPT-6 Luna with reasoning effort `none`.
-The batch began with eight episode slots and three Python workers; Python concurrency later increased to six.
-Full persona text is injected into the simulator system prompt only. Both arms
-can use general knowledge; native scoring references remain private. Exact
-configs, API traces, readable episode traces, and completion records are retained.
-
-
-The previous action-rule persona experiment has been withdrawn. Its injection
-used a narrow subset of the original profiles, so its results do not answer the
-intended full-persona research question. Raw runs, score tables, rankings, and
-generated displays have been removed from the current worktree.
-
-Original persona data and benchmark inputs are retained. We are redesigning the
-persona injection and simulator interaction; preserving the old approved-facts
-boundary is not a requirement. The replacement runtime now supports full-profile system injection and general
-knowledge in the simulator. All 310 episodes have finished; the final tables distinguish scored outcomes, missing submissions, and errors.
-
-The original 300 profiles have been rescreened: **180 are eligible**, including
-the previous 131 and 49 additional profiles. The three static rules require at
-least four concrete behavioral attributes, three directional preferences or
-habits, and evidence across two behavioral areas. Communication, interaction,
-decisions, workflow, and tool collaboration count; there is no domain filter
-or model-score selection. Eligibility does not guarantee a behavioral effect.
-
-Inspect the local [pool and all 300 decisions](data/persona_case_study/full_profile_selection_v2/README.md),
-generated by `scripts/reselect_persona_pool.py`. The earlier 30-profile sample
-from the old pool is superseded. The [replacement 30 and full prompts](data/persona_case_study/full_persona_v2/README.md)
-are now ready: 8 synthetic, 8 Wikipedia-derived, 8 Stack Overflow, 4 survey,
-1 PRISM, and 1 Amazon profile. Selection balances available sources and greedily
-covers different directional behavioral preferences across the five areas;
-it uses no model scores. This is a diversity-oriented sample, not a population
-estimate. `scripts/build_full_persona_cohort.py` records the selection method,
-coverage, original profiles, exact prompts, and field audits.
-The planned injection uses the broader profile with the pinned MatrAIx renderer,
-without domain or knowledge-boundary restrictions. Selection evidence does not
-limit which persona attributes are injected. These artifacts are local and
-ignored by Git; the updated runners now consume these prompts.
-
-[Retirement record](reports/persona_action_case_study/README.md)
+| Location | Purpose |
+|---|---|
+| `reports/full_persona_v2/` | Preserved experiment results, profiles, trace indexes, full traces and case studies |
+| `configs/full_persona_v2/` | Frozen cohort, task selection and model/protocol settings |
+| `docs/design/benchmark_paper_plan.md` | Authoritative future study and paper plan |
+| `src/`, `scripts/`, `tests/` | Runners, conversion/analysis tools and offline checks |
+| `manifests/` | Pinned upstream sources and checksums |
+| `data/`, `external/`, `prepared/`, `runs/` | Ignored local inputs and runtime artifacts; transfer or regenerate explicitly |
 
 <!-- FULL_PERSONA_RESULTS_START -->
 
@@ -224,17 +85,3 @@ Turns exclude tool calls. Reply lengths exclude initial requests and private evi
 
 
 <!-- FULL_PERSONA_RESULTS_END -->
-
-## Repository guide
-
-| Path | Contents |
-|---|---|
-| `src/personasciencebench/` | Six adapters, simulator, runtimes and CLI |
-| `src/expbench/` | EXP-Bench design pipeline |
-| `configs/`, `manifests/` | Experiment settings and pinned sources |
-| `docs/` | Conversion standards, setup and research plans |
-| `reports/conversion_v2/` | Current result summaries and catalog readiness |
-| `reports/persona_action_case_study/` | Retirement record and redesign status |
-| `external/`, `data/`, `prepared/`, `runs/` | Ignored local sources, assets, task packages and raw records |
-
-Old raw runs and persona comparison outputs were deleted during cleanup. Previously committed summaries remain in Git history. Implementation code is MIT licensed; upstream data retain their own licenses. See [CONTRIBUTING.md](CONTRIBUTING.md).

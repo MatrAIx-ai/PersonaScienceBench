@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -42,11 +43,15 @@ def readiness(episode, digest_cache: dict[str, str]) -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--benchmarks", nargs="+", choices=sorted(ADAPTERS),
+                        default=["asibench", "sciconvbench", "discoverybench", "bixbench"])
+    args = parser.parse_args()
     OUTPUT.mkdir(parents=True, exist_ok=True)
     report = {"schema_version": "1", "source_root": str(SOURCE_ROOT.resolve()),
               "benchmarks": {}, "excluded": []}
     digest_cache: dict[str, str] = {}
-    for name in ADAPTERS:
+    for name in args.benchmarks:
         adapter = load_adapter(name, SOURCE_ROOT, ROOT / "manifests/sources.json")
         tasks = adapter.enumerate_tasks()
         converted = []

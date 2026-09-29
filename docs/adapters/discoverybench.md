@@ -8,7 +8,26 @@ unmodified checkout with their licenses.
 
 The counting unit is a native query, identified by split, study, metadata file,
 query-group index and native `qid`. A persona variant reuses that scientific
-question; it does not add an independent source task or study.
+question; it does not add an independent source task or study. Keep related
+source-study questions together in dataset splits.
+
+## Conversion and collaboration
+
+Public packages retain the question, dataset/column descriptions, staged inputs
+and submission contract. Automated extraction retains source-attributed context
+and distinguishes explanatory context from methodological advice. The private
+answer-key join uses dataset, metadata suffix and question ID; missing or
+ambiguous references block conversion. Reference hypotheses, workflows and
+evaluator records remain private.
+
+The current protocol reviews the proposed approach and the resulting discovery
+and evidence. Full persona identity enters the simulator system prompt. The
+[full-persona experiment configuration](../../configs/full_persona_v2/shared.json)
+permits general knowledge in both persona-on and persona-off conditions. The
+Azure ecology configurations below keep general-knowledge expansion disabled;
+knowledge policy is configuration-dependent. See the
+[conversion rules](../design/conversion_revision_v2.md) and
+[interaction protocol](../interaction_protocol.md).
 
 ## Selected episodes
 
@@ -209,7 +228,11 @@ negative scores. Exact prompts, source hash, requested generation settings,
 responses, and intermediate grades stay in the private evaluation result.
 The configured provider and resolved judge model must accompany a real run.
 
-## Validation
+## Records and checks
+
+The [completed full-persona report](../../reports/full_persona_v2/README.md)
+contains study results and traces alongside the focused ecology pilot linked
+above. Use the [setup guide](../reproducibility.md) to prepare a new host.
 
 `tests/test_discoverybench.py` checks composite identities, public/private
 separation, exact query selection (including nonzero `qid`), source/reference

@@ -45,7 +45,7 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
         raise ValueError("parallel must be between one and 25")
     # ScienceAgentBench uses an explicitly versioned Bubblewrap environment
     # adaptation with unchanged native graders. Terminal still needs Harbor.
-    supported = {"discoverybench", "bixbench", "scienceagentbench", "asibench"}
+    supported = {"discoverybench", "bixbench", "scienceagentbench", "asibench", "openproblems_denoising"}
     if set(benchmarks) - supported:
         raise ValueError("This runner executes DiscoveryBench, BixBench and the ScienceAgentBench sandbox adaptation; other sources need their runtime bridges")
     from personasciencebench.collaboration import validate_collaboration, POLICY

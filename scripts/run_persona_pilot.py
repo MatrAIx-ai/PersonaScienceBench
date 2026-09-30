@@ -39,7 +39,7 @@ CONDITIONS = ("persona", "persona_off", "neutral")  # built-in conditions; varia
 
 def condition_order(condition: str) -> tuple[int, str]:
     return (CONDITIONS.index(condition), "") if condition in CONDITIONS else (len(CONDITIONS), condition)
-PRIMARY = {"discoverybench": "final_score"}
+PRIMARY = {"discoverybench": "final_score", "openproblems_denoising": "score"}
 SUCCESS_STATUSES = {"scored", "missing_submission"}
 
 
@@ -101,7 +101,11 @@ class PilotConfig(Record):
     name: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
     description: str = ""
     status: Literal["provisional", "approved"] = "provisional"
-    benchmark: Literal["discoverybench"] = "discoverybench"
+    benchmark: Literal["discoverybench", "openproblems_denoising"] = "discoverybench"
+    # Dedicated actor environment for every episode (e.g. single-cell packages); default: the shared .actor-venv.
+    actor_python: str | None = None
+    # Cost estimates use recorded episodes of this benchmark; before any exist, name a proxy benchmark.
+    estimate_benchmark: str | None = None
     base_config: str = "configs/full_persona_v2/shared.json"
     models: dict | None = None
     collaboration: dict = Field(default_factory=lambda: {
@@ -239,6 +243,9 @@ def runner_config(config: PilotConfig, persona: dict) -> dict:
         shared["models"] = deepcopy(config.models)
     shared["collaboration"] = {**shared.get("collaboration", {}), **config.collaboration}
     shared["pilot_cases_per_benchmark"] = 1
+    if config.actor_python:
+        shared["actor_python_overrides"] = {f"{config.benchmark}:{task}": str((ROOT / config.actor_python).resolve())
+                                            for task in config.tasks}
     shared["persona"] = deepcopy(persona)
     shared["notes"] = [f"Persona pilot {config.name}; frozen by scripts/run_persona_pilot.py.",
                        "The persona block is the only difference between arms; tasks, models and budgets are shared."]
@@ -282,10 +289,12 @@ def cost_model(config: PilotConfig) -> tuple[str, dict[str, int]]:
 
 def estimate_plan(config: PilotConfig, jobs: list[dict]) -> dict:
     model, max_tokens = cost_model(config)
-    samples = estimate.load_samples([ROOT / "reports/full_persona_v2/recorded_traces"], config.benchmark)
+    sources = [ROOT / "reports/full_persona_v2/recorded_traces", *sorted((ROOT / "runs").glob("*/episodes"))]
+    samples = estimate.load_samples(sources, config.estimate_benchmark or config.benchmark)
     summary = estimate.summarize(samples, episodes=len(jobs), model=model, max_tokens=max_tokens,
                                  tpm_limit=config.budget.tpm_limit, headroom=config.budget.headroom)
     summary["by_condition"] = dict(Counter(j["condition"] for j in jobs))
+    summary["proxy_benchmark"] = config.estimate_benchmark
     summary["within_budget_at_p90"] = summary["plan"]["p90"]["cost_usd"] <= config.budget.usd
     return summary
 
@@ -294,6 +303,8 @@ def plan_text(config: PilotConfig, jobs: list[dict], summary: dict) -> str:
     arms = Counter((j["condition"], j["arm"]) for j in jobs)
     lines = [f"Pilot {config.name} ({config.status}): {len(config.tasks)} tasks, {len(jobs)} episodes.", ""]
     lines += [f"  {condition:12} {arm:22} {n} episodes" for (condition, arm), n in sorted(arms.items())]
+    if config.estimate_benchmark:
+        lines.append(f"Estimate uses recorded {config.estimate_benchmark} episodes as a proxy; no {config.benchmark} episodes are recorded yet.")
     lines += ["", estimate.render(summary), "",
               f"Budget ${config.budget.usd:.2f}: p90 plan cost ${summary['plan']['p90']['cost_usd']:.2f} "
               f"({'within' if summary['within_budget_at_p90'] else 'OVER'} budget)."]

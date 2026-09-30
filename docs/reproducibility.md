@@ -8,12 +8,35 @@ Use Linux, Python 3.12, the checked-in lockfiles and Bubblewrap. The repository 
 sudo apt-get update
 sudo apt-get install --yes --no-install-recommends bubblewrap
 uv sync --locked --extra test --extra api --extra annotations --extra actor --extra conversion --extra scientific-evaluation
-uv run --locked python -m venv .actor-venv
+# Build the actor venv from the real base interpreter: uv-managed Pythons are reached through a
+# minor-version symlink directory (cpython-3.12-…) that the sandbox does not mount.
+base=$(uv run --locked python -c 'import os, sys; print(os.path.realpath(sys._base_executable))')
+"$base" -m venv --clear .actor-venv
 uv pip sync --python .actor-venv/bin/python --require-hashes configs/actor-requirements.lock.txt
 uv run --locked python -m personasciencebench check-runtime --actor-python .actor-venv
 ```
 
-The runtime probe checks host isolation support; it does not call a model. There is no unsandboxed fallback. Recreate environments after relocation. The historical batch scheduler hardcodes `external/runtime/bubblewrap-local/usr/bin/bwrap`; resolve that host-specific requirement before using it. The general runner also supports the documented `PERSONASCIENCEBENCH_BWRAP` override.
+The runtime probe checks host isolation support; it does not call a model. There is no unsandboxed fallback. Recreate environments after relocation. The batch scheduler uses `PERSONASCIENCEBENCH_BWRAP` when set, the historical host-local build `external/runtime/bubblewrap-local/usr/bin/bwrap` only where it exists, and otherwise the system `bwrap`.
+
+### macOS and other hosts without Bubblewrap
+
+Run the same steps inside the Linux container. The repository is mounted at `/repo`; its Linux virtual environments and uv's cache live in Docker volumes, so they never replace a host `.venv`.
+
+```bash
+docker build -f docker/sandbox.Dockerfile -t psb-sandbox:latest docker/
+docker/run.sh uv sync --locked --extra test --extra api --extra annotations --extra actor --extra conversion --extra scientific-evaluation
+docker/run.sh bash -c 'base=$(.venv/bin/python -c "import os,sys; print(os.path.realpath(sys._base_executable))") && "$base" -m venv --clear .actor-venv && uv pip sync --python .actor-venv/bin/python --require-hashes configs/actor-requirements.lock.txt'
+docker/run.sh .venv/bin/python -m personasciencebench check-runtime --actor-python .actor-venv
+docker/run.sh .venv/bin/python -m pytest -q -rs
+```
+
+Prefix any later command with `docker/run.sh`; prepared packages record absolute `/repo/...` paths, so prepare and run in the same environment. Bubblewrap needs user namespaces and its own `/proc`, so `docker/run.sh` runs the container with unconfined seccomp/AppArmor profiles and system paths and no added capabilities.
+
+| Symptom | Cause and fix |
+|---|---|
+| `check-runtime`: `python: command not found` | The actor venv links through uv's minor-version directory, which the sandbox does not mount; rebuild it from the real interpreter as above |
+| `No module named personasciencebench` from the macOS host `.venv` | Recent Python skips `.pth` files carrying the macOS `hidden` flag: `chflags -R nohidden .venv .actor-venv` (pytest still works because it adds `src/` itself) |
+| `dns error` or `unexpected eof` during `uv sync` in the container | Transient Docker Desktop networking; rerun, since uv's cache persists in the `psb-uv-cache` volume |
 
 Create `.env` from `.env.example` and configure `OPENROUTER_API_KEY` on the remote host. Credentials remain ignored. The [frozen configs](../configs/full_persona_v2) record the completed study's model/settings, not a guarantee of future provider availability.
 

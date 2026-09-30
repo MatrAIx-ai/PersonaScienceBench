@@ -26,7 +26,10 @@ class ResearcherDecision(Record):
 
 class CollaborationConfig(Record):
     protocol: Literal["active_researcher"] = "active_researcher"
-    unrestricted_knowledge: bool = False
+    # Three independent switches; each changes one thing in the simulated researcher's instructions.
+    unrestricted_knowledge: bool = False  # knowledge source: general knowledge besides the task context
+    embody_identity: bool = False  # style: the persona, not the benchmark's style rules, sets how replies read
+    volunteer_information: bool = False  # disclosure: native SciConv user may give facts it was not asked for
     max_requests: int = Field(default=12, ge=2, le=12, strict=True)
 
 
@@ -40,17 +43,26 @@ class CollaborationHandoff(Record):
     artifacts: dict[str, str] = Field(default_factory=dict)
 
 
+def replace_once(text, old, new):
+    """A prompt edit whose anchor is missing must fail loudly, not leave the prompt silently unedited."""
+    if text.count(old) != 1:
+        raise ValueError(f"Prompt edit anchor not found exactly once: {old[:60]!r}")
+    return text.replace(old, new)
+
+
 def validate_collaboration(value):
     return None if value is None else CollaborationConfig.model_validate(value).model_dump()
 
 
 class ActiveResearcher(Researcher):
-    def __init__(self, *args, unrestricted_knowledge=False, **kwargs):
+    def __init__(self, *args, unrestricted_knowledge=False, embody_identity=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.persona_metadata["researcher_policy_version"] = POLICY
         self.persona_metadata["decision_request_version"] = "single-current-turn-tool-v1"
         self.unrestricted_knowledge = unrestricted_knowledge
+        self.embody_identity = embody_identity
         self.persona_metadata["unrestricted_knowledge"] = unrestricted_knowledge
+        self.persona_metadata["embody_identity"] = embody_identity
         self.requests = 0
         self.approach_approved = False
         self.plan_reviews = 0
@@ -100,13 +112,16 @@ class ActiveResearcher(Researcher):
             "remaining_requests": remaining_requests,
         }
         if self.unrestricted_knowledge:
-            system["instructions"] = system["instructions"].replace(
+            system["instructions"] = replace_once(system["instructions"],
                 "Use ONLY the public project brief, approved facts, and shared handoffs as study knowledge. ",
                 "Use the project context and your general knowledge when collaborating. ")
-            system["instructions"] = system["instructions"].replace(
-                "Use the configured expertise naturally; do not act as an omniscient grader. ",
-                "Embody the supplied identity naturally in your communication and decisions. ")
             system["study_context"] = system.pop("approved_facts")
+        if self.embody_identity:
+            # Applied in every arm, so persona and control differ only by the identity text.
+            system["instructions"] = replace_once(system["instructions"],
+                "Use the configured expertise naturally; do not act as an omniscient grader. ",
+                "Embody the supplied identity, if any, naturally in your communication and decisions; "
+                "do not act as an omniscient grader. ")
         if self.persona.enabled:
             system["identity"] = render_persona(self.persona)
         messages = [{"role": "system", "content": json.dumps(system)}, *self.history,

@@ -9,21 +9,38 @@ from personasciencebench.packaging import safe_component,write_json
 from personasciencebench.registry import load_adapter,project_root
 from personasciencebench.persona import resolve_persona,persona_record,render_persona
 from personasciencebench.adapters.sciconvbench import POLICY
+from personasciencebench.collaboration import replace_once
+
+USER_PROMPT_POLICY='sciconv-user-prompt-v2'
+# Edits to the native simulated-user prompt, grouped by the one switch that owns each.
+KNOWLEDGE_EDITS=[("should answer based strictly on that.","may also use your general knowledge."),
+    ("3. If the complete requirement doesn't specify something, tell the agent: \"Make a reasonable assumption based on best practices.\"",
+     '3. You may offer your own suggestions; distinguish them from stated task requirements.')]
+STYLE_EDITS=[("- Be concise.","- Respond naturally as the supplied identity, if any."),("- Do not explain your reasoning.","")]
+DISCLOSURE_EDITS=[("- Do not provide information not asked for.","")]
+# Mirrors the core researcher's knowledge boundary: persona text never adds task facts.
+PERSONA_BOUNDARY=("\n\nIDENTITY. The identity below sets how you communicate. It does not change the task: "
+    "values you give as requirements come only from the COMPLETE requirement.\n")
+
+def researcher_system_prompt(native,*,unrestricted_knowledge=False,embody_identity=False,volunteer_information=False,persona_text=''):
+    """Native SciConv user system prompt plus the configured edits; the identity only when a persona is on.
+    Edits apply in every arm, so persona and control differ only by the identity text."""
+    edits=(KNOWLEDGE_EDITS if unrestricted_knowledge else [])+(STYLE_EDITS if embody_identity else [])+(DISCLOSURE_EDITS if volunteer_information else [])
+    for old,new in edits:native=replace_once(native,old,new)
+    return native+(PERSONA_BOUNDARY+persona_text if persona_text else '')
 
 class Service:
-    def __init__(self,client,persona_text='',unrestricted=False):
-        self.client=client;self.persona_text=persona_text;self.unrestricted=unrestricted
+    def __init__(self,client,persona_text='',prompt_options=None):
+        self.client=client;self.persona_text=persona_text;self.prompt_options=prompt_options or {}
         self.stats={k:0 for k in ['prompt_tokens','completion_tokens','total_tokens','total_calls','failed_calls','total_retries']}
     def invoke(self,user_prompt,system_prompt):
-        if self.unrestricted:
-            system_prompt = system_prompt.replace("should answer based strictly on that.", "may also use your general knowledge.")
-            system_prompt = system_prompt.replace("3. If the complete requirement doesn\'t specify something, tell the agent: \"Make a reasonable assumption based on best practices.\"", '3. You may offer your own suggestions; distinguish them from stated task requirements.')
-            system_prompt = system_prompt.replace("- Be concise.", "- Respond naturally as the supplied identity, if any.")
-            system_prompt = system_prompt.replace("- Do not explain your reasoning.", "")
-            system_prompt = system_prompt.replace("- Do not provide information not asked for.", "")
         self.stats['total_calls']+=1
+        # The native user class swallows every exception into a canned reply, so a failed prompt edit must be
+        # counted here, where the runner's failed_calls check sees it.
         try:
-            r=self.client.completion([{'role':'system','content':system_prompt+self.persona_text},{'role':'user','content':user_prompt}])
+            if self.prompt_options or self.persona_text:
+                system_prompt=researcher_system_prompt(system_prompt,persona_text=self.persona_text,**self.prompt_options)
+            r=self.client.completion([{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}])
         except Exception:
             self.stats['failed_calls']+=1;raise
         for key in ('prompt_tokens','completion_tokens','total_tokens'):self.stats[key]+=r.get('usage',{}).get(key,0)
@@ -62,14 +79,16 @@ def run(prepared,output,config,parallel):
         def log(call):
             with (controller/'api_calls.private.jsonl').open('a') as f:f.write(json.dumps(call)+'\n')
         services={r:Service(OpenRouterClient(**c,role=r,record=log,supported_parameters=catalog[r]['supported_parameters'])) for r,c in config['models'].items()}
-        services['researcher'].unrestricted=config.get('collaboration',{}).get('unrestricted_knowledge',False)
-        if profile.enabled:services['researcher'].persona_text='\n'+render_persona(profile)
-        result={'episode_id':ep.id,'benchmark':'sciconvbench','source_task_id':ep.source_task_id,'status':'infrastructure_error','case_directory':str(case.resolve()),'interaction_protocol':POLICY,'framework':'native ConvAgent'}
+        collab=config.get('collaboration') or {}
+        prompt_options={k:bool(collab.get(k,False)) for k in ('unrestricted_knowledge','embody_identity','volunteer_information')}
+        services['researcher'].prompt_options=prompt_options
+        if profile.enabled:services['researcher'].persona_text=render_persona(profile)
+        result={'episode_id':ep.id,'benchmark':'sciconvbench','source_task_id':ep.source_task_id,'status':'infrastructure_error','case_directory':str(case.resolve()),'interaction_protocol':POLICY,'user_prompt_policy':USER_PROMPT_POLICY,'user_prompt_options':prompt_options,'framework':'native ConvAgent'}
         try:
             Actor=native_class(adapter.source.repository,'main.py','ConvAgent',services['actor'])
             User=native_class(adapter.source.repository,'llm_user_interface.py','LLMUserInterface',services['researcher'])
             actor=Actor(SimpleNamespace());user=User(services['researcher'],ep.public.question,ep.researcher.facts[0].text,log_file=str(case/'conversation_log.txt'))
-            current=ep.public.question;final=None
+            current=ep.public.question;final=None;limit_reached=False
             event('initial_request',{'message':current})
             for turn in range(10):
                 answer=actor.chat(current)
@@ -79,7 +98,7 @@ def run(prepared,output,config,parallel):
                 current=user.answer_clarification_question(answer)
                 event('researcher_reply',{'answer':current})
                 if services['researcher'].stats['failed_calls']:raise RuntimeError('Native researcher model call failed')
-            if final is None:final=actor.get_final_attempt()
+            if final is None:final=actor.get_final_attempt();limit_reached=True
             event('final_specification',{'answer':final})
             (case/'generated_prompt.txt').write_text(final)
             write_json(controller/'submission.json',{'episode_id':ep.id,'stage':'final','answer':final,'artifacts':{},'payload':{}})
@@ -88,8 +107,10 @@ def run(prepared,output,config,parallel):
             name='Disambiguation' if mode=='disambiguation' else 'Inconsistency'
             judge=native_class(adapter.source.repository,f'llm_judge_{mode}.py','LLMJudge'+name,services['judge'])()
             grading=judge.evaluate(truth,final,issues) if mode=='disambiguation' else judge.evaluate(final,issues,ep.public.question,truth)
+            recovered=None
             if mode=='disambiguation':
                 a,b=map(int,grading['score'].split('/'));grading['strict_score']='1/1' if a==b and b>0 else '0/1'
+                grading['partial_score']=f'{a}/{b}';recovered=a/b if b else None
             else:grading['strict_score']=grading.get('score','0/1')
             Chat=native_class(adapter.source.repository,f'llm_judge_{mode}_chat.py','LLMJudge'+name+'Chat',services['judge']);chat=Chat()
             parsed=chat.parse_conversation_log((case/'conversation_log.txt').read_text())
@@ -102,7 +123,8 @@ def run(prepared,output,config,parallel):
             scorer=native._score_disambiguation if mode=='disambiguation' else native._score_inconsistency
             native_case=scorer(case,len(ep.public.question),domain,config['models']['actor']['model'],row['id'],row)
             fr=int(native_case.FR and native_case.IC);ground=int(native_case.grounded and native_case.IC)
-            metrics={'FRR':fr,'CGRR':fr*ground,'SRR':fr*(1-ground),'intent_capture':native_case.IC,'clarification_recall':chat_result.get('questions_about_missing_entities' if mode=='disambiguation' else 'questions_about_inconsistencies',{}).get('count',0)/len(issues),'clarification_precision':chat_result.get('relevant_questions',{}).get('count',0)/len(parsed) if parsed else 0.0,'native_paper_CR':native_case.CR,'native_paper_CP':native_case.CP,'memory_consistency':native_case.MC}
+            # FR before the intent gate and the recovered share keep fact recovery separable from the intent judge.
+            metrics={'FRR':fr,'FR':int(native_case.FR),'entity_recovery':recovered,'question_limit_reached':int(limit_reached),'CGRR':fr*ground,'SRR':fr*(1-ground),'intent_capture':native_case.IC,'clarification_recall':chat_result.get('questions_about_missing_entities' if mode=='disambiguation' else 'questions_about_inconsistencies',{}).get('count',0)/len(issues),'clarification_precision':chat_result.get('relevant_questions',{}).get('count',0)/len(parsed) if parsed else 0.0,'native_paper_CR':native_case.CR,'native_paper_CP':native_case.CP,'memory_consistency':native_case.MC}
             evaluation={'status':'scored','evaluator_version':POLICY+'+luna-judge','metrics':metrics,'details':{'native_case':dataclasses.asdict(native_case),'native_silent_resolution_correction':True,'clarification_ratio_policy':'native case scripts: covered issues / total issues; relevant questions / all questions; paper aggregator values also retained','score_scope':'specification and conversation; no scientific solver execution'}}
             write_json(case/'evaluation.json',evaluation);result.update(status='scored',evaluation=evaluation,researcher_questions=len(parsed),actor_calls=services['actor'].stats['total_calls'])
         except Exception as exc:result.update(error_type=type(exc).__name__,error=str(exc))

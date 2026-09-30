@@ -82,6 +82,12 @@ personas 148, 046 and 155. Gender swap (Woman → Man): pooled −6.8 pp (p = 0.
 No single-line change produced an effect distinguishable from rewording, and the researcher never
 raised gender. See the [gender-swap audit](counterfactual/README.md#gender-swap-audit).
 
+The reverse direction, [man → woman](gender_reverse/README.md) (personas 089, 026, 147; 225 more
+episodes, 2026-09-30, $1.54), also showed no score effect (woman − man over both directions:
++5.2 pp, p = 0.13). It did show a possible answer-length effect: +136 characters with the woman
+label (p = 0.014), carried by occasional very long hypotheses. This is exploratory and not yet
+confirmed.
+
 ## Design
 
 - **Task screen** ([screen/REPORT.md](screen/REPORT.md)): persona off × 2 on 12 deterministic

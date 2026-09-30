@@ -57,4 +57,6 @@ all three of its contrasts; against both unchanged runs its gender-swap differen
 
 **Scope:** all three personas are recorded as women, so this tests woman → man only, on one model,
 five DiscoveryBench tasks and a reference-agreement judge. A null result here does not show the absence
-of gender effects elsewhere; a man → woman direction needs personas recorded as men.
+of gender effects elsewhere. The man → woman direction was run next with personas recorded as men:
+see [gender_reverse](../gender_reverse/README.md) (score: no detectable effect; answer length: a
+possible effect, still to be confirmed).

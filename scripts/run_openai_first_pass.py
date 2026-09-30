@@ -41,6 +41,7 @@ def main():
     p.add_argument('--model', default='gpt-6-astra')
     p.add_argument('--reasoning-effort', default='low')
     p.add_argument('--retry-infrastructure', action='store_true')
+    p.add_argument('--retry-missing', action='store_true', help='Retry missing submissions; retain earlier attempts and report this as a repair pass')
     a = p.parse_args()
     arms = a.arms
     if len(arms) != len(set(arms)) or ("persona_off" not in arms and a.baseline_run is None):
@@ -160,7 +161,11 @@ def main():
         state = base/'state.json'
         if state.exists():
             old = json.loads(state.read_text())
-            if old['status'] != 'running' and (old['status'] != 'infrastructure_error' or not a.retry_infrastructure):
+            missing = any(r.get('status') == 'missing_submission' for r in old.get('native_results', []))
+            retry = (old['status'] == 'running'
+                     or (old['status'] == 'infrastructure_error' and a.retry_infrastructure)
+                     or (missing and a.retry_missing))
+            if not retry:
                 return old
         base.mkdir(parents=True,exist_ok=True)
         attempt = 1

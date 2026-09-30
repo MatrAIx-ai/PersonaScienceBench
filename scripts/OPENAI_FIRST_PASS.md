@@ -4,7 +4,7 @@ Run the frozen 200-task sample (40 tasks per benchmark), with the two highest-ra
 bash scripts/submit_openai_first_pass.sh
 ```
 
-The submission requests one node, 30 CPUs, 128 GB RAM, and 12 hours on `general`. The coordinator prepares only selected tasks and runs at most 30 episode processes concurrently. Scientific BLAS/OpenMP threads are limited to one. Credentials are read from the ignored `.env`; they are not placed in command arguments or run manifests.
+The submission requests one node, 35 CPUs, 128 GB RAM, and 12 hours on `general`. The coordinator prepares only selected tasks and runs at most 35 episode processes concurrently. Scientific BLAS/OpenMP threads are limited to one. Credentials are read from the ignored `.env`; they are not placed in command arguments or run manifests.
 
 Artifacts are under the printed run directory: frozen `selection.csv`, `manifest.json`, per-condition configs, per-submission implementation hashes, Slurm logs, `progress.json`, and individual episode logs/results. Preparation failures remain in `preparation_errors.json`; tasks are never silently replaced. Successful preparation is reused. No pilot or smoke episodes precede this run. Existing runners retain their intrinsic runtime startup checks.
 
@@ -22,6 +22,10 @@ RUN_DIR=/absolute/path/to/run bash scripts/submit_openai_first_pass.sh --retry-i
 
 Completed scientific outcomes, including missing submissions, are preserved. A fatal API configuration/authentication error creates `fatal_api.json` and prevents further inference; resolve the issue and archive that marker before resubmitting. HTTP 429 responses receive bounded backoff; ambiguous transport failures are not automatically replayed. Native EXP judge repetitions remain three and are not additional episode repetitions. This is a first pass, not a multi-seed confidence-interval estimate.
 
-To resume trials sequentially, submit trial 2 with `--retry-infrastructure`, then set `DEPENDENCY=afterany:JOB_ID` when submitting trial 3. `afterany` waits for the entire preceding job to terminate, including when episode errors cause a nonzero exit; it does not assert that every episode succeeded. Each job still uses at most 30 concurrent episode processes. Previous attempt directories remain intact.
+To resume trials sequentially, submit trial 2 with `--retry-infrastructure`, then set `DEPENDENCY=afterany:JOB_ID` when submitting trial 3. `afterany` waits for the entire preceding job to terminate, including when episode errors cause a nonzero exit; it does not assert that every episode succeeded. Each job still uses at most 35 concurrent episode processes. Previous attempt directories remain intact.
 
 Persona-only expansion batches may use `--baseline-run /path/to/matching/trial` instead of including persona off in `--arms`. The coordinator checks task-panel and generation/protocol compatibility. This references baseline results for later analysis; it never copies or regenerates them. `scripts/submit_top10_expansion.py --after-job JOB_ID` submits the prepared expansion manifest as sequential 600-episode batches.
+
+Worker allocation defaults to 35; set `WORKERS=30` to reproduce the original concurrency. `CPUS_PER_TASK` defaults to `WORKERS` and must be at least that large. On 2026-09-29, pending trial 3 and all nine expansion batches were replaced with 40-worker / 40-CPU jobs; trial 2 remained at 30. Memory stays at 128 GB and jobs remain sequential. See `Experiment/shared/worker_40_resubmission.json` for old/new job IDs.
+
+Later on 2026-09-29, the nine still-pending expansion batches were changed to 35 workers / 35 CPUs to reduce observed rate-limit overhead. Running trial 3 remains at 40. The sequential chain, 128 GB allocation, and scientific configuration are preserved. See `Experiment/shared/worker_35_resubmission.json` for the replacement submission audit.

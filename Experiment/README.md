@@ -25,3 +25,7 @@ Refresh reads each job's `progress.json`; it does not query Slurm. A partially p
 ## Top-ten expansion
 
 Nine additional personas from the ten largest absolute pilot changes are now queued sequentially after the existing trials. See [expansion manifest](shared/top10_expansion.json) for all nine jobs and baseline references. This adds 5,400 episodes; the combined collection including persona 155 totals 7,200. Experiments 1, 2, and 4 should analyze the top-ten panel, keeping 155 labeled as an additional condition. Their original three-condition artifacts remain interim snapshots. `refresh_status.py` currently refreshes the original three trials only; consult the expansion manifest/run progress for new batches.
+
+## Repairs
+
+[Error/missing repair pass](07_error_repairs/PLAN.md): seven sequential repair jobs after the current Astra run, with five later expansion jobs held. Repaired outcomes are kept separately from original trial results.

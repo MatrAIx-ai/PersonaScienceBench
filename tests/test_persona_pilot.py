@@ -205,3 +205,17 @@ def test_configs_reproduce_the_prompts_injected_in_the_published_runs(config_nam
     assert set(arms) == set(recorded)
     for arm, record in recorded.items():
         assert persona_record(Persona.model_validate(arms[arm]["persona"]))["sha256"] == record["persona_sha256"], arm
+
+
+@pytest.mark.parametrize("status, errors, expected", [
+    ("infrastructure_error", None, True),
+    ("error", ["Native judge bridge failed: RemoteProtocolError: Server disconnected without sending a response."], True),
+    ("error", ["Native judge bridge failed: RuntimeError: judge: OpenAI HTTP 503"], True),
+    ("error", ["Native judge bridge failed: ValueError: Judge response must be a JSON object"], False),
+    ("missing_submission", None, False),
+    ("scored", None, False),
+])
+def test_only_infrastructure_failures_are_retried(tmp_path, status, errors, expected):
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps({"status": status, "evaluation": {"errors": errors} if errors else None}))
+    assert pilot.infrastructure_failure({"status": status, "result": str(result)}) is expected

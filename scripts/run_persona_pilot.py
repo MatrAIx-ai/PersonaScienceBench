@@ -385,6 +385,24 @@ def spent_usd(output: Path, price: tuple[float, float, float]) -> float:
     return spent
 
 
+INFRASTRUCTURE_STATUSES = {"infrastructure_error", "runtime_error", "launch_error"}
+# Evaluation errors whose recorded cause is transport, not the submission: the judge never answered.
+TRANSPORT_ERROR = re.compile(r"RemoteProtocolError|ConnectError|ReadError|transport failed|HTTP 5\d\d|HTTP 429")
+
+
+def infrastructure_failure(finished: dict) -> bool:
+    """Retry only failures of the infrastructure, never low or missing scientific outcomes."""
+    if finished["status"] in INFRASTRUCTURE_STATUSES:
+        return True
+    if finished["status"] != "error" or not finished.get("result"):
+        return False
+    result = Path(finished["result"].replace("/repo/", str(ROOT) + "/", 1))
+    if not result.is_file():
+        return False
+    errors = (read(result).get("evaluation") or {}).get("errors") or []
+    return bool(errors) and all(TRANSPORT_ERROR.search(e) for e in errors)
+
+
 def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: bool, retry_errors: bool) -> dict:
     import run_persona_benchmarks as scheduler
     manifest = read(output / "manifest.json")
@@ -397,7 +415,7 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
         for job in manifest["jobs"]:
             done = output / "finished" / (job["key"] + ".json")
             retry = {**job, "key": job["key"] + "-retry2", "attempt": 2}
-            if (done.exists() and read(done)["status"] in {"infrastructure_error", "runtime_error", "launch_error"}
+            if (done.exists() and infrastructure_failure(read(done))
                     and not (output / "finished" / (retry["key"] + ".json")).exists()):
                 pending.append(retry)
     model, _ = cost_model(config)

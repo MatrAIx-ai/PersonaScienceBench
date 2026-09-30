@@ -399,6 +399,8 @@ def spent_usd(output: Path, price: tuple[float, float, float]) -> float:
 INFRASTRUCTURE_STATUSES = {"infrastructure_error", "runtime_error", "launch_error"}
 # Evaluation errors whose recorded cause is transport, not the submission: the judge never answered.
 TRANSPORT_ERROR = re.compile(r"RemoteProtocolError|ConnectError|ReadError|transport failed|HTTP 5\d\d|HTTP 429")
+# Recorded causes meaning the evaluator process itself was killed (e.g. out of memory); the submission stands.
+EVALUATOR_FAILURE = re.compile(r"Signals\.SIGKILL|killed by signal|Native evaluator failure \(infrastructure\)")
 
 
 def infrastructure_failure(finished: dict) -> bool:
@@ -412,6 +414,62 @@ def infrastructure_failure(finished: dict) -> bool:
         return False
     errors = (read(result).get("evaluation") or {}).get("errors") or []
     return bool(errors) and all(TRANSPORT_ERROR.search(e) for e in errors)
+
+
+def _result_path(finished: dict) -> Path | None:
+    if not finished.get("result"):
+        return None
+    path = Path(finished["result"].replace("/repo/", str(ROOT) + "/", 1))
+    return path if path.is_file() else None
+
+
+def regrade_candidates(output: Path) -> list[dict]:
+    """Latest attempt per cell whose every recorded error is an evaluator kill, with a sealed submission."""
+    latest = {}
+    for finished in sorted((read(p) for p in (output / "finished").glob("*.json")), key=lambda f: f.get("attempt", 1)):
+        latest[(finished["arm"], finished["repeat"], finished["task"])] = finished
+    chosen = []
+    for finished in latest.values():
+        result = _result_path(finished)
+        if result is None or not (result.parent / "controller/submission.json").is_file():
+            continue
+        errors = (read(result).get("evaluation") or {}).get("errors") or []
+        if errors and all(EVALUATOR_FAILURE.search(e) for e in errors):
+            chosen.append(finished)
+    return chosen
+
+
+def regrade(output: Path) -> list[dict]:
+    """Re-evaluate sealed submissions whose native evaluator was killed. Programmatic evaluators only; no model calls.
+
+    The actor's work is kept; only grading is repeated. Originals stay; each regrade is recorded as attempt 2.
+    """
+    from personasciencebench.registry import load_adapter
+    from personasciencebench.schema import Episode, Submission
+    prepared = read(output / "prepared/pilot_manifest.json")
+    done = []
+    for finished in regrade_candidates(output):
+        result_path = _result_path(finished)
+        case = result_path.parent
+        episode = Episode.model_validate(read(case / "controller/episode.private.json"))
+        if episode.evaluator.kind != "native_programmatic":
+            raise ValueError(f"{finished['key']}: regrade supports programmatic evaluators only (no judge calls)")
+        adapter = load_adapter(episode.benchmark, Path(prepared["source_root"]), Path(prepared["source_manifest"]))
+        submission = Submission.model_validate(read(case / "controller/submission.json"))
+        evaluation = adapter.evaluate(episode, submission, None)
+        evaluation.details.update(judge_model=None, judge_kind="native_programmatic_verifier", regrade_of=finished["key"])
+        record = {**read(result_path), "status": evaluation.status, "evaluation": evaluation.model_dump(mode="json"),
+                  "regraded_from": finished["key"]}
+        regraded = case / "result.regrade2.json"
+        write(regraded, record)
+        key = finished["key"] + "-regrade2"
+        entry = {**finished, "key": key, "attempt": finished.get("attempt", 1) + 1, "status": evaluation.status,
+                 "result": str(regraded), "regrade": True}
+        write(output / "finished" / (key + ".json"), entry)
+        print(f"{key}: {evaluation.status} {evaluation.metrics.get('score')}", flush=True)
+        done.append(entry)
+    print(f"Regraded {len(done)} sealed submissions; no model calls.")
+    return done
 
 
 def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: bool, retry_errors: bool) -> dict:
@@ -464,7 +522,8 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
 
 def episode_row(output: Path, manifest: dict, finished: dict, price=(0.0, 0.0, 0.0)) -> dict:
     case = Path(finished["result"]).parent if finished.get("result") else None
-    record = read(case / "result.json") if case and (case / "result.json").is_file() else {}
+    # The record this attempt points to: result.json, or result.regrade2.json for a regraded submission.
+    record = read(Path(finished["result"])) if case and Path(finished["result"]).is_file() else {}
     events = []
     if case and (case / "controller/events.jsonl").is_file():
         events = [json.loads(line) for line in (case / "controller/events.jsonl").read_text().splitlines() if line.strip()]
@@ -733,6 +792,8 @@ def main(argv=None):
     running.add_argument("--yes", action="store_true", help="Confirm the paid run after reviewing the estimate")
     running.add_argument("--allow-provisional", action="store_true")
     running.add_argument("--retry-errors", action="store_true", help="Retry infrastructure failures once; keep originals")
+    regrading = commands.add_parser("regrade", help="Re-grade sealed submissions whose native evaluator was killed (no model calls)")
+    regrading.add_argument("--output", type=Path, required=True)
     reporting = commands.add_parser("report", help="Regenerate REPORT.md, results.csv and summary.json")
     reporting.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -744,6 +805,9 @@ def main(argv=None):
         elif args.command == "run":
             run(args.output.resolve(), parallel=args.parallel, yes=args.yes,
                 allow_provisional=args.allow_provisional, retry_errors=args.retry_errors)
+            report(args.output.resolve())
+        elif args.command == "regrade":
+            regrade(args.output.resolve())
             report(args.output.resolve())
         else:
             report(args.output.resolve())

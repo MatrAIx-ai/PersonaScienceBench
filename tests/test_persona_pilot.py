@@ -219,3 +219,25 @@ def test_only_infrastructure_failures_are_retried(tmp_path, status, errors, expe
     result = tmp_path / "result.json"
     result.write_text(json.dumps({"status": status, "evaluation": {"errors": errors} if errors else None}))
     assert pilot.infrastructure_failure({"status": status, "result": str(result)}) is expected
+
+
+def test_regrade_selects_only_evaluator_kills_and_keeps_the_original(tmp_path, monkeypatch):
+    c = config(personas={"ids": [], "repeats": 1}, controls={"persona_off": {"repeats": 1}})
+    jobs = pilot.jobs_for(c, pilot.arm_profiles(c))
+    pilot.write(tmp_path / "manifest.json", {"name": c.name, "benchmark": "discoverybench", "tasks": TASKS, "jobs": jobs,
+                                             "task_metadata": {}})
+    fake_episode(tmp_path, jobs[0], "missing_submission", None)
+    fake_episode(tmp_path, jobs[1], "missing_submission", None)
+    killed = Path(pilot.read(tmp_path / "finished" / (jobs[0]["key"] + ".json"))["result"])
+    record = pilot.read(killed)
+    record["evaluation"] = {"errors": ["Prediction violates the file contract: ... died with <Signals.SIGKILL: 9>."]}
+    pilot.write(killed, record)
+    for job in jobs[:2]:
+        (Path(pilot.read(tmp_path / "finished" / (job["key"] + ".json"))["result"]).parent / "controller/submission.json").write_text("{}")
+    assert [f["key"] for f in pilot.regrade_candidates(tmp_path)] == [jobs[0]["key"]]
+    # A regrade record (attempt 2) supersedes it in selection; the original file is untouched.
+    pilot.write(tmp_path / "finished" / (jobs[0]["key"] + "-regrade2.json"),
+                {**jobs[0], "key": jobs[0]["key"] + "-regrade2", "attempt": 2, "status": "scored", "result": str(killed)})
+    record["evaluation"] = {"status": "scored", "metrics": {"final_score": 0.5}}
+    pilot.write(killed.with_name("result.regrade2.json"), record)
+    assert (tmp_path / "finished" / (jobs[0]["key"] + ".json")).is_file()

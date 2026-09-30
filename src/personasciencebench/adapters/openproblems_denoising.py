@@ -135,7 +135,9 @@ class OpenProblemsDenoisingAdapter(Adapter):
         for key in ("test", "train"):
             if sha256(Path(reference[f"{key}_path"])) != reference[f"{key}_sha256"]:
                 return EvaluationResult(status="error", evaluator_version=POLICY, errors=[f"{key}.h5ad changed since conversion"])
-        work = Path(prediction).parent.parent / "openproblems_evaluation"
+        base = Path(prediction).parent.parent
+        work = next(base / name for name in ("openproblems_evaluation", *(f"openproblems_evaluation-{i}" for i in range(2, 100)))
+                    if not (base / name).exists())
         work.mkdir(exist_ok=False)
         shutil.copyfile(prediction, work / "prediction.h5ad")
         shutil.copyfile(reference["test_path"], work / "test.h5ad")
@@ -167,6 +169,10 @@ class OpenProblemsDenoisingAdapter(Adapter):
         if native is None:
             return EvaluationResult(status="error", evaluator_version=POLICY, errors=["Native OpenProblems evaluation failed"],
                                     details={"stderr_tail": receipt["stderr"][-2000:], "evaluator_directory": str(work)})
+        if native.get("evaluator_failure"):
+            return EvaluationResult(status="error", evaluator_version=POLICY,
+                                    errors=[f"Native evaluator failure (infrastructure): {native['evaluator_failure']}"],
+                                    details={"native_result": native, "evaluator_directory": str(work)})
         if controls:
             native.update(controls, controls_cached=True)
         if native.get("contract_violation"):
@@ -260,9 +266,15 @@ if problems:
 else:
     try:
         result["prediction"] = metrics_for("prediction.h5ad")
+    except subprocess.CalledProcessError as error:
+        if error.returncode < 0:
+            # Killed by a signal (SIGKILL from the kernel when memory runs out): the evaluator failed.
+            result["evaluator_failure"] = f"native {error.cmd[3]} metric killed by signal {-error.returncode} (likely out of memory)"
+        else:
+            result["contract_violation"] = f"native {error.cmd[3]} metric raised an error on the prediction (exit {error.returncode})"
     except Exception:
         result["contract_violation"] = "native metric failed on the prediction: " + traceback.format_exc(limit=2)[-600:]
-if "contract_violation" not in result and "--controls" in sys.argv:
+if not {"contract_violation", "evaluator_failure"} & set(result) and "--controls" in sys.argv:
     run("no_denoising.py", {"input_train": "train.h5ad", "output": "control_negative.h5ad"}, "no_denoising")
     run("perfect_denoising.py", {"input_train": "train.h5ad", "input_test": "test.h5ad", "output": "control_positive.h5ad"}, "perfect_denoising")
     result["negative"] = metrics_for("control_negative.h5ad")

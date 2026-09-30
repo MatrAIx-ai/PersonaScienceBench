@@ -130,6 +130,11 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                         episode, session.submission, runtime_root, case / "controller/native_evaluation")
                     evaluation.details["judge_model"] = None
                     evaluation.details["judge_kind"] = "native_programmatic_verifier"
+                elif episode.evaluator.kind == "native_programmatic":
+                    # Programmatic native metrics: no LLM judge is called, so no judge label applies.
+                    evaluation = adapter.evaluate(episode, session.submission, None)
+                    evaluation.details["judge_model"] = None
+                    evaluation.details["judge_kind"] = "native_programmatic_verifier"
                 else:
                     evaluation = adapter.evaluate(episode, session.submission, clients["judge"])
                     evaluation.details["judge_model"] = clients["judge"].model

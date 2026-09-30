@@ -10,4 +10,4 @@ Compile from this directory when a LaTeX distribution is available:
 latexmk -pdf main.tex
 ```
 
-`main.pdf` is the original supplied template PDF and has not been regenerated for this outline. This environment currently has neither `latexmk` nor `pdflatex`.
+`main.pdf` was imported from the GitHub paper update. It has not been rebuilt for the local resource-budget merge resolution. This environment currently has neither `latexmk` nor `pdflatex`.

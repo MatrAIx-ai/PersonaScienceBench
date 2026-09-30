@@ -19,6 +19,14 @@ def write(p,data):
     tmp=p.with_suffix('.tmp');tmp.write_text(json.dumps(data,indent=2)+'\n');tmp.replace(p)
 
 def main():
+    global ROOT
+    campaign = json.loads((ROOT/'Experiment/07_error_repairs/status.json').read_text())
+    if campaign.get('runtime'):
+        ROOT = Path(campaign['runtime']['root']).resolve()
+        if not (ROOT/'runtime_manifest.json').exists():
+            raise RuntimeError('Pinned repair runtime is missing')
+        sys.path.insert(0, str(ROOT/'src'))
+        os.environ['PYTHONPATH'] = str(ROOT/'src')
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source-run',type=Path,required=True)
     p.add_argument('--run-dir',type=Path,required=True)

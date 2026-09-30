@@ -17,3 +17,7 @@ These are conditional additional attempts, not independent new trials. Report or
 ## Status and results
 
 Seven repair jobs submitted sequentially after 1966129; no repair results yet. Five later expansions held. All 42 source condition/configuration combinations match the current coordinator-generated settings; Python and shell syntax checks passed. Remaining token-cap or schema errors require separate diagnosis rather than unlimited resampling.
+
+## Runtime pin for the GitHub merge
+
+GitHub commit `92036dd` changes scientific persona-control defaults and prompt behavior. To preserve the already queued repair protocol, those jobs use an archived runtime from local commit `de6d85f`, with only `src/personasciencebench/openai_transport.py` overlaid from `92036dd` for the requested upstream transient-error retry fixes. The runtime path and every source/configuration hash are recorded in `status.json` and the ignored runtime directory’s `runtime_manifest.json`. New main-branch work uses the merged upstream implementation. Queued repairs were temporarily held during integration and then released with their original dependencies.

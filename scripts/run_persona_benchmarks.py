@@ -55,12 +55,13 @@ def build(output):
     assert len(profiles) == 31
     shared = read(ROOT / 'configs/conversion-v2-two.json')
     shared['pilot_cases_per_benchmark'] = 1
-    shared['collaboration']['unrestricted_knowledge'] = True
+    # full_persona_v2 settings, now as separate switches: general knowledge, persona-set style, volunteering (SciConv).
+    shared['collaboration'].update(unrestricted_knowledge=True, embody_identity=True, volunteer_information=True)
     shared['notes'] = ['Full MatrAIx profile in simulator system prompt; unrestricted general knowledge for all arms.',
         'Five fixed tasks per benchmark; 30 personas and one fresh shared baseline; native scoring unchanged.']
     shared.pop('actor_python_overrides', None)
     exp = tomllib.loads((ROOT / 'configs/expbench/conversion-v2-two.toml').read_text())
-    exp['collaboration']['unrestricted_knowledge'] = True
+    exp['collaboration'].update(unrestricted_knowledge=True, embody_identity=True)
     for config in [shared, exp]:
         for model in config['models'].values():
             assert model['model'] == 'openai/gpt-6-luna' and model['reasoning_effort'] == 'none'
@@ -135,9 +136,17 @@ def command(output, job):
             '--config', str(config.with_name('exp.json')), '--output', str(result), '--parallel', '1']
 
 
+def bubblewrap_environment(env, local_bwrap=ROOT / 'external/runtime/bubblewrap-local/usr/bin/bwrap'):
+    """An explicit PERSONASCIENCEBENCH_BWRAP wins; the historical host-local build is used only where
+    it exists; otherwise runtime.Sandbox finds the system bwrap on /usr/bin:/bin."""
+    if 'PERSONASCIENCEBENCH_BWRAP' not in env and Path(local_bwrap).is_file():
+        env = {**env, 'PERSONASCIENCEBENCH_BWRAP': str(local_bwrap)}
+    return env
+
+
 def execute(output, job):
     started = time.monotonic()
-    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1', PERSONASCIENCEBENCH_BWRAP=str(ROOT / 'external/runtime/bubblewrap-local/usr/bin/bwrap'))
+    env = bubblewrap_environment(dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1'))
     log = output / 'logs' / (job['key'] + '.log')
     log.parent.mkdir(exist_ok=True)
     with log.open('w') as stream:

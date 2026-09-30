@@ -435,6 +435,7 @@ def run_actor(session, client, sandbox, max_steps: int = 20, *, collaboration: d
             "researcher_requests": session.researcher.requests,
             "researcher_decisions": len(session.researcher.audit),
             "termination": "error" if failure else controller.termination,
+            "approach_approved": session.researcher.approach_approved,
             "max_requests": collaboration["max_requests"],
         }
     session.event("actor_finished", result)
@@ -446,6 +447,7 @@ def _run_collaboration(conversation, controller, config, max_steps):
     session = controller.session
     handoff = None
     candidate = None
+    rejection = None
     limit = config["max_requests"]
     for turn in range(limit + 1):
         decision = session.researcher.decide(session, handoff, limit - turn)
@@ -454,7 +456,8 @@ def _run_collaboration(conversation, controller, config, max_steps):
             break
         if turn == limit or controller.calls >= max_steps:
             controller.termination = "researcher_request_limit" if turn == limit else "actor_call_limit"
-            session.event("collaboration_budget_exhausted", {"reason": controller.termination})
+            session.event("collaboration_budget_exhausted", {"reason": controller.termination,
+                          "approach_approved": session.researcher.approach_approved})
             break
         controller.turn_reply = None
         message = {"researcher_request": decision.message,
@@ -462,6 +465,8 @@ def _run_collaboration(conversation, controller, config, max_steps):
                    "approach_approved": session.researcher.approach_approved}
         if turn == 0:
             message["public_task"] = session.episode.actor_input()
+        if rejection is not None:
+            message["previous_result_rejected"] = rejection
         conversation.send_message(json.dumps(message, ensure_ascii=False))
         conversation.max_iteration_per_run = max_steps - controller.calls
         conversation.run()
@@ -469,6 +474,7 @@ def _run_collaboration(conversation, controller, config, max_steps):
             controller.termination = "actor_error"
             return
         handoff = controller.turn_reply
+        rejection = None
         if handoff is not None and handoff["stage"] == "result":
             contract = session.episode.public.submission
             required = list(contract.get("required_artifacts", []))
@@ -476,9 +482,15 @@ def _run_collaboration(conversation, controller, config, max_steps):
                 required.append(contract["program"])
             if session.episode.benchmark == "bixbench":
                 required.append("analysis")
-            if all(key in handoff["artifacts"] for key in required) and (
-                session.episode.benchmark != "bixbench" or handoff["payload"].get("executed_analysis") is True
-            ):
+            missing = [f"artifacts.{key}" for key in required if key not in handoff["artifacts"]]
+            if session.episode.benchmark == "bixbench" and handoff["payload"].get("executed_analysis") is not True:
+                missing.append("payload.executed_analysis=true")
+            if missing:
+                # Previously silent: the researcher reviewing this result and the actor's next turn both see why.
+                rejection = {"reason": "result does not satisfy the submission contract", "missing": missing}
+                session.event("result_handoff_rejected", rejection)
+                handoff = {**handoff, "payload": {**handoff["payload"], "controller_contract_check": rejection}}
+            else:
                 candidate = {key: handoff[key] for key in ("answer", "payload", "artifacts")}
         if handoff is None:
             controller.termination = "actor_did_not_handoff"

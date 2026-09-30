@@ -37,7 +37,7 @@ For the current shared Python runner settings, see `configs/full_persona_v2/shar
 "collaboration": {"protocol": "active_researcher", "max_requests": 12}
 ```
 
-In active mode, `max_requests` controls dialogue; the passive simulator’s `max_questions` and `max_facts_per_reply` settings do not control active reviews. Source-specific facts remain attributed; the current full-profile configs set `unrestricted_knowledge=true` for both persona-on and persona-off conditions, allowing general knowledge and suggestions.
+In active mode, `max_requests` controls dialogue; the passive simulator’s `max_questions` and `max_facts_per_reply` settings do not control active reviews. Source-specific facts remain attributed; the current full-profile configs set `unrestricted_knowledge`, `embody_identity` and (SciConv only) `volunteer_information` to true for both persona-on and persona-off conditions: general knowledge and suggestions, persona-set reply style, and facts offered unasked. Each switch is off by default and can be set on its own.
 
 The shipped persona-off configurations use GPT-6 Luna for actor, researcher and LLM judges, with 60 total actor calls per case. Native programmatic graders remain programmatic. Use a fresh output directory and set the selected case count and parallelism through the existing runner options. Omitting `collaboration` preserves the earlier passive simulator behavior for historical configurations.
 

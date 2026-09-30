@@ -10,6 +10,9 @@ import httpx
 # server/gateway failures. Resending the identical request cannot select a better answer;
 # the retry count is recorded with the call. Client errors (4xx other than 429) never retry.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Connection failures in which no response arrived (dropped or refused connections). Read and
+# write timeouts are not retried: a request that ran to the timeout is not resent automatically.
+RETRYABLE_TRANSPORT_ERRORS = (httpx.RemoteProtocolError, httpx.NetworkError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 def preflight(models, timeout=45):
@@ -98,7 +101,14 @@ class ResponsesTransport:
         if fatal and Path(fatal).exists():
             raise RuntimeError('Run stopped after a fatal API configuration error; see fatal_api.json')
         for retry in range(6):
-            response = httpx.post('https://api.openai.com/v1/responses', headers={'Authorization': 'Bearer '+key}, json=request, timeout=self.timeout)
+            try:
+                response = httpx.post('https://api.openai.com/v1/responses', headers={'Authorization': 'Bearer '+key}, json=request, timeout=self.timeout)
+            except RETRYABLE_TRANSPORT_ERRORS as error:
+                # No response arrived; the class name is enough context and never carries the request.
+                if retry == 5:
+                    raise RuntimeError(f'OpenAI transport failed ({type(error).__name__}) after {retry + 1} attempts') from None
+                time.sleep(min(60, 2**retry) + random.random())
+                continue
             if response.status_code not in RETRYABLE_STATUS or retry == 5:
                 break
             time.sleep(min(60, float(response.headers.get('retry-after', 2**retry))) + random.random())

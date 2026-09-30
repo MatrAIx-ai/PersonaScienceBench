@@ -51,3 +51,42 @@ def test_retries_are_bounded(provider):
     with pytest.raises(RuntimeError, match='OpenAI HTTP 503'):
         ResponsesTransport().complete(PAYLOAD)
     assert len(provider.requests) == 6 and len(provider.sleeps) == 5
+
+
+@pytest.fixture
+def flaky(monkeypatch, provider):
+    """Raise the queued exceptions before answering; `provider` supplies key, sleeps and the 200 reply."""
+    errors = []
+    answer = httpx.post
+
+    def post(url, **kwargs):
+        if errors:
+            provider.requests.append(kwargs['json'])
+            raise errors.pop(0)
+        return answer(url, **kwargs)
+    monkeypatch.setattr(httpx, 'post', post)
+    return errors
+
+
+@pytest.mark.parametrize('error', [httpx.RemoteProtocolError('Server disconnected without sending a response.'),
+                                   httpx.ConnectError('refused'), httpx.ReadError('reset'), httpx.ConnectTimeout('slow')])
+def test_dropped_connections_are_retried_with_the_identical_request(provider, flaky, error):
+    flaky.append(error)
+    provider.statuses.append(200)
+    result = ResponsesTransport().complete(PAYLOAD)
+    assert result['choices'][0]['message']['content'] == 'done' and result['_rate_limit_retries'] == 1
+    assert provider.requests[0] == provider.requests[1] and len(provider.sleeps) == 1
+
+
+def test_read_timeouts_are_not_resent(provider, flaky):
+    flaky.append(httpx.ReadTimeout('ran to the timeout'))
+    with pytest.raises(httpx.ReadTimeout):
+        ResponsesTransport().complete(PAYLOAD)
+    assert provider.sleeps == []
+
+
+def test_persistent_disconnects_fail_after_six_attempts_without_leaking_the_request(provider, flaky):
+    flaky.extend(httpx.RemoteProtocolError('gone') for _ in range(6))
+    with pytest.raises(RuntimeError, match=r'transport failed \(RemoteProtocolError\) after 6 attempts') as raised:
+        ResponsesTransport().complete(PAYLOAD)
+    assert 'UNIT_TEST_KEY' not in str(raised.value) and len(provider.sleeps) == 5

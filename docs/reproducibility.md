@@ -80,6 +80,8 @@ EXP context extraction and source advice classification may use model calls and 
 
 ## New runs
 
+Estimate tokens, cost and safe parallelism first with [`scripts/estimate_run_cost.py`](cost_estimates.md); it makes no model calls.
+
 Read the [paper plan](design/benchmark_paper_plan.md) before scheduling. The 200-task manifest and expanded six-persona, three-repeat launcher are not yet implemented. `scripts/run_persona_benchmarks.py` preserves the prior scheduler and assumes a historical 25-task build; do not mistake it for the planned study.
 
 Prepare new public task workspaces on the destination host, using explicit source task IDs and selections. Recorded `prepared` packages and the old scheduler's input manifests contain absolute paths. The shared runner supports Discovery/Bix/ASI, `personasciencebench.sciconv_runner` handles SciConv, and `expbench.realistic` handles EXP. Keep independent cases parallel, retain complete traces, and use a fresh output directory for every experiment.

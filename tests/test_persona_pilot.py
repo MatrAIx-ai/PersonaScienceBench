@@ -241,3 +241,22 @@ def test_regrade_selects_only_evaluator_kills_and_keeps_the_original(tmp_path, m
     record["evaluation"] = {"status": "scored", "metrics": {"final_score": 0.5}}
     pilot.write(killed.with_name("result.regrade2.json"), record)
     assert (tmp_path / "finished" / (jobs[0]["key"] + ".json")).is_file()
+
+
+def test_scheduler_stops_after_consecutive_fast_infrastructure_failures(tmp_path, monkeypatch):
+    c = config(personas={"ids": [], "repeats": 1}, controls={"persona_off": {"repeats": 3}}, status="approved")
+    jobs = pilot.jobs_for(c, pilot.arm_profiles(c))
+    estimate = {"per_episode": {"p90": {"cost_usd": 0.0}}, "recommended_parallel": 1}
+    pilot.write(tmp_path / "manifest.json", {"name": c.name, "status": "approved", "config": c.model_dump(),
+                                             "benchmark": "discoverybench", "tasks": TASKS, "jobs": jobs, "estimate": estimate})
+    import run_persona_benchmarks as scheduler
+    launched = []
+    def fake_execute(output, job):
+        launched.append(job["key"])
+        record = {**job, "status": "launch_error", "elapsed_seconds": 0.1, "result": None}
+        pilot.write(output / "finished" / (job["key"] + ".json"), record)
+        return record
+    monkeypatch.setattr(scheduler, "execute", fake_execute)
+    state = pilot.run(tmp_path, parallel=1, yes=True, allow_provisional=False, retry_errors=False)
+    assert len(launched) == pilot.FAST_FAILURE_LIMIT < len(jobs)
+    assert "consecutive infrastructure failures" in state["stopped"]

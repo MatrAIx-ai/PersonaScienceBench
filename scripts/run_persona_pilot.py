@@ -397,6 +397,7 @@ def spent_usd(output: Path, price: tuple[float, float, float]) -> float:
 
 
 INFRASTRUCTURE_STATUSES = {"infrastructure_error", "runtime_error", "launch_error"}
+FAST_FAILURE_SECONDS, FAST_FAILURE_LIMIT = 30, 3
 # Evaluation errors whose recorded cause is transport, not the submission: the judge never answered.
 TRANSPORT_ERROR = re.compile(r"RemoteProtocolError|ConnectError|ReadError|transport failed|HTTP 5\d\d|HTTP 429")
 # Recorded causes meaning the evaluator process itself was killed (e.g. out of memory); the submission stands.
@@ -494,7 +495,7 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
           f"already spent ${spent_usd(output, price):.2f}.")
     if not yes:
         raise ValueError("Paid run: re-run with --yes after reviewing the plan and estimate above")
-    active, stopped = {}, None
+    active, stopped, fast_failures = {}, None, 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         while pending or active:
             # Reserve a p90 episode for every running and newly started job before launching it.
@@ -513,6 +514,17 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
                 job = active.pop(future)
                 result = future.result()
                 print(f"{job['key']}: {result['status']} ({result['elapsed_seconds']:.0f}s)", flush=True)
+                # Circuit breaker: consecutive near-instant infrastructure failures mean the host is broken
+                # (e.g. lost DNS); stop launching instead of failing every remaining job. Resume with run.
+                if result["status"] in INFRASTRUCTURE_STATUSES and result["elapsed_seconds"] < FAST_FAILURE_SECONDS:
+                    fast_failures += 1
+                else:
+                    fast_failures = 0
+                if fast_failures >= FAST_FAILURE_LIMIT and pending:
+                    stopped = (f"{fast_failures} consecutive infrastructure failures under {FAST_FAILURE_SECONDS}s "
+                               f"(last: {job['key']}); check the host and network, then rerun with --retry-errors")
+                    print("STOPPED: " + stopped, flush=True)
+                    pending = []
     state = {"spent_usd": spent_usd(output, price), "stopped": stopped,
              "finished": len(list((output / "finished").glob("*.json"))), "planned": len(manifest["jobs"])}
     write(output / "run_state.json", state)

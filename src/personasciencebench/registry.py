@@ -14,6 +14,7 @@ ADAPTERS = {
     "bixbench": ("bixbench", "BixBenchAdapter"),
     "scienceagentbench": ("scienceagentbench", "ScienceAgentBenchAdapter"),
     "terminal_bench_science": ("terminal_bench_science", "TerminalBenchScienceAdapter"),
+    "openproblems_denoising": ("openproblems_denoising", "OpenProblemsDenoisingAdapter"),
 }
 
 

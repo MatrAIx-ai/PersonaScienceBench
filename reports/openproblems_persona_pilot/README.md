@@ -32,6 +32,27 @@ means worse than returning the raw counts. Shown ×100.
 Per-dataset arm means vary in sign (e.g. 046: +48.7 on `mouse_blood_olsson_labelled`, −19.2 on
 `immune_cells`), consistent with noise rather than stable persona-by-dataset effects.
 
+## Replication: neutral_b
+
+`neutral_b`, a paraphrase of `neutral_a`, on the same five datasets × 5 repeats with identical settings
+([config](configs/neutral_b.json), [report](neutral_b/REPORT.md), [results](neutral_b/results.csv)):
+**25/25 scored, $0.17.**
+
+| Contrast | Δ (pp) | 95% CI | Permutation p |
+|---|---:|---:|---:|
+| neutral_b − persona off | +1.8 | −11.9 to +16.3 | 0.83 |
+| neutral_a − persona off | +5.4 | −8.0 to +19.1 | 0.52 |
+| neutral_b − neutral_a | −3.6 | −15.9 to +9.0 | 0.62 |
+
+Both neutral texts sit within noise of persona off and of each other. Unlike on DiscoveryBench, where
+`neutral_a`'s +21.9 pp failed to replicate, there was no neutral effect here to begin with. Answer length
+was similar (1,661 vs 1,808 vs 1,592 characters), and 13/25 `neutral_b` episodes were no better than raw counts.
+
+**Runtime incidents:** the Mac slept twice during this run (on battery), pausing the Docker VM and
+dropping its DNS on wake. The scheduler's circuit breaker stopped launching both times; 4 cells failed
+before any model call and were relaunched once the network returned (`retry_jobs`: never-started jobs
+may retry until they start; episodes that ran retry once). No scored episode was retried or regraded.
+
 ## Design and dataset choice
 
 - **Screen** ([report](screen/REPORT.md), 12 episodes, $0.10): persona off × 2 on the six datasets whose

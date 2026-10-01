@@ -55,3 +55,23 @@ Expand the current collection to the ten largest absolute prior-pilot deviations
 ## ASI judge transport repair (2026-09-29)
 
 [Repair record](data/asi_judge_bridge_fix.json): the native text and VLM completion boundary now uses the configured controller-side judge (Astra low in this campaign). Sandbox isolation remains; model keys stay outside the evaluator. Native task-level model/temperature/token defaults are overridden explicitly and recorded, while prompts, rubrics, parsers, and aggregation stay unchanged. Evaluation version is `asi-b3-collaborative-b2-v1+asi-configured-judge-v1`. New episode processes pick up the repair; existing evaluations and potentially in-flight processes still reflect the old version. Historical errors need explicit regrading of sealed submissions before updated comparison tables are published. Offline fixtures passed; no paid test episodes were run.
+
+## Concurrency update (2026-09-29)
+
+At the user’s request, resumed trial 3 and all nine pending expansion batches now use 40 concurrent episode workers and 40 CPUs, retaining 128 GB and the sequential `afterany` chain. Trial 2 continues with 30 workers/CPUs. Frozen tasks, personas, model settings, and scientific budgets are unchanged. Pending submissions were replaced before execution; existing trial-3 outcomes are preserved on resume. [Submission audit](../shared/worker_40_resubmission.json) records old/new job IDs. Rate-limit safety at 40 workers has not yet been established by a completed run.
+
+## Expansion concurrency reduction (2026-09-29)
+
+Following observed rate-limit failures at 40 workers, the user requested 35 workers for the nine pending expansion batches. Those submissions were replaced with 35-worker / 35-CPU jobs, retaining 128 GB and sequential dependencies after running trial 3 (40 workers). This changes operational concurrency only. [Submission audit](../shared/worker_35_resubmission.json) preserves old/new IDs and commands; the earlier 40-worker record remains historical. The performance of 35 workers remains to be measured.
+
+## Repeat priority update
+
+At the user’s request, finish the three trials for expansion group 2 (089, 001, 127) first: current trial 1 job 1966123, then trial 2 job 1966126, then trial 3 job 1966129. The other five pending jobs remain scheduled afterward; none were cancelled. All remain sequential at 35 workers / 35 CPUs / 128 GB. [Dependency-change audit](../shared/expansion_group2_priority.json) records the old and new order.
+
+## Expanded Trial 1 EDA
+
+[Report](trial_1_all_personas_eda.md) covers eight personas plus off, with 20,000-resample 95% task-bootstrap intervals, benchmark and super-family means, coverage counts, matched baseline differences excluding ASI, and an 86-task common-panel sensitivity analysis. One episode remained running at the frozen snapshot; 262/224/026 have no Trial 1 results. Raw ASI scores span two judge setups and are descriptive only. Reproduction code and hashed normalized inputs are under `code/report_all_trial1.py` and `data/trial_1_all_personas/`. This is interim EDA; repeated-trial analysis and failure repairs remain pending.
+
+## Error/missing repair queue
+
+The user requested repairs after the running trial. Five later expansion jobs are held; [repair plan](../07_error_repairs/PLAN.md) and [job manifest](../07_error_repairs/status.json) track seven sequential 20-worker passes in separate directories. Original first-pass outcomes remain unchanged, including missing submissions.

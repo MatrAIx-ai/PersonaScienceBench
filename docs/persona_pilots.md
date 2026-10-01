@@ -10,6 +10,7 @@ a no-cost estimate, a budget guard and a persona × task × domain × condition 
 | [`configs/discoverybench_pilot/candidates.json`](../configs/discoverybench_pilot/candidates.json) | 12 screening candidates and their selection rationale |
 | [`configs/discoverybench_pilot/screen.json`](../configs/discoverybench_pilot/screen.json) | Phase 0: persona off × 2 on the candidates (24 episodes) |
 | [`configs/discoverybench_pilot/pilot.json`](../configs/discoverybench_pilot/pilot.json) | Pilot: personas 148/046/155 × 5 tasks × 2, persona off × 3, `neutral_a` × 2 (55 episodes). **Tasks are provisional** until the screen picks them. |
+| [`configs/openproblems_pilot/`](../configs/openproblems_pilot) | OpenProblems denoising: smoke, screen, pilot and neutral_b configs ([adapter](adapters/openproblems_denoising.md)); they set `actor_python: .actor-venv-openproblems` |
 
 ## Why a screen first
 
@@ -137,6 +138,8 @@ submission and native evaluation under `episodes/`.
 | `OpenAI HTTP 429` after retries | Over the TPM limit: lower `parallel` or set `budget.tpm_limit` |
 | `OPENROUTER_API_KEY is not configured` | Add the key to `.env` in the repository root |
 | `Assets are not ready` during `plan` | Fetch sources first; the task's data files are missing |
+| `STOPPED: N consecutive infrastructure failures` or `network: ... did not resolve` | The host lost its network (often after sleep). Fix it, then `run --retry-errors`: jobs that never started relaunch, and episodes that ran retry once |
+| A native metric `killed by signal 9` | Out of memory during grading: lower `parallel`, then `regrade --output runs/<run>` re-grades the sealed submissions without model calls |
 | `... exists; use a fresh output directory` | `plan` never overwrites; choose a new `--output` |
 | Every score is 0 | Expected on many DiscoveryBench tasks; check the screen report before choosing tasks |
 

@@ -473,6 +473,47 @@ def regrade(output: Path) -> list[dict]:
     return done
 
 
+MAX_LAUNCH_ATTEMPTS = 5
+
+
+def retry_jobs(output: Path, jobs: list[dict]) -> list[dict]:
+    """Next attempt for each job whose latest attempt is an infrastructure failure.
+
+    An episode that ran gets one retry. An episode that never started (launch_error: it failed
+    before any model call, e.g. lost DNS) has no outcome and cost nothing, so it may be retried
+    until it starts, up to MAX_LAUNCH_ATTEMPTS. Scientific outcomes are never retried.
+    """
+    retries = []
+    for job in jobs:
+        attempts = [read(p) for p in (output / "finished").glob(job["key"] + "*.json")
+                    if read(p)["key"] in {job["key"], *(f"{job['key']}-retry{n}" for n in range(2, 99))}]
+        if not attempts:
+            continue
+        latest = max(attempts, key=lambda a: a.get("attempt", 1))
+        number = latest.get("attempt", 1)
+        ran = [a for a in attempts if a["status"] != "launch_error"]
+        if not infrastructure_failure(latest) or number >= MAX_LAUNCH_ATTEMPTS:
+            continue
+        if latest["status"] != "launch_error" and len(ran) > 1:
+            continue  # an episode that ran has had its one retry
+        retries.append({**job, "key": f"{job['key']}-retry{number + 1}", "attempt": number + 1})
+    return retries
+
+
+def wait_for_network(host: str = "api.openai.com", patience_seconds: int = 300) -> bool:
+    """True once `host` resolves; waits out short outages (e.g. after the host wakes from sleep)."""
+    import socket
+    deadline = time.monotonic() + patience_seconds
+    while True:
+        try:
+            socket.getaddrinfo(host, 443)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(10)
+
+
 def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: bool, retry_errors: bool) -> dict:
     import run_persona_benchmarks as scheduler
     manifest = read(output / "manifest.json")
@@ -482,12 +523,7 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
     workers = parallel or config.parallel or manifest["estimate"].get("recommended_parallel") or 1
     pending = [j for j in manifest["jobs"] if not (output / "finished" / (j["key"] + ".json")).exists()]
     if retry_errors:
-        for job in manifest["jobs"]:
-            done = output / "finished" / (job["key"] + ".json")
-            retry = {**job, "key": job["key"] + "-retry2", "attempt": 2}
-            if (done.exists() and infrastructure_failure(read(done))
-                    and not (output / "finished" / (retry["key"] + ".json")).exists()):
-                pending.append(retry)
+        pending += retry_jobs(output, manifest["jobs"])
     model, _ = cost_model(config)
     price = estimate.price_for(model, None)
     p90_episode = manifest["estimate"]["per_episode"]["p90"]["cost_usd"]
@@ -503,6 +539,11 @@ def run(output: Path, *, parallel: int | None, yes: bool, allow_provisional: boo
                 projected = spent_usd(output, price) + p90_episode * (len(active) + 1)
                 if projected > config.budget.usd:
                     stopped = f"budget: spent plus in-flight p90 would exceed ${config.budget.usd:.2f}"
+                    pending = []
+                    break
+                if not wait_for_network():
+                    stopped = "network: api.openai.com did not resolve for 5 minutes; rerun with --retry-errors"
+                    print("STOPPED: " + stopped, flush=True)
                     pending = []
                     break
                 job = pending.pop(0)

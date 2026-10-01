@@ -260,3 +260,17 @@ def test_scheduler_stops_after_consecutive_fast_infrastructure_failures(tmp_path
     state = pilot.run(tmp_path, parallel=1, yes=True, allow_provisional=False, retry_errors=False)
     assert len(launched) == pilot.FAST_FAILURE_LIMIT < len(jobs)
     assert "consecutive infrastructure failures" in state["stopped"]
+
+
+def test_never_started_jobs_retry_until_they_start_but_run_episodes_retry_once(tmp_path):
+    c = config(personas={"ids": [], "repeats": 1}, controls={"persona_off": {"repeats": 3}})
+    jobs = pilot.jobs_for(c, pilot.arm_profiles(c))[:3]
+    finished = tmp_path / "finished"
+    def record(job, key, attempt, status):
+        pilot.write(finished / f"{key}.json", {**job, "key": key, "attempt": attempt, "status": status, "result": None})
+    a, b, d = jobs
+    record(a, a["key"], 1, "launch_error"); record(a, a["key"] + "-retry2", 2, "launch_error")
+    record(b, b["key"], 1, "infrastructure_error"); record(b, b["key"] + "-retry2", 2, "infrastructure_error")
+    record(d, d["key"], 1, "scored")
+    retries = {r["key"] for r in pilot.retry_jobs(tmp_path, jobs)}
+    assert retries == {a["key"] + "-retry3"}

@@ -2,9 +2,11 @@
 
 Scientific agents collaborating with diverse simulated researchers.
 
-**Start here:** [remote-agent handoff](docs/TEAM_HANDOFF.md) · [paper and experiment plan](docs/design/benchmark_paper_plan.md) · [completed 30-persona results](reports/full_persona_v2/README.md) · [interaction case studies](reports/full_persona_v2/case_studies.md)
+**Run the main experiment:** [collaborator run guide](docs/MAIN_RUN.md) — **Off / 155 / 001 / 003 / 046**, the same **200 questions (40 per benchmark)**, **1,000 episodes per trial**. Start with `scripts/setup_main.sh`, then `scripts/submit_main.sh`. The analysis folders are not required.
 
-## Current study
+**Research and historical material:** [remote-agent handoff](docs/TEAM_HANDOFF.md) · [paper and experiment plan](docs/design/benchmark_paper_plan.md) · [completed 30-persona results](reports/full_persona_v2/README.md) · [interaction case studies](reports/full_persona_v2/case_studies.md)
+
+## Historical 30-persona pilot
 
 The completed experiment contains **30 full personas plus persona off, two questions from each of five benchmarks, and 310 recorded episodes**. Actor, simulator and judge used GPT-6 Luna with reasoning effort `none`. Full profiles enter only the simulator system prompt; both conditions allow general knowledge, while evaluator references remain private.
 
@@ -24,9 +26,11 @@ There are **2,108 converted cases**. Conversion does not guarantee that every in
 
 Conversion is automated per benchmark. Preserve the scientific question, inputs, deliverables and native grading; separate public context from simulator context and evaluator references; record exclusions and source provenance. Execution/design tasks use approach and result reviews, while SciConv retains native clarification. See the [conversion rules](docs/design/conversion_revision_v2.md) and [benchmark standards](docs/benchmark_standards.md).
 
-## Next experiment
+## Selected main run
 
-The [paper plan](docs/design/benchmark_paper_plan.md) proposes **200 nonvisual questions, six selected personas plus persona off, and three independent complete episodes per condition**. That is 4,200 episodes per actor or 12,600 for three actors. Task selection and the expanded launcher are still to be implemented; the future batch has not been launched. The plan contains the task mixture, behavioral metrics, and figure/table dependencies.
+The [main-run guide](docs/MAIN_RUN.md) fixes five settings (persona off, 155, 001, 003, 046) and 200 questions. One fresh trial comprises 1,000 episodes; three fresh trials comprise 3,000. Defaults are GPT-6 Astra with low reasoning for actor, simulator, and judge, with 30 workers and 128 GB for SLURM submission. These are the collaborator campaign instructions, not a claim that all three fresh trials have finished.
+
+The frozen selection and prompts are in `configs/main_run/`; the dedicated launcher is `scripts/run_main.py`. Older pilot reports and broader paper plans below provide historical context and must not override these run inputs.
 
 ## Setup and navigation
 
@@ -36,14 +40,15 @@ Follow the [Linux setup and migration guide](docs/reproducibility.md). The [pers
 |---|---|
 | `reports/full_persona_v2/` | Preserved experiment results, profiles, trace indexes, full traces and case studies |
 | `configs/full_persona_v2/` | Frozen cohort, task selection and model/protocol settings |
-| `docs/design/benchmark_paper_plan.md` | Authoritative future study and paper plan |
+| `docs/MAIN_RUN.md` | Selected five-setting campaign: setup, run, resume, and result delivery |
+| `docs/design/benchmark_paper_plan.md` | Broader paper and experiment planning |
 | `src/`, `scripts/`, `tests/` | Runners, conversion/analysis tools and offline checks |
 | `manifests/` | Pinned upstream sources and checksums |
 | `data/`, `external/`, `prepared/`, `runs/` | Ignored local inputs and runtime artifacts; transfer or regenerate explicitly |
 
 <!-- FULL_PERSONA_RESULTS_START -->
 
-## Current persona results
+## Historical pilot persona results
 
 Final results: **310/310 episodes finished**. [Benchmark results, all 30 profiles, and interaction traces](reports/full_persona_v2/README.md).
 

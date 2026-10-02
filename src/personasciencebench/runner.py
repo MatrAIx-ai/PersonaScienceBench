@@ -39,6 +39,17 @@ def stage_workspace(package: Path, workspace: Path):
     shutil.copy2(package / "actor/task.json", workspace / "task.json")
 
 
+def researcher_factory(collaboration):
+    """Researcher class and its collaboration keyword options for a validated collaboration config (or None)."""
+    if collaboration is None:
+        return Researcher, {}
+    from personasciencebench.collaboration import ActiveResearcher, ScriptedResearcher
+    options = {key: collaboration[key] for key in ("unrestricted_knowledge", "embody_identity", "truthful_history")}
+    if collaboration["researcher_policy"] != "llm":
+        return ScriptedResearcher, {**options, "policy": collaboration["researcher_policy"]}
+    return ActiveResearcher, options
+
+
 def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root: Path,
                config: dict, *, parallel=2) -> dict:
     if not 1 <= parallel <= 25:
@@ -104,14 +115,9 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
             clients = {role: OpenRouterClient(**spec, role=role, record=record_api,
                                              supported_parameters=catalog[role]["supported_parameters"])
                        for role, spec in config["models"].items()}
-            researcher_type = Researcher
-            if collaboration is not None:
-                from personasciencebench.collaboration import ActiveResearcher
-                researcher_type = ActiveResearcher
+            researcher_type, options = researcher_factory(collaboration)
             researcher = researcher_type(episode, clients["researcher"],
-                                    persona=profiles[episode.id], **config["researcher"],
-                                    **({key: collaboration[key] for key in ("unrestricted_knowledge", "embody_identity")}
-                                       if collaboration else {}))
+                                    persona=profiles[episode.id], **config["researcher"], **options)
             session = EpisodeSession(episode, researcher, case / "controller", artifact_root=workspace)
             actor_result = run_actor(session, clients["actor"], sandbox, max_steps=config["actor_steps"], collaboration=collaboration)
             write_json(case / "actor_result.json", actor_result)

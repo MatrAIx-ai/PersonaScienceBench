@@ -1,5 +1,7 @@
 # Experiment workspace
 
+> **Run configuration versus analysis snapshots:** the [main-run guide](../docs/MAIN_RUN.md) defines the current five-setting, 200-question campaign (1,000 episodes per fresh trial). The paper distinguishes performance, semantic diversity, and behavioral diversity. Collection totals and job states in experiment plans are dated records, not live scheduler status or proof of three complete trials for every selected persona. The published analysis workspace is a historical snapshot; newer local notebooks/results are not included in the main-run setup update.
+
 This directory tracks the paper's experiments, their implementation, status, and results. The [paper plan](../docs/design/benchmark_paper_plan.md) remains the manuscript-level design.
 
 | Folder | Purpose | Current scope |

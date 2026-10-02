@@ -1,3 +1,7 @@
+# Historical first-pass and expansion launcher
+
+These commands document the earlier collection campaign and its worker changes. For the current off / 155 / 001 / 003 / 046 run, use the [main-run guide](../docs/MAIN_RUN.md) and `scripts/submit_main.sh` (30 workers, 128 GB). Old job references below are historical snapshots.
+
 Run the frozen 200-task sample (40 tasks per benchmark), with the two highest-ranked prior-pilot personas (candidate_148 and candidate_155) and persona off (600 episodes), once per condition. Override with `--arms persona_off candidate_148 candidate_155` or another explicit subset. All roles and EXP source-span conversion use direct OpenAI Responses, `gpt-6-astra`, reasoning `low`.
 
 ```bash

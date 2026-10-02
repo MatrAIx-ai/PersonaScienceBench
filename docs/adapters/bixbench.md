@@ -62,4 +62,4 @@ The controller must record the resolved judge model/settings with the run.
 
 ## Records and checks
 
-The [completed report](../../reports/full_persona_v2/README.md) contains the current study and full traces. `tests/test_bixbench.py` covers source tampering, public/private separation, extraction, grading, missing outcomes and submission gates. Superseded construction pilots remain in Git history, not the current results.
+The [completed report](../../reports/full_persona_v2/README.md) contains the historical 30-persona pilot and full traces. `tests/test_bixbench.py` covers source tampering, public/private separation, extraction, grading, missing outcomes and submission gates. Superseded construction pilots remain in Git history, not the current results.

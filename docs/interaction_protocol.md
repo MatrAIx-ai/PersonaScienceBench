@@ -22,6 +22,8 @@ The current controller allows stopping only during result review. An unreadable 
 
 SciConv keeps its native ambiguous/inconsistent request and intended-specification split. The actor asks clarification questions or returns `[COMPLETE]`, with up to ten question turns and a final attempt. The full identity conditions the simulated user's answers. Its first actor question precedes persona exposure. Native judges assess specification recovery, intent and conversational grounding; no scientific solver is executed.
 
+New SciConv evaluations use a model-neutral `+native-judge` evaluator label and explicitly record the configured judge model/provider/reasoning. Historical `+luna-judge` labels were hard-coded even when another model was configured; use the saved model configuration and API records to identify historical judge models. This metadata correction changes no scoring formula.
+
 ## Records and boundaries
 
 Save full shared messages, model requests/responses, tool events, submissions, native grades and termination reasons. Task requirements stay source-attributed; general knowledge and suggestions are allowed in the current on/off conditions. References, hidden graders and credentials stay outside actor/simulator access. Legacy optional-question bridge interfaces remain implemented for compatibility and are a different interaction condition.

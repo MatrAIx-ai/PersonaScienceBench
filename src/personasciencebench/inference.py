@@ -57,9 +57,10 @@ class OpenRouterClient:
     def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None):
         import httpx
 
-        key = os.environ.get("OPENAI_API_KEY" if self.provider == "openai" else "OPENROUTER_API_KEY")
+        key_name = "OPENAI_API_KEY" if self.provider == "openai" else "OPENROUTER_API_KEY"
+        key = os.environ.get(key_name)
         if not key:
-            raise ValueError("OPENROUTER_API_KEY is not configured")
+            raise ValueError(f"{key_name} is not configured")
         allowed = {"temperature", "max_tokens", "top_p", "seed", "logprobs", "top_logprobs",
                    "frequency_penalty", "presence_penalty"}
         settings = dict(settings or {})

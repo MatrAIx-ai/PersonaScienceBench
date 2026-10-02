@@ -57,4 +57,4 @@ The configured provider and resolved judge model must accompany a real run.
 
 ## Records and checks
 
-The [completed report](../../reports/full_persona_v2/README.md) contains current study results and traces. `tests/test_discoverybench.py` covers identities, source/private boundaries, missing results, plan rejection, native scoring, settings and malformed judge responses. Use the [setup guide](../reproducibility.md) to prepare a new host.
+The [completed report](../../reports/full_persona_v2/README.md) contains historical 30-persona pilot results and traces. `tests/test_discoverybench.py` covers identities, source/private boundaries, missing results, plan rejection, native scoring, settings and malformed judge responses. Use the [setup guide](../reproducibility.md) to prepare a new host.

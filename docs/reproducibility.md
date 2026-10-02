@@ -2,6 +2,8 @@
 
 Use Linux, Python 3.12, the checked-in lockfiles and Bubblewrap. The repository is a source checkout; `configs/` and `manifests/` are part of the runtime layout.
 
+For the selected five-setting, 200-question campaign, start with the [main-run guide](MAIN_RUN.md) and `bash scripts/setup_main.sh`. The lower-level steps below also support development and historical tracks.
+
 ## Environment
 
 ```bash
@@ -38,7 +40,7 @@ Prefix any later command with `docker/run.sh`; prepared packages record absolute
 | `No module named personasciencebench` from the macOS host `.venv` | Recent Python skips `.pth` files carrying the macOS `hidden` flag: `chflags -R nohidden .venv .actor-venv` (pytest still works because it adds `src/` itself) |
 | `dns error` or `unexpected eof` during `uv sync` in the container | Transient Docker Desktop networking; rerun, since uv's cache persists in the `psb-uv-cache` volume |
 
-Create `.env` from `.env.example` and configure `OPENROUTER_API_KEY` on the remote host. Credentials remain ignored. The [frozen configs](../configs/full_persona_v2) record the completed study's model/settings, not a guarantee of future provider availability.
+Create `.env` from `.env.example` and configure `OPENAI_API_KEY` for the main run. `OPENROUTER_API_KEY` is only needed for configurations explicitly using OpenRouter. Credentials remain ignored. The [frozen configs](../configs/full_persona_v2) record the completed study's model/settings, not a guarantee of future provider availability.
 
 ## Existing results and exact personas
 
@@ -80,7 +82,7 @@ EXP context extraction and source advice classification may use model calls and 
 
 ## New runs
 
-Read the [paper plan](design/benchmark_paper_plan.md) before scheduling. The 200-task manifest and expanded six-persona, three-repeat launcher are not yet implemented. `scripts/run_persona_benchmarks.py` preserves the prior scheduler and assumes a historical 25-task build; do not mistake it for the planned study.
+Use the [main-run guide](MAIN_RUN.md): `scripts/run_main.py` runs the frozen `configs/main_run/selection.csv` panel under off / 155 / 001 / 003 / 046. `scripts/submit_main.sh` submits one 1,000-episode trial with 30 CPUs / workers and 128 GB RAM; the guide shows three sequential trials. `scripts/run_persona_benchmarks.py` supports other pilot/control campaigns and is a separate launcher.
 
 Prepare new public task workspaces on the destination host, using explicit source task IDs and selections. Recorded `prepared` packages and the old scheduler's input manifests contain absolute paths. The shared runner supports Discovery/Bix/ASI, `personasciencebench.sciconv_runner` handles SciConv, and `expbench.realistic` handles EXP. Keep independent cases parallel, retain complete traces, and use a fresh output directory for every experiment.
 

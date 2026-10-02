@@ -16,13 +16,13 @@ The same **200 unique questions** run under every setting: **40 each** from ASI-
 
 One trial is **1,000 episodes**. Three fresh trials are **3,000 episodes**. Each trial needs a distinct run directory; rerunning the same directory resumes it rather than creating an independent repeat. Historical persona coverage was uneven and is not included here.
 
-Default actor, simulator (`researcher`), and judge: **`gpt-6-astra`, reasoning `low`**, via OpenAI. Model access must exist in the collaborator's account. Defaults are recorded in the launcher; role-specific overrides are available through `--help`. Persona injection affects the simulator. Shared controls come from `configs/full_persona_v2/{shared,exp}.json`: active-researcher protocol, 60 actor steps, 6 researcher questions, 12 collaboration requests, and unrestricted knowledge / identity embodiment enabled. Shared configuration also enables volunteered information. Do not change these across arms.
+Default actor, simulator (`researcher`), and judge: **`gpt-6-astra`, reasoning `low`**, via OpenAI. Model access must exist in the collaborator's account. Defaults are recorded in the launcher; role-specific overrides are available through `--help`. Persona injection affects the simulator. Shared controls come from `configs/full_persona_v2/{shared,exp}.json`: active-researcher protocol, 60 actor steps, 6 researcher questions for the legacy bridge, 12 collaboration requests, and unrestricted knowledge / identity embodiment enabled. Shared configuration also enables volunteered information. SciConv uses its native loop of up to ten clarification exchanges plus a final attempt; the legacy bridge question limit does not set its round cap. Do not change these across arms.
 
 This is a snapshot of the current runtime, including the current SciConv protocol. It is not a promise to reproduce historical traces produced before protocol changes. `configs/main_run/provenance.json` records the parent commit and hashes of runtime files as copied, before the handoff-specific launcher edits. Each launched run additionally records the actual code hashes and resolved configuration.
 
 ## Install and acquire inputs
 
-Use Linux, Python 3.12+, `uv`, and Bubblewrap (`bwrap`). Compute nodes need network access to OpenAI. Source/data downloads require network access and potentially substantial disk space. Install Bubblewrap using your system administrator/package manager.
+Use Linux, Python 3.12+, `uv`, and Bubblewrap (`bwrap`). Compute nodes need network access to OpenAI. Source/data downloads require network access and potentially substantial disk space. Install Bubblewrap using your system administrator/package manager, or set `PERSONASCIENCEBENCH_BWRAP` to an existing executable. Setup creates a new actor environment from the resolved base interpreter; if an existing environment fails the runtime probe, rebuild it using the [migration guide](reproducibility.md#environment).
 
 ```bash
 git clone --single-branch --branch main https://github.com/MatrAIx-ai/PersonaScienceBench.git
@@ -34,7 +34,7 @@ cp .env.example .env
 
 Setup installs locked Python environments, fetches pinned source repositories, downloads BixBench/selected ASI assets and the EXP snapshot, builds local EXP task records, and checks sandbox readiness. It does not run scientific episodes or invoke an LLM. Downloaded data and environments are ignored by Git. Source licenses and access conditions remain applicable. Some scientific tasks may need additional native libraries or tools; preparation errors must be resolved without replacing questions.
 
-Offline input check (standard-library Python only):
+Offline input check verifies the frozen selection checksum, 40-per-source counts, five settings, and exact persona prompt hashes (standard-library Python only):
 
 ```bash
 python scripts/check_main.py
@@ -47,7 +47,7 @@ python scripts/check_main.py
   --run-dir runs/main/trial-1 --workers 30
 ```
 
-**This command makes paid API calls.** The runner first checks model access, creates per-setting configurations, and prepares selected tasks. EXP preparation can invoke the model to extract the simulator context; its extraction cache is stored under `data/design_catalog/extraction_cache`. Preserve that cache across trials to hold converted inputs fixed. Do not launch initial preparation concurrently in multiple trials. All five settings within a trial share the same prepared task inputs. The runner stops before episodes if any of the 200 tasks fails preparation.
+**This command makes paid API calls.** The runner validates the frozen input checksums and local run/configuration identity before checking model access and preparing selected tasks. `--arms` supports subsets of the five shipped settings; `--selection` must retain the exact frozen selection bytes. EXP preparation can invoke the model to extract the simulator context; its extraction cache is stored under `data/design_catalog/extraction_cache`. Preserve that cache across trials to hold converted inputs fixed. Do not launch initial preparation concurrently in multiple trials. All five settings within a trial share the same prepared task inputs. The runner stops before episodes if any of the 200 tasks fails preparation.
 
 ## Submit to SLURM
 

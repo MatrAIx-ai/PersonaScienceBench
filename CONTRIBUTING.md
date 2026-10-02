@@ -1,7 +1,7 @@
 # Contributing
 
 Use Python 3.12 and the checked-in lockfiles. Start with the
-[README](README.md), [handoff](docs/TEAM_HANDOFF.md), and
+[README](README.md), [main-run guide](docs/MAIN_RUN.md), [handoff](docs/TEAM_HANDOFF.md), and
 [reproduction guide](docs/reproducibility.md). The implementation is under
 `src/personasciencebench/`; upstream checkouts and generated runs are external
 inputs, not code to edit or vendor into this repository. EXP-Bench is retained
@@ -37,7 +37,7 @@ CI runs synthetic/offline checks with no credentials or benchmark datasets.
 5. Update the adapter guide and `docs/TEAM_HANDOFF.md`. Add a report only after measured
    runs; do not convert missing infrastructure into zero scientific scores.
 
-Preparation defaults to the original two tasks per benchmark. Larger runs use
+For the selected main run, use `scripts/setup_main.sh`, `scripts/check_main.py`, and `scripts/run_main.py`; its frozen panel has 40 questions per source. The generic pilot preparation CLI defaults to the original two tasks per benchmark. Larger runs use
 `--selection` with a JSON mapping of benchmarks to reviewed task IDs and
 `--cases-per-benchmark`; the run config must specify the matching
 `pilot_cases_per_benchmark`. Do not silently broaden pilot manifests.

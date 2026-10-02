@@ -2,7 +2,11 @@
 
 The current experiment injects the **complete rendered MatrAIx identity into the simulator system prompt**. Actor and judge do not receive the profile. Persona off keeps the same simulator and common protocol but omits the identity. Both conditions can use general knowledge; evaluator references stay private.
 
-## Exact cohort and prompts
+## Selected main-run prompts
+
+The current main-run settings are **persona off, 155, 001, 003, and 046**. Their four exact profiles are committed in [`configs/main_run/personas/`](../configs/main_run/personas/). The [main-run launcher](MAIN_RUN.md) loads these directly; restoring the historical 30-profile directory is unnecessary for this run.
+
+## Historical cohort and prompts
 
 The [cohort manifest](../configs/full_persona_v2/cohort.json) records all 30 IDs, source types, selection provenance, pinned renderer version and prompt hashes. [Published profiles](../reports/full_persona_v2/profiles) contain the exact injected identity inside the `text` fence. Run `python3 scripts/restore_full_persona_cohort.py --check` to verify them, or omit `--check` to reconstruct raw prompt files on a fresh checkout.
 
@@ -19,9 +23,9 @@ import json
 config = json.loads(Path("configs/full_persona_v2/shared.json").read_text())
 config["persona"] = {
     "enabled": True,
-    "id": "candidate_148",
+    "id": "candidate_155",
     "version": "full-persona-v2",
-    "system_prompt": Path("data/persona_case_study/full_persona_v2/prompts/candidate_148.md").read_text(),
+    "system_prompt": Path("configs/main_run/personas/candidate_155.md").read_text(),
 }
 # Save this operator-side configuration for a fresh run.
 ```
@@ -34,4 +38,4 @@ Use `{"enabled": false}` for persona off. Keep the same `collaboration` switches
 
 Profile preferences influence communication and decisions; they do not alter native task requirements or authorize fabricated study facts. Some original profiles contain conflicting attributes. Evaluate observable behavior against the actual prompt, not a demographic label or an assumed expertise level. The [case studies](../reports/full_persona_v2/case_studies.md) show supported links and counterexamples.
 
-The optional structured science-persona API and its [compatibility examples](../examples/science_personas/README.md) remain for tests and existing integrations. They were not used for the completed full-profile study or the proposed follow-up. The sole current experiment plan is [the paper plan](design/benchmark_paper_plan.md).
+The optional structured science-persona API and its [compatibility examples](../examples/science_personas/README.md) remain for tests and existing integrations. They were not used for the completed full-profile study or the proposed follow-up. The [main-run guide](MAIN_RUN.md) defines the runnable campaign; the [paper plan](design/benchmark_paper_plan.md) tracks the broader analysis and historical proposals.

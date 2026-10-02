@@ -3,10 +3,12 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 command -v uv >/dev/null
-command -v bwrap >/dev/null || { echo 'Install bubblewrap on Linux first.' >&2; exit 1; }
+command -v "${PERSONASCIENCEBENCH_BWRAP:-bwrap}" >/dev/null || { echo 'Install Bubblewrap or set PERSONASCIENCEBENCH_BWRAP to its executable.' >&2; exit 1; }
 uv sync --locked --extra api --extra annotations --extra actor --extra conversion --extra scientific-evaluation
 if [[ ! -f .actor-venv/pyvenv.cfg ]]; then
-  uv venv --python .venv/bin/python .actor-venv
+  # Resolve uv's interpreter symlinks before creating the sandbox environment.
+  actor_base=$(.venv/bin/python -c 'import os, sys; print(os.path.realpath(sys._base_executable))')
+  "$actor_base" -m venv .actor-venv
 fi
 uv pip sync --python .actor-venv/bin/python --require-hashes configs/actor-requirements.lock.txt
 .venv/bin/python scripts/check_main.py

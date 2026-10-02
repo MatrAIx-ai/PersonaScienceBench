@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run the frozen 200-task, configurable-condition first pass. No smoke/test episodes."""
+"""Run the frozen 200-question, five-setting main campaign. No smoke/test episodes."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-import csv
 import hashlib
 import importlib.util
 import json
@@ -16,7 +15,7 @@ import time
 import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
-ARMS = ['persona_off', 'candidate_148', 'candidate_046', 'candidate_155', 'candidate_228', 'candidate_137', 'candidate_089', 'candidate_003', 'candidate_004', 'candidate_001', 'candidate_127', 'candidate_262', 'candidate_224', 'candidate_026']
+ARMS = ['persona_off', 'candidate_155', 'candidate_001', 'candidate_003', 'candidate_046']
 PYTHON = ROOT / '.venv/bin/python'
 
 
@@ -63,8 +62,8 @@ def load_native_result(output, source, task_id, key):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir', type=Path, required=True)
-    p.add_argument('--selection', type=Path, default=ROOT/'configs/main_run/selection.csv')
-    p.add_argument('--arms', nargs='+', choices=ARMS, default=['persona_off', 'candidate_155', 'candidate_001', 'candidate_003', 'candidate_046'])
+    p.add_argument('--selection', type=Path, default=ROOT/'configs/main_run/selection.csv', help='Exact copy of the frozen main-run selection; checksum verified')
+    p.add_argument('--arms', nargs='+', choices=ARMS, default=ARMS)
     p.add_argument('--baseline-run', type=Path, help='Existing matching trial supplying persona-off; allows persona-only expansion batches')
     p.add_argument('--workers', type=int, default=30)
     p.add_argument('--model', default='gpt-6-astra')
@@ -84,6 +83,9 @@ def main():
         raise ValueError("Choose unique conditions and include persona_off or supply --baseline-run")
     if "persona_off" in arms and a.baseline_run is not None:
         raise ValueError("Choose a new baseline or an existing baseline, not both")
+    from check_main import validate_inputs
+    a.selection = a.selection.resolve()
+    rows = validate_inputs(ROOT, a.selection)
     os.chdir(ROOT)
     os.umask(0o077)
     if not 1 <= a.workers <= int(os.environ.get('SLURM_CPUS_PER_TASK', '30')):
@@ -94,7 +96,6 @@ def main():
     os.environ['PSB_FATAL_API_FILE'] = str(run/'fatal_api.json')
     from personasciencebench.inference import load_env, preflight
     load_env(ROOT/'.env')
-    rows = list(csv.DictReader(a.selection.open()))
     counts = Counter(r['source'] for r in rows)
     if len(rows) != 200 or set(counts.values()) != {40} or len(counts) != 5 or len({(r['source'],r['task_id']) for r in rows}) != 200:
         raise ValueError('Expected 200 unique tasks: 40 per source')
@@ -119,7 +120,6 @@ def main():
         write(run/'manifest.json', identity)
         (run/'selection.csv').write_bytes(a.selection.read_bytes())
     model = {'model':a.model, 'provider':'openai', 'reasoning_effort':a.reasoning_effort}
-    write(run/'api_access.json', preflight(models))
     if (run/'fatal_api.json').exists():
         raise RuntimeError('Resolve fatal_api.json before resuming')
     for arm in arms:
@@ -140,7 +140,7 @@ def main():
             if kind == 'exp':
                 config['limits']['request_timeout_seconds'] = 600
             else:
-                config['notes'] = [f'Frozen 200-task first pass: 40 per source, {len(arms)} conditions, one episode each.']
+                config['notes'] = [f'Frozen 200-question main run: 40 per source, {len(arms)} conditions, one episode each.']
             if a.baseline_run is not None:
                 baseline_config = json.loads((a.baseline_run/'configs'/f'persona_off.{kind}.json').read_text())
                 comparable = lambda c: {k:v for k,v in c.items() if k not in ('persona','notes')}
@@ -150,6 +150,7 @@ def main():
             if path.exists() and json.loads(path.read_text()) != config:
                 raise ValueError('Configuration changed since run creation')
             write(path, config)
+    write(run/'api_access.json', preflight(models))
     # Freeze implementation hashes separately per submission for debugging provenance.
     write(run/f'code.{os.environ.get("SLURM_JOB_ID", str(time.time_ns()))}.json',
           {str(p.relative_to(ROOT)):digest(p) for folder in ('src','scripts') for p in (ROOT/folder).rglob('*.py')})

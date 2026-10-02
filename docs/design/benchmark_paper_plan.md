@@ -1,5 +1,7 @@
 # Benchmark paper plan
 
+> **Current run (2026-10-01):** [MAIN_RUN.md](../MAIN_RUN.md) defines 200 frozen questions (40 per benchmark), off / 155 / 001 / 003 / 046, and 1,000 episodes per fresh trial (3,000 for three). Default resources are 30 workers / CPUs and 128 GB; all roles use Astra low. The paper has three analysis levels: performance, semantic diversity, and behavioral diversity. Earlier scheduling, cohort, and collection-status statements below are historical planning records; they do not override the main-run guide or establish live job status. Detailed local analysis updates are maintained separately.
+
 Implementation, per-experiment plans, status snapshots, and derived artifacts are tracked in the [Experiment workspace](../../Experiment/README.md).
 
 ## Expansion to the ten largest absolute pilot changes (2026-09-29)

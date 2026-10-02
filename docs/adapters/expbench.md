@@ -31,4 +31,4 @@ The legacy standalone runner remains available with `configs/expbench/default.to
 
 Each run retains task/config snapshots, actor and simulator messages, tool calls, sealed designs and grader outputs locally under ignored `runs/`. Report reference coverage and integrity results separately. Coverage is a design score, not evidence of successful execution or valid scientific conclusions.
 
-The [completed full-persona report](../../reports/full_persona_v2/README.md) retains the current study and its traces.
+The [completed full-persona report](../../reports/full_persona_v2/README.md) retains the historical 30-persona pilot and its traces.

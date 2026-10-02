@@ -1,13 +1,16 @@
 # Remote-agent handoff
 
-## Read in this order
+## Current run and reading order
 
-1. [Paper plan](design/benchmark_paper_plan.md): agreed story, 200 nonvisual questions, six proposed personas, three repetitions, three actors, and figure/table dependencies.
-2. [Completed report](../reports/full_persona_v2/README.md): the 30-persona study and its original table structure.
-3. [Case studies](../reports/full_persona_v2/case_studies.md): profile-to-behavior evidence and known interpretation issues.
-4. [Setup](reproducibility.md), [conversion](design/conversion_revision_v2.md), and [persona injection](personas.md).
+1. [Main-run guide](MAIN_RUN.md): the authoritative fresh-run configuration and commands.
+2. [Root README](../README.md): main-run overview and the three analysis levels—performance, semantic diversity, and behavioral diversity.
+3. [Setup and migration](reproducibility.md), [interaction protocol](interaction_protocol.md), and [persona injection](personas.md).
+4. [Paper plan](design/benchmark_paper_plan.md) and [Experiment workspace](../Experiment/README.md): evolving analysis plans and historical collection records, not launcher defaults.
+5. [Historical pilot report](../reports/full_persona_v2/README.md) and [case studies](../reports/full_persona_v2/case_studies.md): preserved selection provenance.
 
-## Completed experiment: preserve these records
+The main run is **200 questions (40 each from five benchmarks) × five settings (off / 155 / 001 / 003 / 046)**: **1,000 episodes per trial**, or **3,000 across three fresh trials**. Actor, simulator, and judge default to OpenAI GPT-6 Astra with low reasoning. The SLURM launcher defaults to 30 workers / 30 CPUs and 128 GB RAM. These are planned fresh-run totals, not completed-result counts.
+
+## Historical 30-persona pilot: preserve these records
 
 `reports/full_persona_v2/` contains 310 recorded traces: 30 personas × ten questions, plus ten persona-off baselines. The folder also contains exact injected profiles, indexes, a machine-readable snapshot, and frozen experiment metadata. The original report, scores, and traces were not regenerated during cleanup.
 
@@ -24,23 +27,24 @@ The completed run has 265 scored/completed episodes, 43 missing submissions and 
 
 Important reading notes: some frozen trace headers incorrectly say persona disabled; the recorded API system messages contain the actual identity. Raw-log links inside frozen traces are relative to their original local run directories; they do not resolve on GitHub. Whitespace word counts undercount Chinese replies. Some EXP judge/monitor decisions are inconsistent. The case-study report identifies exact examples; these are analysis concerns, not reasons to edit historical records.
 
-## What the next agent should do
+## Running or handing off the main experiment
 
-- Select the 200 nonvisual questions with subfield, format and source-study tags: Discovery 70, Bix 50, EXP 40, SciConv 36, ASI 4. The quotas are a plan, not a finalized task manifest.
-- Use the proposed six-profile panel: 148, 046, 155, 228, 137, 089, plus persona off. Preserve full identity text and allow general knowledge; do not revert to short action-rule or 56-attribute personas.
-- Build the expanded scheduler around explicit task IDs, selected persona IDs, actor configuration and three independent complete episodes per cell. The existing `scripts/run_persona_benchmarks.py` is the historical scheduler: its build path assumes 25 tasks and all 30 personas. It is not the 200-question launcher.
-- Account for its host-specific Bubblewrap path, `external/runtime/bubblewrap-local/usr/bin/bwrap`, before using that scheduler on a different machine. The scientific runtime requires Bubblewrap isolation and has no host-execution fallback. Cleanup did not change sandbox behavior.
-- Start by preparing the paper diagrams/tables and analyzing existing traces. The expanded experiment is 4,200 episodes per actor, 12,600 across three actors, plus 30 if the optional static reference is run. No expanded jobs are running.
+- Use `configs/main_run/selection.csv` and the four exact profiles in `configs/main_run/personas/`. Do not resample questions or restore the superseded 70/50/40/36/4 allocation.
+- Run `scripts/setup_main.sh`, configure `OPENAI_API_KEY`, and validate inputs with `scripts/check_main.py`. Launch with `scripts/run_main.py` or the separate `scripts/submit_main.sh`.
+- Give each independent trial its own run directory. Preserve the EXP extraction cache across sequential trials. The guide documents `afterok` dependencies, resume behavior, and repair flags.
+- Keep historical protocols, original outcomes, and repair attempts distinct. Current SciConv behavior is not interchangeable with pre-change traces. Inspect saved manifests/configurations when analyzing past runs.
+- The main runner does not require analysis notebooks. Existing analysis has uneven trial coverage; the five displayed settings do not imply that every setting has three completed historical trials.
+- Treat job IDs and statuses in old plans as dated snapshots. No live scheduler state is asserted by this document.
 
 ## MLAgentBench track
 
-The [MLAgentBench adapter](adapters/mlagentbench.md) converts 12 tasks (3 excluded for lacking a native verifier) with two hand-reviewed CPU pilots, `vectorization` and `cifar10`, a native `get_score` evaluator, a hashed CPU runtime lock and a baseline/summary script. Only local smoke runs with a non-team model and transport exist so far. It is not part of the 200-question plan above.
+The [MLAgentBench adapter](adapters/mlagentbench.md) converts 12 tasks (3 excluded for lacking a native verifier) with two hand-reviewed CPU pilots, `vectorization` and `cifar10`, a native `get_score` evaluator, a hashed CPU runtime lock and a baseline/summary script. Only local smoke runs with a non-team model and transport exist so far. It is not part of the frozen 200-question main run. The [IdeaGene track](adapters/ideagene.md) is also separate; adding an adapter does not add questions to the main-run selection.
 
-## Cleanup validation
+## Historical cleanup validation (2026-09-27)
 
 All 375 pre-existing report/profile/trace files were checked byte-for-byte, and the README results tables and future paper plan are unchanged. All 30 prompt hashes and restoration overwrite protection passed; the distributable-file/link check passed.
 
-The existing offline suite produced 171 passes, 26 skips, three legacy persona metadata-fixture failures, and six runtime setup errors because Bubblewrap was not on the system path. All six runtime tests passed when rerun with the existing local Bubblewrap through `PERSONASCIENCEBENCH_BWRAP`. The three failures are `test_legacy_rendering_and_metadata_match_the_supplied_repository` (enabled legacy profiles); their expected metadata/hashes disagree with current records. Their code and fixtures were not changed by cleanup. Source-dependent tests skipped at their expected fixture paths. No paid benchmark runs were launched.
+At that cleanup snapshot, the offline suite produced 171 passes, 26 skips, three legacy persona metadata-fixture failures, and six runtime setup errors because Bubblewrap was not on the system path. All six runtime tests passed when rerun with the existing local Bubblewrap through `PERSONASCIENCEBENCH_BWRAP`. The three failures are `test_legacy_rendering_and_metadata_match_the_supplied_repository` (enabled legacy profiles); their expected metadata/hashes disagree with current records. Their code and fixtures were not changed by cleanup. Source-dependent tests skipped at their expected fixture paths. No paid benchmark runs were launched.
 
 ## Local assets to transfer separately
 

@@ -9,6 +9,7 @@ from personasciencebench.adapters.base import SourceConfig, sha256
 
 ADAPTERS = {
     "asibench": ("asibench", "ASIBenchAdapter"),
+    "mlagentbench": ("mlagentbench", "MLAgentBenchAdapter"),
     "sciconvbench": ("sciconvbench", "SciConvBenchAdapter"),
     "discoverybench": ("discoverybench", "DiscoveryBenchAdapter"),
     "bixbench": ("bixbench", "BixBenchAdapter"),

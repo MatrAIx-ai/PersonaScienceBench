@@ -32,6 +32,10 @@ Important reading notes: some frozen trace headers incorrectly say persona disab
 - Account for its host-specific Bubblewrap path, `external/runtime/bubblewrap-local/usr/bin/bwrap`, before using that scheduler on a different machine. The scientific runtime requires Bubblewrap isolation and has no host-execution fallback. Cleanup did not change sandbox behavior.
 - Start by preparing the paper diagrams/tables and analyzing existing traces. The expanded experiment is 4,200 episodes per actor, 12,600 across three actors, plus 30 if the optional static reference is run. No expanded jobs are running.
 
+## MLAgentBench track
+
+The [MLAgentBench adapter](adapters/mlagentbench.md) converts 12 tasks (3 excluded for lacking a native verifier) with two hand-reviewed CPU pilots, `vectorization` and `cifar10`, a native `get_score` evaluator, a hashed CPU runtime lock and a baseline/summary script. Only local smoke runs with a non-team model and transport exist so far. It is not part of the 200-question plan above.
+
 ## Cleanup validation
 
 All 375 pre-existing report/profile/trace files were checked byte-for-byte, and the README results tables and future paper plan are unchanged. All 30 prompt hashes and restoration overwrite protection passed; the distributable-file/link check passed.

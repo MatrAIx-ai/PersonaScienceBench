@@ -45,9 +45,9 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
         raise ValueError("parallel must be between one and 25")
     # ScienceAgentBench uses an explicitly versioned Bubblewrap environment
     # adaptation with unchanged native graders. Terminal still needs Harbor.
-    supported = {"discoverybench", "bixbench", "scienceagentbench", "asibench"}
+    supported = {"discoverybench", "bixbench", "scienceagentbench", "asibench", "mlagentbench"}
     if set(benchmarks) - supported:
-        raise ValueError("This runner executes DiscoveryBench, BixBench and the ScienceAgentBench sandbox adaptation; other sources need their runtime bridges")
+        raise ValueError("This runner executes DiscoveryBench, BixBench, MLAgentBench and the ScienceAgentBench sandbox adaptation; other sources need their runtime bridges")
     from personasciencebench.collaboration import validate_collaboration, POLICY
     collaboration = validate_collaboration(config.get("collaboration"))
     manifest = read_json(prepared / "pilot_manifest.json")
@@ -128,6 +128,11 @@ def run_pilots(prepared: Path, benchmarks: list[str], output: Path, python_root:
                 if episode.benchmark == "scienceagentbench":
                     evaluation = adapter.evaluate_in_sandbox(
                         episode, session.submission, runtime_root, case / "controller/native_evaluation")
+                    evaluation.details["judge_model"] = None
+                    evaluation.details["judge_kind"] = "native_programmatic_verifier"
+                elif episode.benchmark == "mlagentbench":
+                    # Deterministic native get_score; the configured judge makes no calls.
+                    evaluation = adapter.evaluate(episode, session.submission, clients["judge"])
                     evaluation.details["judge_model"] = None
                     evaluation.details["judge_kind"] = "native_programmatic_verifier"
                 else:

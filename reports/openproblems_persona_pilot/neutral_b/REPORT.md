@@ -1,6 +1,6 @@
 # Persona pilot: openproblems-neutral-b
 
-Benchmark **openproblems_denoising**, primary metric `score` (native, 0–100 here). 25/25 planned episodes finished; statuses {'scored': 25}. Code 80ffc1e5026f29c559daceba5e9cd16a53c12473; models gpt-6-luna.
+Benchmark **openproblems_denoising**, primary metric `score_clipped` (native, 0–100 here). 25/25 planned episodes finished; statuses {'scored': 25}. Code 80ffc1e5026f29c559daceba5e9cd16a53c12473; models gpt-6-luna.
 
 Scores average repeats within each arm × task first, then tasks. Missing submissions count as 0 (full_persona_v2 convention); infrastructure and evaluator errors are excluded and listed. Deltas are task-matched against the persona-off mean (and the neutral mean). These are descriptive pilot results, not significance tests.
 
@@ -8,7 +8,7 @@ Scores average repeats within each arm × task first, then tasks. Missing submis
 
 | Condition | Arm | Tasks | Mean score | Δ vs persona off | Δ vs neutral |
 |---|---|---:|---:|---:|---:|
-| neutral | neutral_b | 5 | 0.5 | – | – |
+| neutral | neutral_b | 5 | 9.9 | – | – |
 
 Persona-off run-to-run SD (mean over 0 tasks with repeats): –. A persona delta smaller than this is indistinguishable from ordinary variation.
 
@@ -16,17 +16,17 @@ Persona-off run-to-run SD (mean over 0 tasks with repeats): –. A persona delta
 
 | Task | Domain | neutral_b |
 |---|---|---:|
-| `openproblems_v1/tenx_1k_pbmc` | openproblems_v1 | -0.1 |
-| `openproblems_v1/mouse_blood_olsson_labelled` | openproblems_v1 | -7.1 |
-| `openproblems_v1/pancreas` | openproblems_v1 | 10.1 |
-| `openproblems_v1/tenx_5k_pbmc` | openproblems_v1 | 0.3 |
-| `openproblems_v1/immune_cells` | openproblems_v1 | -0.4 |
+| `openproblems_v1/tenx_1k_pbmc` | openproblems_v1 | 12.7 |
+| `openproblems_v1/mouse_blood_olsson_labelled` | openproblems_v1 | 0.8 |
+| `openproblems_v1/pancreas` | openproblems_v1 | 11.5 |
+| `openproblems_v1/tenx_5k_pbmc` | openproblems_v1 | 12.4 |
+| `openproblems_v1/immune_cells` | openproblems_v1 | 11.9 |
 
 ## By domain and condition
 
 | Domain | Condition | Episodes | Mean score |
 |---|---|---:|---:|
-| openproblems_v1 | neutral | 25 | 0.5 |
+| openproblems_v1 | neutral | 25 | 9.9 |
 
 ## Interaction behavior (means per episode)
 

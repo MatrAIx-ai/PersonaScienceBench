@@ -8,19 +8,23 @@ $0.99 at list price. Personas 148, 046 and 155, persona off and `neutral_a`, 5 r
 [per-episode results](results.csv) · [screen](screen/REPORT.md) · [configs](configs/) ·
 [adapter](../../docs/adapters/openproblems_denoising.md).
 
-**Score:** native molecular-cross-validation metrics (MSE and Poisson loss on held-out molecules), each
-scaled so OpenProblems' `no_denoising` control is 0 and `perfect_denoising` is 1, then averaged. Negative
-means worse than returning the raw counts. Shown ×100.
+**Score (headline: clipped).** The native molecular-cross-validation metrics (MSE and Poisson loss on
+held-out molecules) are each scaled so OpenProblems' `no_denoising` control is 0 and `perfect_denoising` is
+1. The headline `score_clipped` then clips each scaled metric to [0, 1] and averages them; it is shown ×100.
+The clipping is needed because the native Poisson loss is unbounded: a prediction on the wrong scale can
+push it into the thousands, or below zero, and one such episode in this pilot dominated the unclipped mean.
+Raw native values and the unclipped `score` stay in [results.csv](results.csv) and in each episode's
+evaluation record. Earlier versions of this report used the unclipped score; the conclusions are the same.
 
 **Findings (descriptive):**
 
-1. **No arm differs detectably from persona off.** 148 +5.4 pp (95% CI −9.0 to +20.5, p = 0.53),
-   046 +6.1 pp (p = 0.78), 155 +4.9 pp (p = 0.57), `neutral_a` +5.4 pp (p = 0.52). Each persona against
-   `neutral_a`: −0.5 to +0.7 pp. All four identity arms sit about 5 pp above persona off, well inside
-   the noise.
-2. **The task is noisy and hard.** The persona-off run-to-run SD averages 27.5 pp per dataset. In every arm,
-   28–48% of episodes scored no better than the raw counts (persona off 10/25, `neutral_a` 8/25,
-   148 10/25, 046 12/25, 155 7/25). The actor usually improved MSE but worsened the Poisson loss.
+1. **No arm differs detectably from persona off.** 148: +2.0 pp (95% CI −5.3 to +9.6, p = 0.65);
+   046: −1.8 pp (p = 0.64); 155: +0.1 pp (p = 0.98); `neutral_a`: +2.7 pp (p = 0.50). Each persona
+   against `neutral_a`: −4.5 to −0.7 pp (p ≥ 0.26).
+2. **The task is hard and noisy.** The persona-off run-to-run SD averages 9.7 pp per dataset (the clipped
+   score ranges 0–100), and arm means sit between 9 and 14. In every arm, 12–28% of episodes improved on
+   neither metric (clipped score 0: persona off 7/25, `neutral_a` 5/25, 148 5/25, 046 6/25, 155 3/25).
+   The actor usually improved MSE but worsened the Poisson loss.
 3. **Personas did not change the actor's method.** Every arm mostly chose low-rank (SVD/PCA), kNN
    smoothing or empirical-Bayes shrinkage, in similar proportions (keyword classification of the
    submitted method description).
@@ -29,8 +33,9 @@ means worse than returning the raw counts. Shown ×100.
 5. **The DiscoveryBench answer-length effect does not appear here.** Submitted answer length was the
    same with and without an identity (1,587 vs 1,592 characters).
 
-Per-dataset arm means vary in sign (e.g. 046: +48.7 on `mouse_blood_olsson_labelled`, −19.2 on
-`immune_cells`), consistent with noise rather than stable persona-by-dataset effects.
+Per-dataset arm means differ without a consistent pattern (for example 046 scores 5.8 on `immune_cells`
+and 13.7 on `tenx_5k_pbmc`, while persona off scores 19.0 and 11.0), consistent with noise rather than stable
+persona-by-dataset effects.
 
 ## Replication: neutral_b
 
@@ -38,15 +43,15 @@ Per-dataset arm means vary in sign (e.g. 046: +48.7 on `mouse_blood_olsson_label
 ([config](configs/neutral_b.json), [report](neutral_b/REPORT.md), [results](neutral_b/results.csv)):
 **25/25 scored, $0.17.**
 
-| Contrast | Δ (pp) | 95% CI | Permutation p |
+| Contrast (clipped score) | Δ (pp) | 95% CI | Permutation p |
 |---|---:|---:|---:|
-| neutral_b − persona off | +1.8 | −11.9 to +16.3 | 0.83 |
-| neutral_a − persona off | +5.4 | −8.0 to +19.1 | 0.52 |
-| neutral_b − neutral_a | −3.6 | −15.9 to +9.0 | 0.62 |
+| neutral_b − persona off | −1.0 | −7.0 to +5.0 | 0.77 |
+| neutral_a − persona off | +2.7 | −3.7 to +8.7 | 0.50 |
+| neutral_b − neutral_a | −3.7 | −9.8 to +2.7 | 0.34 |
 
 Both neutral texts sit within noise of persona off and of each other. Unlike on DiscoveryBench, where
-`neutral_a`'s +21.9 pp failed to replicate, there was no neutral effect here to begin with. Answer length
-was similar (1,661 vs 1,808 vs 1,592 characters), and 13/25 `neutral_b` episodes were no better than raw counts.
+`neutral_a`'s +21.9 pp failed to replicate, there was no neutral effect here to begin with. Answer length was
+similar (1,661 vs 1,808 vs 1,592 characters), and 4/25 `neutral_b` episodes improved on neither metric.
 
 **Runtime incidents:** the Mac slept twice during this run (on battery), pausing the Docker VM and
 dropping its DNS on wake. The scheduler's circuit breaker stopped launching both times; 4 cells failed
@@ -56,8 +61,8 @@ may retry until they start; episodes that ran retry once). No scored episode was
 ## Design and dataset choice
 
 - **Screen** ([report](screen/REPORT.md), 12 episodes, $0.10): persona off × 2 on the six datasets whose
-  native evaluation fits an 8 GB Linux VM. Scores were continuous and spanned −1.18 to +0.32, so unlike
-  DiscoveryBench no task sat at a floor.
+  native evaluation fits an 8 GB Linux VM. Scores were continuous (clipped dataset means 0.7–19.8;
+  unclipped single episodes −1.18 to +0.32), so unlike DiscoveryBench no task sat at a floor.
 - **Pilot datasets:** `tenx_1k_pbmc`, `mouse_blood_olsson_labelled`, `pancreas`, `tenx_5k_pbmc`,
   `immune_cells`. `cengen` was dropped: it has the highest evaluation memory (6.5 GB peak) and both screen
   runs scored about 0.

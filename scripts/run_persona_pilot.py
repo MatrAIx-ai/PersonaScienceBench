@@ -39,7 +39,9 @@ CONDITIONS = ("persona", "persona_off", "neutral")  # built-in conditions; varia
 
 def condition_order(condition: str) -> tuple[int, str]:
     return (CONDITIONS.index(condition), "") if condition in CONDITIONS else (len(CONDITIONS), condition)
-PRIMARY = {"discoverybench": "final_score", "openproblems_denoising": "score"}
+# OpenProblems' native Poisson loss is unbounded (mis-scaled predictions reach thousands, or go negative),
+# so its headline is the clipped score: each control-scaled metric clipped to [0, 1], then averaged.
+PRIMARY = {"discoverybench": "final_score", "openproblems_denoising": "score_clipped"}
 SUCCESS_STATUSES = {"scored", "missing_submission"}
 
 

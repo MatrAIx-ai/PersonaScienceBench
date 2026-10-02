@@ -36,9 +36,12 @@ fresh directory, and runs them in a separate Bubblewrap sandbox with the evaluat
   `metrics.poisson`.
 - **Controls** `no_denoising` (negative: returns the training counts) and `perfect_denoising` (positive:
   returns the held-out counts) are computed on the same dataset.
-- **Headline score:** each metric scaled to (negative − value) / (negative − positive), so the negative
-  control is 0 and the positive control is 1; then the mean of the two. `score_clipped` clips each scaled
-  metric to [0, 1] first.
+- **Scaled metrics:** each metric scaled to (negative − value) / (negative − positive), so the negative
+  control is 0 and the positive control is 1. `score` is the mean of the two; **`score_clipped` clips each
+  scaled metric to [0, 1] first and is the headline in pilot reports.** The native Poisson loss is
+  unbounded: a prediction on the wrong scale (for example, not on the count scale) can drive it into the
+  thousands, or below zero, and then the unclipped `score` is dominated by a few episodes (1 of the
+  125 pilot episodes did this).
 - A prediction the native metrics cannot read, or with the wrong layer, shape or cell/gene order, is
   reported as `missing_submission` with the contract violation recorded (the pilots count it as 0).
   Evaluator failures are `error`.

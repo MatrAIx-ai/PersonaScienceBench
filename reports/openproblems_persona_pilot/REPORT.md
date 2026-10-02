@@ -1,6 +1,6 @@
 # Persona pilot: openproblems-persona-pilot
 
-Benchmark **openproblems_denoising**, primary metric `score` (native, 0–100 here). 125/125 planned episodes finished; statuses {'missing_submission': 1, 'scored': 124}. Code 64c2d6585631f5d45a1293895de2814a4b69be43; models gpt-6-luna.
+Benchmark **openproblems_denoising**, primary metric `score_clipped` (native, 0–100 here). 125/125 planned episodes finished; statuses {'missing_submission': 1, 'scored': 124}. Code 64c2d6585631f5d45a1293895de2814a4b69be43; models gpt-6-luna.
 
 Scores average repeats within each arm × task first, then tasks. Missing submissions count as 0 (full_persona_v2 convention); infrastructure and evaluator errors are excluded and listed. Deltas are task-matched against the persona-off mean (and the neutral mean). These are descriptive pilot results, not significance tests.
 
@@ -8,13 +8,13 @@ Scores average repeats within each arm × task first, then tasks. Missing submis
 
 | Condition | Arm | Tasks | Mean score | Δ vs persona off | Δ vs neutral |
 |---|---|---:|---:|---:|---:|
-| persona | candidate_046 | 5 | 4.8 | 6.1 pp | 0.7 pp |
-| persona | candidate_148 | 5 | 4.1 | 5.4 pp | 0.0 pp |
-| persona | candidate_155 | 5 | 3.6 | 4.9 pp | -0.5 pp |
-| persona_off | persona_off | 5 | -1.3 | – | – |
-| neutral | neutral_a | 5 | 4.1 | 5.4 pp | – |
+| persona | candidate_046 | 5 | 9.1 | -1.8 pp | -4.5 pp |
+| persona | candidate_148 | 5 | 12.9 | 2.0 pp | -0.7 pp |
+| persona | candidate_155 | 5 | 11.0 | 0.1 pp | -2.6 pp |
+| persona_off | persona_off | 5 | 10.8 | – | – |
+| neutral | neutral_a | 5 | 13.6 | 2.7 pp | – |
 
-Persona-off run-to-run SD (mean over 5 tasks with repeats): 27.5 pp. A persona delta smaller than this is indistinguishable from ordinary variation.
+Persona-off run-to-run SD (mean over 5 tasks with repeats): 9.7 pp. A persona delta smaller than this is indistinguishable from ordinary variation.
 
 ## Uncertainty
 
@@ -22,31 +22,31 @@ Task-matched deltas with a 95% percentile bootstrap interval (episodes resampled
 
 | Contrast | Δ (pp) | 95% CI (pp) | Permutation p |
 |---|---:|---:|---:|
-| candidate_046 - persona_off | +6.1 | [-18.5, +34.4] | 0.782 |
-| candidate_148 - persona_off | +5.4 | [-9.0, +20.5] | 0.528 |
-| candidate_155 - persona_off | +4.9 | [-10.4, +20.0] | 0.574 |
-| neutral_a - persona_off | +5.4 | [-8.0, +19.1] | 0.520 |
-| candidate_046 - neutral_a | +0.7 | [-23.0, +29.3] | 0.975 |
-| candidate_148 - neutral_a | +0.0 | [-12.8, +13.6] | 0.997 |
-| candidate_155 - neutral_a | -0.5 | [-14.2, +13.3] | 0.949 |
+| candidate_046 - persona_off | -1.8 | [-8.0, +4.2] | 0.639 |
+| candidate_148 - persona_off | +2.0 | [-5.3, +9.6] | 0.650 |
+| candidate_155 - persona_off | +0.1 | [-6.4, +7.1] | 0.977 |
+| neutral_a - persona_off | +2.7 | [-3.7, +8.7] | 0.496 |
+| candidate_046 - neutral_a | -4.5 | [-11.0, +2.1] | 0.263 |
+| candidate_148 - neutral_a | -0.7 | [-8.0, +7.1] | 0.880 |
+| candidate_155 - neutral_a | -2.6 | [-9.2, +4.9] | 0.530 |
 
 ## By task
 
 | Task | Domain | candidate_046 | candidate_148 | candidate_155 | persona_off | neutral_a |
 |---|---|---:|---:|---:|---:|---:|
-| `openproblems_v1/tenx_1k_pbmc` | openproblems_v1 | -5.2 | 12.5 | 7.1 | 16.0 | 3.1 |
-| `openproblems_v1/mouse_blood_olsson_labelled` | openproblems_v1 | 48.7 | -6.0 | -17.8 | -28.4 | -2.3 |
-| `openproblems_v1/pancreas` | openproblems_v1 | -14.1 | 16.7 | 11.3 | -12.0 | 27.2 |
-| `openproblems_v1/tenx_5k_pbmc` | openproblems_v1 | 13.7 | 1.0 | 3.9 | 0.8 | -16.1 |
-| `openproblems_v1/immune_cells` | openproblems_v1 | -19.2 | -3.5 | 13.7 | 17.3 | 8.7 |
+| `openproblems_v1/tenx_1k_pbmc` | openproblems_v1 | 5.9 | 12.6 | 10.0 | 16.4 | 3.6 |
+| `openproblems_v1/mouse_blood_olsson_labelled` | openproblems_v1 | 10.2 | 10.3 | 10.7 | 0.0 | 10.7 |
+| `openproblems_v1/pancreas` | openproblems_v1 | 9.8 | 18.1 | 13.4 | 7.9 | 31.5 |
+| `openproblems_v1/tenx_5k_pbmc` | openproblems_v1 | 13.7 | 18.1 | 6.1 | 11.0 | 5.6 |
+| `openproblems_v1/immune_cells` | openproblems_v1 | 5.8 | 5.2 | 14.7 | 19.0 | 16.3 |
 
 ## By domain and condition
 
 | Domain | Condition | Episodes | Mean score |
 |---|---|---:|---:|
-| openproblems_v1 | neutral | 25 | 4.1 |
-| openproblems_v1 | persona | 75 | 4.2 |
-| openproblems_v1 | persona_off | 25 | -1.3 |
+| openproblems_v1 | neutral | 25 | 13.6 |
+| openproblems_v1 | persona | 75 | 11.0 |
+| openproblems_v1 | persona_off | 25 | 10.8 |
 
 ## Interaction behavior (means per episode)
 

@@ -54,3 +54,22 @@ outcomes remain unchanged. The original `configs/main_run/provenance.json`
 records an earlier snapshot; per-run code receipts record the implementation
 used by a new submission. Live scheduler state and model-account access were
 not checked.
+
+## Subsequent trace-publication request
+
+The user requested one trial per selected persona and withdrew the incomplete
+Sol campaign. The [Astra trial-1 collection](../traces/astra_trial1/README.md)
+publishes 898 shared conversations and accounts for all 1,000 planned slots.
+It retains 305 zero-scoring scientific outcomes; 102 slots have no publishable
+conversation. Endpoint selection prefers an evaluable repair rather than the
+highest score, with original fallback; repairs are labeled within trial 1.
+Five synthetic exporter tests passed, including private-field exclusion,
+credential-pattern redaction, and endpoint-selection checks.
+
+Thirteen incomplete/cancelled directories were moved to the ignored local
+`runs/_archive/20261001-incomplete-campaigns/` archive with a restoration
+manifest. This includes Sol, five unstarted expansion batches, and the
+zero-scored new-protocol SciConv attempt. No active experiment job was listed
+by Slurm before the move; an interactive bash allocation remained active.
+Mixed-outcome Astra runs needed by historical analyses and repair provenance
+were preserved. Nothing was permanently deleted.

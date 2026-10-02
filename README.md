@@ -31,6 +31,10 @@ Together, these levels characterize persona-associated differences in scientific
 
 This overview describes the analysis scope. The run instructions below produce the underlying scores and traces; analysis notebooks and results are maintained separately.
 
+## Recorded interaction traces
+
+Browse [Astra trial-1 conversations](traces/astra_trial1/README.md) for **off / 155 / 001 / 003 / 046**. The index accounts for all 200 questions per setting and links available shared conversations. Repaired endpoints are labeled; completed zero-scoring outcomes are retained. Sol and infrastructure-only slots are excluded from transcript publication. These are historical interactions with recorded protocol provenance, not new runs of the current launcher.
+
 ## Quick start
 
 ### Install and prepare

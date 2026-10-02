@@ -1,5 +1,7 @@
 # Actor comparison
 
+> Withdrawn on 2026-10-01 at the user’s request. The incomplete Sol campaign is excluded from current results and public traces; raw runs are retained in `runs/_archive/20261001-incomplete-campaigns/`. Plans and counts below are historical.
+
 ## Question
 
 Which actor models remain effective across different researcher profiles?

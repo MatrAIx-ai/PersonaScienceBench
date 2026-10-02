@@ -31,6 +31,36 @@ Together, these levels characterize persona-associated differences in scientific
 
 This overview describes the analysis scope. The run instructions below produce the underlying scores and traces; analysis notebooks and results are maintained separately.
 
+## From saved runs to final figures
+
+All three levels start from the frozen question selection, saved native evaluations, and recorded interactions. Join records by **benchmark, question, persona, and trial**; retain scientific super-family and source-study identifiers for grouping and uncertainty estimates. Keep original and repaired endpoints distinguishable. The selected display panel is **off / 155 / 001 / 003 / 046**. Historical coverage is three original trials for off/155/001 and one for 003/046; the fresh three-trial run above is a separate collection target.
+
+### 1. Performance: native results → matched comparisons → score and difference plots
+
+- **Extract:** normalize each benchmark's native score to 0–100. Scientific missing submissions receive zero; infrastructure/evaluation failures remain missing. The available-performance view prefers an evaluable repair, with original fallback; original-only results remain a sensitivity view. Repairs are not additional trials.
+- **Aggregate and compare:** average observed trials within each question, then questions within benchmark or super-family. Pairwise differences match question and trial and require compatible evaluation settings; ASI pairs require the corrected judge. Bootstrap source studies for pointwise 95% CIs.
+- **Display:** absolute-performance estimates with CIs on the left; persona-by-persona difference heatmaps for each benchmark and super-family on the right. Cells are **row minus column**. The main comparison uses study-block sign-flip tests with Holm correction across 90 unique contrasts: green/orange indicate positive/negative significant differences; gray indicates no detected difference. Alternative tests remain separate sensitivity figures.
+
+Working notebook: `Experiment/02_performance_and_fields/performance_analysis.ipynb`. Pairwise tables retain effect sizes, p values, task/trial counts, and evaluator compatibility. Native scores have different meanings across benchmarks, so super-family summaries are descriptive composites.
+
+### 2. Semantic diversity: final messages → embeddings → separation heatmaps and trajectories
+
+- **Extract and embed:** use the final simulator message and final actor response from original trial 1, keeping roles separate. The current complete five-setting intersection has **97 questions**. Exclude system prompts, injected persona text, and repeated history. Encode generated messages offline with the fixed **Qwen3-Embedding-0.6B** model, L2-normalize, and calculate cosine distances before projection.
+- **Compare:** within each super-family, calculate cross-persona distance minus the average within-persona distance, using **different-question pairs** in both terms; give the four families equal weight. Question-wise persona-label swaps provide permutation tests, with Holm correction across 20 role/pair comparisons. Question bootstraps within benchmark × family provide CIs. This controls family composition; it does not estimate same-question rollout variability or eliminate question-level variation.
+- **Display:** lower-triangle, role-separated 5 × 5 separation heatmaps alongside local UMAP trajectories for the selected BixBench `bix-57-q1` and SciConvBench `matToolUse/disambiguation/case_236` examples. Each question/role projection is fitted jointly across the five settings. Curved connectors are visual guides between observed messages; the manually selected cases illustrate interactions and are not independent quantitative evidence.
+
+Working notebook: `Experiment/01_behavioral_diversity/semantic_trajectory_analysis.ipynb`. Detailed methods and the candidate caption are maintained in `SEMANTIC_FIGURE_CAPTION.md` in the same folder. Semantic distance describes generated content and may include language/style effects; it is not a quality or realism score.
+
+### 3. Behavioral diversity: saved events and API usage → interaction metrics → pairwise profiles
+
+- **Extract:** use complete original traces and actual recorded API output-token counts, including reasoning. Simulator tokens are measured per noninitial decision/reply; actor tokens are measured per completed interaction, including intervening tool generation. SciConv actor counts use clarification-question calls. Also extract revision requests from result-review decisions and clarification recall from saved native SciConv evaluations. No new LLM judge or estimated character-to-token conversion is used.
+- **Compare and display:** match question and original trial, average paired differences within question, and weight represented benchmarks equally. Four 5 × 5 heatmaps show simulator tokens, actor tokens, revision requests, and clarification recall. Cells are **row minus column**; colors show raw differences, not significance. Pointwise 95% study-cluster bootstrap CIs and pair-specific coverage accompany the figure.
+- **Complementary behavior panels:** actor self-repetition measures overlap with earlier actor messages in the same conversation (at least three corresponding word matches in six-word windows; the current common panel has 79 questions). The setting was selected in an exploratory window grid. Complete-fact-recovery bars use SciConv disambiguation episodes ending in native failure, average within case and then across eligible cases, and show no CIs. Eligibility can differ by persona; these are conditional descriptive summaries.
+
+Working notebooks: `Experiment/01_behavioral_diversity/behavioral_analysis.ipynb` and `Experiment/09_offline_metric_suite/metric_suite.ipynb`. Token use, revisions, clarification, repetition, and recovery describe different behaviors; they are not combined into a single universally desirable score.
+
+The notebooks retain extraction/aggregation code, coverage tables, figure code, and embedded outputs. Current notebook figures supersede older exported report/figure snapshots where labeled. These notebook paths identify the local analysis workspaces; the setup/trace release does not yet include the newer analysis notebooks and derived results. All analyses reuse saved runs; local embedding extraction does not generate new scientific interactions. Persona and display choices are exploratory, and diversity alone does not establish human realism.
+
 ## Recorded interaction traces
 
 Browse [Astra trial-1 conversations](traces/astra_trial1/README.md) for **off / 155 / 001 / 003 / 046**. The index accounts for all 200 questions per setting and links available shared conversations. Repaired endpoints are labeled; completed zero-scoring outcomes are retained. Sol and infrastructure-only slots are excluded from transcript publication. These are historical interactions with recorded protocol provenance, not new runs of the current launcher.

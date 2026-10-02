@@ -2,17 +2,64 @@
 
 Scientific agents collaborating with diverse simulated researchers.
 
-**Run the main experiment:** [collaborator run guide](docs/MAIN_RUN.md) — **Off / 155 / 001 / 003 / 046**, the same **200 questions (40 per benchmark)**, **1,000 episodes per trial**. Start with `scripts/setup_main.sh`, then `scripts/submit_main.sh`. The analysis folders are not required.
+## Main experiment
 
-**Research and historical material:** [remote-agent handoff](docs/TEAM_HANDOFF.md) · [paper and experiment plan](docs/design/benchmark_paper_plan.md) · [completed 30-persona results](reports/full_persona_v2/README.md) · [interaction case studies](reports/full_persona_v2/case_studies.md)
+Run the same frozen **200 questions** under **five simulator settings**. Persona profiles are injected into the simulator; the actor and judge use the shared configuration.
 
-## Historical 30-persona pilot
+| Run setting | Configuration |
+|---|---|
+| Simulator personas | Persona off, 155, 001, 003, 046 |
+| Questions | 40 each from ASI-Bench, BixBench, DiscoveryBench, EXP-Bench, and SciConvBench |
+| Models | GPT-6 Astra, reasoning effort `low`, for actor, simulator, and judge |
+| Episodes | 1,000 per trial; 3,000 for three fresh trials |
+| SLURM resources | 30 CPUs, 30 workers, 128 GB RAM per job |
+| Frozen inputs | [Question selection](configs/main_run/selection.csv) and [persona prompts](configs/main_run/personas/) |
 
-The completed experiment contains **30 full personas plus persona off, two questions from each of five benchmarks, and 310 recorded episodes**. Actor, simulator and judge used GPT-6 Luna with reasoning effort `none`. Full profiles enter only the simulator system prompt; both conditions allow general knowledge, while evaluator references remain private.
+These settings describe the fresh-run configuration. Historical runs have different coverage and protocol versions. The current SciConv protocol applies to new runs. See the [complete run guide](docs/MAIN_RUN.md) for shared controls and provenance.
 
-The [results report](reports/full_persona_v2/README.md) preserves all scores, persona indexes, exact injected profiles, and **310 full Markdown traces**, including failed and missing-submission episodes. [Frozen experiment metadata](reports/full_persona_v2/experiment.json) and [configuration snapshots](configs/full_persona_v2) accompany them. Raw JSON logs and execution artifacts remain local; see the handoff for transfer instructions.
+### Install and prepare
 
-## Five retained benchmarks
+Requires Linux, Python 3.12+, `uv`, and Bubblewrap (`bwrap`).
+
+```bash
+git clone --single-branch --branch main https://github.com/MatrAIx-ai/PersonaScienceBench.git
+cd PersonaScienceBench
+bash scripts/setup_main.sh
+cp .env.example .env
+# Set OPENAI_API_KEY in .env.
+python scripts/check_main.py
+```
+
+Setup installs dependencies and downloads source/data assets without LLM inference. Downloaded assets and environments remain local. Analysis notebooks and paper files are not needed to run the experiment.
+
+### Run a trial
+
+Run locally:
+
+```bash
+.venv/bin/python scripts/run_main.py --run-dir runs/main/trial-1 --workers 30
+```
+
+Or submit to SLURM, supplying your cluster account and partition:
+
+```bash
+export ACCOUNT=your_account PARTITION=your_partition
+bash scripts/submit_main.sh 1
+```
+
+To submit three sequential trials:
+
+```bash
+j1=$(bash scripts/submit_main.sh 1)
+j2=$(DEPENDENCY=afterok:${j1%%;*} bash scripts/submit_main.sh 2)
+DEPENDENCY=afterok:${j2%%;*} bash scripts/submit_main.sh 3
+```
+
+Choose either the single-trial submission or the three-trial sequence. Run commands make paid API calls. Each independent trial needs a separate run directory; rerunning the same directory resumes that trial. Preserve the EXP extraction cache across trials to keep prepared inputs fixed. A failed job blocks its dependent jobs until repaired and dependencies updated.
+
+Results and traces are written to `runs/main/trial-N/`. See the [run guide](docs/MAIN_RUN.md#monitor-resume-and-deliver-results) for monitoring, repair flags, and result delivery. Run artifacts and API credentials are excluded from Git.
+
+## Benchmarks in the main run
 
 | Benchmark | Converted cases | Scientific coverage | Native evaluation |
 |---|---:|---|---|
@@ -25,12 +72,6 @@ The [results report](reports/full_persona_v2/README.md) preserves all scores, pe
 There are **2,108 converted cases**. Conversion does not guarantee that every input or runtime is ready. [Conversion inventory](reports/conversion_v2/conversion_summary.md). ScienceAgentBench and Terminal-Bench-Science were discarded from the active study because of their heavier data/runtime requirements; compatibility code remains for existing interfaces and tests.
 
 Conversion is automated per benchmark. Preserve the scientific question, inputs, deliverables and native grading; separate public context from simulator context and evaluator references; record exclusions and source provenance. Execution/design tasks use approach and result reviews, while SciConv retains native clarification. See the [conversion rules](docs/design/conversion_revision_v2.md) and [benchmark standards](docs/benchmark_standards.md).
-
-## Selected main run
-
-The [main-run guide](docs/MAIN_RUN.md) fixes five settings (persona off, 155, 001, 003, 046) and 200 questions. One fresh trial comprises 1,000 episodes; three fresh trials comprise 3,000. Defaults are GPT-6 Astra with low reasoning for actor, simulator, and judge, with 30 workers and 128 GB for SLURM submission. These are the collaborator campaign instructions, not a claim that all three fresh trials have finished.
-
-The frozen selection and prompts are in `configs/main_run/`; the dedicated launcher is `scripts/run_main.py`. Older pilot reports and broader paper plans below provide historical context and must not override these run inputs.
 
 ## Setup and navigation
 
@@ -46,6 +87,15 @@ Follow the [Linux setup and migration guide](docs/reproducibility.md). The [pers
 | `src/`, `scripts/`, `tests/` | Runners, conversion/analysis tools and offline checks |
 | `manifests/` | Pinned upstream sources and checksums |
 | `data/`, `external/`, `prepared/`, `runs/` | Ignored local inputs and runtime artifacts; transfer or regenerate explicitly |
+
+## Historical pilot
+
+<details>
+<summary>Earlier 30-persona pilot: setup and recorded results</summary>
+
+The completed experiment contains **30 full personas plus persona off, two questions from each of five benchmarks, and 310 recorded episodes**. Actor, simulator and judge used GPT-6 Luna with reasoning effort `none`. Full profiles enter only the simulator system prompt; both conditions allow general knowledge, while evaluator references remain private.
+
+The [results report](reports/full_persona_v2/README.md) preserves all scores, persona indexes, exact injected profiles, and **310 full Markdown traces**, including failed and missing-submission episodes. [Frozen experiment metadata](reports/full_persona_v2/experiment.json) and [configuration snapshots](configs/full_persona_v2) accompany them. Raw JSON logs and execution artifacts remain local; see the handoff for transfer instructions.
 
 <!-- FULL_PERSONA_RESULTS_START -->
 
@@ -91,3 +141,5 @@ Turns exclude tool calls. Reply lengths exclude initial requests and private evi
 
 
 <!-- FULL_PERSONA_RESULTS_END -->
+
+</details>

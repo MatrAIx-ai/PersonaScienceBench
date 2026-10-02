@@ -1,6 +1,6 @@
 # PersonaScienceBench
 
-Scientific agents collaborating with diverse simulated researchers. PersonaScienceBench studies how injecting a simulator persona changes scientific collaboration across three levels: **task performance, semantic diversity, and behavioral diversity**.
+Scientific agents collaborating with diverse simulated researchers. PersonaScienceBench evaluates **scientific effectiveness, information acquisition, interaction behavior, and resource use** under different researcher personas. Model-level benchmark results come first; performance, semantic, and behavioral analyses then explain how collaborator personas shape the interaction. Personas condition the researcher simulator, while the scientific actor encounters their effects through conversation.
 
 ## Main experiment
 
@@ -17,31 +17,62 @@ Run the same frozen **200 questions** under **five simulator settings**. Persona
 
 These settings describe the fresh-run configuration. Historical runs have different coverage and protocol versions. The current SciConv protocol applies to new runs. See the [complete run guide](docs/MAIN_RUN.md) for shared controls and provenance.
 
-## Three levels of analysis
+## Primary benchmark scorecard
 
-The same evaluation questions are run across persona settings, with persona off as the baseline. The analysis asks whether personas change outcomes, generated content, and interaction behavior.
+The main results table has **one row per evaluated actor model**, using the same frozen task/persona panel and documented interaction settings. Persona off is a separate reference; persona means average **155 / 001 / 003 / 046** equally.
+
+| Column | What it reports |
+|---|---|
+| **Persona-off performance** | Native scientific score with no injected simulator persona. |
+| **Mean Persona Performance** | Native scientific score averaged across the four injected personas and source benchmarks. |
+| **Fact recovery (%)** | Fraction of required withheld facts recovered across eligible SciConv disambiguation runs, without conditioning on success or failure. |
+| **Self-repetition (%)** | Actor reuse of earlier messages, measured with the selected six-word / three-matching-position definition. |
+| **Actor output (k tokens/episode)** | Recorded whole-episode actor output, including reasoning and final replies, divided by 1,000. |
+| **Tool calls/episode** | Recorded execution/inspection actions; excludes researcher handoffs and applies to four sources rather than SciConv. |
+
+Use equal question weights within each benchmark and equal benchmark weights, averaging available repeats within question first. Report 95% confidence intervals and metric-specific coverage. Resource columns use **absolute units**, not ratios to persona off; fewer tokens or tool calls alone do not establish better adaptation. The metrics remain separate rather than being combined into one adaptation score.
+
+The [Experiment 02 notebook](Experiment/02_performance_and_fields/performance_analysis.ipynb) produces the [saved scorecard](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.md), [CSV](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.csv), and [LaTeX table](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.tex). The current retrospective row is Astra low, using metric-specific common question panels across all five settings: 101 questions for performance and tokens, 20 for fact recovery, 79 for repetition, and 61 for tool use. These counts are analysis coverage, not a replacement for the 200-question benchmark inventory. Additional-model evaluation is being expanded; completed results will populate the same scorecard after coverage and protocol compatibility are checked.
+
+## Three levels of explanatory analysis
+
+The same scientific questions are evaluated across researcher settings, with persona off as a reference. These analyses explain the model-level results rather than define three separate leaderboard scores.
 
 | Level | Research question | Measurements |
 |---|---|---|
-| **Performance** | Does the simulator persona change how well the actor completes scientific tasks? | Native benchmark scores, aggregated by benchmark and scientific super-family; matched differences between persona settings with uncertainty. |
-| **Semantic diversity** | Do different personas lead to different generated content and conversation paths? | Embedding-based distances between persona settings, keeping simulator and actor outputs separate; question-specific semantic trajectory visualizations. |
-| **Behavioral diversity** | Does the simulator persona change how the interaction unfolds? | Simulator and actor output-token usage, revision requests, clarification recall, actor self-repetition, and withheld-fact recovery where benchmark records support it. |
+| **Performance** | How do scientific outcomes vary across researcher personas? | Persona-specific native scores and matched differences. Benchmark and super-family breakdowns are supporting analyses. |
+| **Semantic diversity** | Do personas change generated content and conversation paths? | Role-separated embedding distances and question-specific trajectory illustrations. |
+| **Behavioral diversity** | How does the collaboration change? | Recorded token and tool use, review/revision behavior, clarification, actor repetition, and fact recovery. |
 
-Together, these levels characterize persona-associated differences in scientific interactions. Semantic separation measures differences in generated content, not task quality. Behavioral measures retain their benchmark-specific definitions and eligibility rules. Diversity motivates broader coverage of interaction styles; it does not by itself establish human realism.
+These measurements characterize adaptation-related outcomes and persona-associated variation. Semantic separation is not a quality score; behavioral change alone does not establish successful fulfillment of a researcher's needs. Diversity motivates broader collaborator coverage, without claiming measured human realism.
 
-This overview describes the analysis scope. The run instructions below produce the underlying scores and traces; analysis notebooks and results are maintained separately.
+## Paper structure and discussion cases
+
+The paper follows **benchmark construction → evaluation metrics and setup → model-level results → explanatory analyses → discussion**:
+
+1. **Introduction and related work:** motivate scientific collaboration and the need to evaluate agents across different researchers.
+2. **PersonaScienceBench:** define persona construction, task conversion, role visibility, the 200-question mixture, interaction protocols, and the metric contract.
+3. **Experimental setup and main results:** specify the actor/simulator/judge configuration and controls, then report the model-level scorecard.
+4. **Performance, semantic, and behavioral analyses:** explain persona-dependent outcomes and interaction differences; keep detailed benchmark/domain tables and sensitivity analyses as supporting material.
+5. **Discussion with conversation snippets:** use selected, trace-linked excerpts to explain **why evaluating scientific agents with persona-conditioned collaborators matters**. Show the researcher's request or response, the actor's subsequent action, and the observed scientific consequence where available. Cases can illustrate clarification, disclosure, approval, revision, or persistent misunderstanding; their inclusion depends on the recorded evidence.
+6. **Limitations, conclusion, and appendix:** state what simulated collaborators and the measured outcomes establish, and provide implementation details, coverage, full comparisons, and extended traces.
+
+Discussion snippets should compare the same question across persona settings where possible, identify the benchmark, question, persona and trial, and link to the full conversation. Include helpful, unproductive, and mixed interactions when supported. Their purpose is to make the quantitative findings concrete and motivate collaborator diversity in scientific-agent evaluation; selected cases do not establish prevalence, causal mechanisms, a universal performance benefit from personas, or human realism. Relevant examples can also appear beside the Results they illustrate, with Discussion drawing the broader argument.
+
+See the [paper structure review](paper/STRUCTURE.md) and [paper workspace](paper/README.md). This describes the intended manuscript organization; the current LaTeX draft still contains placeholders and older displays awaiting integration.
 
 ## From saved runs to final figures
 
 All three levels start from the frozen question selection, saved native evaluations, and recorded interactions. Join records by **benchmark, question, persona, and trial**; retain scientific super-family and source-study identifiers for grouping and uncertainty estimates. Keep original and repaired endpoints distinguishable. The selected display panel is **off / 155 / 001 / 003 / 046**. Historical coverage is three original trials for off/155/001 and one for 003/046; the fresh three-trial run above is a separate collection target.
 
-### 1. Performance: native results → matched comparisons → score and difference plots
+### 1. Primary scorecard and supporting performance comparisons
 
-- **Extract:** normalize each benchmark's native score to 0–100. Scientific missing submissions receive zero; infrastructure/evaluation failures remain missing. The available-performance view prefers an evaluable repair, with original fallback; original-only results remain a sensitivity view. Repairs are not additional trials.
-- **Aggregate and compare:** average observed trials within each question, then questions within benchmark or super-family. Pairwise differences match question and trial and require compatible evaluation settings; ASI pairs require the corrected judge. Bootstrap source studies for pointwise 95% CIs.
-- **Display:** absolute-performance estimates with CIs on the left; persona-by-persona difference heatmaps for each benchmark and super-family on the right. Cells are **row minus column**. The main comparison uses study-block sign-flip tests with Holm correction across 90 unique contrasts: green/orange indicate positive/negative significant differences; gray indicates no detected difference. Alternative tests remain separate sensitivity figures.
+- **Extract:** the primary scorecard uses saved original native scores, complete traces, and recorded API usage. Scientific missing submissions follow the native zero-score rules; infrastructure/evaluation failures remain missing. Keep original and repaired endpoints distinguishable; repairs are not additional trials.
+- **Aggregate:** for each metric, retain questions with observations under all five settings. Average available trials within question, questions within source, sources equally, and the four injected personas equally. Keep persona off separate. Bootstrap whole studies within source, retaining the settings together, for pointwise 95% CIs. Existing trial counts and evaluator versions vary and are disclosed.
+- **Display:** save one model row in the primary table, with the definitions and coverage above. Actor output is episode-total k tokens and tool use is actions per episode; no baseline normalization is applied.
+- **Supporting analysis:** retain available-endpoint persona comparisons, benchmark/super-family breakdowns and difference heatmaps in the [previous executed notebook](Experiment/02_performance_and_fields/supporting/performance_analysis_before_scorecard.ipynb). That analysis may prefer evaluable repairs with original fallback and uses matched question/trial contrasts with evaluator-compatibility filters. Its different inclusion rules mean those values need not reproduce the original-only primary scorecard.
 
-Working notebook: `Experiment/02_performance_and_fields/performance_analysis.ipynb`. Pairwise tables retain effect sizes, p values, task/trial counts, and evaluator compatibility. Native scores have different meanings across benchmarks, so super-family summaries are descriptive composites.
+Working notebook: [performance_analysis.ipynb](Experiment/02_performance_and_fields/performance_analysis.ipynb). [Definitions and limitations](Experiment/02_performance_and_fields/MODEL_SCORECARD.md) distinguish the metric-specific panels. Native scores retain different meanings across sources; source/domain breakdowns provide supporting context.
 
 ### 2. Semantic diversity: final messages → embeddings → separation heatmaps and trajectories
 
@@ -56,6 +87,8 @@ Working notebook: `Experiment/01_behavioral_diversity/semantic_trajectory_analys
 - **Extract:** use complete original traces and actual recorded API output-token counts, including reasoning. Simulator tokens are measured per noninitial decision/reply; actor tokens are measured per completed interaction, including intervening tool generation. SciConv actor counts use clarification-question calls. Also extract revision requests from result-review decisions and clarification recall from saved native SciConv evaluations. No new LLM judge or estimated character-to-token conversion is used.
 - **Compare and display:** match question and original trial, average paired differences within question, and weight represented benchmarks equally. Four 5 × 5 heatmaps show simulator tokens, actor tokens, revision requests, and clarification recall. Cells are **row minus column**; colors show raw differences, not significance. Pointwise 95% study-cluster bootstrap CIs and pair-specific coverage accompany the figure.
 - **Complementary behavior panels:** actor self-repetition measures overlap with earlier actor messages in the same conversation (at least three corresponding word matches in six-word windows; the current common panel has 79 questions). The setting was selected in an exploratory window grid. Complete-fact-recovery bars use SciConv disambiguation episodes ending in native failure, average within case and then across eligible cases, and show no CIs. Eligibility can differ by persona; these are conditional descriptive summaries.
+
+The behavioral notebook also includes a five-setting tool-call difference heatmap. Its per-interaction token summaries differ from the primary table's whole-episode token totals. Experiment 09's failure-conditioned complete-fact recovery is a separate diagnostic from the primary scorecard's unconditional fraction of facts recovered; do not interchange their denominators or labels.
 
 Working notebooks: `Experiment/01_behavioral_diversity/behavioral_analysis.ipynb` and `Experiment/09_offline_metric_suite/metric_suite.ipynb`. Token use, revisions, clarification, repetition, and recovery describe different behaviors; they are not combined into a single universally desirable score.
 

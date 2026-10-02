@@ -77,15 +77,16 @@ Results and traces are written to `runs/main/trial-N/`. See the [run guide](docs
 
 ## Benchmarks in the main run
 
-| Benchmark | Converted cases | Scientific coverage | Native evaluation |
+| Benchmark | Selected questions | Source scientific coverage | Native evaluation |
 |---|---:|---|---|
-| DiscoveryBench | 264 | Biology, humanities, sociology, economics, engineering, meta-science | Discovery scoring |
-| BixBench | 205 | Computational biology | Open-answer grading with executed-analysis submission |
-| EXP-Bench | 440 | ML and scientific experiment design | Design coverage and integrity gate; design only |
-| ASI-Bench | 60 | Scientific computing across disciplines | Local gates and weighted scores |
-| SciConvBench | 1,139 | Fluids, PDEs, materials, solid mechanics | Clarification and specification metrics |
+| DiscoveryBench | 40 | Biology, humanities, sociology, economics, engineering, meta-science | Discovery scoring |
+| BixBench | 40 | Computational biology | Open-answer grading with executed-analysis submission |
+| EXP-Bench | 40 | ML and scientific experiment design | Design coverage and integrity gate; design only |
+| ASI-Bench | 40 | Scientific computing across disciplines | Local gates and weighted scores |
+| SciConvBench | 40 | Fluids, PDEs, materials, solid mechanics | Clarification and specification metrics |
+| **Total** | **200** | | |
 
-There are **2,108 converted cases**. Conversion does not guarantee that every input or runtime is ready. [Conversion inventory](reports/conversion_v2/conversion_summary.md). ScienceAgentBench and Terminal-Bench-Science were discarded from the active study because of their heavier data/runtime requirements; compatibility code remains for existing interfaces and tests.
+The main run uses **200 unique questions**, with **40 from each benchmark**, fixed in the [selection file](configs/main_run/selection.csv). Every question is evaluated under all five settings: **1,000 episodes per trial**, or **3,000 episodes across three trials**. The broader converted source pools are documented separately in the [conversion inventory](reports/conversion_v2/conversion_summary.md).
 
 Conversion is automated per benchmark. Preserve the scientific question, inputs, deliverables and native grading; separate public context from simulator context and evaluator references; record exclusions and source provenance. Execution/design tasks use approach and result reviews, while SciConv retains native clarification. See the [conversion rules](docs/design/conversion_revision_v2.md) and [benchmark standards](docs/benchmark_standards.md).
 

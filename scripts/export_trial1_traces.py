@@ -132,6 +132,8 @@ def export(out):
     expected = {(r['source'], r['task_id'], arm) for r in panel for arm in ARMS}
     rows, receipts, seen = [], [], set()
     out.mkdir(parents=True)
+    # Preserve byte-level receipts and verbatim whitespace in recorded messages.
+    (out / ".gitattributes").write_text("* -text\n*.md whitespace=-blank-at-eol\n")
     for name in RUNS:
         original_run, repair_run = ROOT / 'runs' / name, ROOT / 'runs' / ('repair-1-' + name)
         original_file, repair_file = repair_run / 'original_results_snapshot.json', repair_run / 'results.json'

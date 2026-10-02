@@ -14,6 +14,9 @@ from personasciencebench.researcher import Researcher
 from personasciencebench.persona import resolve_persona, persona_record
 from personasciencebench.schema import Episode, Submission
 
+# Adding an opt-in design track must not broaden existing acquisition/pilot defaults.
+DEFAULT_BENCHMARKS = [name for name in ADAPTERS if name != "ideagene"]
+
 
 def prepare(args):
     selection = read_json(args.selection) if getattr(args, "selection", None) else None
@@ -78,7 +81,7 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=project_root() / "manifests/sources.json")
     commands = parser.add_subparsers(dest="command", required=True)
     fetching = commands.add_parser("fetch-sources", help="Download and verify pinned sources and public pilot assets")
-    fetching.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
+    fetching.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=DEFAULT_BENCHMARKS)
     provisioning = commands.add_parser("provision-sab", help="Extract reviewed files from a supplied verified ZIP")
     provisioning.add_argument("--archive", type=Path, required=True)
     checking = commands.add_parser("check-runtime", help="Probe the isolated scientific runtime without models")
@@ -87,11 +90,11 @@ def main(argv=None):
     preview.add_argument("--episode", type=Path, required=True)
     preview.add_argument("--config", type=Path, default=project_root() / "configs/pilot.json")
     catalog = commands.add_parser("catalog", help="Enumerate metadata without running tasks or models")
-    catalog.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
+    catalog.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=DEFAULT_BENCHMARKS)
     preparation = commands.add_parser("prepare", help="Export explicitly selected reviewed candidates")
     preparation.add_argument("--selection", type=Path, help="JSON mapping benchmark names to reviewed task IDs")
     preparation.add_argument("--cases-per-benchmark", type=int, default=2)
-    preparation.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=list(ADAPTERS))
+    preparation.add_argument("--benchmarks", nargs="+", choices=ADAPTERS, default=DEFAULT_BENCHMARKS)
     preparation.add_argument("--output", type=Path, required=True)
     serving = commands.add_parser("serve", help="Start a researcher interface for an independent actor")
     serving.add_argument("--episode", type=Path, required=True)
@@ -122,9 +125,28 @@ def main(argv=None):
     evaluation.add_argument("--judge-model")
     evaluation.add_argument("--env-file", type=Path, default=project_root() / ".env")
     evaluation.add_argument("--native-request", action="store_true", help="Write a native execution request, without running it")
+    ideagene = commands.add_parser("run-ideagene", help="Opt-in text-only IG-Arena review pilot")
+    ideagene.add_argument("--config", type=Path, default=project_root() / "configs/ideagene/pilot.json")
+    ideagene.add_argument("--output", type=Path, required=True)
+    ideagene.add_argument("--dry-run", action="store_true", help="Verify tasks/profiles and emit plan; no inference")
+    ideagene.add_argument("--evaluate-native", action="store_true", help="Run native PES after each sealed submission")
+    ideagene.add_argument("--native-python", type=Path, help="Python executable with upstream evaluator dependencies")
+    ideagene.add_argument("--env-file", type=Path, default=project_root() / ".env")
     args = parser.parse_args(argv)
     try:
-        if args.command == "fetch-sources":
+        if args.command == "run-ideagene":
+            from personasciencebench.ideagene_runner import pilot_plan, run_pilot
+            config = read_json(args.config)
+            if args.dry_run:
+                adapter = load_adapter("ideagene", args.source_root, args.manifest)
+                result = pilot_plan(adapter, config)
+                args.output.mkdir(parents=True, exist_ok=False)
+                write_json(args.output / "plan.json", result, exclusive=True)
+            else:
+                load_env(args.env_file)
+                result = run_pilot(args.source_root, args.manifest, config, args.output,
+                                   evaluate_native=args.evaluate_native, native_python=args.native_python)
+        elif args.command == "fetch-sources":
             from personasciencebench.sources import fetch_sources
             result = fetch_sources(args.source_root, args.benchmarks, args.manifest)
         elif args.command == "provision-sab":

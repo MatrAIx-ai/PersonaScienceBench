@@ -1,6 +1,6 @@
 # PersonaScienceBench
 
-Scientific agents collaborating with diverse simulated researchers.
+Scientific agents collaborating with diverse simulated researchers. PersonaScienceBench studies how injecting a simulator persona changes scientific collaboration across three levels: **task performance, semantic diversity, and behavioral diversity**.
 
 ## Main experiment
 
@@ -16,6 +16,22 @@ Run the same frozen **200 questions** under **five simulator settings**. Persona
 | Frozen inputs | [Question selection](configs/main_run/selection.csv) and [persona prompts](configs/main_run/personas/) |
 
 These settings describe the fresh-run configuration. Historical runs have different coverage and protocol versions. The current SciConv protocol applies to new runs. See the [complete run guide](docs/MAIN_RUN.md) for shared controls and provenance.
+
+## Three levels of analysis
+
+The same evaluation questions are run across persona settings, with persona off as the baseline. The analysis asks whether personas change outcomes, generated content, and interaction behavior.
+
+| Level | Research question | Measurements |
+|---|---|---|
+| **Performance** | Does the simulator persona change how well the actor completes scientific tasks? | Native benchmark scores, aggregated by benchmark and scientific super-family; matched differences between persona settings with uncertainty. |
+| **Semantic diversity** | Do different personas lead to different generated content and conversation paths? | Embedding-based distances between persona settings, keeping simulator and actor outputs separate; question-specific semantic trajectory visualizations. |
+| **Behavioral diversity** | Does the simulator persona change how the interaction unfolds? | Simulator and actor output-token usage, revision requests, clarification recall, actor self-repetition, and withheld-fact recovery where benchmark records support it. |
+
+Together, these levels characterize persona-associated differences in scientific interactions. Semantic separation measures differences in generated content, not task quality. Behavioral measures retain their benchmark-specific definitions and eligibility rules. Diversity motivates broader coverage of interaction styles; it does not by itself establish human realism.
+
+This overview describes the analysis scope. The run instructions below produce the underlying scores and traces; analysis notebooks and results are maintained separately.
+
+## Quick start
 
 ### Install and prepare
 

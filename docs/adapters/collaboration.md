@@ -1,6 +1,6 @@
 # Shared researcher collaboration
 
-Protocol `researcher-review-v2` uses the same loop across DiscoveryBench, BixBench, ASI-Bench, and the current EXP-Bench design-only track:
+Protocol `researcher-review-v2` uses the same loop across DiscoveryBench, BixBench, ASI-Bench, MLAgentBench, and the current EXP-Bench design-only track:
 
 **Inspect → discuss the approach → execute or develop the design → review evidence → revise or finish.**
 

@@ -98,7 +98,8 @@ def test_failed_prompt_edit_is_counted_as_a_failed_call():
 
 def test_collaboration_switches_are_independent_and_strict():
     assert CollaborationConfig().model_dump() == {"protocol": "active_researcher", "unrestricted_knowledge": False,
-        "embody_identity": False, "volunteer_information": False, "max_requests": 12}
+        "embody_identity": False, "volunteer_information": False, "truthful_history": False,
+        "researcher_policy": "llm", "max_requests": 12}
     with pytest.raises(ValueError):
         CollaborationConfig(unknown_switch=True)
 

@@ -8,7 +8,9 @@ import subprocess
 from personasciencebench.adapters.base import SourceConfig, sha256
 
 ADAPTERS = {
+    "ideagene": ("ideagene", "IdeaGeneAdapter"),
     "asibench": ("asibench", "ASIBenchAdapter"),
+    "mlagentbench": ("mlagentbench", "MLAgentBenchAdapter"),
     "sciconvbench": ("sciconvbench", "SciConvBenchAdapter"),
     "discoverybench": ("discoverybench", "DiscoveryBenchAdapter"),
     "bixbench": ("bixbench", "BixBenchAdapter"),
@@ -35,7 +37,12 @@ def load_adapter(name: str, source_root: Path, manifest: Path | None = None,
             ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True,
             stderr=subprocess.PIPE).strip()
         if actual != spec["revision"]:
-            raise ValueError(f"{name}: source revision differs from manifest")
+            expected_tree = spec.get("source_tree")
+            actual_tree = subprocess.check_output(
+                ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"], text=True,
+                stderr=subprocess.PIPE).strip()
+            if not expected_tree or actual_tree != expected_tree:
+                raise ValueError(f"{name}: source revision/tree differs from manifest")
         if spec.get("repository_file_hashes"):
             # Large upstream archives contain historical runs outside our import.
             # Verify every consumed source/data file directly against pinned hashes.

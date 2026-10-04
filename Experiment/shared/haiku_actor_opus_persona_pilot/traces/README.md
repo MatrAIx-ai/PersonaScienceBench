@@ -1,9 +1,19 @@
 # Compact trace inventory
 
-This folder contains the Git-friendly evidence retained from the three raw
-pilot trials.
+This folder contains Git-friendly evidence for the three raw pilot trials and
+the completed 1,000-episode full campaign.
 
-## Per-trial records
+## Full campaign
+
+- `full-campaign-receipt.json`: the final 1,000/1,000 completion record, fixed
+  model/task manifest, raw-input SHA-256 checksums, native status counts, nine
+  attempt-2 slots, and checksums of the compact generated reports.
+
+The full nested `results.json` is about 18 MB and is not duplicated here.
+`../full_campaign_episodes.csv` and `../full_campaign_pairs.csv` contain the
+compact data needed to inspect and reproduce the reported statistics.
+
+## Pilot per-trial records
 
 - `trial-N-manifest.json`: models, arms, task count, AWS region, and selection
   checksum.

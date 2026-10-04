@@ -113,6 +113,9 @@ This ranking is descriptive and should not be read as a stable ordering without 
 - `full_campaign_pairs.csv`: 800 same-task persona/control comparisons.
 - `full_campaign_audit.json`: raw-input checksums and infrastructure repairs.
 - `traces/full-campaign-receipt.json`: compact completion/provenance receipt.
+- `traces/full-campaign-{manifest,progress,results}.json`: exact top-level raw run records, matching the trace depth retained for the pilot trials.
+- `traces/full-campaign-shared-events.jsonl`: actual controller-level actor/researcher interaction traces for all 1,000 final episodes.
+- `traces/full-campaign-shared-events-index.csv`: lookup table for the shared trace JSONL.
 - `report_full_campaign.py`: offline report generator.
 - `candidate_*.md`: exact synthetic researcher persona prompts.
 

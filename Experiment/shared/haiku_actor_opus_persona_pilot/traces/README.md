@@ -8,10 +8,23 @@ the completed 1,000-episode full campaign.
 - `full-campaign-receipt.json`: the final 1,000/1,000 completion record, fixed
   model/task manifest, raw-input SHA-256 checksums, native status counts, nine
   attempt-2 slots, and checksums of the compact generated reports.
+- `full-campaign-manifest.json`: exact final model, arm, task-count, region, and
+  selection identity.
+- `full-campaign-progress.json`: exact terminal runner accounting.
+- `full-campaign-results.json`: exact top-level native results for all 1,000
+  episodes. This is the full-campaign counterpart of `trial-N-results.json`.
+- `full-campaign-shared-events.jsonl`: actual controller-level shared events
+  for every final episode, including researcher decisions, actor/researcher
+  handoffs, clarification questions/replies, submissions, and termination.
+- `full-campaign-shared-events-index.csv`: one row per episode with its JSONL
+  line number, score, status, event counts, source path, and source checksum.
 
-The full nested `results.json` is about 18 MB and is not duplicated here.
-`../full_campaign_episodes.csv` and `../full_campaign_pairs.csv` contain the
-compact data needed to inspect and reproduce the reported statistics.
+`../full_campaign_episodes.csv` and `../full_campaign_pairs.csv` provide
+smaller analysis-ready views of the same campaign.
+
+Raw actor tool commands/results, system prompts, API payloads, and
+judge-private records are deliberately excluded from the shared export. The
+source event-log checksum on every row preserves provenance.
 
 ## Pilot per-trial records
 

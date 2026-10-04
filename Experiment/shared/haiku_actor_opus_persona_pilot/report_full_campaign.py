@@ -9,6 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import re
+import shutil
 from statistics import mean
 from typing import Any
 
@@ -40,6 +42,28 @@ BENCHMARK_LABELS = {
 }
 ACTOR_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 OPUS_MODEL = "us.anthropic.claude-opus-4-6-v1"
+SHARED_EVENT_TYPES = {
+    "initial_request",
+    "researcher_decision",
+    "agent_handoff",
+    "researcher_question",
+    "researcher_reply",
+    "actor_finished",
+    "collaboration_candidate_selected",
+    "final_submission",
+    "result_handoff_rejected",
+    "final_specification",
+    "design_submission",
+    "collaboration_missing_submission",
+    "collaboration_budget_exhausted",
+    "collaboration_stopped",
+}
+SECRET_PATTERN = re.compile(
+    r"(?:sk-(?:proj-|or-v1-)?[A-Za-z0-9_-]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"AKIA[A-Z0-9]{16})"
+)
 
 
 def sha256(path: Path) -> str:
@@ -547,6 +571,132 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def sanitize_trace_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return SECRET_PATTERN.sub("[REDACTED_CREDENTIAL]", value).replace(
+            str(ROOT), "<LOCAL_REPOSITORY>"
+        )
+    if isinstance(value, list):
+        return [sanitize_trace_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_trace_value(item) for key, item in value.items()
+        }
+    return value
+
+
+def export_shared_traces(
+    run_dir: Path,
+    records: list[dict[str, Any]],
+    output_dir: Path,
+) -> dict[str, Any]:
+    state_paths: dict[tuple[str, str, str], Path] = {}
+    for state_path in run_dir.glob("episodes/*/*/state.json"):
+        state = json.loads(state_path.read_text())
+        state_paths[(state["source"], state["task_id"], state["arm"])] = state_path
+    trace_path = output_dir / "traces/full-campaign-shared-events.jsonl"
+    index_path = output_dir / "traces/full-campaign-shared-events-index.csv"
+    index_rows = []
+    total_events = 0
+    event_type_counts: Counter[str] = Counter()
+    ordered = sorted(
+        records,
+        key=lambda row: (
+            BENCHMARKS.index(row["benchmark"]),
+            row["task_id"],
+            ARMS.index(row["arm"]),
+        ),
+    )
+    with trace_path.open("w") as handle:
+        for line_number, record in enumerate(ordered, 1):
+            key = (record["benchmark"], record["task_id"], record["arm"])
+            state_path = state_paths.get(key)
+            if state_path is None:
+                raise ValueError(f"No state file for trace export: {key}")
+            attempt_dir = state_path.parent / f"attempt-{record['attempt']}" / "output"
+            event_paths = list(attempt_dir.glob("**/controller/events.jsonl"))
+            if not event_paths:
+                event_paths = list(attempt_dir.glob("**/events.jsonl"))
+            if len(event_paths) != 1:
+                raise ValueError(
+                    f"Expected one final controller event log for {key}, "
+                    f"found {len(event_paths)}"
+                )
+            event_path = event_paths[0]
+            events = []
+            local_counts: Counter[str] = Counter()
+            for raw_line in event_path.read_text(errors="replace").splitlines():
+                if not raw_line.strip():
+                    continue
+                event = json.loads(raw_line)
+                event_type = event.get("type")
+                if event_type not in SHARED_EVENT_TYPES:
+                    continue
+                events.append(
+                    {
+                        "sequence": event.get("sequence"),
+                        "time": event.get("time"),
+                        "type": event_type,
+                        "payload": sanitize_trace_value(event.get("payload") or {}),
+                    }
+                )
+                local_counts[event_type] += 1
+                event_type_counts[event_type] += 1
+            trace = {
+                "benchmark": record["benchmark"],
+                "task_id": record["task_id"],
+                "arm": record["arm"],
+                "attempt": record["attempt"],
+                "runner_status": record["runner_status"],
+                "native_status": record["native_status"],
+                "score_0_100": record["score_0_100"],
+                "submitted": record["submitted"],
+                "source_event_log": str(event_path.relative_to(ROOT)),
+                "source_event_log_sha256": sha256(event_path),
+                "event_count": len(events),
+                "events": events,
+            }
+            serialized = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+            if SECRET_PATTERN.search(serialized):
+                raise ValueError(f"Credential pattern remained in shared trace: {key}")
+            handle.write(serialized + "\n")
+            total_events += len(events)
+            index_rows.append(
+                {
+                    "line_number": line_number,
+                    "benchmark": record["benchmark"],
+                    "task_id": record["task_id"],
+                    "arm": record["arm"],
+                    "attempt": record["attempt"],
+                    "native_status": record["native_status"],
+                    "score_0_100": record["score_0_100"],
+                    "submitted": record["submitted"],
+                    "shared_event_count": len(events),
+                    "event_type_counts": json.dumps(
+                        dict(local_counts), sort_keys=True, separators=(",", ":")
+                    ),
+                    "source_event_log": str(event_path.relative_to(ROOT)),
+                    "source_event_log_sha256": sha256(event_path),
+                }
+            )
+    write_csv(index_path, index_rows)
+    return {
+        "episodes": len(index_rows),
+        "events": total_events,
+        "event_type_counts": dict(event_type_counts),
+        "excluded_event_types": ["actor_command", "actor_command_result"],
+        "scope": (
+            "Controller-level actor/researcher handoffs, researcher messages, final "
+            "submissions, and termination events. Raw actor tool commands/results, "
+            "system prompts, API payloads, and judge-private records are excluded."
+        ),
+        "trace_file": str(trace_path.relative_to(output_dir)),
+        "trace_file_sha256": sha256(trace_path),
+        "index_file": str(index_path.relative_to(output_dir)),
+        "index_file_sha256": sha256(index_path),
+    }
+
+
 def interval_text(interval: list[float]) -> str:
     return f"[{interval[0]:.2f}, {interval[1]:.2f}]"
 
@@ -761,6 +911,12 @@ def render_brief(summary: dict[str, Any], receipt: dict[str, Any]) -> str:
         "- `full_campaign_pairs.csv`: 800 same-task persona/control comparisons.",
         "- `full_campaign_audit.json`: raw-input checksums and infrastructure repairs.",
         "- `traces/full-campaign-receipt.json`: compact completion/provenance receipt.",
+        "- `traces/full-campaign-{manifest,progress,results}.json`: exact top-level "
+        "raw run records, matching the trace depth retained for the pilot trials.",
+        "- `traces/full-campaign-shared-events.jsonl`: actual controller-level "
+        "actor/researcher interaction traces for all 1,000 final episodes.",
+        "- `traces/full-campaign-shared-events-index.csv`: lookup table for the "
+        "shared trace JSONL.",
         "- `report_full_campaign.py`: offline report generator.",
         "- `candidate_*.md`: exact synthetic researcher persona prompts.",
         "",
@@ -830,6 +986,21 @@ def main() -> int:
     (output_dir / "full_campaign_brief.md").write_text(
         render_brief(summary, receipt)
     )
+    shared_trace = export_shared_traces(run_dir, records, output_dir)
+    raw_trace_sources = {
+        "full-campaign-manifest.json": run_dir / "manifest.json",
+        "full-campaign-progress.json": run_dir / "progress.json",
+        "full-campaign-results.json": run_dir / "results.json",
+    }
+    raw_trace_copy_sha256 = {}
+    for name, source in raw_trace_sources.items():
+        target = output_dir / "traces" / name
+        shutil.copyfile(source, target)
+        source_hash = sha256(source)
+        target_hash = sha256(target)
+        if target_hash != source_hash:
+            raise ValueError(f"Raw trace copy checksum mismatch: {name}")
+        raw_trace_copy_sha256[name] = target_hash
     trace_receipt = {
         "campaign": summary["analysis"],
         "manifest": receipt["manifest"],
@@ -839,6 +1010,8 @@ def main() -> int:
         "native_status_counts": receipt["native_status_counts"],
         "retried_episodes": receipt["retried_episodes"],
         "retry_classification_counts": receipt["retry_classification_counts"],
+        "shared_trace": shared_trace,
+        "raw_trace_copy_sha256": raw_trace_copy_sha256,
         "compact_outputs_sha256": {},
     }
     for name in (
@@ -847,6 +1020,8 @@ def main() -> int:
         "full_campaign_summary.json",
         "full_campaign_audit.json",
         "full_campaign_brief.md",
+        "traces/full-campaign-shared-events.jsonl",
+        "traces/full-campaign-shared-events-index.csv",
     ):
         trace_receipt["compact_outputs_sha256"][name] = sha256(output_dir / name)
     (output_dir / "traces/full-campaign-receipt.json").write_text(
@@ -860,6 +1035,8 @@ def main() -> int:
                 "pairs": len(pairs),
                 "runner_status_counts": receipt["runner_status_counts"],
                 "retried_episodes": len(receipt["retried_episodes"]),
+                "shared_trace_episodes": shared_trace["episodes"],
+                "shared_trace_events": shared_trace["events"],
                 "mean_scores": {
                     arm: summary["overall_by_arm"][arm]["mean_score_0_100"]
                     for arm in ARMS

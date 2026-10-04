@@ -1,262 +1,171 @@
-# Haiku actor / Opus collaborator persona pilot
+# Haiku actor / Opus collaborator persona experiments
 
 ## Start here
 
-This experiment asked a simple question:
+This folder contains a completed experiment on whether the persona of an
+AI-simulated research collaborator changes a scientific agent's performance.
 
-> Does changing the persona of an AI-simulated research collaborator change how
-> well a separate scientific AI agent performs?
+The final campaign ran:
 
-The short answer is: **the persona changed some outcomes, but this pilot did not
-find a stable overall improvement or decline.** The persona condition averaged
-4.13 points lower than persona off, but the uncertainty interval included both
-harm and no effect. The largest exploratory difference appeared on
-DiscoveryBench, where the persona condition performed worse.
+- 200 frozen scientific tasks;
+- five collaborator settings: persona off plus four synthetic personas;
+- one episode for every task/setting combination;
+- **1,000 total episodes, all completed**.
 
-This was a small feasibility study, not a final benchmark result. It shows that
-PersonaScienceBench can measure persona-related changes in end-to-end agent
-performance using a weaker actor model on Amazon Bedrock.
+Claude Haiku 4.5 was the scientific actor. Claude Opus 4.6 was the simulated
+researcher and model-based judge. All calls used Amazon Bedrock. The persona
+was applied only to the Opus researcher; the Haiku actor, judge, tasks, limits,
+and scoring policy were held fixed.
 
-## Who did what?
+Read [`full_campaign_brief.md`](full_campaign_brief.md) for the author-facing
+result. The compact CSV and JSON files in this folder reproduce its numbers
+without copying the large raw run.
 
-Three model roles were involved:
+## Main result
 
-| Role | Model | Job |
-|---|---|---|
-| Scientific actor | Claude Haiku 4.5 | Solved the task, used tools, analyzed evidence, and submitted the final answer |
-| Simulated researcher | Claude Opus 4.6 | Reviewed plans and results and responded to the actor during collaboration |
-| Judge | Claude Opus 4.6 | Applied a benchmark's model-based grading procedure when one was required |
+The persona-off control averaged **34.60/100**. None of the four personas had a
+reliably different overall score in the paired task bootstrap:
 
-The **persona was applied only to the simulated researcher**. Haiku did not
-receive the persona as its own identity. The judge and all other settings were
-kept the same between conditions.
+| Setting | Mean score | Difference vs persona off | 95% interval | Valid submissions |
+|---|---:|---:|---:|---:|
+| `persona_off` | 34.60 | — | — | 171/200 |
+| `candidate_155` | 33.55 | -1.05 | [-6.22, 4.09] | 170/200 |
+| `candidate_001` | 34.19 | -0.41 | [-5.11, 4.26] | 173/200 |
+| `candidate_003` | 33.04 | -1.56 | [-6.42, 3.36] | 171/200 |
+| `candidate_046` | 34.51 | -0.09 | [-5.39, 5.14] | 179/200 |
 
-Using Haiku as the actor was intentional: it tested whether collaborator
-persona effects remain visible when the working agent has less capability than
-the stronger models commonly used in scientific-agent experiments.
+Averaging the four selected persona conditions within each task gave a
+**-0.78-point** difference from persona off; its 95% interval also crossed
+zero.
 
-## What were the two conditions?
+The clearest exploratory benchmark-specific pattern was EXP-Bench: all four
+persona conditions were lower than persona off by 3.06–10.32 points, and each
+unadjusted paired task-bootstrap interval was below zero. This needs a fresh
+trial before it is treated as a stable finding.
 
-Every selected task was run under both conditions:
+The earlier pilot's large negative DiscoveryBench result for `candidate_155`
+did not replicate on the full 40-task DiscoveryBench panel. Its full-panel
+difference was -1.05 points with an interval that crossed zero.
 
-| Condition | Meaning |
-|---|---|
-| `persona_off` | The Opus researcher collaborated without the synthetic persona profile |
-| `candidate_155` | The same Opus researcher was instructed to embody the fixed `candidate_155` profile |
+## What was compared?
 
-`candidate_155` is a synthetic, bundled stress-test persona. Among many
-attributes, it describes a formal Mandarin-speaking, highly conscientious,
-orderly, accuracy-oriented, collaborative agronomy practitioner. The complete
-profile is in [`candidate_155.md`](candidate_155.md).
+Every condition used the same 40 tasks from each benchmark:
 
-Because the profile changes many attributes together, the experiment cannot
-tell us whether any observed difference came from language, age, occupation,
-personality, communication style, or another individual feature.
-
-## What was run?
-
-The package's frozen main panel contains five scientific benchmark families.
-Five tasks were selected from each family:
-
-| Benchmark | What it tests in this experiment |
+| Benchmark | What it tests here |
 |---|---|
 | ASI-Bench | Multi-step scientific work with required structured artifacts |
 | BixBench | Bioinformatics and scientific data-analysis answers |
 | DiscoveryBench | Data-supported scientific hypotheses and discoveries |
 | EXP-Bench | Experimental-design quality and coverage |
-| SciConvBench | Scientific clarification and information recovery through conversation |
+| SciConvBench | Scientific clarification and information recovery |
 
-The procedure was:
+The five collaborator settings were:
 
-1. Freeze 25 tasks: five from each benchmark family.
-2. Run each task once with persona off and once with `candidate_155`.
-3. This creates 50 episodes in one trial.
-4. Repeat the same 50-episode experiment three times with fresh model calls.
-5. Score each episode with its benchmark's original scoring procedure.
-6. Normalize the different benchmark scores to a common 0–100 scale for a
-   descriptive combined summary.
+| Setting | Meaning |
+|---|---|
+| `persona_off` | The Opus researcher collaborated without a synthetic persona |
+| `candidate_155` | Opus embodied the exact profile in `candidate_155.md` |
+| `candidate_001` | Opus embodied the exact profile in `candidate_001.md` |
+| `candidate_003` | Opus embodied the exact profile in `candidate_003.md` |
+| `candidate_046` | Opus embodied the exact profile in `candidate_046.md` |
 
-The final dataset therefore contains:
+These profiles vary many attributes simultaneously. The experiment estimates
+condition-level effects; it cannot identify age, language, occupation,
+personality, or another single attribute as the cause.
 
-- 25 unique tasks;
-- two persona conditions;
-- three independent trials;
-- 150 total agent episodes;
-- 75 paired comparisons of persona off versus `candidate_155`.
+## What does “submitted” mean?
 
-“Paired” means that the two conditions were compared on exactly the same task
-within the same trial.
+A valid submission means Haiku completed the benchmark's required output
+contract and produced an answer its native evaluator could grade. It does not
+merely mean that the process finished.
 
-## What does “valid submission” mean?
+An episode is a non-submission when, for example, Haiku reaches its step or
+wall-time limit without using the required submission mechanism or omits
+required structured artifacts. These outcomes remain in the analysis with a
+score of zero because protocol completion is part of end-to-end agent
+performance.
 
-A valid submission means that Haiku completed the benchmark's required
-submission contract and produced an answer that the benchmark could grade.
-It does **not** merely mean that the program finished running.
+## How to interpret the result
 
-For example, an episode is a non-submission when Haiku:
+The full campaign improves task coverage, but it contains only **one stochastic
+trial**. It therefore does not measure run-to-run model variance.
 
-- reaches its actor-call limit without using the required submission tool;
-- reaches the wall-time limit before submitting;
-- omits required structured artifacts; or
-- produces work but does not place it in the benchmark's required output field.
+The earlier pilot repeated 25 tasks three times and found that the
+`candidate_155` effect changed direction across trials. The scientifically
+appropriate framing is:
 
-Non-submissions were scored zero. This is intentional: completing the output
-protocol is part of end-to-end agent performance.
+> The complete 200-task first trial found no stable overall score difference
+> for any of four persona-conditioned collaborators. It did reveal
+> benchmark-specific and submission-behavior differences worth replication,
+> especially the common negative pattern on EXP-Bench.
 
-Across all three trials:
+Do not describe the descriptive condition ranking as a stable ranking of
+personas or human traits.
 
-- persona off produced 64 valid submissions from 75 episodes;
-- `candidate_155` produced 63 valid submissions from 75 episodes;
-- most missing submissions occurred in ASI-Bench, where both conditions
-  submitted successfully in only 6 of 15 episodes.
+## Data quality and retries
 
-The similar submission totals mean that the overall score difference was not
-simply caused by one condition failing to submit much more often.
+- Final runner accounting is 1,000/1,000 finished.
+- Nine slots ended on attempt 2.
+- Four had a recorded infrastructure/runtime failure on attempt 1.
+- Five had no native result before the campaign was resumed.
+- Model missing/no-submission outcomes were not intentionally retried.
+- No score was manually changed and no analysis overlay was applied.
 
-## Main results
+Exact slots and raw-input checksums are in
+[`full_campaign_audit.json`](full_campaign_audit.json).
 
-Across all benchmarks and repeats:
+## Files
 
-| Condition | Mean normalized score |
-|---|---:|
-| Persona off | 42.56/100 |
-| `candidate_155` | 38.44/100 |
-| Paired difference | -4.13 points |
+Full 1,000-episode campaign:
 
-The task-bootstrap 95% interval for the difference was **[-10.75, 2.25]**.
-Because this interval crosses zero, the pilot does not establish a reliable
-overall benefit or harm from the persona.
+- [`full_campaign_brief.md`](full_campaign_brief.md): concise findings and
+  paper interpretation.
+- [`full_campaign_summary.json`](full_campaign_summary.json): aggregate
+  statistics and paired bootstrap intervals.
+- [`full_campaign_episodes.csv`](full_campaign_episodes.csv): one compact row
+  per episode.
+- [`full_campaign_pairs.csv`](full_campaign_pairs.csv): 800 same-task
+  persona/control comparisons.
+- [`full_campaign_audit.json`](full_campaign_audit.json): completion,
+  checksums, and retry provenance.
+- [`report_full_campaign.py`](report_full_campaign.py): reproducible offline
+  report generator.
+- [`traces/full-campaign-receipt.json`](traces/full-campaign-receipt.json):
+  compact completion and provenance receipt.
 
-Results differed by benchmark:
+Earlier 25-task, three-repeat pilot:
 
-| Benchmark | Persona off | `candidate_155` | Paired difference | Valid submissions |
-|---|---:|---:|---:|---:|
-| ASI-Bench | 12.54 | 9.26 | -3.29 | 6/15 in both conditions |
-| BixBench | 46.67 | 40.00 | -6.67 | 13/15 in both conditions |
-| DiscoveryBench | 44.21 | 26.83 | -17.39 | 15/15 in both conditions |
-| EXP-Bench | 56.07 | 56.11 | +0.04 | 15/15 off; 14/15 persona |
-| SciConvBench | 53.33 | 60.00 | +6.67 | 15/15 in both conditions |
+- [`brief.md`](brief.md): pilot findings.
+- [`summary.json`](summary.json): pilot aggregate results.
+- [`episodes.csv`](episodes.csv): 150 pilot episodes.
+- [`pairs.csv`](pairs.csv): 75 pilot comparisons.
+- [`audit.json`](audit.json): pilot data-quality decisions.
+- [`report.py`](report.py): pilot report generator.
+- [`pilot_README.md`](pilot_README.md): detailed explanation of the pilot.
+- [`traces/`](traces/): compact pilot evidence plus the full-campaign receipt.
 
-The combined average should be treated as descriptive because the five
-benchmarks measure different abilities. The benchmark-level results are more
-informative.
+Experiment inputs:
 
-The clearest exploratory observation was DiscoveryBench:
-`candidate_155` scored lower in 7 of 15 task-trial comparisons, tied in the
-other 8, and was never higher. This should be replicated with more frozen tasks
-before being presented as a general result.
+- `candidate_001.md`, `candidate_003.md`, `candidate_046.md`, and
+  `candidate_155.md`: exact researcher persona prompts.
+- [`run_full_campaign.sh`](run_full_campaign.sh): resumable campaign launcher.
 
-## Why are trials 1, 2, and 3 different?
+## Reproduce the full report
 
-The trials are independent repeats of the **same experiment**, not different
-configurations or stages.
+The raw run is intentionally not duplicated in this Git-friendly folder. It
+remains at:
 
-Each trial used the same:
-
-- 25 frozen tasks;
-- Haiku actor and Opus researcher/judge;
-- persona conditions;
-- prompts and collaboration protocol;
-- call and time limits; and
-- scoring policy.
-
-Every episode began with a fresh conversation and workspace. No memory,
-training, answer, or other state carried over from one trial to another.
-
-The results differed because model generation and multi-step agent behavior are
-stochastic. A small difference in an early response can change later tool
-calls, researcher interactions, analysis choices, and whether the agent
-eventually submits a valid answer.
-
-| Trial | Persona off | `candidate_155` | Paired difference | Valid submissions |
-|---:|---:|---:|---:|---:|
-| 1 | 37.07 | 45.66 | +8.59 | 22/25 off; 21/25 persona |
-| 2 | 44.53 | 38.34 | -6.19 | 21/25 off; 20/25 persona |
-| 3 | 46.10 | 31.32 | -14.77 | 21/25 off; 22/25 persona |
-
-The effect changes direction across trials. This run-to-run instability is the
-main reason not to claim a stable overall persona effect from the pilot.
-
-## What happened during data processing?
-
-Three trial-1 records required documented handling:
-
-1. Two DiscoveryBench actor submissions were valid, but the Opus judge omitted
-   a non-scoring JSON explanation field. The original Haiku answers were kept
-   and graded again after making that optional field tolerant. Their resulting
-   scores were 60 and 75.
-2. One EXP-Bench persona episode made 59 actor calls but reached its wall-time
-   limit without submitting an experiment design. It was classified as a
-   genuine model non-submission and scored zero.
-
-No actor answer was regenerated or replaced. The original run artifacts remain
-unchanged, and all three decisions are recorded in [`audit.json`](audit.json).
-
-## What can we conclude?
-
-This pilot supports the following statements:
-
-- PersonaScienceBench can run a paired persona experiment across all five
-  scientific benchmark families using Bedrock.
-- A collaborator persona can coincide with differences in task score,
-  interaction behavior, and protocol completion.
-- Weak-model evaluation should measure non-submission and run-to-run
-  instability, not only the quality of successfully graded answers.
-- DiscoveryBench is a useful candidate for a larger follow-up because it showed
-  the most consistent difference in this task sample.
-
-This pilot does **not** establish:
-
-- that personas generally improve or harm scientific agents;
-- that `candidate_155` is generally harmful;
-- which attribute inside `candidate_155` caused a difference;
-- that the DiscoveryBench result generalizes beyond these five selected tasks;
-  or
-- that the normalized cross-benchmark average is a single universal measure of
-  scientific ability.
-
-## What should happen next?
-
-The next experiment should use several pre-registered personas that vary one
-dimension at a time, retain persona off as the shared control, and expand the
-number of frozen tasks. Repeating each condition remains important because this
-pilot showed substantial stochastic variation.
-
-## Files in this folder
-
-- [`brief.md`](brief.md): concise author-facing interpretation and recommended
-  paper claim.
-- [`summary.json`](summary.json): aggregate results and bootstrap intervals.
-- [`episodes.csv`](episodes.csv): normalized records for all 150 episodes.
-- [`pairs.csv`](pairs.csv): the 75 paired persona comparisons.
-- [`audit.json`](audit.json): documented handling of the three trial-1 records.
-- [`report.py`](report.py): reproducible analysis and report generator.
-- [`candidate_155.md`](candidate_155.md): complete tested persona.
-- [`traces/`](traces/): compact, Git-friendly run evidence.
-
-## Trace policy
-
-The complete raw trials total about 1 GB and are not duplicated here. The
-[`traces/`](traces/) folder contains:
-
-- each trial's model and experiment manifest;
-- terminal completion counts;
-- all 50 top-level native results from each trial;
-- the frozen task selection;
-- both DiscoveryBench regrades; and
-- the EXP-Bench timeout event trace.
-
-This approximately 3 MB bundle is sufficient to inspect and reproduce the
-reported numbers without committing complete API logs, private task snapshots,
-prepared workspaces, or every intermediate event.
-
-## Reproduce the report
+```text
+runs/main/haiku-actor-opus-five-condition-full-trial-1
+```
 
 From the repository root:
 
 ```bash
-docker/run.sh .venv/bin/python haiku_actor_opus_persona_pilot/report.py
+docker/run.sh .venv/bin/python \
+  haiku_actor_opus_persona_pilot/report_full_campaign.py
 ```
 
-The script writes analysis artifacts to
-`analysis/haiku_actor_opus_persona_pilot` and refreshes the brief under `docs/`.
+The report generator verifies the 1,000 expected slots, fixed model roles,
+task selection, benchmark counts, and raw input hashes before writing the
+compact artifacts.

@@ -132,6 +132,17 @@ Full 1,000-episode campaign:
   report generator.
 - [`traces/full-campaign-receipt.json`](traces/full-campaign-receipt.json):
   compact completion and provenance receipt.
+- [`traces/full-campaign-results.json`](traces/full-campaign-results.json):
+  exact top-level native results for all 1,000 episodes, matching the evidence
+  retained for each pilot trial.
+- [`traces/full-campaign-shared-events.jsonl`](traces/full-campaign-shared-events.jsonl):
+  actual controller-level actor/researcher interaction events for all 1,000
+  final episodes.
+- [`traces/full-campaign-shared-events-index.csv`](traces/full-campaign-shared-events-index.csv):
+  searchable lookup table for the shared event traces.
+- `traces/full-campaign-manifest.json` and
+  `traces/full-campaign-progress.json`: exact final run identity and completion
+  records.
 
 Earlier 25-task, three-repeat pilot:
 
@@ -168,4 +179,7 @@ docker/run.sh .venv/bin/python \
 
 The report generator verifies the 1,000 expected slots, fixed model roles,
 task selection, benchmark counts, and raw input hashes before writing the
-compact artifacts.
+compact artifacts. The shared trace export includes researcher decisions,
+actor/researcher handoffs, clarification exchanges, final submissions, and
+termination events. It deliberately excludes raw actor tool commands/results,
+system prompts, API payloads, and judge-private records.

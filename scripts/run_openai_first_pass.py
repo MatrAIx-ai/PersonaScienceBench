@@ -31,6 +31,35 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def role_models(model, effort, actor_model=None, actor_effort=None,
+                researcher_model=None, researcher_effort=None):
+    roles = {r: {'model': model, 'provider': 'openai', 'reasoning_effort': effort}
+             for r in ('actor', 'researcher', 'judge')}
+    if actor_model:
+        roles['actor']['model'] = actor_model
+    if actor_effort:
+        roles['actor']['reasoning_effort'] = actor_effort
+    if researcher_model:
+        roles['researcher']['model'] = researcher_model
+    if researcher_effort:
+        roles['researcher']['reasoning_effort'] = researcher_effort
+    return roles
+
+
+def load_native_result(output, source, task_id, key):
+    # Only read the harness result, never actor-created result.json artifacts.
+    path = output / (task_id.replace('/', '__') if source == 'expbench' else key) / 'result.json'
+    if not path.exists():
+        return []
+    result = json.loads(path.read_text())
+    if not isinstance(result, dict):
+        raise ValueError(f'Native result must be an object: {path}')
+    expected = result.get('task_id') if source == 'expbench' else result.get('source_task_id')
+    if expected != task_id:
+        raise ValueError(f'Native result task does not match {task_id}')
+    return [result]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir', type=Path, required=True)
@@ -40,9 +69,16 @@ def main():
     p.add_argument('--workers', type=int, default=30)
     p.add_argument('--model', default='gpt-6-astra')
     p.add_argument('--reasoning-effort', default='low')
+    p.add_argument('--actor-model', help='Override only the actor; keep researcher/judge on --model')
+    p.add_argument('--actor-reasoning-effort', help='Override only actor reasoning')
+    p.add_argument('--researcher-model', help='Override the researcher simulator model')
+    p.add_argument('--researcher-reasoning-effort', help='Override researcher simulator reasoning')
+    p.add_argument('--require-prepared', action='store_true', help='Require frozen prepared tasks; never regenerate source conversions')
     p.add_argument('--retry-infrastructure', action='store_true')
     p.add_argument('--retry-missing', action='store_true', help='Retry missing submissions; retain earlier attempts and report this as a repair pass')
     a = p.parse_args()
+    models = role_models(a.model, a.reasoning_effort, a.actor_model, a.actor_reasoning_effort,
+                         a.researcher_model, a.researcher_reasoning_effort)
     arms = a.arms
     if len(arms) != len(set(arms)) or ("persona_off" not in arms and a.baseline_run is None):
         raise ValueError("Choose unique conditions and include persona_off or supply --baseline-run")
@@ -65,11 +101,16 @@ def main():
     identity = {'model': a.model, 'provider': 'openai', 'reasoning_effort': a.reasoning_effort,
                 'selection_sha256': digest(a.selection), 'arms': arms, 'episode_repeats': 1,
                 'task_count':200, 'episode_count':len(rows)*len(arms), 'source_counts':dict(counts)}
+    if a.actor_model or a.actor_reasoning_effort or a.researcher_model or a.researcher_reasoning_effort:
+        identity['role_models'] = models
     if a.baseline_run is not None:
         a.baseline_run = a.baseline_run.resolve()
         baseline = json.loads((a.baseline_run/'manifest.json').read_text())
         if 'persona_off' not in baseline['arms'] or any(baseline[k] != identity[k] for k in ('model','provider','reasoning_effort','selection_sha256','task_count','source_counts')):
             raise ValueError('External baseline does not match the model, reasoning, or frozen task panel')
+        baseline_models = baseline.get('role_models') or role_models(baseline['model'], baseline['reasoning_effort'])
+        if baseline_models != models:
+            raise ValueError('External baseline uses different role models')
         identity['baseline_run'] = str(a.baseline_run)
     if (run/'manifest.json').exists():
         if json.loads((run/'manifest.json').read_text()) != identity:
@@ -78,7 +119,7 @@ def main():
         write(run/'manifest.json', identity)
         (run/'selection.csv').write_bytes(a.selection.read_bytes())
     model = {'model':a.model, 'provider':'openai', 'reasoning_effort':a.reasoning_effort}
-    write(run/'api_access.json', preflight({'actor':model}))
+    write(run/'api_access.json', preflight(models))
     if (run/'fatal_api.json').exists():
         raise RuntimeError('Resolve fatal_api.json before resuming')
     for arm in arms:
@@ -86,10 +127,14 @@ def main():
         for kind in ('shared','exp'):
             config = json.loads((ROOT/f'configs/full_persona_v2/{kind}.json').read_text())
             config['persona'] = persona
-            for spec in config['models'].values():
-                spec.update(model)
+            for role, spec in config['models'].items():
+                spec.update(models[role])
                 if kind == 'exp':
-                    spec.update(input_usd_per_million=10, output_usd_per_million=50)
+                    prices = {'gpt-6-astra': (10, 50), 'gpt-5.6-sol': (4, 20)}
+                    if spec['model'] not in prices:
+                        raise ValueError(f"Set verified EXP accounting prices for {spec['model']}")
+                    input_price, output_price = prices[spec['model']]
+                    spec.update(input_usd_per_million=input_price, output_usd_per_million=output_price)
                 else:
                     spec['timeout'] = 600
             if kind == 'exp':
@@ -121,6 +166,9 @@ def main():
         tid, source = row['task_id'], row['source']
         key = safe_component(source+':'+tid)
         prepared = run/'prepared'/key
+        required = prepared/('tasks.jsonl' if source == 'expbench' else 'pilot_manifest.json')
+        if a.require_prepared and not required.exists():
+            raise ValueError(f'Frozen preparation missing: {required}')
         if source == 'expbench':
             path = prepared/'tasks.jsonl'
             if not path.exists():
@@ -186,8 +234,11 @@ def main():
         else:
             with (out/'process.log').open('w') as log:
                 proc = subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT)
-            summaries = list(output.rglob('result.json')) if output.exists() else []
-            native = [json.loads(path.read_text()) for path in summaries]
+            try:
+                native = load_native_result(output, source, row['task_id'], key)
+            except (ValueError, OSError) as exc:
+                native = []
+                result['result_read_error'] = str(exc)
             result.update(returncode=proc.returncode,native_results=native,
                           status='infrastructure_error' if proc.returncode or not native or any(r.get('status') in ('infrastructure_error','runtime_error','error') for r in native) else 'finished')
         result['finished_at'] = time.time(); write(state,result)

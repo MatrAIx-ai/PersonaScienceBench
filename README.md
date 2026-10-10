@@ -4,6 +4,8 @@ Scientific agents collaborating with diverse simulated researchers. PersonaScien
 
 ## Main experiment
 
+For agents evaluating another model, use the [run-to-table handoff](docs/TEAM_HANDOFF.md#new-model-campaign--paper-main-table-updated-2026-10-10): exact commands, model-role configuration, and the required tracked export to `results/<model-slug>/trial-<N>/`. The running agent commits and pushes the complete traces/submissions; our team handles final grading and table computation.
+
 Run the same frozen **200 questions** under **five simulator settings**. Persona profiles are injected into the simulator; the actor and judge use the shared configuration.
 
 | Run setting | Configuration |
@@ -17,6 +19,8 @@ Run the same frozen **200 questions** under **five simulator settings**. Persona
 
 These settings describe the fresh-run configuration. Historical runs have different coverage and protocol versions. The current SciConv protocol applies to new runs. See the [complete run guide](docs/MAIN_RUN.md) for shared controls and provenance.
 
+Existing delivered campaigns are indexed in [results/README.md](results/README.md), with explicit completeness labels and per-file checksum manifests. Active raw runs remain local under `runs/`.
+
 ## Primary benchmark scorecard
 
 The main results table has **one row per evaluated actor model**, using the same frozen task/persona panel and documented interaction settings. Persona off is a separate reference; persona means average **155 / 001 / 003 / 046** equally.
@@ -27,12 +31,10 @@ The main results table has **one row per evaluated actor model**, using the same
 | **Mean Persona Performance** | Native scientific score averaged across the four injected personas and source benchmarks. |
 | **Fact recovery (%)** | Fraction of required withheld facts recovered across eligible SciConv disambiguation runs, without conditioning on success or failure. |
 | **Self-repetition (%)** | Actor reuse of earlier messages, measured with the selected six-word / three-matching-position definition. |
-| **Actor output (k tokens/episode)** | Recorded whole-episode actor output, including reasoning and final replies, divided by 1,000. |
-| **Tool calls/episode** | Recorded execution/inspection actions; excludes researcher handoffs and applies to four sources rather than SciConv. |
 
-Use equal question weights within each benchmark and equal benchmark weights, averaging available repeats within question first. Report 95% confidence intervals and metric-specific coverage. Resource columns use **absolute units**, not ratios to persona off; fewer tokens or tool calls alone do not establish better adaptation. The metrics remain separate rather than being combined into one adaptation score.
+Use equal question weights within each benchmark and equal benchmark weights, averaging available repeats within question first. Report 95% confidence intervals and metric-specific coverage. Actor output tokens and tool calls are retained in supporting resource tables, using absolute units; they are not main-table columns. Fewer tokens or tool calls alone do not establish better adaptation. The metrics remain separate rather than being combined into one adaptation score.
 
-The [Experiment 02 notebook](Experiment/02_performance_and_fields/performance_analysis.ipynb) produces the [saved scorecard](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.md), [CSV](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.csv), and [LaTeX table](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.tex). The current retrospective row is Astra low, using metric-specific common question panels across all five settings: 101 questions for performance and tokens, 20 for fact recovery, 79 for repetition, and 61 for tool use. These counts are analysis coverage, not a replacement for the 200-question benchmark inventory. Additional-model evaluation is being expanded; completed results will populate the same scorecard after coverage and protocol compatibility are checked.
+The [Experiment 02 notebook](Experiment/02_performance_and_fields/performance_analysis.ipynb) produces the [saved scorecard](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.md), [CSV](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.csv), and [LaTeX table](Experiment/02_performance_and_fields/data/model_scorecard/model_scorecard.tex). The saved scorecard includes historical Astra low (101 common questions for performance, 20 for fact recovery, 79 for repetition) and Haiku–Haiku (200 questions for performance; behavioral means/CIs are collaborator-reported pending complete trace delivery). Each model uses its own available common-five-setting panel. These counts are analysis coverage, not a replacement for the 200-question benchmark inventory. Additional-model evaluation is being expanded; completed results will populate the same scorecard after coverage and protocol compatibility are checked.
 
 ## Three levels of explanatory analysis
 
@@ -96,7 +98,7 @@ The notebooks retain extraction/aggregation code, coverage tables, figure code, 
 
 ## Recorded interaction traces
 
-Browse [Astra trial-1 conversations](traces/astra_trial1/README.md) for **off / 155 / 001 / 003 / 046**. The index accounts for all 200 questions per setting and links available shared conversations. Repaired endpoints are labeled; completed zero-scoring outcomes are retained. Sol and infrastructure-only slots are excluded from transcript publication. These are historical interactions with recorded protocol provenance, not new runs of the current launcher.
+Browse [Astra trial-1 conversations](results/astra-actor-astra-simulator-astra-judge/trial-1/README.md) for **off / 155 / 001 / 003 / 046**. The index accounts for all 200 questions per setting and links available shared conversations. Repaired endpoints are labeled; completed zero-scoring outcomes are retained. Sol and infrastructure-only slots are excluded from transcript publication. These are historical interactions with recorded protocol provenance, not new runs of the current launcher.
 
 ## Quick start
 

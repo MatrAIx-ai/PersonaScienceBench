@@ -1,0 +1,3 @@
+# QA
+
+All 65 setting/threshold cells reconcile to per-source finished counts and score totals. Final threshold includes all eligible runs, so M(12) equals overall episode mean for each setting. All thresholds 0–12 shown; no sampling or missing-to-zero substitution. Source composition changes with threshold and is documented. No CI; descriptive preview changes only the original Panel C denominator. Single axes: inter-panel alignment not applicable. Visual check: readable legend, no overlapping text, markers not clipped. PDF text and collision checks pass; PNG 300 dpi preview and editable vectors exported. New notebook section executed; embedded PNG matches export. Existing figures unchanged.

@@ -1,0 +1,3 @@
+# QA
+
+Both panels restricted to 29 shared-success SciConv questions. Panel A retains 580 question/setting/bin rows; all source labels SciConv, identical matched questions as Panel B. Each question-series distribution sums to 100%. 95% percentile CIs independently reproduced from 20,000 shared question resamples (seed 20261005); all eight endpoints match saved values. Resampling preserves all settings/repeats jointly and conditions on the selected shared-success set. No significance test. Panel B unchanged at 3.10/2.81 without CI. Visual inspection: no labels cross error bars; no clipping. Alignment, PDF text and collision audits pass. Notebook reexecuted and embedded PNG matches export. Editable vectors and 300 dpi preview retained.

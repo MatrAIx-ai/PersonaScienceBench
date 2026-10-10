@@ -1,0 +1,3 @@
+# Figure QA
+
+Rendered PDF: no collision failures or warnings; text meets the 5 pt minimum; single-panel alignment passes. Visually inspected all 20 off-diagonal labels, ticks, gray diagonal, color scale and title. Static width warning is resolved by the explicit 105.4 mm standalone-panel contract; this is not a journal submission at a prescribed column width. Static uncertainty warning is resolved by the marginal 95% intervals in the accompanying results table; colors encode effect size only. PNG at 600 dpi is the requested raster deliverable; TIFF is not required for this standalone figure. The explicit save calls use the same output arguments as the rendered export loop.

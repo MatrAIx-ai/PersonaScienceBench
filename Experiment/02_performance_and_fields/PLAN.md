@@ -6,26 +6,29 @@ Do persona-conditioned researchers change task performance, and does the effect 
 
 ## Design and shared setting
 
-Use the [shared setting](../shared/setting.json) and [paper plan](../../docs/design/benchmark_paper_plan.md). The current campaign is 200 frozen tasks (40 per source), persona off / 148 / 155, three independent complete episodes, GPT-6 Astra low for actor/researcher/model-based evaluator, and 128 GB / 30 CPUs per trial. The actor comparison and static reference are proposed extensions, not current jobs.
+Use the [integrated paper plan](../../docs/design/benchmark_paper_plan.md) and frozen source manifests. Current primary analysis covers off/148/155/089/001/127 across three completed Astra-low trial jobs and 003/004/046 across one completed trial job, on the same 200 tasks (40 per source). Available endpoints and original-only sensitivity are separate. The [shared setting](../shared/setting.json) retains the original three-condition configuration as history. Sol and the new SciConv protocol are separate. Cancelled initial-job records are excluded; 003/004/046 are included with explicit single-trial labels.
 
 ## Status
 
-Trial-1 descriptive and paired analyses complete; three-trial analysis pending.
+**Current:** [ALL_AVAILABLE_PERFORMANCE.md](ALL_AVAILABLE_PERFORMANCE.md) and the executed performance notebook cover every eligible persona. Heatmaps are retained, and the forest alternative is discarded. The following consolidation describes the preserved earlier six-setting analysis.
+
+The requested offline consolidation is complete: [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md), [performance_analysis.ipynb](performance_analysis.ipynb), and `data/consolidated/`. Existing benchmark/super-family table structures are retained. New analyses add same-task/same-trial contrasts, corrected-version ASI filtering, submission/conditional scores, within-task run SDs, complete-panel and no-ASI sensitivities, and an explicit metadata-overlap audit. Collection missingness still limits scientific conclusions.
 
 See [status.json](status.json) and the [shared run status](../shared/run_status.json) for timestamped collection snapshots. Snapshot counts are not live scheduler state. `finished` can include missing submissions; it does not mean scientifically correct or scored.
 
 ## Planned work
 
-- [ ] Keep the benchmark and super-family tables with task counts, three condition means, and 95% confidence intervals.
-- [ ] Report matched-task changes, all-attempt scores, submission rates, technical errors, and conditional-on-submission scores.
-- [ ] Annotate direct/adjacent/outside/unknown persona–field relationships separately from statistical or coding familiarity.
-- [ ] Aggregate three repeats per task/condition and estimate source-study-aware uncertainty; retain missingness and paired baselines.
+- [x] Keep the benchmark and super-family table structures with six setting rows, task/episode counts, means and 95% confidence intervals.
+- [x] Report matched-task/trial changes, evaluable-attempt scores (scientific missing submissions = zero), submission rates, technical errors, and conditional-on-submission scores. Infrastructure failures remain missing.
+- [x] Create direct/adjacent/outside/unknown metadata-overlap records with explicit profile evidence, separate from statistical/coding familiarity. These automatic rules are exploratory and do not establish actual competence or a causal expertise effect.
+- [x] Aggregate repeats within task, estimate source-study-aware uncertainty, report observed within-task score SDs, and retain missingness and paired baselines.
 
 ## Implementation
 
 - `code/report_first_pass_ci.py` delegates to the existing interim analysis implementation.
 - Trial-1 tables, matched scores, and paired-comparison output are copied into `data/trial_1/` with provenance.
-- The repeated-run aggregation, study-cluster analysis, and expertise mapping are pending. Do not label interim task-bootstrap intervals as the final repeated analysis.
+- `code/consolidate_performance.py` uses the existing hashed snapshot; `code/plot_matched_performance.py` exports matched benchmark/family figures. All 108 absolute-score means and denominators reproduce the earlier report. New CIs use a fixed reproducible seed.
+- Original pairs are primary; repair outcomes, all-six-setting complete panels and ASI-free family summaries are sensitivity analyses. Shared study-cluster routines and executed-notebook builder live in `../shared/`.
 
 ## Data and provenance
 
@@ -33,20 +36,26 @@ See [status.json](status.json) and the [shared run status](../shared/run_status.
 
 ## Results so far
 
+- Current three-trial consolidation: most original benchmark-level matched intervals include zero. Strict common coverage is 103 original tasks and 116 after-repair tasks, with no original ASI task meeting the full corrected-version panel. Family effects remain descriptive and conditional on sparse source/study strata. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md).
+- The following three bullets preserve the earlier, smaller trial-1 analysis:
 - Trial 1: 600 processed; 536 scored, 32 missing submissions, 32 technical/evaluation errors.
 - 185 tasks were evaluable under all three conditions; missing submissions counted as zero.
 - No significant paired difference was detected across 27 benchmark/family contrasts; none reached p < 0.05 before correction. This does not establish equivalence.
 
-## Completion criteria
+## Completion criteria for the current offline consolidation
 
-- [ ] Planned outputs exist with task/trial/condition provenance and denominators.
-- [ ] Technical failures and missing submissions are reported separately.
-- [ ] Analysis matches the documented experimental unit and uncertainty method.
-- [ ] Results and limitations are written back into this plan; manuscript outputs are linked.
+- [x] Outputs exist with task/trial/condition provenance and denominators.
+- [x] Technical failures and missing submissions are reported separately.
+- [x] Analysis matches the documented experimental unit and uncertainty method.
+- [x] Results and limitations are written back into this plan; reports, notebooks and figures are linked.
+
+Collection limitations remain explicit; completing the analysis does not make the underlying dataset complete. [Figure QA](figures/consolidated/qa/QA_NOTES.md) records the final checks.
 
 ## Change log
 
 - 2026-09-29: Created experiment tracker from the updated paper plan and existing implementation.
+- 2026-09-30: Completed matched three-trial consolidation, evaluator filtering, coverage and run-variation summaries, field-overlap audit, sensitivities, executed notebook and figure QA. No new model calls or regrading.
+- 2026-09-30: Redrew Figure 4 using `ars-codex:academic-research-suite` v3.22.2. The executed performance notebook now includes two forest panels, all 45 printed estimates and 95% CIs, 8 pt minimum text, a full caption and reproducible plotting source. Estimates and denominators are unchanged. Historical ARS QA (discarded when the user removed the forest alternative) record the checks.
 
 ## Top-ten scope update (2026-09-29)
 
@@ -75,3 +84,33 @@ At the user’s request, finish the three trials for expansion group 2 (089, 001
 ## Error/missing repair queue
 
 The user requested repairs after the running trial. Five later expansion jobs are held; [repair plan](../07_error_repairs/PLAN.md) and [job manifest](../07_error_repairs/status.json) track seven sequential 20-worker passes in separate directories. Original first-pass outcomes remain unchanged, including missing submissions.
+
+## Three-trial Astra report and figures
+
+Generated `three_trial_persona_results.md`, two annotated bar figures in `figures/three_trials/` (PNG/PDF/SVG), and normalized data/CSV tables in `data/three_trials/`. Reproduce with `code/report_three_trials.py`. Scope: off/148/155/089/001/127 across three trials, after one repair pass; original-outcome sensitivity tables retained. Each task averages available trial scores, then tasks receive equal weight. Pointwise 95% intervals resample studies within source, preserving observed source weights. Figures include numeric mean/CI annotations and task/episode denominators. Analysis remains provisional because technical errors, conditional retries, and ASI evaluator drift limit comparability; these are not significance tests or pure trial-randomness intervals. Input hashes, unique trial/task/condition keys, summary denominators, and CI bounds were checked; both figures were visually inspected.
+
+## Notebook tracking convention
+
+User preference: every plotting analysis must include a Jupyter notebook documenting data inputs, aggregation, CI computation, tables, plot code, and saved outputs. The three-trial notebook is `three_trial_persona_analysis.ipynb`; it reproduces the existing summary from the frozen snapshot and exports both annotated figures.
+
+## Current scope: completed-trial personas, heatmaps only
+
+The user discarded the forest plot and requested every persona with at least one completed trial. The cancelled initial run is excluded entirely. Include off/148/155/089/001/127 across three trials and 003/004/046 across one trial, without requiring three repeats. All 4,200 planned slots of those completed campaigns are tracked; 3,973 have an evaluable available endpoint. Unscored episodes remain missing.
+
+[All-available report](ALL_AVAILABLE_PERFORMANCE.md), `data/all_available/`, and the executed `performance_analysis.ipynb` are now the primary expanded performance analysis. New absolute and matched-change heatmaps preserve the original design; the previous six-setting heatmap and historical bar figures are retained separately. Repairs are within-trial endpoints, not additional trials. A failed repair falls back to a valid original result; original-only sensitivity remains available. Counts, evaluator compatibility and single-trial uncertainty limits are explicit.
+
+## Model-level scorecard (2026-10-02)
+
+The primary entry point is now `performance_analysis.ipynb`, rewritten around one row per actor model: explicit persona-off performance, Mean Persona Performance, fact recovery, actor self-repetition, absolute actor output in thousands of tokens per episode, and execution/inspection tool calls per episode. Current eligible data support only a historical Astra-low row. Each metric uses a common five-setting question panel, equal setting/source weights and source-stratified study-cluster intervals. Unequal repeats and historical evaluator versions are disclosed. [Report and definitions](MODEL_SCORECARD.md); CSV/Markdown/LaTeX exports in `data/model_scorecard/`. The prior executed notebook, including benchmark/super-family results, is preserved at `supporting/performance_analysis_before_scorecard.ipynb`. No inference or benchmark submission was performed.
+
+### Resource normalization update
+
+Removed worst-persona performance. Resource columns now show the ratio of four-persona mean use to persona-off mean use on the same metric-specific question panel. Numerator and denominator are recomputed jointly in each study-bootstrap draw. A ratio of 1 is equal use; the ratios are not success-adjusted efficiency. Raw means and intervals are retained in `data/model_scorecard/resource_use_raw.csv` and displayed in the notebook.
+
+### Absolute resource units (supersedes ratio columns)
+
+The primary scorecard now reports actor output in k tokens/episode and tool calls/episode. Token estimates and confidence limits are divided by 1,000 only as a unit conversion. No baseline normalization is used in the main table. Raw counts and persona-off ratios remain supporting comparisons.
+
+## Aggregate model leaderboard figure (2026-10-05)
+
+Added a three-panel bar figure to the final section of `performance_analysis.ipynb`: Mean Persona Performance, fact recovery, and actor self-repetition. Model-colored bars average the four injected personas and applicable benchmarks equally with 95% intervals from 20,000 source-stratified study-cluster bootstrap samples; performance includes persona-off point-reference ticks. Per the updated reporting instruction, each model uses its own available eligible questions, retaining all-five-setting eligibility within each model but applying no intersection across models. Astra uses 101 / 20 / 79 questions and Haiku uses 200 / 20 / 137 for performance / fact recovery / repetition. Means and intervals now match the supporting scorecard; Mean Persona Performance is 48.82% for Astra and 33.82% for Haiku. Exact model-specific membership, coverage exclusions, input hashes, values and source CSV are saved under `data/model_leaderboard/`; PDF/SVG/PNG exports are under `figures/model_leaderboard/`. [Methods and candidate caption](MODEL_LEADERBOARD.md) document differing coverage, unequal repeats, historical evaluator differences and the exploratory repetition matcher. These are descriptive summaries of historical configurations, not matched or paired model comparisons. Offline analysis only.

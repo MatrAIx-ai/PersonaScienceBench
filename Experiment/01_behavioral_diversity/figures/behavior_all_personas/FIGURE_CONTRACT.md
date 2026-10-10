@@ -1,0 +1,3 @@
+# Expanded behavioral figures
+
+Question: how do observed communication and interaction summaries differ from off across all personas with completed trial jobs? Preserve the existing heatmap, full task distribution and original repeated-panel design. Python/Matplotlib; 183 mm width; PDF/SVG and 600 dpi PNG/TIFF. Raw paired changes and pointwise 95% study-cluster CIs are printed; heatmap colors standardize by baseline task SD solely for display. Eight persona rows; 1T/3T labels identify available trial jobs. Repeat-distance figure includes only off/148/155/089/001/127. No semantic or realism inference. Original outputs are preserved separately.

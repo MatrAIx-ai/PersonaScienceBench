@@ -1,0 +1,10 @@
+# Mean performance among runs completed by t
+
+## Figure contract
+Change only the denominator of the existing all-benchmark Panel C estimator for comparison: use completed-by-t episodes rather than all episodes. Retain its five settings, 1,958 evaluable traces, episode weighting, native final scores, and protocol interaction counts. Keep the existing figure unchanged; add a preview. No new inference or uncertainty claim.
+
+## Candidate caption
+**Mean final performance among runs completed by each interaction threshold.** For each setting, M(t) is the sum of final native scores for episodes whose observed interaction count is at most t, divided by the number of those episodes. The same 1,958 evaluable original Astra episodes as the existing Panel C are used across all five benchmarks, with off/155/001/003/046 shown separately. Scores are on 0–100 and retain partial credit; this is not uniformly a binary success rate. Both numerator and denominator change as episodes finish, so curves can rise or fall. Episodes, not benchmarks, receive equal weights, matching the original Panel C; the preview changes only its denominator. Benchmark and question composition therefore change with t. Zero-denominator points are undefined rather than assigned zero. SciConv counts clarification exchanges, whereas the other sources count actor handoffs including required plan/result stages. M(t) uses final scores from different observed episodes and is not performance after t interactions for a fixed cohort or an experimentally assigned interaction budget. A rise does not establish within-run recovery or a causal benefit of extra interaction. No CIs are displayed in this descriptive line preview. Per-setting denominators and per-source composition are provided in the source tables.
+
+## Reproduction
+Run `code/plot_completed_mean.py` or execute the M(t) preview section of `metric_suite.ipynb`. Source tables and hashes: `data/completed_mean/`; editable PDF/SVG and PNG: `figures/completed_mean/`. Earlier figures are unchanged.

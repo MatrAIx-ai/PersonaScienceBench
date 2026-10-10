@@ -58,7 +58,7 @@ not checked.
 ## Subsequent trace-publication request
 
 The user requested one trial per selected persona and withdrew the incomplete
-Sol campaign. The [Astra trial-1 collection](../traces/astra_trial1/README.md)
+Sol campaign. The [Astra trial-1 collection](../results/astra-actor-astra-simulator-astra-judge/trial-1/README.md)
 publishes 898 shared conversations and accounts for all 1,000 planned slots.
 It retains 305 zero-scoring scientific outcomes; 102 slots have no publishable
 conversation. Endpoint selection prefers an evaluable repair rather than the

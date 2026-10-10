@@ -31,8 +31,8 @@ def digest(path):
 
 
 def role_models(model, effort, actor_model=None, actor_effort=None,
-                researcher_model=None, researcher_effort=None):
-    roles = {r: {'model': model, 'provider': 'openai', 'reasoning_effort': effort}
+                researcher_model=None, researcher_effort=None, provider='openai'):
+    roles = {r: {'model': model, 'provider': provider, 'reasoning_effort': effort}
              for r in ('actor', 'researcher', 'judge')}
     if actor_model:
         roles['actor']['model'] = actor_model
@@ -64,9 +64,12 @@ def main():
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--selection', type=Path, default=ROOT/'configs/main_run/selection.csv', help='Exact copy of the frozen main-run selection; checksum verified')
     p.add_argument('--arms', nargs='+', choices=ARMS, default=ARMS)
+    p.add_argument('--standalone-arm', action='store_true', help='Run exactly one condition independently; no paired baseline is borrowed')
     p.add_argument('--baseline-run', type=Path, help='Existing matching trial supplying persona-off; allows persona-only expansion batches')
     p.add_argument('--workers', type=int, default=30)
     p.add_argument('--model', default='gpt-6-astra')
+    p.add_argument('--provider', choices=['openai','openrouter'], default='openai')
+    p.add_argument('--judge-max-tokens', type=int, default=4096)
     p.add_argument('--reasoning-effort', default='low')
     p.add_argument('--actor-model', help='Override only the actor; keep researcher/judge on --model')
     p.add_argument('--actor-reasoning-effort', help='Override only actor reasoning')
@@ -77,9 +80,11 @@ def main():
     p.add_argument('--retry-missing', action='store_true', help='Retry missing submissions; retain earlier attempts and report this as a repair pass')
     a = p.parse_args()
     models = role_models(a.model, a.reasoning_effort, a.actor_model, a.actor_reasoning_effort,
-                         a.researcher_model, a.researcher_reasoning_effort)
+                         a.researcher_model, a.researcher_reasoning_effort, a.provider)
     arms = a.arms
-    if len(arms) != len(set(arms)) or ("persona_off" not in arms and a.baseline_run is None):
+    if a.standalone_arm and (len(arms) != 1 or a.baseline_run is not None):
+        raise ValueError('--standalone-arm requires exactly one arm and no external baseline')
+    if len(arms) != len(set(arms)) or ("persona_off" not in arms and a.baseline_run is None and not a.standalone_arm):
         raise ValueError("Choose unique conditions and include persona_off or supply --baseline-run")
     if "persona_off" in arms and a.baseline_run is not None:
         raise ValueError("Choose a new baseline or an existing baseline, not both")
@@ -99,17 +104,17 @@ def main():
     counts = Counter(r['source'] for r in rows)
     if len(rows) != 200 or set(counts.values()) != {40} or len(counts) != 5 or len({(r['source'],r['task_id']) for r in rows}) != 200:
         raise ValueError('Expected 200 unique tasks: 40 per source')
-    identity = {'model': a.model, 'provider': 'openai', 'reasoning_effort': a.reasoning_effort,
+    identity = {'model': a.model, 'provider': a.provider, 'reasoning_effort': a.reasoning_effort,
                 'selection_sha256': digest(a.selection), 'arms': arms, 'episode_repeats': 1,
                 'task_count':200, 'episode_count':len(rows)*len(arms), 'source_counts':dict(counts)}
-    if a.actor_model or a.actor_reasoning_effort or a.researcher_model or a.researcher_reasoning_effort:
+    if a.actor_model or a.actor_reasoning_effort or a.researcher_model or a.researcher_reasoning_effort or a.provider != 'openai':
         identity['role_models'] = models
     if a.baseline_run is not None:
         a.baseline_run = a.baseline_run.resolve()
         baseline = json.loads((a.baseline_run/'manifest.json').read_text())
         if 'persona_off' not in baseline['arms'] or any(baseline[k] != identity[k] for k in ('model','provider','reasoning_effort','selection_sha256','task_count','source_counts')):
             raise ValueError('External baseline does not match the model, reasoning, or frozen task panel')
-        baseline_models = baseline.get('role_models') or role_models(baseline['model'], baseline['reasoning_effort'])
+        baseline_models = baseline.get('role_models') or role_models(baseline['model'], baseline['reasoning_effort'], provider=baseline.get('provider','openai'))
         if baseline_models != models:
             raise ValueError('External baseline uses different role models')
         identity['baseline_run'] = str(a.baseline_run)
@@ -119,9 +124,10 @@ def main():
     else:
         write(run/'manifest.json', identity)
         (run/'selection.csv').write_bytes(a.selection.read_bytes())
-    model = {'model':a.model, 'provider':'openai', 'reasoning_effort':a.reasoning_effort}
+    model = {'model':a.model, 'provider':a.provider, 'reasoning_effort':a.reasoning_effort}
     if (run/'fatal_api.json').exists():
         raise RuntimeError('Resolve fatal_api.json before resuming')
+    catalog = preflight(models) if a.provider == 'openrouter' else None
     for arm in arms:
         persona = {'enabled':False} if arm == 'persona_off' else {'enabled':True, 'id':arm, 'system_prompt':(ROOT/f'configs/main_run/personas/{arm}.md').read_text()}
         for kind in ('shared','exp'):
@@ -129,11 +135,15 @@ def main():
             config['persona'] = persona
             for role, spec in config['models'].items():
                 spec.update(models[role])
+                if role == 'judge':spec['max_output_tokens' if kind=='exp' else 'max_tokens']=a.judge_max_tokens
                 if kind == 'exp':
                     prices = {'gpt-6-astra': (10, 50), 'gpt-5.6-sol': (4, 20)}
-                    if spec['model'] not in prices:
-                        raise ValueError(f"Set verified EXP accounting prices for {spec['model']}")
-                    input_price, output_price = prices[spec['model']]
+                    if catalog is not None:
+                        input_price=float(catalog[role]['pricing']['prompt'])*1_000_000
+                        output_price=float(catalog[role]['pricing']['completion'])*1_000_000
+                    else:
+                        if spec['model'] not in prices:raise ValueError(f"Set verified EXP accounting prices for {spec['model']}")
+                        input_price, output_price = prices[spec['model']]
                     spec.update(input_usd_per_million=input_price, output_usd_per_million=output_price)
                 else:
                     spec['timeout'] = 600

@@ -17,8 +17,8 @@ class ModelSettings(Record):
     provider: str = "openrouter"
     model: str = Field(min_length=1)
     max_output_tokens: int = Field(ge=256, le=32768)
-    input_usd_per_million: float = Field(gt=0)
-    output_usd_per_million: float = Field(gt=0)
+    input_usd_per_million: float = Field(ge=0)
+    output_usd_per_million: float = Field(ge=0)
     reasoning_effort: str | None = None
 
 

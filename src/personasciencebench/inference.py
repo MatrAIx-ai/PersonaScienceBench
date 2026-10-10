@@ -90,9 +90,10 @@ class OpenRouterClient:
             data = self.openai.complete(payload)
         else:
             try:
-                response = httpx.post("https://openrouter.ai/api/v1/chat/completions",
+                from personasciencebench.openrouter_pacing import paced_post
+                response = paced_post(lambda: httpx.post(os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions",
                                       headers={"Authorization": f"Bearer {key}"},
-                                      json=payload, timeout=self.timeout)
+                                      json=payload, timeout=float(os.environ.get('PSB_LOCAL_CLIENT_TIMEOUT', self.timeout)) if os.environ.get('OPENROUTER_BASE_URL', '').startswith('http://127.0.0.1:') else self.timeout), payload)
             except httpx.HTTPError as exc:
                 raise RuntimeError(f"{self.role}: OpenRouter transport failed ({type(exc).__name__})") from None
             if response.status_code != 200:
@@ -104,7 +105,7 @@ class OpenRouterClient:
                          "request": payload, "response": data,
                          "requested_native_settings": requested_settings,
                          "omitted_native_settings": omitted,
-                         "usage": data.get("usage", {}), "automatic_retries": 0})
+                         "usage": data.get("usage", {}), "automatic_retries": getattr(response, "_psb_rate_limit_retries", 0) if self.provider == "openrouter" else 0})
         if data.get("error"):
             raise RuntimeError(f"{self.role}: OpenRouter returned an error response")
         try:
@@ -148,7 +149,7 @@ def preflight(models: dict, *, timeout=45) -> dict:
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
         raise ValueError("OPENROUTER_API_KEY is not configured; no inference requested")
-    with httpx.Client(base_url="https://openrouter.ai/api/v1", timeout=timeout,
+    with httpx.Client(base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"), timeout=timeout,
                       headers={"Authorization": f"Bearer {key}"}) as client:
         for route in ("/key", "/models"):
             response = client.get(route)

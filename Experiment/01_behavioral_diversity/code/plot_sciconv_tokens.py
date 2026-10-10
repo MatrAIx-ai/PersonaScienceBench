@@ -1,0 +1,64 @@
+"""Role-separated SciConv output tokens, with saved case-weighted confidence intervals."""
+from pathlib import Path
+import csv,json,hashlib
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.transforms import ScaledTranslation
+from audit_panel_alignment import require_matplotlib_panel_alignment
+BASE=Path(__file__).resolve().parents[1]
+ARMS=['persona_off','candidate_148','candidate_155','candidate_089','candidate_001','candidate_127']
+LABELS=['Off','148','155','089','001','127']
+
+def plot(summary,show=False):
+    plt.rcParams.update({'font.family':'sans-serif','font.sans-serif':['DejaVu Sans'],
+        'font.size':7,'axes.labelsize':7,'axes.titlesize':8,'xtick.labelsize':6.5,'ytick.labelsize':6.5,
+        'axes.spines.top':False,'axes.spines.right':False,'axes.linewidth':0.6,
+        'xtick.major.width':0.6,'ytick.major.width':0.6,'xtick.major.size':2.5,'ytick.major.size':2.5,
+        'pdf.fonttype':42,'svg.fonttype':'none','legend.frameon':False})
+    p=summary['roles']
+    fig,axes=plt.subplots(1,2,figsize=(7.2047244094,3.9370078740))
+    fig.subplots_adjust(left=.085,right=.985,bottom=.255,top=.81,wspace=.28)
+    rows=[]
+    specs=[(axes[0],ARMS,LABELS,[p['actor'][a]['output_tokens_per_call'] for a in ARMS],'Actor output','Output tokens per call'),
+           (axes[1],ARMS,LABELS,[p['researcher'][a]['output_tokens_per_call'] for a in ARMS],'Simulator output','Output tokens per reply')]
+    for letter,(ax,arms,labels,stats,title,ylabel) in zip(['a','b'],specs):
+        ax.set_title(title,loc='left',fontweight='normal',pad=12)
+        ax.text(0,1,letter,transform=ax.transAxes+ScaledTranslation(-19/72,12/72,fig.dpi_scale_trans),fontsize=9,fontweight='bold',va='bottom')
+        for i,(arm,s) in enumerate(zip(arms,stats)):
+            assert s['mean'] is not None and len(s['ci95'])==2
+            mean=s['mean'];lo,hi=np.array(s['ci95'])
+            assert np.isfinite([mean,lo,hi]).all() and lo<=mean<=hi
+            ax.bar(i,mean,width=.64,color='#9DA6AE' if arm=='persona_off' else '#528D96',edgecolor='none',zorder=2)
+            ax.errorbar(i,mean,yerr=[[mean-lo],[hi-mean]],fmt='none',ecolor='#25343B',elinewidth=.75,capsize=2.5,capthick=.75,zorder=3)
+            ax.annotate(f'{mean:.0f}\n[{lo:.0f}–{hi:.0f}]',(i,hi),xytext=(0,5),textcoords='offset points',ha='center',va='bottom',fontsize=5.5,linespacing=1.3)
+            rows.append({'panel':letter,'persona':arm,'mean':mean,'ci95_low':lo,'ci95_high':hi,'cases':s['cases'],'episodes_or_pairs':s['episodes']})
+        ax.set_xticks(range(len(labels)),[f'{label}\n{s["cases"]}/{s["episodes"]}' for label,s in zip(labels,stats)])
+        ax.set_xlabel('Persona · cases/episodes',labelpad=6)
+        ax.set_ylabel(ylabel,labelpad=4)
+        ax.set_axisbelow(True)
+        ax.grid(False)
+        ax.margins(x=.08)
+    upper=max(p[role][a]['output_tokens_per_call']['ci95'][1] for role in ['actor','researcher'] for a in ARMS)
+    for ax in axes: ax.set_ylim(0,upper*1.35)
+    fig.suptitle('SciConv interaction output tokens',x=.085,y=.975,ha='left',fontsize=10,fontweight='bold')
+    fig.text(.085,.912,'GPT-6 Astra · low reasoning · three original trials · 40 cases',fontsize=6.5,color='#4C5960')
+    fig.text(.085,.10,'Bars: mean output per call, averaged within episodes, trials and cases. Whiskers: pointwise 95% CIs.',fontsize=6)
+    fig.text(.085,.062,'20,000 study-cluster bootstrap draws within mode. Actor includes questions and final specifications.',fontsize=6)
+    fig.text(.085,.024,'Output includes reported reasoning tokens. One technical failure excluded; judge calls kept separate.',fontsize=6,color='#4C5960')
+    destination=BASE/'figures/sciconv_tokens';qa=destination/'qa';qa.mkdir(exist_ok=True)
+    fig.canvas.draw()
+    require_matplotlib_panel_alignment(fig,json_out=qa/'output_tokens.alignment.json',overlay_svg=qa/'output_tokens.alignment.svg',
+        tolerance_pt=1.5,gutter_tolerance_pt=1.5,require_panel_labels=True,strict=True,panel_ids=['a','b'])
+    # Fixed physical size: never crop or change layout after the alignment gate.
+    fig.savefig(destination/'output_tokens.pdf',facecolor='white')
+    fig.savefig(destination/'output_tokens.svg',facecolor='white')
+    fig.savefig(destination/'output_tokens.png',dpi=600,facecolor='white')
+    fig.savefig(destination/'output_tokens.tiff',dpi=600,facecolor='white')
+    with (destination/'output_tokens.source_data.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+    (qa/'input_summary.sha256').write_text(hashlib.sha256((BASE/'data/sciconv_tokens/summary.json').read_bytes()).hexdigest()+'\n')
+    if show:plt.show()
+    else:plt.close(fig)
+    return fig
+
+if __name__=='__main__':plot(json.loads((BASE/'data/sciconv_tokens/summary.json').read_text()))

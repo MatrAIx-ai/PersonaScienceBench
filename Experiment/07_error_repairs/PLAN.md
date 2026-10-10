@@ -1,6 +1,8 @@
 # Error and missing-submission repair pass
 
-After current job 1966129 terminates, run one sequential repair pass over the seven Astra runs already started. Prioritize trials 1–3 for personas 089/001/127, then original off/148/155 trials 1–3, then expansion group 046/003/004 trial 1. The five unstarted expansion jobs remain held until explicitly resumed.
+> Operational provenance only. Retired launchers were moved to [the dated archive](../_archive/20261002/07_error_repairs/code/) on 2026-10-02. Status and data stay here because current offline analyses read them. Historical commands below describe their original locations.
+
+After current job 1966129 terminates, run one repair pass with at most two concurrent jobs over the seven Astra runs already started. Prioritize trials 1–3 for personas 089/001/127, then original off/148/155 trials 1–3, then expansion group 046/003/004 trial 1. The five unstarted expansion jobs remain held until explicitly resumed.
 
 ## Implementation
 
@@ -16,8 +18,12 @@ These are conditional additional attempts, not independent new trials. Report or
 
 ## Status and results
 
-Seven repair jobs submitted sequentially after 1966129; no repair results yet. Five later expansions held. All 42 source condition/configuration combinations match the current coordinator-generated settings; Python and shell syntax checks passed. Remaining token-cap or schema errors require separate diagnosis rather than unlimited resampling.
+Seven repair jobs submitted after 1966129; the user authorized two concurrent 20-worker repair jobs on 2026-09-30. Repair results are in progress. Five later expansions held. All 42 source condition/configuration combinations match the current coordinator-generated settings; Python and shell syntax checks passed. Remaining token-cap or schema errors require separate diagnosis rather than unlimited resampling.
 
 ## Runtime pin for the GitHub merge
 
 GitHub commit `92036dd` changes scientific persona-control defaults and prompt behavior. To preserve the already queued repair protocol, those jobs use an archived runtime from local commit `de6d85f`, with only `src/personasciencebench/openai_transport.py` overlaid from `92036dd` for the requested upstream transient-error retry fixes. The runtime path and every source/configuration hash are recorded in `status.json` and the ignored runtime directory’s `runtime_manifest.json`. New main-branch work uses the merged upstream implementation. Queued repairs were temporarily held during integration and then released with their original dependencies.
+
+## Two-job concurrency update
+
+The two sequential lanes are `1968753 → 1968755 → 1968757 → 1968759` and `1968754 → 1968756 → 1968758`. Each job retains 20 workers, 30 CPUs, and 128 GB; at most 40 repair workers run concurrently. Job 1968754 can now start alongside 1968753. Dependencies use `afterany`. The Sol campaign waits for both lane tails (1968758 and 1968759), then runs sequentially with 30 workers per job. Existing expansion holds remain in place. Scheduler changes are recorded in `data/concurrency_two.json`.

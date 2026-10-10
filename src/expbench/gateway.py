@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -28,8 +29,8 @@ class OpenRouterTransport:
         if not key.strip():
             raise ValueError("Set OPENROUTER_API_KEY before a live run")
         self.client = httpx.Client(
-            base_url="https://openrouter.ai/api/v1",
-            headers={"Authorization": f"Bearer {key}"}, timeout=timeout,
+            base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+            headers={"Authorization": f"Bearer {key}"}, timeout=float(os.environ.get('PSB_LOCAL_CLIENT_TIMEOUT', timeout)) if os.environ.get('OPENROUTER_BASE_URL', '').startswith('http://127.0.0.1:') else timeout,
             follow_redirects=False,
         )
 
@@ -63,7 +64,7 @@ class OpenRouterTransport:
                                ("completion", spec.output_usd_per_million)):
                 try:
                     price = float(model["pricing"][field]) * 1_000_000
-                    if not math.isfinite(price) or price <= 0:
+                    if not math.isfinite(price) or price < 0:
                         raise ValueError()
                     if enforce_price_caps and price > cap + 1e-9:
                         raise ValueError()
@@ -77,7 +78,8 @@ class OpenRouterTransport:
 
     def complete(self, role: str, payload: dict) -> dict:
         try:
-            response = self.client.post("/chat/completions", json=payload)
+            from personasciencebench.openrouter_pacing import paced_post
+            response = paced_post(lambda: self.client.post("/chat/completions", json=payload), payload)
             response.raise_for_status()
             result = response.json()
         except httpx.HTTPStatusError as exc:

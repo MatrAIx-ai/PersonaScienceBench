@@ -238,5 +238,5 @@ def export(out):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'traces/astra_trial1')
+    parser.add_argument('--output', type=Path, default=ROOT / 'results/astra-actor-astra-simulator-astra-judge/trial-1')
     export(parser.parse_args().output)

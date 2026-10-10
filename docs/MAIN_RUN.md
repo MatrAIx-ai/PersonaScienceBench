@@ -2,6 +2,8 @@
 
 This guide is the entry point for running the selected five-setting campaign. Only `src/`, the run/setup scripts, `configs/`, and `manifests/` are needed; `Experiment/`, analysis notebooks, figures, and paper files are not inputs to this run. Historical studies elsewhere in the repository use different cohorts.
 
+For a new-model paper-table campaign, follow the [end-to-end handoff](TEAM_HANDOFF.md#new-model-campaign--paper-main-table-updated-2026-10-10): one trial, explicit actor/simulator/judge roles, frozen preparation, four metric definitions, and the required upload bundle. The default command below runs Astra in all roles; it is not a generic common-judge model comparison.
+
 ## Fixed design
 
 | Setting | Injected simulator persona |
@@ -47,7 +49,7 @@ python scripts/check_main.py
   --run-dir runs/main/trial-1 --workers 30
 ```
 
-**This command makes paid API calls.** The runner validates the frozen input checksums and local run/configuration identity before checking model access and preparing selected tasks. `--arms` supports subsets of the five shipped settings; `--selection` must retain the exact frozen selection bytes. EXP preparation can invoke the model to extract the simulator context; its extraction cache is stored under `data/design_catalog/extraction_cache`. Preserve that cache across trials to hold converted inputs fixed. Do not launch initial preparation concurrently in multiple trials. All five settings within a trial share the same prepared task inputs. The runner stops before episodes if any of the 200 tasks fails preparation.
+**This command makes paid API calls.** The runner validates the frozen input checksums and local run/configuration identity before checking model access and preparing selected tasks. `--arms` supports subsets of the five shipped settings; `--selection` must retain the exact frozen selection bytes. EXP preparation can invoke the model to extract the simulator context; its extraction cache is stored under `data/design_catalog/extraction_cache`. Preserve that cache across trials; its key includes model settings. For cross-model comparisons, reuse validated frozen prepared packages with `--require-prepared` instead of assuming cache reuse holds inputs fixed. Do not launch initial preparation concurrently in multiple trials. All five settings within a trial share the same prepared task inputs. The runner stops before episodes if any of the 200 tasks fails preparation.
 
 ## Submit to SLURM
 
@@ -81,7 +83,7 @@ A complete trial must account for all **1,000** planned episodes. `finished` is 
 
 Resume with the same command and run directory. For a repair pass, use `--retry-infrastructure`; add `--retry-missing` only when intentionally repairing missing scientific submissions. Earlier attempts are retained. After quota/authentication failures, inspect `fatal_api.json`, resolve the cause, then archive/remove that marker before resuming. Do not blindly retry an exhausted account. API retry/backoff is implemented in the runtime, but cannot repair missing funding or permissions.
 
-Return all three run directories plus the EXP extraction cache, source manifests, and the Git commit ID to the analyst through the agreed storage channel. Keep `.env` and API keys out of any archive. Runs/data are ignored by Git; pushing this branch does not upload results.
+Export every requested trial (one by default) to `results/<model-slug>/trial-<N>/` using the collection contract in [TEAM_HANDOFF.md](TEAM_HANDOFF.md), then commit and push that directory. Include complete traces, final submissions, available evaluations, frozen input provenance and actual code revision; our team can perform final grading and compute the table afterward. Report the pushed branch, commit and result path. Keep credentials out of the export. Raw `runs/` files are ignored; a push without a tracked `results/` export does not deliver them. The current runner still invokes evaluation inline and has no generic collect-only switch; document grading-only failures without discarding completed interactions.
 
 ## Handoff validation
 

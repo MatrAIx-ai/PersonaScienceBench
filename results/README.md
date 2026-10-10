@@ -1,0 +1,37 @@
+# Delivered model campaigns
+
+Running agents store their complete collection exports here and **commit and push them**. Raw `runs/` directories are ignored and are not a deliverable by themselves. Our analysis team handles final grading, metric computation and the paper table.
+
+Use `results/<model-and-role-slug>/trial-<N>/`. Each campaign is 200 frozen questions × five settings (off / 155 / 001 / 003 / 046), or 1,000 episode slots for one trial. Do not mix model configurations or independent trials in one directory.
+
+Required bundle contents:
+
+- `README.md`: actual model roles/providers/settings, run command, counts, errors, grading status, repair policy.
+- `episodes.csv`: all 1,000 keyed slots and selected attempts, including scientific failures and non-submissions. Pending grading is explicit, not zero.
+- `traces/final-results.json`, `traces/shared-events.jsonl`, and `traces/shared-events-index.csv`: original ordered conversations, results/termination records, and artifact mapping for every slot.
+- `submissions/`: actor final answers/files required for native regrading; include image/file outputs if produced.
+- `grading_inputs/`: grading-input manifest and portable redistributable inputs. References must be available to the receiving team, not just absolute paths on the runner's machine. Record access routes and hashes for restricted assets.
+- `evaluations/metrics.jsonl`: available native metrics and explicit pending/error records.
+- `provenance/`: exact configs, selection/persona/input hashes, source revisions, runtime code hashes and source changes needed to reproduce the configuration.
+- `bundle_manifest.json`: relative path, byte size and SHA-256 for every delivered file except itself.
+
+Final score tables and `analysis/` outputs are optional for the running agent. Complete traces/submissions are mandatory even if aggregate scores are already available. Keep per-episode token/tool records when available as supporting data.
+
+Shard large JSONL files by benchmark/persona or compress/split large payloads, and document reconstruction and full-file checksums. Include all parts in the commit. Never include credentials, `.env`, environments, or unreviewed private API payloads. Respect source asset visibility; include restricted references only through an authorized team-accessible route.
+
+Before pushing, verify manifest hashes, slot counts, score/trace/attempt alignment and artifact existence. Stage only the intended campaign directory. After pushing, report the **branch, commit hash, repository-relative path, 1,000-slot coverage, pending grading and unresolved errors**, and verify the remote commit. Collection is not complete if actor/simulator execution is missing; clearly label partial checkpoints.
+
+See [the full handoff](../docs/TEAM_HANDOFF.md) for runnable examples, exact schemas, metric definitions, and known launcher limitations. Existing campaigns are catalogued below. These are historical exports, not newly rerun episodes; delivery completeness is explicitly recorded.
+
+## Current inventory
+
+| Campaign | Location | Delivered scope |
+|---|---|---|
+| Astra actor / Astra simulator / Astra judge | [trial-1](astra-actor-astra-simulator-astra-judge/trial-1/DELIVERY.md) | 1,000-slot index; 898 Markdown conversations; partial historical export |
+| Haiku actor / Opus simulator / Opus judge | [legacy-export](haiku-actor-opus-simulator-opus-judge/legacy-export/DELIVERY.md) | Original pilot and full-campaign records; original filenames retained |
+| Haiku actor / Opus simulator / Astra judge | [trial-1](haiku-actor-opus-simulator-astra-judge/trial-1/DELIVERY.md) | 1,000 scores, native metrics and conversations; all four metric inputs available; not a complete standalone regrading package |
+| Haiku actor / Haiku simulator / Astra judge | [trial-1](haiku-actor-haiku-simulator-astra-judge/trial-1/DELIVERY.md) | 1,000 scores and reported behavioral aggregates; full conversations/submissions missing |
+
+Qwen runtime outputs remain under ignored `runs/qwen38-local-trial-1/`; they have not been packaged as a complete delivery. Current Slurm state must be queried, not inferred from this inventory. Original transport ZIPs and older duplicate exports were preserved in ignored `.local_archive/20261010/` on the maintainer's machine.
+
+Run `python scripts/audit_result_bundles.py` from the repository root to verify all packaged file hashes and episode-key counts. Each directory has a current `bundle_manifest.json`; original receipts remain unchanged where present. [Migration record](migration_20261010.json) maps old paths to their new locations. Do not use archived exporter scripts bundled as provenance as current launch commands; use `scripts/` and `docs/TEAM_HANDOFF.md`.

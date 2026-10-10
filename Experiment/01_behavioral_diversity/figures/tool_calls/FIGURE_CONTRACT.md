@@ -1,0 +1,3 @@
+# Tool-call heatmap contract
+
+Question: how does recorded actor tool-use intensity differ between simulator persona settings? Single quantitative heatmap; five settings; complete original episodes only. Matched question/trial differences, equal benchmark weights across four applicable sources. Colors show signed differences, not significance. Numerical estimates in cells; marginal 95% source-stratified study-cluster bootstrap intervals and coverage in TOOL_CALLS.md and data/tool_calls/. No missing-value imputation. Saved action logs are the evidence; no new inference. Python/Matplotlib, nominal 105.4 × 94.0 mm canvas with tight crop, vector PDF/SVG and 600 dpi PNG. Single panel alignment and rendered PDF text/collision checks recorded alongside exports.

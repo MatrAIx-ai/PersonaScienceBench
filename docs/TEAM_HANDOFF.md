@@ -4,11 +4,54 @@
 
 This is the handoff contract for another agent evaluating a new model. Run **one fresh trial of 200 questions × five settings = 1,000 episodes** unless additional independent trials are explicitly requested. **The running agent must save the complete collection bundle under `results/<model-slug>/trial-<N>/`, commit it, and push it to the repository. Our analysis team handles final grading, metric extraction, CIs and paper-table updates afterward.** Deliver the underlying records, not just four aggregate numbers; computing the main table is not a prerequisite for delivery. The main table has **Persona-off performance, Mean Persona Performance, Fact recovery (%), and Self-repetition (%)**, each with a 95% CI when reproducible. Tokens/tool calls are supporting data, not main-table columns.
 
+## Model expansion TODO — medium reasoning (2026-10-10)
+
+**20 requested target models.** For this expansion, use the target model for both actor and simulator, requesting **medium reasoning for both**. Keep the common final judge as **GPT-6 Astra / low**, consistent with the existing grading contract; our team can grade after collection. This checklist does not modify existing low-effort jobs, historical results, or CLI defaults.
+
+Names below are requested planning labels, not verified API IDs. Before launching, resolve the exact provider ID/version/variant and verify that the provider supports the requested medium setting (or a documented equivalent). Record the actual transmitted setting and any equivalent token budget. If medium is unsupported, flag the entry rather than silently ignoring it or substituting low. Do not count a similarly named model/version as completed.
+
+Count against the current paper table: **2 exact-name overlaps** (Opus 5.5 and Astra), plus **1 possible overlap** (Gemini 3.7, if the intended variant is Flash). Thus **18 lack an exact-name paper row, or 17 if Gemini 3.7 means Gemini 3.7 Flash**. A paper row alone does not establish reproducible medium-effort coverage. **0 of these 20 currently has a verified complete medium-effort collection bundle in `results/`; all 20 remain unchecked** until the configuration and delivery are verified. Some entries may be completed by obtaining and verifying existing collaborators' bundles rather than rerunning them.
+
+Each verified campaign requires 200 frozen questions × five settings × one trial = **1,000 episodes**. The full 20-model target is **20,000 episodes**, before any separately tracked repairs/additional trials. This is a target inventory, not a claim that 20,000 new episodes must be rerun.
+
+| Done | Target actor + simulator | Required effort | Existing evidence / next action |
+|---|---|---|---|
+| [ ] | Claude Opus 5.5 | Medium | Paper row exists; medium configuration and full result bundle need verification. |
+| [ ] | Claude Fable 5.1 | Medium | No matching paper row or delivered campaign. |
+| [ ] | Claude Sonnet 5.5 | Medium | No matching paper row or delivered campaign. |
+| [ ] | Claude Haiku 5.5 | Medium | No matching campaign; existing Haiku 4.5 is a different version. |
+| [ ] | GPT-6 Astra | Medium | Paper row and historical traces exist at low effort; medium campaign still required. |
+| [ ] | GPT-6 Luna | Medium | Historical rate-limit probe only; no full matching paper row. |
+| [ ] | GPT-6 Sol | Medium | No matching campaign; historical GPT-5.6 Sol is a different version. |
+| [ ] | GPT-5.6 Terra | Medium | No matching paper row or delivered campaign. |
+| [ ] | GPT-5.5 | Medium | No matching paper row or delivered campaign; GPT-5 mini/nano do not count. |
+| [ ] | Muse Glimmer 30B | Medium | No matching paper row or delivered campaign. |
+| [ ] | Muse Spark 1.3 | Medium | No matching paper row or delivered campaign. |
+| [ ] | Gemini 3.8 Flash | Medium | No matching campaign; Gemini 3.7 Flash is a different version. |
+| [ ] | Gemini 3.7 | Medium | Gemini 3.7 Flash has a paper row; confirm whether Flash is the intended variant, then verify effort and bundle. |
+| [ ] | Kimi-K3 | Medium | No matching paper row or delivered campaign. |
+| [ ] | GLM 5.3 Flash | Medium | No matching paper row or delivered campaign. |
+| [ ] | Grok 4.6 | Medium | No matching paper row or delivered campaign. |
+| [ ] | Qwen 3.8 27B | Medium | Existing local campaign uses low effort; no verified complete medium bundle. Query scheduler for current job state. |
+| [ ] | Qwen 3.8 Flash | Medium | No matching paper row or delivered campaign; separate from Qwen 3.8 27B. |
+| [ ] | DeepSeek V4.1 | Medium | Historical Flash cost pilot only; resolve the requested variant and collect a full medium campaign. |
+| [ ] | MiniMax M3 | Medium | No matching paper row or delivered campaign. |
+
+For each entry, the running agent should:
+
+- [ ] Resolve model/provider ID and medium support; record actor/simulator settings and judge disposition.
+- [ ] Confirm the frozen 200-question panel and five exact persona prompts.
+- [ ] Collect all 1,000 episode slots and repair execution failures without selecting favorable outcomes.
+- [ ] Save complete traces, final submissions, grading inputs and provenance to `results/<model-and-role-slug>-medium/trial-1/`.
+- [ ] Verify hashes/coverage, commit and push the bundle, then add its path, branch and commit to the model row above.
+
+Only mark a model done when its complete collection bundle is available in the pushed repository and the requested configuration is verified. Final scoring/CIs may remain pending with our team.
+
 ### 1. Freeze inputs and identify the model roles
 
 - Use `configs/main_run/selection.csv`: exactly 40 questions each from ASI, BixBench, DiscoveryBench, EXP, and SciConvBench. Do not sample a new panel or replace difficult tasks.
 - Run `persona_off`, `candidate_155`, `candidate_001`, `candidate_003`, `candidate_046`. Use the exact files in `configs/main_run/personas/`; inject them into the simulator only. IDs remain the authoritative keys even if figures use descriptive aliases.
-- Final paper comparison configuration: **actor = target model; researcher/simulator = target model; judge = GPT-6 Astra, low reasoning** wherever the native evaluator uses a model. Deterministic evaluation remains deterministic. Record exact provider model IDs and resolved settings for every role; the actor name alone is insufficient. Final Astra grading may be performed by our team after collection. Preserve all submissions and evaluator inputs needed for that pass; mark provisional scores and pending grading explicitly.
+- Final paper comparison configuration: **actor = target model; researcher/simulator = target model; judge = GPT-6 Astra, low reasoning**. The model-expansion checklist above requests **medium** effort for actor and simulator. The common Astra judge applies wherever the native evaluator uses a model; deterministic evaluation remains deterministic. Record exact provider model IDs and resolved settings for every role; the actor name alone is insufficient. Final Astra grading may be performed by our team after collection. Preserve all submissions and evaluator inputs needed for that pass; mark provisional scores and pending grading explicitly.
 - Pin the repository/runtime version, source revisions, prepared inputs, persona hashes, reasoning/decoding settings, token limits and interaction limits. Use a distinct run directory for every model/configuration/trial. Current SciConv is not interchangeable with earlier protocol versions.
 - Obtain the reference campaign's frozen `prepared/` task packages and EXP extraction cache from the maintainer. A fresh checkout does not contain these ignored assets. Prepared packages contain machine-specific paths: audit/rebase path references for the new host while preserving task text, withheld facts, evaluator inputs and asset bytes. Record a content-hash manifest. Simply copying a stale symlink is insufficient.
 - Reusing only the EXP cache does **not** guarantee identical preparation across models: its key includes model settings. Use validated frozen prepared packages and `--require-prepared` for a comparable new-model run. Do not silently regenerate missing packages with the target model.
@@ -27,7 +70,7 @@ Setup requires Linux, Python 3.12+, `uv`, Bubblewrap and access to the pinned be
 
 **Important launcher semantics:** `--model` supplies the default for **all three roles**, including the judge. `--actor-model` and `--researcher-model` override those two roles only. `--provider` is currently shared by all roles; there is no CLI flag for a separate judge provider. Do not assume `--model TARGET` preserves Astra judging.
 
-A supported OpenAI example, evaluating Sol with an Astra judge, is:
+The existing Sol/Astra launcher pattern below shows explicit medium overrides for actor/simulator (verify model support before execution). Sol 5.6 is an example of the existing route, not completion of the requested GPT-6 Sol entry:
 
 ```bash
 RUN_DIR="$PWD/runs/main/sol-self-astra-trial-1"
@@ -38,8 +81,8 @@ ln -s "$FROZEN_PREPARED" "$RUN_DIR/prepared"
 .venv/bin/python scripts/run_main.py \
   --run-dir "$RUN_DIR" --workers 30 --provider openai \
   --model gpt-6-astra --reasoning-effort low \
-  --actor-model gpt-5.6-sol --actor-reasoning-effort low \
-  --researcher-model gpt-5.6-sol --researcher-reasoning-effort low \
+  --actor-model gpt-5.6-sol --actor-reasoning-effort medium \
+  --researcher-model gpt-5.6-sol --researcher-reasoning-effort medium \
   --require-prepared
 ```
 
@@ -49,8 +92,8 @@ For SLURM, use the **same flags**, with `RUN_DIR` exported to the submission scr
 RUN_DIR="$PWD/runs/main/sol-self-astra-trial-1" WORKERS=30 \
 bash scripts/submit_main.sh 1 \
   --provider openai --model gpt-6-astra --reasoning-effort low \
-  --actor-model gpt-5.6-sol --actor-reasoning-effort low \
-  --researcher-model gpt-5.6-sol --researcher-reasoning-effort low \
+  --actor-model gpt-5.6-sol --actor-reasoning-effort medium \
+  --researcher-model gpt-5.6-sol --researcher-reasoning-effort medium \
   --require-prepared
 ```
 

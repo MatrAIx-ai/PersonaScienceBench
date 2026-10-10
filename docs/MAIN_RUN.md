@@ -4,6 +4,8 @@ This guide is the entry point for running the selected five-setting campaign. On
 
 For a new-model paper-table campaign, follow the [end-to-end handoff](TEAM_HANDOFF.md#new-model-campaign--paper-main-table-updated-2026-10-10): one trial, explicit actor/simulator/judge roles, frozen preparation, four metric definitions, and the required upload bundle. The default command below runs Astra in all roles; it is not a generic common-judge model comparison.
 
+The [20-model expansion checklist](TEAM_HANDOFF.md#model-expansion-todo--medium-reasoning-2026-10-10) requests medium reasoning for actor/simulator, with Astra low as the final judge. Specify role overrides explicitly; the launcher defaults below remain historical low-effort defaults.
+
 ## Fixed design
 
 | Setting | Injected simulator persona |

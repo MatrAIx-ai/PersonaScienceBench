@@ -53,7 +53,7 @@ Only mark a model done when its complete collection bundle is available in the p
 - Run `persona_off`, `candidate_155`, `candidate_001`, `candidate_003`, `candidate_046`. Use the exact files in `configs/main_run/personas/`; inject them into the simulator only. IDs remain the authoritative keys even if figures use descriptive aliases.
 - Final paper comparison configuration: **actor = target model; researcher/simulator = target model; judge = GPT-6 Astra, low reasoning**. The model-expansion checklist above requests **medium** effort for actor and simulator. The common Astra judge applies wherever the native evaluator uses a model; deterministic evaluation remains deterministic. Record exact provider model IDs and resolved settings for every role; the actor name alone is insufficient. Final Astra grading may be performed by our team after collection. Preserve all submissions and evaluator inputs needed for that pass; mark provisional scores and pending grading explicitly.
 - Pin the repository/runtime version, source revisions, prepared inputs, persona hashes, reasoning/decoding settings, token limits and interaction limits. Use a distinct run directory for every model/configuration/trial. Current SciConv is not interchangeable with earlier protocol versions.
-- Obtain the reference campaign's frozen `prepared/` task packages and EXP extraction cache from the maintainer. A fresh checkout does not contain these ignored assets. Prepared packages contain machine-specific paths: audit/rebase path references for the new host while preserving task text, withheld facts, evaluator inputs and asset bytes. Record a content-hash manifest. Simply copying a stale symlink is insufficient.
+- Restore the tracked [frozen preparation bundle](../configs/main_run/frozen/astra-20260929-v1/README.md) after downloading the pinned public assets. It includes all 200 prepared tasks and the final EXP cards; no EXP extraction cache or new preparation inference is needed. `scripts/restore_main_preparation.py` verifies asset checksums, rebases machine-specific paths and writes `preparation_receipt.json`. Include that receipt in the delivered provenance. The bundle freezes inputs, not runtime code; record the actual protocol revision separately.
 - Reusing only the EXP cache does **not** guarantee identical preparation across models: its key includes model settings. Use validated frozen prepared packages and `--require-prepared` for a comparable new-model run. Do not silently regenerate missing packages with the target model.
 
 ### 2. Install and run
@@ -74,10 +74,7 @@ The existing Sol/Astra launcher pattern below shows explicit medium overrides fo
 
 ```bash
 RUN_DIR="$PWD/runs/main/sol-self-astra-trial-1"
-FROZEN_PREPARED="/absolute/path/to/validated/frozen/prepared"
-mkdir -p "$RUN_DIR"
-# On a fresh run directory; transfer/rebase the packages before this step.
-ln -s "$FROZEN_PREPARED" "$RUN_DIR/prepared"
+python scripts/restore_main_preparation.py --run-dir "$RUN_DIR"
 .venv/bin/python scripts/run_main.py \
   --run-dir "$RUN_DIR" --workers 30 --provider openai \
   --model gpt-6-astra --reasoning-effort low \

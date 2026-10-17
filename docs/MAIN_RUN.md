@@ -44,6 +44,17 @@ Offline input check verifies the frozen selection checksum, 40-per-source counts
 python scripts/check_main.py
 ```
 
+## Restore frozen preparation for model comparisons
+
+The reference [200-task preparation bundle](../configs/main_run/frozen/astra-20260929-v1/README.md) is tracked in Git. After acquiring the public assets above, restore it into a fresh run directory:
+
+```bash
+RUN_DIR="$PWD/runs/main/trial-1"
+python scripts/restore_main_preparation.py --run-dir "$RUN_DIR"
+```
+
+Launch with that same `--run-dir` and **`--require-prepared`**, using the role overrides in the [handoff](TEAM_HANDOFF.md). The restore step makes no model calls, preserves the frozen task/fact/evaluator content, and writes a checksum receipt. The final EXP cards are included; an extraction cache is unnecessary for this route. Large public datasets remain separately downloaded. Restoration does not test or repair Bubblewrap: the runtime isolation check must pass before launching episodes. Record the runner revision because the bundle does not freeze the interaction protocol.
+
 ## Run one trial locally
 
 ```bash

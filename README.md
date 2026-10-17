@@ -15,7 +15,7 @@ Run the same frozen **200 questions** under **five simulator settings**. Persona
 | Models | GPT-6 Astra, reasoning effort `low`, for actor, simulator, and judge |
 | Episodes | 1,000 per trial; 3,000 for three fresh trials |
 | SLURM resources | 30 CPUs, 30 workers, 128 GB RAM per job |
-| Frozen inputs | [Question selection](configs/main_run/selection.csv) and [persona prompts](configs/main_run/personas/) |
+| Frozen inputs | [Question selection](configs/main_run/selection.csv), [persona prompts](configs/main_run/personas/), and [portable preparation bundle](configs/main_run/frozen/astra-20260929-v1/README.md) |
 
 These settings describe the fresh-run configuration. Historical runs have different coverage and protocol versions. The current SciConv protocol applies to new runs. See the [complete run guide](docs/MAIN_RUN.md) for shared controls and provenance.
 

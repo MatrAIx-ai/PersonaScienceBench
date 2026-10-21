@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+Single-cell RNA-seq Integrated Analysis Pipeline
+Outputs:
+  - clusters.npy: int32 (n_cells,)
+  - pseudotime.npy: float64 (n_cells,)
+  - de_genes.json: {"gene_indices": [...]}
+  - grn_scores.npy: float64 (n_tf_genes, n_tf_genes)
+  - method_choices.json: per-step methods and justifications
+"""
+
+import json
+import os
+import numpy as np
+import scipy.stats as stats
+from scipy.cluster.vq import kmeans2
+from scipy.spatial.distance import cdist
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+
+def run_pipeline(
+    counts_path="data/counts.npy",
+    system_info_path="data/system_info.json",
+    random_seed=42
+):
+    # Set random seed for reproducibility
+    np.random.seed(random_seed)
+
+    # 1. Load data
+    counts = np.load(counts_path)  # shape (n_cells, n_genes)
+    with open(system_info_path, "r") as f:
+        system_info = json.load(f)
+
+    n_cells = counts.shape[0]
+    n_genes = counts.shape[1]
+    n_clusters = system_info.get("n_clusters", 4)
+    n_tf_genes = system_info.get("n_tf_genes", 20)
+    tf_gene_indices = system_info.get("tf_gene_indices", list(range(n_tf_genes)))
+
+    # 2. Normalization: Library size normalization to 10,000 + log1p
+    lib_sizes = counts.sum(axis=1, keepdims=True)
+    lib_sizes[lib_sizes == 0] = 1.0
+    norm_counts = np.log1p((counts / lib_sizes) * 10000.0)
+
+    # 3. Dimensionality Reduction: PCA via SVD
+    gene_means = norm_counts.mean(axis=0)
+    gene_stds = norm_counts.std(axis=0)
+    gene_stds[gene_stds == 0] = 1.0
+    X_scaled = (norm_counts - gene_means) / gene_stds
+
+    U, S, Vt = np.linalg.svd(X_scaled, full_matrices=False)
+    pcs = U * S
+    n_pcs = 10
+    X_pca = pcs[:, :n_pcs]
+
+    # 4. Clustering (K-Means on top PCs)
+    centroids, cluster_labels = kmeans2(
+        X_pca, n_clusters, minit="points", iter=50, seed=random_seed
+    )
+    cluster_labels = cluster_labels.astype(np.int32)
+    np.save("clusters.npy", cluster_labels)
+
+    # 5. Pseudotime Inference: Graph-based shortest path (Dijkstra) on kNN graph
+    k_neighbors = 15
+    dist_matrix = cdist(X_pca, X_pca)
+
+    row_ind = []
+    col_ind = []
+    graph_weights = []
+
+    for i in range(n_cells):
+        # k nearest neighbors excluding self
+        nn_idx = np.argsort(dist_matrix[i])[1 : k_neighbors + 1]
+        for j in nn_idx:
+            row_ind.append(i)
+            col_ind.append(j)
+            graph_weights.append(dist_matrix[i, j])
+
+    adj = csr_matrix((graph_weights, (row_ind, col_ind)), shape=(n_cells, n_cells))
+    adj = adj.maximum(adj.T)  # undirected / symmetric
+
+    # Root cell chosen at the extreme minimum of PC1
+    root_cell = int(np.argmin(X_pca[:, 0]))
+    shortest_paths = dijkstra(adj, indices=root_cell, directed=False)
+
+    # Scale pseudotime to [0.0, 1.0]
+    min_pt = np.min(shortest_paths)
+    max_pt = np.max(shortest_paths)
+    pseudotime = (shortest_paths - min_pt) / (max_pt - min_pt)
+    pseudotime = pseudotime.astype(np.float64)
+    np.save("pseudotime.npy", pseudotime)
+
+    # 6. Differential Expression / Candidate Marker Genes
+    non_tf_indices = [g for g in range(n_genes) if g not in tf_gene_indices]
+
+    cluster_top_markers = {c: [] for c in range(n_clusters)}
+    for c in range(n_clusters):
+        in_c = (cluster_labels == c)
+        out_c = ~in_c
+        c_stats = []
+        for g in non_tf_indices:
+            x_in = norm_counts[in_c, g]
+            x_out = norm_counts[out_c, g]
+            diff = float(np.mean(x_in) - np.mean(x_out))
+            t_stat, p_val = stats.ttest_ind(x_in, x_out, equal_var=False)
+            if np.isnan(p_val):
+                p_val = 1.0
+                t_stat = 0.0
+            c_stats.append((g, diff, p_val, t_stat))
+        # Sort by t_stat descending (upregulated markers)
+        c_stats.sort(key=lambda x: -x[3])
+        cluster_top_markers[c] = c_stats
+
+    # Select top 20 marker genes per cluster and rank by global significance
+    selected_marker_dict = {}
+    for c in range(n_clusters):
+        for item in cluster_top_markers[c][:20]:
+            g_idx, diff, p_val, t_stat = item
+            if diff > 0 and p_val < 1e-4:
+                if g_idx not in selected_marker_dict:
+                    selected_marker_dict[g_idx] = (p_val, -t_stat)
+                else:
+                    # Keep lowest p-value
+                    if p_val < selected_marker_dict[g_idx][0]:
+                        selected_marker_dict[g_idx] = (p_val, -t_stat)
+
+    ranked_de_genes = sorted(
+        selected_marker_dict.keys(),
+        key=lambda g: (selected_marker_dict[g][0], selected_marker_dict[g][1])
+    )
+
+    with open("de_genes.json", "w") as f:
+        json.dump({"gene_indices": ranked_de_genes}, f, indent=2)
+
+    # 7. Directed Gene Regulatory Network (GRN) Scoring
+    # Using only the first n_tf_genes columns
+    tf_norm = norm_counts[:, :n_tf_genes]
+    tf_norm_std = (tf_norm - tf_norm.mean(axis=0)) / np.where(
+        tf_norm.std(axis=0) > 0, tf_norm.std(axis=0), 1.0
+    )
+
+    grn_scores = np.zeros((n_tf_genes, n_tf_genes), dtype=np.float64)
+    alpha = 1.0  # Ridge regularization parameter
+
+    for j in range(n_tf_genes):
+        regulators = [i for i in range(n_tf_genes) if i != j]
+        X_reg = tf_norm_std[:, regulators]
+        y_tgt = tf_norm_std[:, j]
+
+        XtX = X_reg.T @ X_reg
+        Xty = X_reg.T @ y_tgt
+        reg_matrix = XtX + alpha * np.eye(len(regulators))
+        beta = np.linalg.solve(reg_matrix, Xty)
+
+        for reg_pos, reg_idx in enumerate(regulators):
+            # grn_scores[i, j] represents directed edge i -> j
+            grn_scores[reg_idx, j] = float(np.abs(beta[reg_pos]))
+
+    # Ensure diagonal is strictly zero
+    np.fill_diagonal(grn_scores, 0.0)
+    np.save("grn_scores.npy", grn_scores)
+
+    # 8. Document Method Choices
+    method_choices = {
+        "preprocessing_and_normalization": {
+            "method": "Library-size normalization scaled to 10,000 counts per cell + log1p transformation",
+            "justification": "Accounts for varying sequencing depths and technical droplet capture efficiency while variance-stabilizing count data (Luecken & Theis 2019)."
+        },
+        "dimensionality_reduction": {
+            "method": "Principal Component Analysis (PCA) via SVD on standardized log-normalized counts",
+            "n_components": n_pcs,
+            "justification": "Compresses high-dimensional gene expression into the dominant axes of biological variance, capturing trajectory and cluster separation."
+        },
+        "clustering": {
+            "method": "K-means clustering on top 10 principal components",
+            "n_clusters": n_clusters,
+            "seed": random_seed,
+            "justification": "Unsupervised partitioning into 4 clusters in low-dimensional latent PCA space matching system_info.json."
+        },
+        "pseudotime": {
+            "method": "Graph-based shortest path distance (Dijkstra) on a 15-nearest neighbor graph constructed in PCA space, normalized to [0, 1]",
+            "k_neighbors": k_neighbors,
+            "root_selection": f"Cell {root_cell} at the minimum extreme of principal component 1",
+            "justification": "Faithfully traverses non-linear cellular manifolds along the dominant developmental continuum (Luecken & Theis 2019)."
+        },
+        "differential_expression": {
+            "method": "One-versus-rest Welch's two-sample t-test on non-TF candidate marker genes",
+            "n_selected_genes": len(ranked_de_genes),
+            "selection_criteria": "Top positive effect size (logFC > 0) per cluster with p < 1e-4, ranked by statistical significance",
+            "justification": "Identifies distinct cluster-defining marker genes robust to unequal cluster sample sizes and heteroskedasticity."
+        },
+        "grn_inference": {
+            "method": "Multivariate regularized linear regression (Ridge regression) across candidate transcription factors",
+            "regularization_alpha": alpha,
+            "matrix_convention": "grn_scores[i, j] denotes directed regulatory edge from TF i to target TF j; diagonal is zero",
+            "justification": "Canonical continuous multivariate regression model isolating direct regulatory contributions from indirect correlations in a pure NumPy/SciPy runtime."
+        }
+    }
+
+    with open("method_choices.json", "w") as f:
+        json.dump(method_choices, f, indent=2)
+
+    print("Pipeline execution complete. All outputs generated successfully.")
+
+
+if __name__ == "__main__":
+    run_pipeline()

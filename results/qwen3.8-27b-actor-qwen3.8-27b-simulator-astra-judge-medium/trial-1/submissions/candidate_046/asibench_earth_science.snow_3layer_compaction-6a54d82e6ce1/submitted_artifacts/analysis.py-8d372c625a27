@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Process-based 3-layer fixed snowpack dynamics model.
+
+State per layer (i=0 top .. 2 bottom): h (m), ice (mm), liq (mm), T (K).
+Derived consistently with mass: mass=ice+liq (kg/m2), rho=mass/h (kg/m3).
+Processes per substep (dt=10 min): deposition, Anderson-Niu compaction,
+energy balance (surface SW+LW+sensible + implicit conduction + latent
+melt/refreeze at 0C), liquid retention + drainage, bottom runoff.
+Ice/liquid separate states; no degree-day curve; no single-bucket SWE.
+"""
+import os, json
+import numpy as np
+import pandas as pd
+
+RHO_W=1000.0; RHO_ICE=917.0; C_ICE=2100.0; C_W=4200.0
+L_F=334000.0; SIGMA=5.670374e-8; G_GRAV=9.81; T0=273.15; EPS=0.99
+A_AN=2.3e-5; B_AN=2.8e-4
+ALB_DRY=0.82; ALB_WET=0.47; H_S=6.0; F_RET=0.5; TAU_DRAIN=1800.0
+RHO_FRESH=100.0
+H_SKIN=0.01      # m, surface skin thickness (~1 cm)
+C_S=2100.0        # J/m2/K skin heat capacity (~1 kg/m2 of ice)
+DT=600.0; SUB_HR=int(3600/DT)
+
+def thermal_k(rho):
+    return 2.3*(np.clip(rho,0.0,RHO_ICE)/RHO_ICE)**1.38
+
+def heat_capacity(ice,liq):
+    return ice*C_ICE+liq*C_W
+
+def solve_temperature(T,C,G01,G12,Fsurf,dt):
+    A=np.zeros((3,3)); b=np.zeros(3)
+    A[0,0]=C[0]+dt*G01; A[0,1]=-dt*G01; b[0]=C[0]*T[0]+dt*Fsurf
+    A[1,0]=-dt*G01; A[1,1]=C[1]+dt*G01+dt*G12; A[1,2]=-dt*G12; b[1]=C[1]*T[1]
+    A[2,1]=-dt*G12; A[2,2]=C[2]+dt*G12; b[2]=C[2]*T[2]
+    return np.linalg.solve(A,b)
+
+def solve_skin(Ts,T,CS,C,Gs0,G01,G12,Fsurf,dt):
+    """Implicit 4-node solve: surface skin + 3 layers.
+    Returns (Ts_new, T_new[3]). Skin exchanges Fsurf with atmosphere and
+    conducts to layer 0; bottom insulated."""
+    A=np.zeros((4,4)); b=np.zeros(4)
+    A[0,0]=CS+dt*Gs0; A[0,1]=-dt*Gs0; b[0]=CS*Ts+dt*Fsurf
+    A[1,0]=-dt*Gs0; A[1,1]=C[0]+dt*Gs0+dt*G01; A[1,2]=-dt*G01; b[1]=C[0]*T[0]
+    A[2,1]=-dt*G01; A[2,2]=C[1]+dt*G01+dt*G12; A[2,3]=-dt*G12; b[2]=C[1]*T[1]
+    A[3,2]=-dt*G12; A[3,3]=C[2]+dt*G12; b[3]=C[2]*T[2]
+    x=np.linalg.solve(A,b)
+    return x[0],x[1:4]
+
+def phase_change(Tp,C,ice,liq):
+    melt=np.zeros(3); refreeze=np.zeros(3); Tn=Tp.copy()
+    for i in range(3):
+        if Tp[i]>T0 and ice[i]>1e-9:
+            surplus=C[i]*(Tp[i]-T0); m=surplus/L_F
+            if m>=ice[i]:
+                melt[i]=ice[i]; leftover=surplus-ice[i]*L_F
+                mass=ice[i]+liq[i]
+                Tn[i]=T0+(leftover/(mass*C_W)) if mass>0 else T0
+                liq[i]=mass; ice[i]=0.0
+            else:
+                melt[i]=m; Tn[i]=T0; ice[i]-=m; liq[i]+=m
+        elif Tp[i]<T0 and liq[i]>1e-9:
+            deficit=C[i]*(T0-Tp[i]); r=deficit/L_F
+            if r>=liq[i]:
+                refreeze[i]=liq[i]; leftover=deficit-liq[i]*L_F
+                mass=ice[i]+liq[i]
+                Tn[i]=T0-(leftover/(mass*C_ICE)) if mass>0 else T0
+                ice[i]=mass; liq[i]=0.0
+            else:
+                refreeze[i]=r; Tn[i]=T0; liq[i]-=r; ice[i]+=r
+    return Tn,melt,refreeze
+
+def main():
+    base=os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(os.path.join(base,"results"),exist_ok=True)
+    with open(os.path.join(base,"data","snowpack_init.json")) as f:
+        init=json.load(f)
+    df=pd.read_csv(os.path.join(base,"data","forcing.csv"))
+    h=np.array([l["thickness_m"] for l in init["layers"]],float)
+    ice=np.array([l["ice_mm"] for l in init["layers"]],float)
+    liq=np.array([l["liq_mm"] for l in init["layers"]],float)
+    T=np.array([l["temp_K"] for l in init["layers"]],float)
+    n_hours=len(df); n_days=n_hours//24
+    assert n_hours%24==0
+    snow_state=np.zeros((n_days,3,5))
+    sm={"day":[],"swe_mm":[],"snow_depth_m":[],"melt_mm":[],
+        "refreeze_mm":[],"runoff_mm":[],"mean_density_kg_m3":[]}
+    day_melt=day_refreeze=day_runoff=0.0
+    swe0=(ice+liq).sum(); total_in=0.0; total_runoff=0.0
+    T_s=float(T[0])
+    for hr in range(n_hours):
+        row=df.iloc[hr]
+        t_air=row["t_air_K"]; sw_in=max(0.0,row["sw_in_wm2"])
+        lw_in=max(0.0,row["lw_in_wm2"]); snow_hr=max(0.0,row["snowfall_mm_hr"])
+        rain_hr=max(0.0,row["rainfall_mm_hr"])
+        for _ in range(SUB_HR):
+            # 1. deposition (layer 0)
+            snow_add=snow_hr/SUB_HR; rain_add=rain_hr/SUB_HR
+            if snow_add+rain_add>0:
+                C_old=heat_capacity(ice[0],liq[0])
+                h_new=snow_add/RHO_FRESH+rain_add/RHO_W
+                T_new=min(t_air,T0); C_new=snow_add*C_ICE+rain_add*C_W
+                ice[0]+=snow_add; liq[0]+=rain_add; h[0]+=h_new
+                Ctot=heat_capacity(ice[0],liq[0])
+                T[0]=(C_old*T[0]+C_new*T_new)/max(Ctot,1e-9)
+                total_in+=snow_add+rain_add
+            # 2. Anderson-Niu compaction
+            mass=ice+liq
+            rho=np.where(h>1e-6,mass/np.maximum(h,1e-6),0.0)
+            overb=np.array([0.0,G_GRAV*mass[0],G_GRAV*(mass[0]+mass[1])])
+            for i in range(3):
+                if mass[i]<=0: continue
+                drho=A_AN*np.exp(B_AN*overb[i])*(1-rho[i]/RHO_ICE)*DT
+                rho_new=min(rho[i]+drho,RHO_ICE)
+                if rho_new>0: h[i]=mass[i]/rho_new
+            # 3. energy balance (surface skin + 3 layers, implicit)
+            mass=ice+liq
+            rho=np.where(h>1e-6,mass/np.maximum(h,1e-6),0.0)
+            C=heat_capacity(ice,liq); k=thermal_k(rho)
+            def cond(i,j):
+                return 1.0/(h[i]/(2*max(k[i],1e-6))+h[j]/(2*max(k[j],1e-6)))
+            G01=cond(0,1); G12=cond(1,2)
+            k_skin=thermal_k(RHO_FRESH)
+            Gs0=1.0/(H_SKIN/(2*max(k_skin,1e-6))+h[0]/(2*max(k[0],1e-6)))
+            phi0=max(0.0,1-rho[0]/RHO_ICE)
+            liq_max0=F_RET*phi0*h[0]*1000.0
+            wet=min(liq[0]/liq_max0,1.0) if liq_max0>1e-6 else 0.0
+            albedo=ALB_DRY+(ALB_WET-ALB_DRY)*wet
+            Fsurf=(1-albedo)*sw_in+EPS*(lw_in-SIGMA*T_s**4)+H_S*(t_air-T_s)
+            T_s,Tp=solve_skin(T_s,T,C_S,C,Gs0,G01,G12,Fsurf,DT)
+            melt=np.zeros(3); refreeze=np.zeros(3)
+            # surface melt / refreeze driven by the skin energy surplus
+            # (acts on the layer-0 surface; gradual, flux-limited)
+            if T_s>T0:
+                avail=C_S*(T_s-T0)/L_F
+                if ice[0]>1e-9:
+                    m=min(avail,ice[0]); melt[0]=m; ice[0]-=m; liq[0]+=m
+                T_s=T0
+            elif T_s<T0 and liq[0]>1e-9:
+                avail=C_S*(T0-T_s)/L_F
+                r=min(avail,liq[0]); refreeze[0]=r; liq[0]-=r; ice[0]+=r
+                T_s=T0
+            # conduction-driven phase change in interior layers 1,2
+            for i in (1,2):
+                if Tp[i]>T0 and ice[i]>1e-9:
+                    m=C[i]*(Tp[i]-T0)/L_F
+                    if m>=ice[i]: melt[i]=ice[i]; liq[i]=ice[i]+liq[i]; ice[i]=0.0
+                    else: melt[i]=m; ice[i]-=m; liq[i]+=m
+                    Tp[i]=T0
+                elif Tp[i]<T0 and liq[i]>1e-9:
+                    r=C[i]*(T0-Tp[i])/L_F
+                    if r>=liq[i]: refreeze[i]=liq[i]; ice[i]=ice[i]+liq[i]; liq[i]=0.0
+                    else: refreeze[i]=r; liq[i]-=r; ice[i]+=r
+                    Tp[i]=T0
+            # layer-0 bulk melt only (refreeze handled by the surface skin)
+            if Tp[0]>T0 and ice[0]>1e-9:
+                mm=min(C[0]*(Tp[0]-T0)/L_F,ice[0]); melt[0]+=mm
+                ice[0]-=mm; liq[0]+=mm; Tp[0]=T0
+            T=Tp
+            # 4. liquid retention + drainage
+            mass=ice+liq
+            rho=np.where(h>1e-6,mass/np.maximum(h,1e-6),0.0)
+            for i in range(3):
+                if mass[i]<=0: continue
+                phi=max(0.0,1-rho[i]/RHO_ICE)
+                liq_max=F_RET*phi*h[i]*1000.0
+                if liq[i]>liq_max:
+                    excess=liq[i]-liq_max
+                    drain=min(excess,excess/TAU_DRAIN*DT)
+                    if drain>0:
+                        liq[i]-=drain
+                        if i<2:
+                            liq[i+1]+=drain; h[i+1]+=drain/RHO_W
+                        else:
+                            day_runoff+=drain; total_runoff+=drain
+            mass=ice+liq
+            rho=np.where(h>1e-6,mass/np.maximum(h,1e-6),0.0)
+            for i in range(3):
+                if mass[i]>0 and rho[i]>0: h[i]=mass[i]/rho[i]
+            day_melt+=melt.sum(); day_refreeze+=refreeze.sum()
+        if (hr+1)%24==0:
+            d=(hr+1)//24-1
+            mass=ice+liq
+            rho=np.where(h>1e-6,mass/np.maximum(h,1e-6),0.0)
+            snow_state[d,:,0]=h; snow_state[d,:,1]=rho
+            snow_state[d,:,2]=ice; snow_state[d,:,3]=liq; snow_state[d,:,4]=T
+            tm=mass.sum()
+            sm["day"].append(d+1); sm["swe_mm"].append(tm)
+            sm["snow_depth_m"].append(h.sum()); sm["melt_mm"].append(day_melt)
+            sm["refreeze_mm"].append(day_refreeze); sm["runoff_mm"].append(day_runoff)
+            sm["mean_density_kg_m3"].append(tm/h.sum() if h.sum()>0 else 0.0)
+            day_melt=day_refreeze=day_runoff=0.0
+    swe_final=(ice+liq).sum(); d_swe=swe_final-swe0
+    print(f"Initial SWE  : {swe0:10.3f} mm")
+    print(f"Final SWE    : {swe_final:10.3f} mm")
+    print(f"Total input  : {total_in:10.3f} mm")
+    print(f"Total runoff : {total_runoff:10.3f} mm")
+    print(f"dSWE         : {d_swe:10.3f} mm")
+    print(f"Balance in-dSWE-runoff = {total_in-d_swe-total_runoff:.4f} mm")
+    np.save(os.path.join(base,"results","snow_state.npy"),snow_state)
+    pd.DataFrame(sm).to_csv(os.path.join(base,"results","snow_summary.csv"),index=False)
+    plot(snow_state,sm,n_days,base)
+    print("Saved results/ outputs")
+
+def plot(snow_state,sm,n_days,base):
+    path=os.path.join(base,"results","snow_evolution.png")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        days=np.arange(1,n_days+1)
+        fig,axes=plt.subplots(2,2,figsize=(13,9))
+        fig.suptitle("3-layer snowpack dynamics (Anderson-Niu, energy balance, drainage)",fontsize=13)
+        ax=axes[0,0]; ax.plot(days,sm["swe_mm"],"b-",lw=2,label="SWE (mm)")
+        ax.set_xlabel("Day"); ax.set_ylabel("SWE (mm)",color="b")
+        ax2=ax.twinx(); ax2.plot(days,sm["snow_depth_m"],"g--",lw=2,label="Depth (m)")
+        ax2.set_ylabel("Snow depth (m)",color="g")
+        ax.set_title("Snow water equivalent & depth"); ax.grid(alpha=0.3)
+        ax=axes[0,1]
+        for i,lab in enumerate(["Top (layer 1)","Mid (layer 2)","Bottom (layer 3)"]):
+            ax.plot(days,snow_state[:,i,4]-T0,label=lab)
+        ax.axhline(0,color="k",lw=0.5,ls=":"); ax.set_xlabel("Day")
+        ax.set_ylabel("Temperature (deg C)"); ax.set_title("Layer temperatures")
+        ax.legend(); ax.grid(alpha=0.3)
+        ax=axes[1,0]
+        ax.plot(days,sm["melt_mm"],"r-",label="Melt (mm)")
+        ax.plot(days,sm["refreeze_mm"],"c-",label="Refreeze (mm)")
+        ax.plot(days,sm["runoff_mm"],"b-",label="Runoff (mm)")
+        ax.set_xlabel("Day"); ax.set_ylabel("mm/day")
+        ax.set_title("Daily melt / refreeze / runoff"); ax.legend(); ax.grid(alpha=0.3)
+        ax=axes[1,1]; ax.plot(days,sm["mean_density_kg_m3"],"k-",lw=2)
+        ax.set_xlabel("Day"); ax.set_ylabel("Density (kg/m3)",color="k")
+        ax2=ax.twinx(); bot=np.zeros(n_days)
+        for i in range(3):
+            ax2.fill_between(days,bot,bot+snow_state[:,i,0],alpha=0.4,label=f"Layer {i+1}")
+            bot+=snow_state[:,i,0]
+        ax2.set_ylabel("Layer thickness (m)"); ax.set_title("Mean density & layer thickness")
+        ax.grid(alpha=0.3); fig.tight_layout(rect=[0,0,1,0.97])
+        fig.savefig(path,dpi=130); plt.close(fig)
+        print("Figure saved via matplotlib")
+    except Exception as e:
+        import pngplot
+        pngplot.render(path,snow_state,sm,n_days)
+        print(f"matplotlib unavailable ({type(e).__name__}); figure saved via pngplot fallback")
+
+if __name__=="__main__":
+    main()

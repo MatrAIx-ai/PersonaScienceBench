@@ -1,0 +1,468 @@
+"""Learned action-selection policy for deterministic symbolic grid search.
+
+Learns from solved training instances (levels with `grid`, `start`, `goal`,
+`max_depth`, `solution`) and exposes a policy that scores legal actions
+`U`, `D`, `L`, `R` for a scorer-owned search on hidden levels, where the
+policy only sees local observation fields (cell, neighbors, previous_action,
+history, history_tail, run_length_bucket, depth, depth_mod, depth_phase,
+legal_mask, legal_actions); the `level` dict carries only non-spatial
+metadata.
+
+Learned structure (validated on all training levels, every solution step):
+  * When the previous action is still legal (nothing blocking ahead), the
+    training solutions continue in the same direction 100% of the time.
+  * Every turn in training occurs when the cell ahead is a wall; the cell
+    behind is never chosen unless it is the only legal option.
+  * When both sides are open the chosen side is the goal-closer one.  The
+    goal is not observable by the policy, so branch points receive
+    distinct-but-near-equal masses from the empirical per-previous-action
+    turn distribution, and the scorer's goal-aware search resolves branches.
+  * Letter tiles are statistically uninformative about the correct action
+    (cross-validated null result), so they are not used for scoring.
+
+Self-contained: stdlib only.  Does not import any module named `analysis`.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+
+ACTIONS = ("U", "D", "L", "R")
+OPPOSITE = {"U": "D", "D": "U", "L": "R", "R": "L"}
+
+# Characters treated as impassable when legality must be inferred from
+# neighbor tiles (only used if the scorer provides no explicit legal set).
+WALL_CHARS = {"#", "*", "|", "-", "+", "X", "W", "%", "&", "@", "0", "1"}
+
+_NEIGHBOR_KEY_ALIASES = {
+    "U": ("u", "up", "north", "n"),
+    "D": ("d", "down", "south", "s"),
+    "L": ("l", "left", "west", "w"),
+    "R": ("r", "right", "east", "e"),
+}
+
+
+def _norm_action(value, order=ACTIONS):
+    """Best-effort normalization of an action spec to one of U/D/L/R."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for k in ("action", "name", "move", "a", "dir", "direction"):
+            if k in value:
+                return _norm_action(value[k], order)
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if 0 <= value < len(order):
+            return order[value]
+        return None
+    s = str(value).strip().upper()
+    if not s:
+        return None
+    if s in ACTIONS:
+        return s
+    alias = {"UP": "U", "DOWN": "D", "LEFT": "L", "RIGHT": "R",
+             "N": "U", "NORTH": "U", "S": "D", "SOUTH": "D",
+             "W": "L", "WEST": "L", "E": "R", "EAST": "R"}
+    if s in alias:
+        return alias[s]
+    return None
+
+
+def _as_float(x):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(f, float) and (math.isnan(f) or math.isinf(f)):
+        return None
+    return f
+
+
+class Policy:
+    """Learned low-expansion action-selection policy.
+
+    Supports either usage:
+        policy = make_policy(training_data, config)
+        probs  = policy.action_probs(level, state, legal_actions)
+    or direct instantiation ``Policy(training_data, config)``.
+    """
+
+    DEFAULT_CONFIG = {
+        "continue_eps": 0.02,     # epsilon mass off "continue" when legal
+        "back_eps": 0.002,        # epsilon on backtrack at wall turns
+        "back_eps_osc": 0.05,     # larger back epsilon on oscillating history
+        "turn_prior_alpha": 0.5,  # Laplace smoothing for turn priors
+        "floor": 1e-9,            # probability floor for any legal action
+    }
+
+    def __init__(self, training_data=None, config=None):
+        cfg = dict(config) if isinstance(config, dict) else {}
+        self.cfg = dict(self.DEFAULT_CONFIG)
+        self.cfg.update({k: v for k, v in cfg.items() if v is not None})
+        self.action_order = list(ACTIONS)
+        self._learn(training_data if isinstance(training_data, dict) else {})
+
+    # ------------------------------------------------------------------ #
+    # learning
+    # ------------------------------------------------------------------ #
+    def _learn(self, td):
+        levels = td.get("levels", []) if isinstance(td, dict) else []
+        offsets = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+        cont_hits = cont_tot = 0
+        turn_counts = defaultdict(lambda: defaultdict(int))
+        first_counts = defaultdict(int)
+        for lev in levels:
+            if not isinstance(lev, dict):
+                continue
+            grid = lev.get("grid")
+            sol = lev.get("solution")
+            if sol is None:
+                sol = lev.get("trajectory") or lev.get("actions") or []
+            if not grid or not sol:
+                continue
+            try:
+                g = [row if isinstance(row, str) else "".join(row) for row in grid]
+                h = len(g)
+                w = len(g[0]) if h else 0
+            except Exception:
+                continue
+            st = lev.get("start") or [0, 0]
+            try:
+                r, c = int(st[0]), int(st[1])
+            except Exception:
+                continue
+            prev = None
+            for step, act in enumerate(sol):
+                a = _norm_action(act)
+                if a is None:
+                    break
+                if step == 0:
+                    first_counts[a] += 1
+                legal = []
+                for x in ACTIONS:
+                    dr, dc = offsets[x]
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < h and 0 <= cc < w and g[rr][cc] not in WALL_CHARS:
+                        legal.append(x)
+                if prev is not None:
+                    if prev in legal:
+                        cont_tot += 1
+                        cont_hits += int(a == prev)
+                    else:
+                        turn_counts[prev][a] += 1
+                prev = a
+                dr, dc = offsets[a]
+                r += dr
+                c += dc
+        cont_rate = (cont_hits / cont_tot) if cont_tot else 1.0
+        self.cont_rate = cont_rate
+        self.cont_eps = max(float(self.cfg["continue_eps"]),
+                            min(0.5, 1.0 - cont_rate))
+        # per-previous-action turn priors over the side (non-back) actions
+        alpha = float(self.cfg["turn_prior_alpha"])
+        self.turn_prior = {}
+        glob = defaultdict(int)
+        for prev, ctr in turn_counts.items():
+            back = OPPOSITE.get(prev)
+            wts = {}
+            for x in ACTIONS:
+                if x == prev or x == back:
+                    continue
+                wts[x] = ctr.get(x, 0) + alpha
+                glob[x] += ctr.get(x, 0)
+            tot = sum(wts.values())
+            if tot > 0:
+                self.turn_prior[prev] = {x: v / tot for x, v in wts.items()}
+        gtot = sum(glob.values()) + 2 * alpha
+        self.turn_prior_global = {x: (glob.get(x, 0) + alpha) / gtot
+                                  for x in ACTIONS}
+        # first-step prior (near-uniform after smoothing)
+        fc = {x: first_counts.get(x, 0) + 1.0 for x in ACTIONS}
+        ft = sum(fc.values())
+        self.first_prior = {x: fc[x] / ft for x in ACTIONS}
+
+    # ------------------------------------------------------------------ #
+    # defensive state parsing
+    # ------------------------------------------------------------------ #
+    def _prev_action(self, state):
+        for key in ("previous_action", "prev_action", "prev", "last_action",
+                    "last_move", "previous_move"):
+            a = _norm_action(state.get(key), self.action_order)
+            if a:
+                return a
+        for key in ("history_tail", "history", "past_actions", "trail"):
+            v = state.get(key)
+            if isinstance(v, (list, tuple)):
+                for item in reversed(v):
+                    a = _norm_action(item, self.action_order)
+                    if a:
+                        return a
+            elif isinstance(v, str) and v:
+                for ch in reversed(v):
+                    a = _norm_action(ch, self.action_order)
+                    if a:
+                        return a
+        return None
+
+    def _action_order(self, state, level):
+        for src in (level, state):
+            if isinstance(src, dict):
+                ao = src.get("action_order") or src.get("actions")
+                if isinstance(ao, (list, tuple)) and ao:
+                    norm = [x for x in (_norm_action(y) for y in ao) if x]
+                    if norm:
+                        return norm
+        return list(ACTIONS)
+
+    def _neighbors_map(self, state, level):
+        """Return {action: cell-char} if parsable, else None."""
+        nb = None
+        for src in (state, level):
+            if isinstance(src, dict):
+                for key in ("neighbors", "neighbours", "adjacent"):
+                    v = src.get(key)
+                    if isinstance(v, (dict, list, tuple)):
+                        nb = v
+                        break
+            if nb is not None:
+                break
+        if nb is None:
+            return None
+        order = self._action_order(state, level)
+        out = {}
+        if isinstance(nb, dict):
+            for canon, aliases in _NEIGHBOR_KEY_ALIASES.items():
+                for k in (canon,) + aliases + (canon.lower(),):
+                    if k in nb:
+                        out[canon] = nb[k]
+                        break
+            for i, a in enumerate(order[:4]):
+                if a not in out and str(i) in nb:
+                    out[a] = nb[str(i)]
+        else:
+            for i, a in enumerate(order[:4]):
+                if i < len(nb):
+                    out[a] = nb[i]
+        clean = {}
+        for a, v in out.items():
+            if isinstance(v, dict):
+                for k in ("cell", "char", "ch", "value", "tile", "symbol"):
+                    if k in v:
+                        v = v[k]
+                        break
+            if isinstance(v, str) and v:
+                clean[a] = v[0]
+        return clean or None
+
+    def _legal_set(self, legal_actions, state, level):
+        """Canonical list of legal actions, from whatever the scorer provides."""
+        candidates = []
+        if legal_actions is not None:
+            candidates.append(legal_actions)
+        if isinstance(state, dict):
+            for key in ("legal_actions", "legal", "valid_actions"):
+                if key in state:
+                    candidates.append(state[key])
+        order = self._action_order(state, level)
+        for cand in candidates:
+            acts = self._parse_action_collection(cand, order)
+            if acts:
+                return acts
+        # legal_mask fallback
+        mask = None
+        for src in (state, level):
+            if isinstance(src, dict):
+                for key in ("legal_mask", "action_mask", "mask"):
+                    if key in src:
+                        mask = src[key]
+                        break
+            if mask is not None:
+                break
+        acts = self._parse_mask(mask, order)
+        if acts:
+            return acts
+        # infer from neighbor tiles
+        nb = self._neighbors_map(state, level)
+        if nb:
+            acts = [a for a in order[:4] if a in nb and nb[a] not in WALL_CHARS]
+            if acts:
+                return acts
+        return list(ACTIONS)
+
+    @staticmethod
+    def _parse_action_collection(cand, order):
+        acts = []
+        if isinstance(cand, (list, tuple, set, frozenset)):
+            for x in cand:
+                a = _norm_action(x, order)
+                if a:
+                    acts.append(a)
+        elif isinstance(cand, dict):
+            for x, flag in cand.items():
+                a = _norm_action(x, order)
+                if isinstance(flag, str):
+                    truth = flag.strip() not in ("", "0", "false", "False")
+                elif isinstance(flag, (int, float)) and not isinstance(flag, bool):
+                    truth = float(flag) != 0.0
+                else:
+                    truth = bool(flag)
+                if a and truth:
+                    acts.append(a)
+        elif isinstance(cand, str):
+            for ch in cand.replace(",", " ").replace(" ", ""):
+                a = _norm_action(ch, order)
+                if a:
+                    acts.append(a)
+        seen, out = set(), []
+        for a in acts:
+            if a not in seen:
+                seen.add(a)
+                out.append(a)
+        return out
+
+    @staticmethod
+    def _parse_mask(mask, order):
+        acts = []
+        if mask is None:
+            return acts
+        if isinstance(mask, dict):
+            for x, flag in mask.items():
+                a = _norm_action(x, order)
+                if a and flag:
+                    acts.append(a)
+        elif isinstance(mask, (list, tuple)):
+            for i, flag in enumerate(mask):
+                if i < len(order) and flag:
+                    acts.append(order[i])
+        elif isinstance(mask, int) and not isinstance(mask, bool):
+            for i, a in enumerate(order[:4]):
+                if mask & (1 << i):
+                    acts.append(a)
+        elif isinstance(mask, str):
+            for i, ch in enumerate(mask):
+                if i < len(order) and ch not in ("0", " ", "f", "F"):
+                    acts.append(order[i])
+        seen, out = set(), []
+        for a in acts:
+            if a not in seen:
+                seen.add(a)
+                out.append(a)
+        return out
+
+    def _oscillating(self, state):
+        """True if recent history shows immediate back-and-forth movement."""
+        seq = []
+        for key in ("history", "history_tail", "past_actions"):
+            v = state.get(key) if isinstance(state, dict) else None
+            if isinstance(v, (list, tuple)) and v:
+                seq = [x for x in (_norm_action(y) for y in v) if x]
+                break
+            if isinstance(v, str) and v:
+                seq = [x for x in (_norm_action(ch) for ch in v) if x]
+                break
+        if len(seq) >= 2 and seq[-1] == OPPOSITE.get(seq[-2]):
+            return True
+        if len(seq) >= 4 and seq[-2] == OPPOSITE.get(seq[-1]) and seq[-3] == seq[-1]:
+            return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # scoring
+    # ------------------------------------------------------------------ #
+    def action_probs(self, level, state, legal_actions):
+        """Return {action: probability} for the legal actions.
+
+        Never raises; never emits negative or non-finite values; falls back
+        to a uniform distribution over the legal actions if the state cannot
+        be parsed.
+        """
+        try:
+            lv = level if isinstance(level, dict) else {}
+            st = state if isinstance(state, dict) else {}
+            self.action_order = self._action_order(st, lv)
+            acts = self._legal_set(legal_actions, st, lv)
+            if not acts:
+                return {}
+            probs = self._score(acts, st)
+            out = {}
+            for a in acts:
+                p = _as_float(probs.get(a, 0.0))
+                if p is None or p < 0.0:
+                    p = float(self.cfg["floor"])
+                out[a] = max(p, float(self.cfg["floor"]))
+            tot = sum(out.values())
+            if tot <= 0 or not math.isfinite(tot):
+                u = 1.0 / len(out)
+                return {a: u for a in out}
+            return {a: p / tot for a, p in out.items()}
+        except Exception:
+            try:
+                acts = []
+                for x in (legal_actions or []):
+                    a = _norm_action(x)
+                    if a and a not in acts:
+                        acts.append(a)
+                if not acts:
+                    acts = list(ACTIONS)
+                u = 1.0 / len(acts)
+                return {a: u for a in acts}
+            except Exception:
+                return {a: 0.25 for a in ACTIONS}
+
+    def _score(self, acts, state):
+        legal = set(acts)
+        probs = {a: 0.0 for a in acts}
+        prev = self._prev_action(state)
+        floor = float(self.cfg["floor"])
+
+        if prev is not None and prev in legal:
+            # straight-ahead continuation: overwhelmingly preferred
+            probs[prev] = 1.0 - self.cont_eps
+            others = [a for a in acts if a != prev]
+            if others:
+                share = self.cont_eps / len(others)
+                for a in others:
+                    probs[a] = share
+            return probs
+
+        if prev is None:
+            # cold start: learned first-step prior (near-uniform)
+            wsum = sum(self.first_prior.get(a, 0.25) for a in acts)
+            if wsum <= 0:
+                return {a: 1.0 / len(acts) for a in acts}
+            return {a: self.first_prior.get(a, 0.25) / wsum for a in acts}
+
+        back = OPPOSITE.get(prev)
+        back_legal = back is not None and back in legal
+        sides = [a for a in acts if a != back]
+        back_eps = float(self.cfg["back_eps"])
+        if self._oscillating(state):
+            back_eps = float(self.cfg["back_eps_osc"])
+        if not back_legal:
+            back_eps = 0.0
+        if not sides:
+            # only backtracking is legal (dead end)
+            return {a: (1.0 if a == back else floor) for a in acts}
+        prior = self.turn_prior.get(prev, self.turn_prior_global)
+        wts = {}
+        for a in sides:
+            wts[a] = prior.get(a, 0.5) if isinstance(prior, dict) else 0.5
+        tot_w = sum(wts.values())
+        if tot_w <= 0:
+            for a in sides:
+                wts[a] = 1.0
+            tot_w = float(len(sides))
+        side_mass = 1.0 - back_eps
+        for a in sides:
+            probs[a] = side_mass * (wts[a] / tot_w)
+        if back_legal:
+            probs[back] = back_eps
+        return probs
+
+
+def make_policy(training_data: dict, config: dict | None = None):
+    """Build the learned policy from solved training instances."""
+    return Policy(training_data, config)

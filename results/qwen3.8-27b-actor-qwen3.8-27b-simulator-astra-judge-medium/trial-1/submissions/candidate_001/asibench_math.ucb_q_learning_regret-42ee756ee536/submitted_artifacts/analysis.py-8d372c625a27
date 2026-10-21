@@ -1,0 +1,210 @@
+"""analysis.py — low-regret online agent for hidden finite-horizon MDPs.
+
+Algorithm: horizon-indexed, tabular, ONLINE, MODEL-FREE optimistic Q-learning
+("design C": a TD(lambda)-style blend of a one-step target and the observed
+episode return-to-go, in a single code path).
+
+Per (h, s, a) cell (h = 1..H; 0-indexed internally as h0 = h-1) we keep only
+scalar statistics (total storage O(H*S*A)):
+    n       : visit count
+    Q       : value estimate, initialized to the remaining-horizon upper bound
+              U_h0 = (H - h0) * rmax   (explicit OPTIMISTIC initialization)
+    wmean   : running mean of the blended targets (Welford)
+    M2      : Welford second-moment accumulator (variance of blended targets)
+
+Updates (all online, all derived from the ONE observed scalar transition; no
+transition model, no next-state count tensor, no replay, no planning):
+  * at observe(h, s, a, r, s', done):
+        t_td = r + max_a' Q[h+1, s']        (one-step target; O(A) lookup on the
+                                             OBSERVED next state only -- no
+                                             enumeration of all next states)
+        Q[h,s,a] += (1 - LAMBDA) * step(n) * (t_td - Q[h,s,a])
+  * at episode end, from the single bounded episode trace (<= H entries):
+        G    = observed return-to-go (suffix sum of rewards, includes r_h)
+        t    = (1 - LAMBDA) * t_td + LAMBDA * G
+        Welford update of (wmean, M2) with t
+        Q[h,s,a] += LAMBDA * step(n) * (t - Q[h,s,a])
+    step(n) = ALPHA / (n - 1 + ALPHA)  (visit-dependent; ALPHA=1 -> 1/n mean).
+    LAMBDA=1 -> pure Monte-Carlo return-to-go (zero bootstrap drift);
+    LAMBDA=0 -> pure one-step TD.  The frozen config uses LAMBDA=0.9, i.e. an
+    almost-MC estimate: the MC return-to-go is unbiased and its target does not
+    drift while downstream Q values are still learning, which is the model-free
+    remedy for the UCB-B finite-sample burn-in described in the task.
+
+Explicit optimism / confidence (Bernstein):
+  * unvisited cells stay at U_h0 (max possible remaining reward) -> explored;
+  * for visited cells a Bernstein confidence bonus is added at selection time:
+        b = BETA * ( sqrt(2 * v * ln(1+N) / n) + U_h0 * ln(1+N) / (3 n) )
+    where v = M2/n (online variance of the blended targets), N = total
+    transitions observed so far, and U_h0 is the target range. The sqrt term
+    captures variance-driven uncertainty and the U_h0*lnN/(3n) term keeps
+    under-sampled (small-n) actions explored. The selection value Q+b is used
+    for argmax (optimism may push it above U_h0); the STORED Q is always
+    clipped to the valid remaining-horizon range [Ulo_h0, U_h0].
+
+Compliance:
+  * make_agent uses only public spec fields: S, A, H, K, initial_state,
+    reward_range.  spec["P"]/spec["R"] are deliberately IGNORED if present.
+  * act() always returns a Python int in {0, ..., A-1} and never raises.
+  * observe() never raises.
+  * total storage O(H*S*A) + one bounded episode trace (<= H entries).
+  * NO transition model, NO H*S*A*S tensor / next-state counts, NO
+    replay-based planning, NO posterior sampling, NO policy-gradient/deep RL,
+    NO updates that enumerate all possible next states.
+  * one shared configuration for every case (no branching on case_id,
+    dimensions, action patterns, or individual MDPs).
+
+Frozen shared configuration (selected once on the public diagnostic suite):
+    LAMBDA_BLEND = 0.9,  BETA = 0.3,  ALPHA = 1.0
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+# ---- frozen shared configuration (single set for all cases) ----
+LAMBDA_BLEND = 0.9   # 0.0 -> pure one-step TD; 1.0 -> pure MC return-to-go
+BETA = 0.3           # Bernstein bonus coefficient
+ALPHA = 1.0          # step schedule ALPHA/(n-1+ALPHA); 1.0 -> 1/n running mean
+DEBUG_CHECKS = False # internal invariant checks (off in final submission)
+
+
+class _Agent:
+    __slots__ = (
+        "S", "A", "H", "rmin", "rmax", "U", "Ulo", "Q", "n", "wmean", "M2",
+        "V", "trace", "N", "rng", "lam", "beta", "alpha",
+    )
+
+    def __init__(self, env_spec: dict, seed: int) -> None:
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.H = int(env_spec["H"])
+        rmin, rmax = (float(x) for x in env_spec.get("reward_range", (0.0, 1.0)))
+        self.rmin = rmin
+        self.rmax = rmax
+        H = self.H
+        steps_left = np.arange(H, 0, -1, dtype=np.float64)   # H-h0 for h0=0..H-1
+        self.U = steps_left * rmax        # upper bound of remaining reward
+        self.Ulo = steps_left * rmin      # lower bound of remaining reward
+        shape = (H, self.S, self.A)
+        self.Q = np.broadcast_to(self.U[:, None, None], shape).copy()
+        self.n = np.zeros(shape, dtype=np.int64)
+        self.wmean = np.zeros(shape, dtype=np.float64)
+        self.M2 = np.zeros(shape, dtype=np.float64)
+        self.V = self.Q.max(axis=2)       # (H, S) max-a Q, bootstrap table
+        self.trace: list[list[float]] = []  # the single bounded episode trace
+        self.N = 0                        # total transitions observed
+        self.rng = np.random.default_rng(int(seed))
+        self.lam = float(LAMBDA_BLEND)
+        self.beta = float(BETA)
+        self.alpha = float(ALPHA)
+
+    # ------------------------------------------------------------------ act
+    def act(self, h: int, state: int) -> int:
+        h0 = int(h) - 1
+        if h0 < 0:
+            h0 = 0
+        elif h0 >= self.H:
+            h0 = self.H - 1
+        s = int(state)
+        if s < 0 or s >= self.S:
+            s = 0
+        if h0 == 0 and self.trace:      # safety: previous episode not yet closed
+            self._finish_episode()
+        nrow = self.n[h0, s]
+        vals = self.Q[h0, s].copy()
+        lnN = math.log1p(self.N)
+        b = np.zeros(self.A, dtype=np.float64)
+        m = nrow > 0
+        if m.any():
+            n = nrow[m].astype(np.float64)
+            v = np.maximum(self.M2[h0, s][m] / n, 0.0)
+            # full Bernstein: variance term + range/small-n term
+            b[m] = self.beta * (
+                np.sqrt(2.0 * v * lnN / n) + self.U[h0] * lnN / (3.0 * n)
+            )
+        vals = vals + b   # selection value (optimism) intentionally unclipped
+        mx = vals.max()
+        cand = np.flatnonzero(vals >= mx - 1e-12)
+        return int(self.rng.choice(cand))
+
+    # --------------------------------------------------------------- observe
+    def observe(self, h: int, state: int, action: int, reward: float,
+                next_state: int, done: bool) -> None:
+        h0 = int(h) - 1
+        if h0 < 0 or h0 >= self.H:
+            return
+        s = int(state)
+        if s < 0 or s >= self.S:
+            return
+        a = int(action)
+        if a < 0 or a >= self.A:
+            a = 0
+        r = float(reward)
+        s2 = int(next_state)
+        if s2 < 0 or s2 >= self.S:
+            s2 = 0
+        cont = float(self.V[h0 + 1, s2]) if h0 + 1 < self.H else 0.0
+        t_td = r + cont
+        self.trace.append([h0, s, a, r, t_td, 0.0])
+        idx = (h0, s, a)
+        self.n[idx] += 1
+        n = int(self.n[idx])
+        st = self.alpha / (n - 1.0 + self.alpha)
+        if self.lam < 1.0:
+            self.Q[idx] += (1.0 - self.lam) * st * (t_td - self.Q[idx])
+            self._clip_row(h0)
+        self.N += 1
+        self.V = self.Q.max(axis=2)
+        if done:
+            self._finish_episode()
+        if DEBUG_CHECKS:
+            self._check()
+
+    # ------------------------------------------------------------ internals
+    def _clip_row(self, h0: int) -> None:
+        np.clip(self.Q[h0], self.Ulo[h0], self.U[h0], out=self.Q[h0])
+
+    def _finish_episode(self) -> None:
+        if not self.trace:
+            return
+        g = 0.0
+        for e in reversed(self.trace):
+            g += e[3]
+            e[5] = g
+        lam = self.lam
+        for h0, s, a, _r, t_td, gg in self.trace:
+            idx = (h0, s, a)
+            n = int(self.n[idx])
+            t = (1.0 - lam) * t_td + lam * gg
+            old = self.wmean[idx]
+            new = old + (t - old) / n
+            self.wmean[idx] = new
+            self.M2[idx] += (t - old) * (t - new)
+            if lam > 0.0:
+                st = self.alpha / (n - 1.0 + self.alpha)
+                self.Q[idx] += lam * st * (t - self.Q[idx])
+                self._clip_row(h0)
+        self.trace.clear()
+        self.V = self.Q.max(axis=2)
+
+    def _check(self) -> None:
+        assert np.all(np.isfinite(self.Q))
+        assert np.all(self.Q >= self.Ulo[:, None, None] - 1e-12)
+        assert np.all(self.Q <= self.U[:, None, None] + 1e-12)
+        assert len(self.trace) <= self.H
+        assert np.all(self.M2 >= -1e-9)
+
+    # optional runner hooks
+    def reset_episode(self, episode: int, state: int) -> None:
+        if self.trace:
+            self._finish_episode()
+
+    def end_episode(self, episode: int, episode_reward: float) -> None:
+        if self.trace:
+            self._finish_episode()
+
+
+def make_agent(env_spec: dict, seed: int):
+    return _Agent(env_spec, seed)

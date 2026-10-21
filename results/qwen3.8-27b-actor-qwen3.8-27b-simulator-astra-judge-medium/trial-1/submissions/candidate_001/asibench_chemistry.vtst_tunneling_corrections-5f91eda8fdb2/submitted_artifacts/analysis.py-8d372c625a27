@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""
+VTST tunneling-correction analysis (asibench:chemistry.vtst_tunneling_corrections)
+
+Pipeline
+--------
+1. Load the 2D surface, ordered corridor, transverse scans, kinetic metrics,
+   temperature grid, isotope cases and manifest (units / public constants).
+2. 1D corridor profile V(s) from the q=0 scan values; transverse curvature from
+   a quadratic (harmonic) fit of each 13-point scan -> transverse frequency
+   nu(s) = FREQ_SCALE * sqrt(k_trans / m_trans).
+3. Pointwise free energy  F(s,T) = V(s) - R T ln(nu(s)/nu_ref)
+   (harmonic transverse partition function; additive constant cancels in barriers).
+4. Local crossing surface  = s where V(s) is maximal (conventional saddle, T-independent).
+   Optimized crossing surface = s where F(s,T) is maximal (variational, T-dependent).
+5. WKB transmission  kappa(E) = exp(-2 A(E)),  A = ACTION_SCALE * sqrt(mu_scale) * INT sqrt(2 mu (V-E)) ds
+   (ACTION_SCALE = manifest 'semiclassical_action_scale' = 1.24 converts the raw
+    reduced-coordinate integral to action in units of h).
+   - action_corridor: trapezoid over the contiguous forbidden span of the 121-point corridor.
+   - action_2d: minimum-action path through the 2D grid (multi-source Dijkstra,
+     trapezoid edge costs), local path relaxation, fine bilinear re-integration.
+   Thermal energy for rates: E_t = E_b - k_B T.
+6. Rates  k = (k_B T / h) exp(-dF‡/RT) kappa  with dF‡ = F(s‡) - F(s_reactant).
+   k_local: s‡=s_local, corridor action at E_b_local.
+   k_optimized: s‡=s_opt, corridor action at E_b_opt.
+   k_enhanced: s‡=s_opt, 2D action at E_b_opt.
+7. Isotopes: uniform mass scales -> actions x sqrt(scale_L); nu / sqrt(scale_T)
+   (cancels in dF‡); KIE = log10 k_enh(light) - log10 k_enh(case) at equal T.
+8. Crossover temperature: T where corridor kappa(E_b_local - k_B T) = exp(-1).
+"""
+import json
+import math
+import heapq
+from collections import deque
+
+import numpy as np
+import pandas as pd
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
+import os
+
+DATA, RESULTS = "data", "results"
+os.makedirs(RESULTS, exist_ok=True)
+
+# ---------------------------------------------------------------------- load
+manifest = json.load(open(f"{DATA}/system_manifest.json"))
+PC = manifest["public_constants"]
+R = PC["R_kJ_mol_K"]
+FREQ_SCALE = PC["frequency_scale_cm1_per_sqrt_kj_mol_coord2"]
+HC_KB = PC["hc_over_kB_K_cm"]
+KB_OVER_H = PC["kB_over_h_s_per_K"]
+ACTION_SCALE = PC["semiclassical_action_scale"]
+
+curve = pd.read_csv(f"{DATA}/curve_samples.csv").sort_values("point_id").reset_index(drop=True)
+tube = pd.read_csv(f"{DATA}/tube_scan.csv").merge(
+    curve[["point_id", "s_coord"]], on="point_id")
+kin = pd.read_csv(f"{DATA}/kinetic_metric.csv").sort_values("point_id").reset_index(drop=True)
+surf = pd.read_csv(f"{DATA}/surface_samples.csv")
+Tgrid = pd.read_csv(f"{DATA}/temperature_grid.csv")
+isotopes = pd.read_csv(f"{DATA}/isotope_cases.csv")
+
+N = len(curve)
+s = curve["s_coord"].to_numpy()
+x_c = curve["x"].to_numpy()
+y_c = curve["y"].to_numpy()
+
+# ------------------------------------------- 1D profile + transverse fit
+V1 = np.zeros(N)
+k_trans = np.zeros(N)
+quad_residual = np.zeros(N)
+for i, pid in enumerate(curve["point_id"].to_numpy()):
+    pt = tube[tube["point_id"] == pid].sort_values("q_id")
+    q = pt["q_offset"].to_numpy()
+    v = pt["potential_kj_mol"].to_numpy()
+    V1[i] = v[np.argmin(np.abs(q))]          # value at q = 0 (scan is centered)
+    a, b, c0 = np.polyfit(q, v, 2)           # harmonic fit V = c0 + b q + (a) q^2
+    k_trans[i] = max(2.0 * a, 0.0)
+    quad_residual[i] = np.max(np.abs(v - (a * q**2 + b * q + c0)))
+
+mu_long = kin["longitudinal_reduced_mass_amu"].to_numpy()
+mu_trans = kin["transverse_reduced_mass_amu"].to_numpy()
+
+def transverse_freq(scale_T=1.0):
+    return FREQ_SCALE * np.sqrt(k_trans / (mu_trans * scale_T))
+
+NU = transverse_freq(1.0)          # light-case transverse frequencies (cm-1)
+NU_REF = NU[0]
+
+def free_energy(T, scale_T=1.0):
+    nu = transverse_freq(scale_T)
+    return V1 - R * T * np.log(nu / NU_REF)
+
+# ------------------------------------------- basins / local saddle
+i_local = int(np.argmax(V1))
+E_b_local = V1[i_local]
+V_r = V1[0]                          # reactant minimum (corridor start)
+i_prod = int(np.argmin(V1[i_local:])) + i_local
+
+# conventional 2D saddle on the grid (local max along one axis, min along the other)
+X = np.unique(surf["x"].to_numpy())
+Y = np.unique(surf["y"].to_numpy())
+Vg = surf.pivot(index="grid_y_index", columns="grid_x_index",
+                values="potential_kj_mol").to_numpy()
+ny, nx = Vg.shape
+dx, dy = X[1] - X[0], Y[1] - Y[0]
+x0, y0 = X[0], Y[0]
+saddle_xy, saddle_V = None, None
+for i in range(1, ny - 1):
+    for j in range(1, nx - 1):
+        if (Vg[i, j] > Vg[i-1, j] and Vg[i, j] > Vg[i+1, j]
+                and Vg[i, j] < Vg[i, j-1] and Vg[i, j] < Vg[i, j+1]):
+            saddle_xy, saddle_V = (X[j], Y[i]), Vg[i, j]
+        if (Vg[i, j] > Vg[i, j-1] and Vg[i, j] > Vg[i, j+1]
+                and Vg[i, j] < Vg[i-1, j] and Vg[i, j] < Vg[i+1, j]):
+            saddle_xy, saddle_V = (X[j], Y[i]), Vg[i, j]
+jsad = int(np.argmin(np.abs(X - saddle_xy[0])))
+isad = int(np.argmin(np.abs(Y - saddle_xy[1])))
+X_sad = X[jsad]
+
+# ------------------------------------------- bilinear potential
+def V_bilinear(xx, yy):
+    jf = np.clip((np.asarray(xx, float) - x0) / dx, 0.0, nx - 1 - 1e-12)
+    ifl = np.clip((np.asarray(yy, float) - y0) / dy, 0.0, ny - 1 - 1e-12)
+    j0 = jf.astype(int); i0 = ifl.astype(int)
+    j1 = np.minimum(j0 + 1, nx - 1); i1 = np.minimum(i0 + 1, ny - 1)
+    tj = jf - j0; ti = ifl - i0
+    return ((Vg[i0, j0] * (1 - tj) + Vg[i0, j1] * tj) * (1 - ti)
+            + (Vg[i1, j0] * (1 - tj) + Vg[i1, j1] * tj) * ti)
+
+# ------------------------------------------- 1D WKB action (raw, then scaled)
+def action_1d_raw(E):
+    if E >= E_b_local:
+        return 0.0
+    i1 = i_local
+    while i1 > 0 and V1[i1 - 1] > E:
+        i1 -= 1
+    i2 = i_local
+    while i2 < N - 1 and V1[i2 + 1] > E:
+        i2 += 1
+    f = np.sqrt(2.0 * mu_long[i1:i2 + 1] * np.clip(V1[i1:i2 + 1] - E, 0.0, None))
+    return float(np.trapezoid(f, s[i1:i2 + 1]))
+
+def action_1d(E, scale_L=1.0):
+    return ACTION_SCALE * math.sqrt(scale_L) * action_1d_raw(E)
+
+# ------------------------------------------- 2D minimum-action path
+_STEPS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+def _edge_cost(ia, ja, ib, jb, f):
+    L = math.hypot((ja - jb) * dx, (ia - ib) * dy)
+    return 0.5 * L * (f[ia, ja] + f[ib, jb])
+
+def _forbidden_component(E):
+    forbid = Vg > E
+    if not forbid[isad, jsad]:
+        return set()
+    comp, dq = set(), deque([(isad, jsad)])
+    while dq:
+        i, j = dq.popleft()
+        if (i, j) in comp:
+            continue
+        comp.add((i, j))
+        for di, dj in _STEPS:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < ny and 0 <= nj < nx and forbid[ni, nj] and (ni, nj) not in comp:
+                dq.append((ni, nj))
+    return comp
+
+def _fine_action(path, E, scale_L):
+    tot = 0.0
+    for (ia, ja), (ib, jb) in zip(path, path[1:]):
+        xa, ya = X[ja], Y[ia]
+        xb, yb = X[jb], Y[ib]
+        L = math.hypot(xb - xa, yb - ya)
+        nseg = max(4, int(math.ceil(L / 0.005)))
+        t = np.linspace(0.0, 1.0, nseg + 1)
+        f = np.sqrt(2.0 * scale_L * np.clip(
+            V_bilinear(xa + t * (xb - xa), ya + t * (yb - ya)) - E, 0.0, None))
+        tot += L * float(np.trapezoid(f, t))
+    return tot
+
+def _relax(path, f, E):
+    """Local detour relaxation: replace an interior node by any grid node within
+    Chebyshev radius 2 if the two-edge cost decreases."""
+    for _pass in range(3):
+        changed = False
+        for t in range(1, len(path) - 1):
+            ia, ja = path[t]
+            best = None
+            for di in range(-2, 3):
+                for dj in range(-2, 3):
+                    if di == 0 and dj == 0:
+                        continue
+                    ni, nj = ia + di, ja + dj
+                    if not (0 <= ni < ny and 0 <= nj < nx):
+                        continue
+                    if (ni, nj) in (path[t - 1], path[t + 1]):
+                        continue
+                    c_new = (_edge_cost(path[t-1][0], path[t-1][1], ni, nj, f)
+                             + _edge_cost(ni, nj, path[t+1][0], path[t+1][1], f))
+                    c_old = (_edge_cost(path[t-1][0], path[t-1][1], ia, ja, f)
+                             + _edge_cost(ia, ja, path[t+1][0], path[t+1][1], f))
+                    if c_new < c_old - 1e-12 and (best is None or c_new < best[0]):
+                        best = (c_new, (ni, nj))
+            if best is not None:
+                path[t] = best[1]
+                changed = True
+        if not changed:
+            break
+    return path
+
+def minaction_2d(E):
+    """Minimum WKB action through the 2D surface at energy E.
+    Returns (raw_action, path) with the path as a list of (i, j) grid nodes."""
+    if E >= Vg[isad, jsad]:
+        return 0.0, [(isad, jsad)]
+    f = np.sqrt(2.0 * np.clip(Vg - E, 0.0, None))
+    comp = _forbidden_component(E)
+    cand = set()
+    for (i, j) in comp:
+        for di, dj in _STEPS:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < ny and 0 <= nj < nx and not (Vg[ni, nj] > E):
+                cand.add((ni, nj))
+    src = [n for n in cand if X[n[1]] < X_sad]
+    tgt = [n for n in cand if X[n[1]] > X_sad]
+    if not src:
+        # no classically-allowed node on the reactant side at this energy:
+        # start from the reactant basin floor (its V is the turning point)
+        i_f, j_f = divmod(int(np.argmin(np.where(X[None, :] < X_sad,
+                                                 Vg, np.inf))), nx)
+        src = [(i_f, j_f)]
+    if not tgt:
+        i_f, j_f = divmod(int(np.argmin(np.where(X[None, :] > X_sad,
+                                                 Vg, np.inf))), nx)
+        tgt = [(i_f, j_f)]
+    dist = np.full((ny, nx), np.inf)
+    prev = np.full((ny, nx), -1, dtype=np.int64)
+    heap = []
+    for (i, j) in src:
+        dist[i, j] = 0.0
+        heapq.heappush(heap, (0.0, i, j))
+    end = None
+    while heap:
+        d, i, j = heapq.heappop(heap)
+        if d > dist[i, j]:
+            continue
+        if (i, j) in tgt:
+            end = (i, j)
+            break
+        for di, dj in _STEPS:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < ny and 0 <= nj < nx:
+                nd = d + _edge_cost(i, j, ni, nj, f)
+                if nd < dist[ni, nj]:
+                    dist[ni, nj] = nd
+                    prev[ni, nj] = i * nx + j
+                    heapq.heappush(heap, (nd, ni, nj))
+    if end is None:
+        end = min(tgt, key=lambda t: dist[t])
+    path = []
+    i, j = end
+    while i * nx + j != -1:
+        path.append((i, j))
+        p = prev[i, j]
+        if p == -1:
+            break
+        i, j = p // nx, p % nx
+    path.reverse()
+    path = _relax(path, f, E)
+    return _fine_action(path, E, 1.0), path
+
+# ------------------------------------------- transmission energy grid (56 pts)
+Egrid = np.linspace(V_r, E_b_local, 56)
+prof_rows = []
+paths_by_energy = {}
+for eid, E in enumerate(Egrid):
+    A1 = action_1d(E)
+    A2raw, path = minaction_2d(E)
+    A2 = ACTION_SCALE * A2raw
+    paths_by_energy[eid] = path
+    ratio = (A2 / A1) if A1 > 0 else 1.0
+    prof_rows.append(dict(
+        energy_id=eid, energy_kj_mol=E,
+        action_corridor=A1, action_2d=A2,
+        transmission_corridor=math.exp(-2.0 * A1),
+        transmission_2d=math.exp(-2.0 * A2),
+        action_ratio_2d_over_corridor=ratio))
+profile = pd.DataFrame(prof_rows)
+
+# ------------------------------------------- rates (light + isotopes)
+def crossover_T(scale_L):
+    """T where 2 * A_corridor(E_b_local - R T) * sqrt(scale_L) = 1 (kappa = e^-1)."""
+    lo, hi = 1e-9, 1e5
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if 2.0 * action_1d(E_b_local - R * mid, scale_L) > 1.0:
+            hi = mid      # action grows with T; root is below
+        else:
+            lo = mid
+    return 0.5 * (lo + hi)
+
+def rates_at(T, scale_L, scale_T):
+    F = free_energy(T, scale_T)
+    i_opt = int(np.argmax(F))
+    E_b_opt = V1[i_opt]
+    dG_local = F[i_local] - F[0]
+    dG_opt = F[i_opt] - F[0]
+    pre = KB_OVER_H * T
+    k_local = pre * math.exp(-dG_local / (R * T)) * math.exp(-2.0 * action_1d(E_b_local - R * T, scale_L))
+    k_opt = pre * math.exp(-dG_opt / (R * T)) * math.exp(-2.0 * action_1d(E_b_opt - R * T, scale_L))
+    A2raw, _ = minaction_2d(E_b_opt - R * T)
+    k_enh = pre * math.exp(-dG_opt / (R * T)) * math.exp(-2.0 * ACTION_SCALE * math.sqrt(scale_L) * A2raw)
+    return dict(i_opt=i_opt, s_opt=s[i_opt], E_b_opt=E_b_opt,
+                barrier_local=E_b_local - V_r, barrier_opt=E_b_opt - V_r,
+                log10_k_local=math.log10(k_local),
+                log10_k_optimized=math.log10(k_opt),
+                log10_k_enhanced=math.log10(k_enh),
+                kappa_corridor=math.exp(-2.0 * action_1d(E_b_opt - R * T, scale_L)),
+                enhancement_factor=k_enh / k_opt)
+
+rate_rows, iso_rows = [], []
+light_enh = {}
+for T in Tgrid["T_K"].to_numpy():
+    r = rates_at(T, 1.0, 1.0)
+    Tc = crossover_T(1.0)
+    rate_rows.append(dict(T_K=T,
+                          log10_k_local_s_inv=r["log10_k_local"],
+                          log10_k_optimized_s_inv=r["log10_k_optimized"],
+                          log10_k_enhanced_s_inv=r["log10_k_enhanced"],
+                          kappa_corridor=r["kappa_corridor"],
+                          enhancement_factor=r["enhancement_factor"],
+                          s_optimized=r["s_opt"],
+                          barrier_local_kj_mol=r["barrier_local"],
+                          barrier_optimized_kj_mol=r["barrier_opt"],
+                          crossover_T_K=Tc))
+    light_enh[T] = r["log10_k_enhanced"]
+rates_df = pd.DataFrame(rate_rows)
+
+for _, ic in isotopes.iterrows():
+    sL, sT = ic["longitudinal_mass_scale"], ic["transverse_mass_scale"]
+    Tc = crossover_T(sL)
+    for T in Tgrid["T_K"].to_numpy():
+        r = rates_at(T, sL, sT)
+        iso_rows.append(dict(
+            case_id=ic["case_id"], isotopologue=ic["isotopologue"],
+            longitudinal_mass_scale=sL, transverse_mass_scale=sT, T_K=T,
+            log10_k_local_s_inv=r["log10_k_local"],
+            log10_k_optimized_s_inv=r["log10_k_optimized"],
+            log10_k_enhanced_s_inv=r["log10_k_enhanced"],
+            enhancement_factor=r["enhancement_factor"],
+            s_optimized=r["s_opt"], crossover_T_K=Tc,
+            log10_KIE_sct_vs_light=light_enh[T] - r["log10_k_enhanced"]))
+iso_df = pd.DataFrame(iso_rows)
+
+# isotope transmission profiles (uniform mass scale -> actions x sqrt(scale_L))
+iso_prof_rows = []
+for _, ic in isotopes.iterrows():
+    sL = ic["longitudinal_mass_scale"]
+    fL = math.sqrt(sL)
+    for row in profile.itertuples():
+        A1 = row.action_corridor * fL
+        A2 = row.action_2d * fL
+        iso_prof_rows.append(dict(
+            case_id=ic["case_id"], isotopologue=ic["isotopologue"],
+            longitudinal_mass_scale=sL,
+            transverse_mass_scale=ic["transverse_mass_scale"],
+            energy_id=row.energy_id, energy_kj_mol=row.energy_kj_mol,
+            action_corridor=A1, action_2d=A2,
+            transmission_corridor=math.exp(-2.0 * A1),
+            transmission_2d=math.exp(-2.0 * A2),
+            action_ratio_2d_over_corridor=row.action_ratio_2d_over_corridor))
+iso_profile = pd.DataFrame(iso_prof_rows)
+
+# ------------------------------------------- free-energy profile (12 T x 121 pts)
+fe_rows = []
+for T in Tgrid["T_K"].to_numpy():
+    F = free_energy(T)
+    i_opt = int(np.argmax(F))
+    for i in range(N):
+        fe_rows.append(dict(T_K=T, point_id=int(curve["point_id"].iloc[i]),
+                            s_coord=s[i], x=x_c[i], y=y_c[i],
+                            transverse_frequency_cm1=NU[i],
+                            free_energy_kj_mol=F[i],
+                            optimized_flag=1 if i == i_opt else 0))
+fe_df = pd.DataFrame(fe_rows)
+
+# ------------------------------------------- path samples (8 representative energies)
+sample_ids = list(range(0, 56, 7))          # 0,7,14,21,28,35,42,49
+path_rows = []
+for eid in sample_ids:
+    E = Egrid[eid]
+    path = paths_by_energy[eid]
+    for step, (i, j) in enumerate(path):
+        path_rows.append(dict(energy_id=eid, path_step=step, energy_kj_mol=E,
+                              x=X[j], y=Y[i], potential_kj_mol=float(Vg[i, j])))
+paths_df = pd.DataFrame(path_rows)
+
+# ------------------------------------------- rate plot (matplotlib, or pure-Python fallback)
+_FONT = {
+ '0':".###. #...# #..## #.#.# ##..# #...# .###.".split(),
+ '1':"..#.. .##.. ..#.. ..#.. ..#.. ..#.. .###.".split(),
+ '2':".###. #...# ....# ...#. ..#.. .#... #####".split(),
+ '3':".###. #...# ....# ..##. ....# #...# .###.".split(),
+ '4':"...#. ..##. .#.#. #..#. ##### ...#. ...#.".split(),
+ '5':"##### #.... ####. ....# ....# #...# .###.".split(),
+ '6':"..##. .#... #.... ####. #...# #...# .###.".split(),
+ '7':"##### ....# ...#. ..#.. ..#.. ..#.. ..#..".split(),
+ '8':".###. #...# #...# .###. #...# #...# .###.".split(),
+ '9':".###. #...# #...# .#### ....# ...#. .##..".split(),
+ '.':"..... ..... ..... ..... ..... ..#.. ..#..".split(),
+ '-':"..... ..... ..... ##### ..... ..... .....".split(),
+ '_':"..... ..... ..... ..... ..... ..... #####".split(),
+ '(':"...#. ..#.. .#... .#... .#... ..#.. ...#.".split(),
+ ')':".#... ..#.. ...#. ...#. ...#. ..#.. .#...".split(),
+ '^':"..#.. .#.#. #...# ..... ..... ..... .....".split(),
+ '=':"..... ..... ##### ..... ##### ..... .....".split(),
+ ' ':"..... ..... ..... ..... ..... ..... .....".split(),
+ 'R':"####. #...# #...# ####. #.#.# #..#. #...#".split(),
+ 'T':"##### ..#.. ..#.. ..#.. ..#.. ..#.. ..#..".split(),
+ 'K':"#...# #..#. #.#.. ##... #.#.. #..#. #...#".split(),
+ 'a':"..... ..... .###. ....# .#### #...# .####".split(),
+ 'c':"..... ..... .###. #.... #.... #.... .###.".split(),
+ 'e':"..... ..... .###. #...# ##### #.... .###.".split(),
+ 'f':"..##. .#.#. .#... ####. .#... .#... .#...".split(),
+ 'g':"..... .#### #...# #...# .#### #...# .###.".split(),
+ 'h':"..... #.... #.##. #...# #...# #...# #...#".split(),
+ 'i':"..... ..#.. .###. ..#.. ..#.. ..#.. .###.".split(),
+ 'l':".###. ..#.. ..#.. ..#.. ..#.. ..#.. .##..".split(),
+ 'm':"..... .#.#. #.#.# #.#.# #...# #...# #...#".split(),
+ 'n':"..... #.##. #...# #...# #...# #...# #...#".split(),
+ 'o':"..... ..... .###. #...# #...# #...# .###.".split(),
+ 'p':"..... ####. #...# #...# ####. #.... #....".split(),
+ 'r':"..... #.##. #.#.. #.#.. #.... #.... #....".split(),
+ 's':"..... .#### #.... .###. ....# ####. .....".split(),
+ 't':".#... .#... ####. .#... .#... .#.#. ..##.".split(),
+ 'v':"..... #...# #...# #...# #...# .#.#. ..#..".split(),
+ 'z':"..... ##### ...#. ..#.. .#... ##### .....".split(),
+}
+
+def _png_write(path, px, w, h):
+    import zlib, struct
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    raw = b"".join(b"\x00" + bytes(px[y * w * 3:(y + 1) * w * 3]) for y in range(h))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+def _plot_fallback(path, rates_df, Tc):
+    """Minimal labeled line plot without matplotlib (pure stdlib PNG writer)."""
+    W, H = 1000, 640
+    px = bytearray([255] * (W * H * 3))
+    def put(x, y, col):
+        if 0 <= x < W and 0 <= y < H:
+            o = (y * W + x) * 3
+            px[o:o+3] = bytes(col)
+    def line(x1, y1, x2, y2, col, wdt=1):
+        n = max(abs(x2 - x1), abs(y2 - y1), 1)
+        for k in range(n + 1):
+            x = round(x1 + (x2 - x1) * k / n); y = round(y1 + (y2 - y1) * k / n)
+            for dx in range(wdt):
+                for dy in range(wdt):
+                    put(x + dx, y + dy, col)
+    def rect(x1, y1, x2, y2, col, fill=False):
+        if fill:
+            for y in range(y1, y2 + 1):
+                for x in range(x1, x2 + 1):
+                    put(x, y, col)
+        else:
+            line(x1, y1, x2, y1, col); line(x1, y2, x2, y2, col)
+            line(x1, y1, x1, y2, col); line(x2, y1, x2, y2, col)
+    def dashed(x1, y1, x2, y2, col, dash=8):
+        n = max(abs(x2 - x1), abs(y2 - y1), 1)
+        k = 0
+        while k <= n:
+            k2 = min(k + dash, n)
+            xa = x1 + (x2 - x1) * k / n; ya = y1 + (y2 - y1) * k / n
+            xb = x1 + (x2 - x1) * k2 / n; yb = y1 + (y2 - y1) * k2 / n
+            line(round(xa), round(ya), round(xb), round(yb), col)
+            k += 2 * dash
+    def text(x, y, string, col, scale=2):
+        for ch in string:
+            g = _FONT.get(ch, _FONT[' '])
+            for ry, row in enumerate(g):
+                for rx, bit in enumerate(row):
+                    if bit != '.':
+                        rect(x + (rx * scale), y + (ry * scale),
+                             x + (rx * scale) + scale - 1,
+                             y + (ry * scale) + scale - 1, col)
+            x += 6 * scale
+    # axes: x log T in [150, 1000], y log10 k in [-2, 9], right axis enh in [0.9, 1.1]
+    x0p, x1p, y0p, y1p = 80, 920, 60, 560
+    import math as _m
+    lx0, lx1 = _m.log10(150.0), _m.log10(1000.0)
+    ly0, ly1 = 9.0, -2.0
+    ry0, ry1 = 1.10, 0.90
+    def PT(T, val):
+        return (x0p + (x1p - x0p) * (_m.log10(T) - lx0) / (lx1 - lx0),
+                y0p + (y1p - y0p) * (val - ly0) / (ly1 - ly0))
+    def RT(val):
+        return y0p + (y1p - y0p) * (val - ry0) / (ry1 - ry0)
+    rect(x0p, y0p, x1p, y1p, (60, 60, 60))
+    for T in (200, 300, 500, 700, 1000):
+        gx = round(x0p + (x1p - x0p) * (_m.log10(T) - lx0) / (lx1 - lx0))
+        line(gx, y0p, gx, y1p, (225, 225, 225))
+        text(gx - 15, y1p + 8, str(T), (0, 0, 0))
+    for v in (-2, 0, 2, 4, 6, 8):
+        gy = round(y0p + (y1p - y0p) * (v - ly0) / (ly1 - ly0))
+        line(x0p, gy, x1p, gy, (225, 225, 225))
+        text(x0p - 30, gy - 7, str(v), (0, 0, 0))
+    for v in (0.90, 0.95, 1.00, 1.05, 1.10):
+        gy = round(RT(v))
+        text(x1p + 8, gy - 7, f"{v:.2f}", (0, 0, 0))
+    # crossover line
+    cx = round(x0p + (x1p - x0p) * (_m.log10(Tc) - lx0) / (lx1 - lx0))
+    dashed(cx, y0p, cx, y1p, (120, 120, 120), dash=6)
+    # series
+    Ts = rates_df["T_K"].to_numpy()
+    series = [("log10_k_local_s_inv", (200, 0, 0), True),
+              ("log10_k_optimized_s_inv", (0, 0, 200), True),
+              ("log10_k_enhanced_s_inv", (0, 140, 0), True)]
+    for colname, col, mk in series:
+        pts = [PT(T, v) for T, v in zip(Ts, rates_df[colname])]
+        for (xa, ya), (xb, yb) in zip(pts, pts[1:]):
+            line(round(xa), round(ya), round(xb), round(yb), col, 2)
+        for (xa, ya) in pts:
+            rect(round(xa) - 3, round(ya) - 3, round(xa) + 3, round(ya) + 3, col, fill=True)
+    epts = [(x0p + (x1p - x0p) * (_m.log10(T) - lx0) / (lx1 - lx0), RT(v))
+            for T, v in zip(Ts, rates_df["enhancement_factor"])]
+    for (xa, ya), (xb, yb) in zip(epts, epts[1:]):
+        dashed(round(xa), round(ya), round(xb), round(yb), (0, 0, 0), dash=7)
+    # legend
+    lx, ly = x0p + 15, y1p - 130
+    rect(lx - 8, ly - 10, lx + 150, ly + 88, (255, 255, 255), fill=True)
+    rect(lx - 8, ly - 10, lx + 150, ly + 88, (60, 60, 60))
+    for k, (label, col) in enumerate([("k_local", (200, 0, 0)), ("k_optimized", (0, 0, 200)),
+                                      ("k_enhanced", (0, 140, 0)), ("enh. factor", (0, 0, 0))]):
+        yy = ly + k * 24
+        if k < 3:
+            line(lx, yy + 5, lx + 28, yy + 5, col, 2)
+            rect(lx + 11, yy + 2, lx + 17, yy + 8, col, fill=True)
+        else:
+            dashed(lx, yy + 5, lx + 28, yy + 5, col, dash=5)
+        text(lx + 36, yy, label, (0, 0, 0), scale=1)
+    text(lx + 36, ly + 96, f"cross-over T = {Tc:.0f} K", (120, 120, 120), scale=1)
+    # titles / labels
+    text(330, 18, "Rate estimates vs T (light isotope)", (0, 0, 0), scale=2)
+    text(470, y1p + 42, "T (K)", (0, 0, 0), scale=2)
+    text(14, 280, "log10 k (s^-1)", (0, 0, 0), scale=2)
+    text(930, 300, "enh. factor", (0, 0, 0), scale=1)
+    _png_write(path, px, W, H)
+
+def make_rate_plot(path):
+    Tc = crossover_T(1.0)
+    if _HAS_MPL:
+        fig, ax1 = plt.subplots(figsize=(8, 5))
+        ax1.semilogx(rates_df["T_K"], rates_df["log10_k_local_s_inv"], "o-", label=r"$\log_{10} k_{local}$")
+        ax1.semilogx(rates_df["T_K"], rates_df["log10_k_optimized_s_inv"], "s-", label=r"$\log_{10} k_{optimized}$")
+        ax1.semilogx(rates_df["T_K"], rates_df["log10_k_enhanced_s_inv"], "^-", label=r"$\log_{10} k_{enhanced}$ (2D action)")
+        ax1.axvline(Tc, color="gray", ls=":", label=f"cross-over T = {Tc:.0f} K")
+        ax1.set_xlabel("T (K)"); ax1.set_ylabel(r"$\log_{10} k$ (s$^{-1})$"); ax1.grid(alpha=0.3)
+        ax2 = ax1.twinx()
+        ax2.semilogx(rates_df["T_K"], rates_df["enhancement_factor"], "k--",
+                     label=r"enhancement factor $k_{enh}/k_{opt}$")
+        ax2.set_ylabel("enhancement factor")
+        h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="lower left", fontsize=9)
+        ax1.set_title("Temperature-dependent rate estimates (light isotope)")
+        fig.tight_layout(); fig.savefig(path, dpi=150)
+    else:
+        _plot_fallback(path, rates_df, Tc)
+
+# ------------------------------------------- diagnostics
+red = 1.0 - profile["action_ratio_2d_over_corridor"]
+r297 = rates_at(297.5, 1.0, 1.0)
+Tc_light = crossover_T(1.0)
+diag = {
+    "units": {"coordinate": manifest["coordinate_unit"],
+              "energy": manifest["energy_unit"],
+              "rate_constant": manifest["rate_constant_unit"]},
+    "basins": {
+        "reactant": {"x": float(x_c[0]), "y": float(y_c[0]),
+                     "s_coord": float(s[0]), "potential_kj_mol": float(V1[0])},
+        "product": {"x": float(x_c[i_prod]), "y": float(y_c[i_prod]),
+                    "s_coord": float(s[i_prod]), "potential_kj_mol": float(V1[i_prod])},
+    },
+    "conventional_saddle": {"x": float(saddle_xy[0]), "y": float(saddle_xy[1]),
+                            "potential_kj_mol": float(saddle_V)},
+    "corridor_local_saddle": {"point_id": int(curve["point_id"].iloc[i_local]),
+                              "s_coord": float(s[i_local]),
+                              "potential_kj_mol": float(E_b_local)},
+    "barrier_height_local_kj_mol": float(E_b_local - V_r),
+    "crossover_temperature_K": float(Tc_light),
+    "crossover_definition": ("T at which the corridor WKB transmission "
+                             "kappa = exp(-2 A(E_b_local - k_B T)) equals exp(-1); "
+                             "action in units of h via semiclassical_action_scale=1.24"),
+    "action_scale": ACTION_SCALE,
+    "mean_action_reduction_fraction": float(red.mean()),
+    "mean_action_ratio_2d_over_corridor": float(profile["action_ratio_2d_over_corridor"].mean()),
+    "action_reduction_fraction_range": [float(red.min()), float(red.max())],
+    "worst_transverse_quad_residual_kj_mol": float(quad_residual.max()),
+    "transverse_frequency_range_cm1": [float(NU.min()), float(NU.max())],
+    "rate_ordering_example": {
+        "T_K": 297.5,
+        "log10_k_local_s_inv": r297["log10_k_local"],
+        "log10_k_optimized_s_inv": r297["log10_k_optimized"],
+        "log10_k_enhanced_s_inv": r297["log10_k_enhanced"],
+        "statement": ("k_optimized and k_local agree within ~0.06 log10 units "
+                      "(variational surface shifts <= 2 corridor steps toward the "
+                      "reactant side above ~330 K); the enhancement factor "
+                      "k_enhanced/k_optimized spans ~0.94-1.09: 2D action reduction "
+                      "dominates at high T (deep tunneling) while near the barrier top "
+                      "the grid-quantized 2D action is marginally larger than the "
+                      "finer 1D corridor integral"),
+    },
+    "assumptions": [
+        "semiclassical_action_scale (1.24) multiplies the raw reduced-coordinate WKB integral to give action in units of h; kappa = exp(-2A)",
+        "thermal tunneling energy E_t = E_b - k_B T for the temperature-dependent rates",
+        "crossover temperature defined where kappa = exp(-1) (kappa = 1/2 instead would give a lower T)",
+        "harmonic (quadratic) transverse fits; pointwise free energy F = V - R T ln(nu/nu_ref)",
+        "uniform isotope mass scaling: actions scale by sqrt(longitudinal_mass_scale); transverse frequencies by 1/sqrt(transverse_mass_scale); with uniform scaling s_optimized and dF are isotope-invariant, so the KIE is purely tunneling-driven",
+        "kappa_corridor and enhancement_factor referenced to the optimized surface",
+    ],
+}
+with open(f"{RESULTS}/diagnostics.json", "w") as fh:
+    json.dump(diag, fh, indent=2)
+
+# ------------------------------------------- write outputs
+make_rate_plot(f"{RESULTS}/rate_plot.png")
+fe_df.to_csv(f"{RESULTS}/free_energy_profile.csv", index=False)
+rates_df.to_csv(f"{RESULTS}/rate_constants.csv", index=False)
+profile.to_csv(f"{RESULTS}/transmission_profile.csv", index=False)
+paths_df.to_csv(f"{RESULTS}/path_samples.csv", index=False)
+iso_df.to_csv(f"{RESULTS}/isotope_effects.csv", index=False)
+iso_profile.to_csv(f"{RESULTS}/isotope_transmission_profile.csv", index=False)
+
+# ------------------------------------------- console summary
+print("=== SUMMARY ===")
+print(f"local saddle: point {int(curve['point_id'].iloc[i_local])}, s={s[i_local]:.4f}, "
+      f"V={E_b_local:.4f} kJ/mol; barrier={E_b_local - V_r:.4f}")
+print(f"conventional 2D saddle: ({saddle_xy[0]:.4f}, {saddle_xy[1]:.4f}) V={saddle_V:.4f}")
+print(f"crossover T: light={Tc_light:.2f} K, "
+      + ", ".join(f"{ic['case_id']}={crossover_T(ic['longitudinal_mass_scale']):.2f}"
+                  for _, ic in isotopes.iterrows() if ic['case_id'] != 'light'))
+print(f"mean action reduction fraction (2D vs corridor) = {red.mean():.4f} "
+      f"(range {red.min():.4f}..{red.max():.4f})")
+print(rates_df.to_string(index=False,
+      formatters={c: "{:.4f}".format for c in rates_df.columns if c not in ("T_K", "s_optimized")}))
+print()
+print(iso_df[["case_id", "T_K", "log10_k_enhanced_s_inv",
+              "log10_KIE_sct_vs_light", "crossover_T_K"]]
+      .to_string(index=False,
+      formatters={c: "{:.4f}".format for c in
+                  ["log10_k_enhanced_s_inv", "log10_KIE_sct_vs_light", "crossover_T_K"]}))
+print()
+print("rows:", {f: len(d) for f, d in [
+    ("free_energy_profile", fe_df), ("rate_constants", rates_df),
+    ("transmission_profile", profile), ("path_samples", paths_df),
+    ("isotope_effects", iso_df), ("isotope_transmission_profile", iso_profile)]})
+print("done")

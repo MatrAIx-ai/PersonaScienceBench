@@ -1,0 +1,336 @@
+"""
+analysis.py
+-----------
+Learns an action-selection model from solved grid-search training levels and
+exposes a policy that scores legal actions from *local* observations only.
+
+The file is fully self-contained: it imports only the standard-library module
+``math`` (no numpy / no third-party / no separate ``analysis`` module).
+
+Model
+-----
+A maximum-entropy (logistic) model over the four candidate directions
+``U, D, L, R``.  For a candidate action ``a`` in a local context the logit is a
+weighted sum of "compound local context" features (mirroring the task
+description: recent action runs, depth phase, relative tiles, legal masks):
+
+  * a global bias,
+  * the *turn* of ``a`` relative to the previous action
+    (straight / left / right / back),
+  * turn x run-length-bucket   (momentum of the current run),
+  * turn x depth-phase         (periodic behaviour along the path),
+  * the current cell tile's learned preference for direction ``a``
+    ("relative tiles"),
+  * the target neighbour tile's (the cell we would move into) learned
+    preference for direction ``a``.
+
+Only legal actions are scored.  The returned dict maps each legal action to a
+temperature-scaled softmax probability.  The default temperature (``T=3.0``)
+keeps the true best action as the clear leader while guaranteeing meaningful
+residual mass on the runner-up so a threshold / beam / best-first search can
+backtrack.  (The *ranking* is invariant to temperature, so this does not change
+which action is expanded first -- only the probability magnitudes.)
+
+Robustness
+----------
+Every feature the model needs is recomputed from the raw, unambiguous fields
+(``history`` / ``depth`` / ``cell`` / ``neighbors`` / ``legal_actions``) so that
+training and inference always use identical feature definitions, regardless of
+the scorer's exact field formats.  ``neighbors`` / ``legal_mask`` are parsed
+defensively (dict *or* list); ``run_length_bucket`` / ``depth_phase`` are used
+as fallbacks only when the raw history/depth are unavailable.
+"""
+
+from __future__ import annotations
+
+import math
+
+# --------------------------------------------------------------------------- #
+# Direction bookkeeping (fixed; matches action_order ['U','D','L','R'])
+# --------------------------------------------------------------------------- #
+DIRS = {'U': (-1, 0), 'D': (1, 0), 'L': (0, -1), 'R': (0, 1)}
+DIRLIST = ['U', 'D', 'L', 'R']
+OPPOSITE = {'U': 'D', 'D': 'U', 'L': 'R', 'R': 'L'}
+# turning left / right *from* a given heading
+LEFT_OF = {'U': 'L', 'L': 'D', 'D': 'R', 'R': 'U'}
+RIGHT_OF = {'U': 'R', 'R': 'D', 'D': 'L', 'L': 'U'}
+TURNS = ['straight', 'left', 'right', 'back']
+TIDX = {t: i for i, t in enumerate(TURNS)}
+
+# model hyper-parameters (overridable via ``config``)
+DEPTH_PHASES = 4     # depth phase = depth % DEPTH_PHASES
+RUN_BUCKETS = 4      # run bucket   = min(run, RUN_BUCKETS - 1)
+
+
+def _turn_of(action, prev):
+    """Classify ``action`` relative to ``prev`` (None at the start)."""
+    if prev is None:
+        return None
+    if action == prev:
+        return 'straight'
+    if action == LEFT_OF[prev]:
+        return 'left'
+    if action == RIGHT_OF[prev]:
+        return 'right'
+    if action == OPPOSITE[prev]:
+        return 'back'
+    return None
+
+
+def _is_wall(v):
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v in ('#', 'wall', 'W', 'x', 'X', '')
+    return v in (0, False)
+
+
+class Policy:
+    """Maximum-entropy local action-selection policy."""
+
+    def __init__(self, training_data, config=None):
+        config = config or {}
+        self.temperature = float(config.get('temperature', 3.0))
+        self.lr = float(config.get('lr', 0.05))
+        self.epochs = int(config.get('epochs', 30))
+        self.lam = float(config.get('l2', 1e-2))
+
+        records = self._build_records(training_data)
+        # learn tile vocabularies from the data
+        self.cell_letters = sorted({r['cell'] for r in records
+                                    if not _is_wall(r['cell'])})
+        self.nbr_letters = sorted({r['nbr'][d] for r in records for d in DIRLIST
+                                   if not _is_wall(r['nbr'][d])})
+        self._ci = {ch: i for i, ch in enumerate(self.cell_letters)}
+        self._ni = {ch: i for i, ch in enumerate(self.nbr_letters)}
+
+        # feature layout
+        cL = len(self.cell_letters)
+        nL = len(self.nbr_letters)
+        self.n_feat = 1 + 4 + 4 * RUN_BUCKETS + 4 * DEPTH_PHASES + cL * 4 + nL * 4
+        self.off_turn = 1
+        self.off_tr = 5
+        self.off_tdp = 5 + 4 * RUN_BUCKETS
+        self.off_cur = self.off_tdp + 4 * DEPTH_PHASES
+        self.off_nbr = self.off_cur + cL * 4
+
+        self.w = self._fit(records)
+
+    # ------------------------------------------------------------------ #
+    # training-data -> per-step records
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _tile(grid, r, c):
+        R, C = len(grid), len(grid[0])
+        if 0 <= r < R and 0 <= c < C:
+            return grid[r][c]
+        return '#'
+
+    def _build_records(self, training_data):
+        if isinstance(training_data, dict):
+            levels = training_data.get('levels', [])
+        elif isinstance(training_data, list):
+            levels = training_data
+        else:
+            levels = []
+        recs = []
+        for l in levels:
+            grid = l.get('grid')
+            sol = l.get('solution')
+            start = l.get('start')
+            if grid is None or sol is None or start is None:
+                continue
+            r, c = start
+            for i, a in enumerate(sol):
+                prev = sol[i - 1] if i > 0 else None
+                run = 0
+                while i - run - 1 >= 0 and sol[i - run - 1] == a:
+                    run += 1
+                legal = [d for d in DIRLIST
+                         if not _is_wall(self._tile(grid, r + DIRS[d][0],
+                                                     c + DIRS[d][1]))]
+                recs.append({
+                    'act': a, 'prev': prev, 'run': run, 'depth': i,
+                    'cell': self._tile(grid, r, c),
+                    'nbr': {d: self._tile(grid, r + DIRS[d][0], c + DIRS[d][1])
+                            for d in DIRLIST},
+                    'legal': legal,
+                })
+                r, c = r + DIRS[a][0], c + DIRS[a][1]
+        return recs
+
+    # ------------------------------------------------------------------ #
+    # feature vector for a candidate action
+    # ------------------------------------------------------------------ #
+    def _feat(self, prev, run, depth, cell, nbr, a):
+        v = [0.0] * self.n_feat
+        v[0] = 1.0
+        t = _turn_of(a, prev)
+        if t is not None:
+            ti = TIDX[t]
+            v[self.off_turn + ti] = 1.0
+            v[self.off_tr + ti * RUN_BUCKETS + min(run, RUN_BUCKETS - 1)] = 1.0
+            v[self.off_tdp + ti * DEPTH_PHASES + (depth % DEPTH_PHASES)] = 1.0
+        ci = self._ci.get(cell)
+        if ci is not None:
+            v[self.off_cur + ci * 4 + DIRLIST.index(a)] = 1.0
+        ni = self._ni.get(nbr.get(a))
+        if ni is not None:
+            v[self.off_nbr + ni * 4 + DIRLIST.index(a)] = 1.0
+        return v
+
+    # ------------------------------------------------------------------ #
+    # fit weights (gradient ascent on the log-likelihood + L2)
+    # ------------------------------------------------------------------ #
+    def _fit(self, records):
+        w = [0.0] * self.n_feat
+        n = self.n_feat
+        lr, lam, epochs = self.lr, self.lam, self.epochs
+        shrink = 1.0 - lr * lam
+        for _ in range(epochs):
+            for r in records:
+                legal = r['legal']
+                if not legal:
+                    continue
+                F = [self._feat(r['prev'], r['run'], r['depth'], r['cell'],
+                                r['nbr'], a) for a in legal]
+                logits = [sum(w[j] * f[j] for j in range(n) if f[j])
+                          for f in F]
+                m = max(logits)
+                exps = [math.exp(x - m) for x in logits]
+                Z = sum(exps)
+                p = [e / Z for e in exps]
+                for k, a in enumerate(legal):
+                    y = 1.0 if a == r['act'] else 0.0
+                    g = (y - p[k]) * lr
+                    f = F[k]
+                    for j in range(n):
+                        if f[j]:
+                            w[j] += g * f[j]
+                if shrink != 1.0:
+                    for j in range(n):
+                        w[j] *= shrink
+        return w
+
+    # ------------------------------------------------------------------ #
+    # defensive observation parsing
+    # ------------------------------------------------------------------ #
+    def _parse_neighbors(self, state):
+        """Return {U,D,L,R: tile-char} from ``neighbors`` (dict or 4-list)."""
+        nbr = state.get('neighbors')
+        out = {}
+        keymap = {'u': 'U', 'd': 'D', 'l': 'L', 'r': 'R',
+                  'up': 'U', 'down': 'D', 'left': 'L', 'right': 'R'}
+        if isinstance(nbr, dict):
+            for k, v in nbr.items():
+                kk = keymap.get(str(k).strip().lower())
+                if kk is not None:
+                    out[kk] = v if isinstance(v, str) else str(v)
+        elif isinstance(nbr, (list, tuple)) and len(nbr) == 4:
+            for kk, v in zip(DIRLIST, nbr):
+                out[kk] = v if isinstance(v, str) else str(v)
+        return out
+
+    def _legal_from_state(self, state):
+        """Recover the legal action set, preferring explicit fields."""
+        la = state.get('legal_actions')
+        if isinstance(la, (list, tuple)) and la:
+            la = [a for a in la if a in DIRS]
+            if la:
+                return la
+        lm = state.get('legal_mask')
+        if isinstance(lm, dict):
+            la = [d for d in DIRLIST if lm.get(d) or lm.get(d.lower())]
+            if la:
+                return la
+        if isinstance(lm, (list, tuple)) and len(lm) == 4:
+            la = [d for d, flag in zip(DIRLIST, lm) if flag]
+            if la:
+                return la
+        # fall back to neighbour tiles
+        nbr = self._parse_neighbors(state)
+        la = [d for d in DIRLIST if not _is_wall(nbr.get(d))]
+        return la or list(DIRLIST)
+
+    @staticmethod
+    def _as_int(x):
+        return x if isinstance(x, int) and not isinstance(x, bool) else None
+
+    # ------------------------------------------------------------------ #
+    # inference
+    # ------------------------------------------------------------------ #
+    def action_probs(self, level, state, legal_actions):
+        state = state or {}
+        legal = list(legal_actions) if (
+            isinstance(legal_actions, (list, tuple)) and legal_actions) \
+            else self._legal_from_state(state)
+        seen = set()
+        legal = [a for a in legal if a in DIRS and not (a in seen or seen.add(a))]
+        if not legal:
+            legal = list(DIRLIST)
+
+        # --- depth ---
+        hist = state.get('history')
+        if not isinstance(hist, (list, tuple)):
+            hist = state.get('history_tail') or []
+        depth = self._as_int(state.get('depth'))
+        if depth is None:
+            depth = len(hist)
+
+        # --- previous action + run length ---
+        prev = state.get('previous_action')
+        if prev not in DIRS:
+            prev = hist[-1] if hist else None
+        run = 0
+        if prev in DIRS:
+            for h in reversed(hist):
+                if h == prev:
+                    run += 1
+                else:
+                    break
+        if run == 0 and prev in DIRS:
+            # fallback to the scorer's derived field when history is missing
+            rl = self._as_int(state.get('run_length_bucket'))
+            if rl is not None:
+                run = rl
+
+        # --- depth phase fallback ---
+        if depth == 0:
+            dp = self._as_int(state.get('depth_phase'))
+            if dp is not None and 0 <= dp < DEPTH_PHASES:
+                depth = dp  # only the phase is used (depth % DEPTH_PHASES)
+
+        cell = state.get('cell')
+        if not isinstance(cell, str):
+            cell = ''
+        nbr = self._parse_neighbors(state)
+
+        w = self.w
+        n = self.n_feat
+        logits = []
+        for a in legal:
+            f = self._feat(prev, run, depth, cell, nbr, a)
+            s = 0.0
+            for j in range(n):
+                if f[j]:
+                    s += w[j] * f[j]
+            logits.append(s)
+
+        T = self.temperature if self.temperature > 0 else 1.0
+        scaled = [x / T for x in logits]
+        m = max(scaled)
+        exps = [math.exp(x - m) for x in scaled]
+        Z = sum(exps)
+        return {a: e / Z for a, e in zip(legal, exps)}
+
+
+def make_policy(training_data, config=None):
+    return Policy(training_data, config)
+
+
+if __name__ == '__main__':  # pragma: no cover - smoke test
+    import json, os
+    with open(os.path.join('data', 'training_levels.json')) as fh:
+        data = json.load(fh)
+    pol = make_policy(data)
+    print('trained, n_feat =', pol.n_feat)

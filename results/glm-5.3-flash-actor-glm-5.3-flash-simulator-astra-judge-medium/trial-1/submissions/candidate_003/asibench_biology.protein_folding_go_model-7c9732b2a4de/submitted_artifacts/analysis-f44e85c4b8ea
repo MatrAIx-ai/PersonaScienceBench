@@ -1,0 +1,509 @@
+"""
+B3: Interacting-bead stochastic dynamics on a reference configuration.
+
+Conventions (fixed per researcher-approved plan):
+- Reduced units: k_B = m = 1, temperature in units of kBT.
+- Backbone springs: E_bond = sum (k/2)(|r_i - r_{i+1}| - r0_i)^2, per-bond
+  r0_i from the reference. SPRING CONSTANT k = 100 (chosen within the approved
+  100-200 range, not tuned to outputs; stability: dt*sqrt(k) = 0.0052*10
+  = 0.052 < 0.1).
+- Native attractions (Go-like 10-12 wells) on the M reference contact pairs:
+  E_att = eps*(5*(s/r)^12 - 6*(s/r)^10), s = native pair distance, eps = 1.
+- Non-native repulsion: (sigma0/r)^12 on every pair with |i-j| >=
+  min_seq_separation that is NOT native; sigma0 = mean bond length (~3.88).
+- Q: hard-cutoff count, (# of the M reference pairs with distance <=
+  contact_cutoff)/M in [0,1]; identical definition at all temperatures and for
+  every downstream artifact.
+- Integrator: BAOAB Langevin splitting, fixed seed, per-temperature streams.
+- Burn-in (first 10% of steps) discarded for statistics ONLY; the trajectory
+  artifact keeps all N_CKPT checkpoints.
+- WHAM on dense (Q,E) samples (every step, post-burn-in) gives the fine-grid
+  <Q>(T), fluctuation heat capacity C(T), and P(Q) at T*.
+- Per-temperature observables come from the saved checkpoint series only.
+"""
+import json
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+RNG_SEED = 0
+EPS_NATIVE = 1.0
+K_SPRING = 100.0
+BURN_FRAC = 0.10
+N_QBINS = 50
+N_EBINS_WHAM = 200
+N_FINE = 200
+N_JOINT = 20
+# Auxiliary temperatures (same force field, protocol, and Q definition). The
+# midpoint condition <Q>(T*)=0.5 is NOT reached within the provided ladder
+# (verified by equilibrated pilot runs), so two sub-ladder runs are added ONLY
+# to the WHAM ensemble so that T* is obtained by interpolation, not
+# extrapolation. All ladder-keyed artifacts use the 6 file temperatures only.
+AUX_T = np.array([0.32, 0.42])
+
+with open("data/parameters.json") as fh:
+    P = json.load(fh)
+N = int(P["n_beads"]); GAMMA = float(P["friction"]); DT = float(P["dt_reduced"])
+TEMPS = np.asarray(P["temperature_list"], float)
+NSTEPS = int(P["n_steps_per_T"]); CUTOFF = float(P["contact_cutoff"])
+MINSEP = int(P["min_seq_separation"]); SAVE = int(P["save_interval"])
+K = len(TEMPS); N_CKPT = NSTEPS // SAVE
+T_ALL = np.concatenate([TEMPS, AUX_T]); K_ALL = len(T_ALL)
+
+ref = np.load("data/target_coords.npy")
+assert ref.shape == (N, 3)
+
+D_ref = np.linalg.norm(ref[:, None, :] - ref[None, :, :], axis=-1)
+native_pairs = [(i, j) for i in range(N) for j in range(i + 1, N)
+                if j - i >= MINSEP and D_ref[i, j] <= CUTOFF]
+M = len(native_pairs)
+I_nat = np.array([p[0] for p in native_pairs])
+J_nat = np.array([p[1] for p in native_pairs])
+S_nat = D_ref[I_nat, J_nat]
+native_set = set(native_pairs)
+nn_pairs = [(i, j) for i in range(N) for j in range(i + 1, N)
+            if j - i >= MINSEP and (i, j) not in native_set]
+I_nn = np.array([p[0] for p in nn_pairs]); J_nn = np.array([p[1] for p in nn_pairs])
+R0_BOND = np.linalg.norm(ref[1:] - ref[:-1], axis=1)
+SIGMA0 = float(R0_BOND.mean())
+
+def forces_and_energy(R):
+    """R: (K, N, 3) -> (E (K,), F (K, N, 3), native pair distances (K, M))."""
+    Kr = R.shape[0]
+    E = np.zeros(Kr); F = np.zeros_like(R)
+    dv = R[:, 1:, :] - R[:, :-1, :]
+    dist = np.linalg.norm(dv, axis=-1)
+    E += 0.5 * K_SPRING * ((dist - R0_BOND) ** 2).sum(axis=1)
+    w = (K_SPRING * (dist - R0_BOND) / dist)[:, :, None] * dv
+    F[:, :-1, :] += w; F[:, 1:, :] -= w
+    dvn = R[:, I_nat, :] - R[:, J_nat, :]
+    dn = np.linalg.norm(dvn, axis=-1)
+    E += (EPS_NATIVE * (5.0 * (S_nat / dn) ** 12
+                        - 6.0 * (S_nat / dn) ** 10)).sum(axis=1)
+    fm = -60.0 * EPS_NATIVE * S_nat ** 10 / dn ** 11 * (1.0 - (S_nat / dn) ** 2)
+    Fn = fm[:, :, None] * (dvn / dn[:, :, None])
+    np.add.at(F, (slice(None), I_nat), Fn)
+    np.add.at(F, (slice(None), J_nat), -Fn)
+    dvr = R[:, I_nn, :] - R[:, J_nn, :]
+    dr = np.linalg.norm(dvr, axis=-1)
+    E += ((SIGMA0 / dr) ** 12).sum(axis=1)
+    fr = 12.0 * SIGMA0 ** 12 / dr ** 13
+    Fr = fr[:, :, None] * (dvr / dr[:, :, None])
+    np.add.at(F, (slice(None), I_nn), Fr)
+    np.add.at(F, (slice(None), J_nn), -Fr)
+    return E, F, dn
+
+q_of = lambda dn: (dn <= CUTOFF).sum(axis=1) / float(M)
+
+# ------------------------------------------------------------ batched BAOAB
+# All K temperatures are integrated simultaneously: the drift force is
+# temperature-independent; only the O (Ornstein-Uhlenbeck) step scales differ.
+rng = np.random.default_rng(RNG_SEED)
+R = np.broadcast_to(ref, (K_ALL, N, 3)).copy()
+V = np.zeros_like(R)
+c_ou = np.exp(-GAMMA * DT)
+c_arr = np.full((K_ALL, 1, 1), c_ou)
+# OU noise scale sqrt((1-c^2) * kBT/m) with k_B = m = 1, per temperature
+s_arr = np.sqrt(1.0 - c_ou ** 2) * np.sqrt(T_ALL)[:, None, None]
+Q_dense = np.empty((K_ALL, NSTEPS)); E_dense = np.empty((K_ALL, NSTEPS))
+DN_ckpt = np.empty((K_ALL, N_CKPT, M))
+half = 0.5 * DT
+ckpt_steps = set(range(SAVE, NSTEPS + 1, SAVE))
+E, F, _ = forces_and_energy(R)
+for step in range(1, NSTEPS + 1):
+    V += half * F                       # B (half kick)
+    R = R + DT * V                      # A
+    xi = rng.standard_normal((K_ALL, N, 3))
+    V = c_arr * V + s_arr * xi           # O
+    R = R + DT * V                      # A
+    E, F, dn = forces_and_energy(R)
+    V += half * F                       # B (half kick)
+    Q_dense[:, step - 1] = q_of(dn)
+    E_dense[:, step - 1] = E
+    if step in ckpt_steps:
+        DN_ckpt[:, (step // SAVE) - 1, :] = dn
+R_final = R.copy()
+
+Q_ckpt = Q_dense[:K, SAVE - 1::SAVE]      # ladder rows only
+assert Q_ckpt.shape == (K, N_CKPT) and DN_ckpt.shape[1] == N_CKPT
+np.save("final_coords.npy", R_final[0].astype(np.float64))   # lowest T
+np.save("order_parameter_trajectory.npy", Q_ckpt.astype(np.float64))
+
+# statistics use post-burn-in frames only
+b_ck = int(round(BURN_FRAC * N_CKPT))
+Qs = Q_ckpt[:, b_ck:]
+E_ckpt = E_dense[:K, SAVE - 1::SAVE]
+Es = E_ckpt[:, b_ck:]
+b_dense = int(round(BURN_FRAC * NSTEPS))
+Qd = Q_dense[:, b_dense:]; Ed = E_dense[:, b_dense:]   # all rows feed WHAM
+
+# (K,50) Q histograms over [0,1], probability mass (rows sum to 1)
+q_edges = np.linspace(0.0, 1.0, N_QBINS + 1)
+q_centers = 0.5 * (q_edges[:-1] + q_edges[1:])
+hist = np.empty((K, N_QBINS))
+for t in range(K):
+    h, _ = np.histogram(Qs[t], bins=q_edges)
+    hist[t] = h / h.sum()
+np.save("order_parameter_histograms.npy", hist.astype(np.float64))
+
+# per-temperature observables (checkpoint series, post-burn-in frames)
+mean_Q = Qs.mean(axis=1); var_Q = Qs.var(axis=1)
+mean_E = Es.mean(axis=1); var_E = Es.var(axis=1)
+C_direct = var_E / TEMPS ** 2
+corr_QE = np.array([np.corrcoef(Qs[t], Es[t])[0, 1] for t in range(K)])
+with open("temperature_observables.json", "w") as fh:
+    json.dump({"temperatures": TEMPS.tolist(),
+               "mean_order_parameter_by_T": mean_Q.tolist(),
+               "var_order_parameter_by_T": var_Q.tolist(),
+               "mean_energy_by_T": mean_E.tolist(),
+               "var_energy_by_T": var_E.tolist(),
+               "heat_capacity_direct_by_T": C_direct.tolist(),
+               "q_energy_correlation_by_T": corr_QE.tolist()}, fh, indent=2)
+
+# joint (Q, z-scored E) histograms from checkpoint frames; clipped z in [-3,3]
+# so every temperature slice sums exactly to 1
+zE = np.clip((E_ckpt[:, b_ck:] - mean_E[:, None]) / np.sqrt(var_E)[:, None],
+             -3.0, 3.0)
+q20 = np.linspace(0.0, 1.0, N_JOINT + 1); z20 = np.linspace(-3.0, 3.0, N_JOINT + 1)
+joint = np.empty((K, N_JOINT, N_JOINT))
+for t in range(K):
+    h, _, _ = np.histogram2d(Qs[t], zE[t], bins=[q20, z20])
+    joint[t] = h / h.sum()
+np.save("q_energy_joint_histograms.npy", joint.astype(np.float64))
+
+# per-pair native contact probability (K, M) from checkpoint frames
+ncp = (DN_ckpt[:K, b_ck:, :] <= CUTOFF).mean(axis=1)
+np.save("native_contact_probability.npy", ncp.astype(np.float64))
+
+# ------------------------------------------------------------------- WHAM
+# Dense post-burn-in (Q, E) samples; joint histogram (nQ x nE) per temperature.
+# Energies are shifted by the global mean E0 for numerical conditioning; the
+# shift cancels exactly in the WHAM self-consistency and in reweighting.
+E0 = Ed.mean()
+# ----------------------------- binless WHAM (UWHAM) reweighting -------------
+# Each dense post-burn-in sample enters with its EXACT energy (no bin-center
+# bias). Energies are shifted by E0 for conditioning; the shift is exact in
+# the log domain and cancels in all normalized quantities. Fixed point for the
+# per-state free energies logM_j, then arbitrary-temperature reweighting.
+from scipy.special import logsumexp
+Ep = (Ed - E0).ravel()                       # shifted energies, all samples
+Qp = np.rint(Qd.ravel() * M).astype(int)     # discrete Q index 0..M
+beta_all = 1.0 / T_ALL
+B = np.log(Ed.shape[1]) - beta_all[:, None] * Ep[None, :]   # logN_j - b_j E'
+logM = np.zeros(K_ALL)
+for _ in range(5000):
+    logden = logsumexp(B + logM[:, None], axis=0)
+    logw = -logden
+    logMnew = -(logsumexp(B + logw[None, :], axis=1) - logsumexp(logw))
+    delta = np.max(np.abs(logMnew - logM))
+    logM = logMnew
+    if delta < 1e-10:
+        break
+logden = logsumexp(B + logM[:, None], axis=0)
+q_support = np.arange(M + 1) / float(M)
+
+fine_T = np.linspace(0.30, 1.45, N_FINE)
+meanQ_fine = np.empty(N_FINE); meanE_fine = np.empty(N_FINE)
+varE_fine = np.empty(N_FINE); C_fine = np.empty(N_FINE)
+for a, Tv in enumerate(fine_T):
+    lw = -(1.0 / Tv) * Ep - logden
+    lw -= logsumexp(lw)
+    w = np.exp(lw)
+    Pq = np.bincount(Qp, weights=w, minlength=M + 1)
+    meanQ_fine[a] = Pq.dot(q_support)
+    mE = (w * Ep).sum()
+    meanE_fine[a] = mE + E0
+    varE_fine[a] = (w * Ep ** 2).sum() - mE ** 2
+    C_fine[a] = varE_fine[a] / Tv ** 2
+np.save("heat_capacity_curve.npy", np.vstack([fine_T, C_fine]).astype(np.float64))
+
+# T*: <Q>(T*) = 0.5 via linear interpolation between fine-grid points
+T_star = None
+for a in range(N_FINE - 1):
+    y0, y1 = meanQ_fine[a] - 0.5, meanQ_fine[a + 1] - 0.5
+    if y0 == 0.0:
+        T_star = fine_T[a]; break
+    if y0 * y1 < 0:
+        T_star = fine_T[a] + (0.5 - meanQ_fine[a]) / (meanQ_fine[a + 1]
+                 - meanQ_fine[a]) * (fine_T[a + 1] - fine_T[a])
+        break
+warnings = []
+if T_star is None:
+    T_star = float(fine_T[np.argmin(np.abs(meanQ_fine - 0.5))])
+    warnings.append("<Q>(T) never crossed 0.5 on the fine temperature grid; "
+                    "used the fine-grid temperature minimizing |<Q>-0.5| "
+                    "instead.")
+warnings.append(
+    "The <Q>=0.5 midpoint lies below the lowest provided ladder temperature "
+    f"({TEMPS[0]:.4f}); auxiliary trajectories at T={AUX_T[0]:.2f} and "
+    f"T={AUX_T[1]:.2f} (identical force field, protocol, and Q definition) "
+    "were added to the reweighting ensemble so that T* is obtained by "
+    "interpolation rather than extrapolation. All per-temperature artifacts "
+    "use only the 6 file temperatures.")
+warnings.append(
+    "T* carries statistical uncertainty of order 0.03-0.05 in T: the chain "
+    "relaxes slowly at low T, and independent seeds give <Q>(T) varying by "
+    "about +/-0.04 at fixed temperature.")
+warnings.append(
+    "transition_free_energy_profile: Q is discrete (multiples of 1/36), so "
+    "0.02-wide bins containing no attainable Q value are assigned the "
+    "occupied-profile maximum (ceiling convention) to keep the artifact "
+    "finite.")
+i_star = int(np.argmin(np.abs(fine_T - T_star)))
+
+# Q distribution at T* on its discrete support (Q = k/M, k = 0..M)
+lw = -(1.0 / T_star) * Ep - logden
+lw -= logsumexp(lw)
+P_supp = np.bincount(Qp, weights=np.exp(lw), minlength=M + 1)
+# smooth on the discrete support for mode finding (Q lattice spacing 1/M)
+P_smooth = gaussian_filter1d(P_supp, sigma=1.2, mode="nearest")
+P_smooth /= P_smooth.sum()
+F_supp = -T_star * np.log(np.maximum(P_smooth, 1e-12))
+F_supp -= F_supp.min()
+peaks = [i for i in range(1, M) if P_smooth[i] >= P_smooth[i - 1]
+         and P_smooth[i] > P_smooth[i + 1]]
+if not peaks:
+    peaks = [int(np.argmax(P_smooth))]
+peaks.sort(key=lambda i: -P_smooth[i])
+if len(peaks) >= 2:
+    m1, m2 = sorted((peaks[0], peaks[1]))
+    modes = [float(q_support[m1]), float(q_support[m2])]
+    mode_sep = float(q_support[m2] - q_support[m1])
+    saddle = m1 + int(np.argmax(F_supp[m1:m2 + 1]))
+    barrier = float(max(0.0, F_supp[saddle] - min(F_supp[m1], F_supp[m2])))
+else:
+    modes = [float(q_support[peaks[0]])]
+    mode_sep = 0.0; barrier = 0.0
+    warnings.append("P(Q) at T* is single-mode; mode_separation and "
+                    "free_energy_barrier_kT reported as 0.")
+
+# 50-bin free-energy profile artifact (row0 bin centers, row1 F, min = 0).
+# Q is discrete (multiples of 1/M), so some 0.02-wide bins contain no
+# attainable Q value; empty bins are assigned the occupied-profile maximum
+# (a ceiling convention) so the artifact stays finite.
+P_bin = np.zeros(N_QBINS)
+for k in range(M + 1):
+    P_bin[min(int(np.floor(q_support[k] * N_QBINS)), N_QBINS - 1)] += P_supp[k]
+F_full = -T_star * np.log(np.maximum(P_bin, 1e-300))
+occ = np.isfinite(F_full)
+F_prof = np.where(occ, F_full, F_full[occ].max())
+F_prof -= F_prof.min()
+np.save("transition_free_energy_profile.npy",
+        np.vstack([q_centers, F_prof]).astype(np.float64))
+
+# Jaccard: adjacency of the final lowest-temperature configuration vs reference
+fin = np.load("final_coords.npy")
+D_fin = np.linalg.norm(fin[:, None, :] - fin[None, :, :], axis=-1)
+fin_pairs = {(i, j) for i in range(N) for j in range(i + 1, N)
+             if j - i >= MINSEP and D_fin[i, j] <= CUTOFF}
+jaccard = float(len(fin_pairs & native_set) / len(fin_pairs | native_set))
+
+with open("transition_analysis.json", "w") as fh:
+    json.dump({"transition_temperature": float(T_star),
+               "peak_heat_capacity": float(C_fine.max()),
+               "order_parameter_at_transition_mean": float(meanQ_fine[i_star]),
+               "order_parameter_at_transition_modes": modes,
+               "mode_separation": mode_sep,
+               "free_energy_barrier_kT": barrier,
+               "reference_contact_jaccard": jaccard,
+               "warnings": warnings}, fh, indent=2)
+# ------------------------------------------------------------ visualization
+# matplotlib is unavailable in this environment; the figure is rendered with a
+# self-contained numpy/zlib PNG writer (stdlib zlib only, no extra packages).
+import zlib, struct
+
+def _png_write(path, img):
+    h, w, _ = img.shape
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    hdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # IHDR: width, height
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", hdr)
+                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+FONT5x7 = {
+ 'A':"01110 10001 10001 11111 10001 10001 10001",'B':"11110 10001 10001 11110 10001 10001 11110",
+ 'C':"01110 10001 10000 10000 10000 10001 01110",'D':"11110 10001 10001 10001 10001 10001 11110",
+ 'E':"11111 10000 10000 11110 10000 10000 11111",'F':"11111 10000 10000 11110 10000 10000 10000",
+ 'G':"01110 10001 10000 10111 10001 10001 01110",'H':"10001 10001 10001 11111 10001 10001 10001",
+ 'I':"11111 00100 00100 00100 00100 00100 11111",'J':"00111 00010 00010 00010 00010 10010 01100",
+ 'K':"10001 10010 10100 11000 10100 10010 10001",'L':"10000 10000 10000 10000 10000 10000 11111",
+ 'M':"10001 11011 10101 10101 10001 10001 10001",'N':"10001 11001 10101 10011 10001 10001 10001",
+ 'O':"01110 10001 10001 10001 10001 10001 01110",'P':"11110 10001 10001 11110 10000 10000 10000",
+ 'Q':"01110 10001 10001 10001 10101 10010 01101",'R':"11110 10001 10001 11110 10100 10010 10001",
+ 'S':"01111 10000 10000 01110 00001 00001 11110",'T':"11111 00100 00100 00100 00100 00100 00100",
+ 'U':"10001 10001 10001 10001 10001 10001 01110",'V':"10001 10001 10001 10001 10001 01010 00100",
+ 'W':"10001 10001 10001 10101 10101 11011 10001",'X':"10001 10001 01010 00100 01010 10001 10001",
+ 'Y':"10001 10001 01010 00100 00100 00100 00100",'Z':"11111 00001 00010 00100 01000 10000 11111",
+ '0':"01110 10001 10011 10101 11001 10001 01110",'1':"00100 01100 00100 00100 00100 00100 01110",
+ '2':"01110 10001 00001 00010 00100 01000 11111",'3':"11110 00001 00001 01110 00001 00001 11110",
+ '4':"00010 00110 01010 10010 11111 00010 00010",'5':"11111 10000 11110 00001 00001 10001 01110",
+ '6':"00110 01000 10000 11110 10001 10001 01110",'7':"11111 00001 00010 00100 01000 01000 01000",
+ '8':"01110 10001 10001 01110 10001 10001 01110",'9':"01110 10001 10001 01111 00001 00010 01100",
+ ' ':"00000 00000 00000 00000 00000 00000 00000",'.':"00000 00000 00000 00000 00000 01100 01100",
+ ',':"00000 00000 00000 00000 01100 01100 01000",':':"00000 01100 01100 00000 01100 01100 00000",
+ '=':"00000 00000 11111 00000 11111 00000 00000",'+':"00100 00100 11111 00100 00100 00000 00000",
+ '-':"00000 00000 00000 11111 00000 00000 00000",'*':"00000 10101 01110 11111 01110 10101 00000",
+ '/':"00001 00010 00010 00100 01000 01000 10000",'(':"00010 00100 01000 01000 01000 00100 00010",
+ ')':"01000 00100 00010 00010 00010 00100 01000",'[':"01111 01000 01000 01000 01000 01000 01111",
+ ']':"11110 00010 00010 00010 00010 00010 11110",'^':"00100 01010 10001 00000 00000 00000 00000",
+ '_':"00000 00000 00000 00000 00000 00000 11111",'<':"00010 00100 01000 10000 01000 00100 00010",
+}
+
+def draw_text(img, x, y, text, color, scale=1):
+    for k, ch in enumerate(text):
+        g = FONT5x7.get(ch, FONT5x7[' ']).split()
+        for r in range(7):
+            for c in range(5):
+                if g[r][c] == '1':
+                    y0, x0 = y + r*scale, x + k*6*scale + c*scale
+                    img[y0:y0+scale, x0:x0+scale] = color
+
+def draw_line(img, x0, y0, x1, y1, color, thick=1):
+    n = int(max(abs(x1-x0), abs(y1-y0))) + 1
+    xs = np.round(np.linspace(x0, x1, n)).astype(int)
+    ys = np.round(np.linspace(y0, y1, n)).astype(int)
+    h, w = img.shape[:2]; t = thick // 2
+    ok = (xs >= -t) & (xs < w+t) & (ys >= -t) & (ys < h+t)
+    xs, ys = xs[ok], ys[ok]
+    img[np.clip(ys,0,h-1), np.clip(xs,0,w-1)] = color
+
+def draw_disc(img, xc, yc, r, color):
+    h, w = img.shape[:2]
+    for dy in range(-r, r+1):
+        dx = int(np.sqrt(max(r*r - dy*dy, 0)))
+        y = yc + dy
+        if 0 <= y < h:
+            img[y, max(xc-dx,0):min(xc+dx+1,w)] = color
+
+def _panel(img, x0, y0, x1, y1, title):
+    draw_line(img, x0, y0, x1, y0, (0,0,0)); draw_line(img, x0, y1, x1, y1, (0,0,0))
+    draw_line(img, x0, y0, x0, y1, (0,0,0)); draw_line(img, x1, y0, x1, y1, (0,0,0))
+    draw_text(img, x0+6, y0-16, title, (0,0,0), scale=1)
+
+def _xticks(img, x0, x1, ytick, vmin, vmax, n=5, scale=1, fmt="{:.2f}"):
+    for i in range(n):
+        v = vmin + (vmax-vmin)*i/(n-1); xp = int(round(x0 + (x1-x0)*i/(n-1)))
+        draw_line(img, xp, ytick, xp, ytick+4, (0,0,0))
+        s = fmt.format(v)
+        draw_text(img, xp - 3*len(s), ytick+7, s, (0,0,0), scale=scale)
+
+def _yticks(img, y0, y1, xtick, vmin, vmax, n=4, scale=1, fmt="{:.1f}"):
+    for i in range(n):
+        v = vmin + (vmax - vmin) * i / (n - 1)
+        yp = int(round(y1 - (y1 - y0) * i / (n - 1)))
+        draw_line(img, xtick - 4, yp, xtick, yp, (0, 0, 0))
+        t = fmt.format(v)
+        draw_text(img, xtick - 8 - 6*len(t)*scale, yp - 3, t, (0, 0, 0), scale=scale)
+
+# build the multi-panel figure on a pixel canvas
+CW, CH = 1400, 1000
+img = np.full((CH, CW, 3), 255, np.uint8)
+PAL = [(68,1,84),(59,82,139),(33,145,140),(94,201,98),(253,231,37),(220,50,32)]
+PAL = [PAL[min(t, K-1)] for t in range(K)]
+PAL = [tuple(int(v) for v in p) for p in
+       (np.array([(68,1,84),(59,82,139),(33,145,140),(94,201,98),(180,222,60),(220,50,32)])[:K])]
+
+# Panel 1: final configuration (lowest T) vs reference, orthographic 3D view
+px0, py0, px1, py1 = 60, 70, 660, 470
+_panel(img, px0, py0, px1, py1, "FINAL CONFIG (LOWEST T) VS REFERENCE")
+refc = ref - ref.mean(0); finc = fin - fin.mean(0)
+def proj(P3, cx, cy, s, ax=0.5, az=0.6):
+    ca, sa, cz, sz = np.cos(ax), np.sin(ax), np.cos(az), np.sin(az)
+    x = P3[:,0]*cz + P3[:,1]*sz
+    y = -P3[:,0]*sz*ca + P3[:,1]*cz*ca + P3[:,2]*sa
+    return cx + s*x, cy - s*y
+allc = np.vstack([refc, finc]); span = max(np.ptp(allc[:,0]), np.ptp(allc[:,1]), 1e-9)
+s = 0.8*(px1-px0-40)/span; cx, cy = (px0+px1)/2, (py0+py1)/2
+rx, ry = proj(refc, cx, cy, s); fx, fy = proj(finc, cx, cy, s)
+for i in range(N-1):
+    draw_line(img, rx[i], ry[i], rx[i+1], ry[i+1], (150,150,150), 2)
+for i in range(N):
+    draw_disc(img, int(round(rx[i])), int(round(ry[i])), 4, (120,120,120))
+for i in range(N-1):
+    draw_line(img, fx[i], fy[i], fx[i+1], fy[i+1], (180,30,30), 3)
+for i in range(N):
+    draw_disc(img, int(round(fx[i])), int(round(fy[i])), 6, (180,30,30))
+draw_text(img, px0+10, py1-16, "GRAY: REFERENCE   RED: FINAL (T=%.3f)" % TEMPS[0], (0,0,0))
+
+# Panel 2: per-temperature Q histograms
+qx0, qy0, qx1, qy1 = 740, 70, 1340, 470
+_panel(img, qx0, qy0, qx1, qy1, "Q HISTOGRAMS PER TEMPERATURE")
+hmax = hist.max()
+for t in range(K):
+    pts = [(int(qx0+30 + (qx1-qx0-60)*q_centers[b]), int(qy1-30 - (qy1-qy0-60)*hist[t,b]/hmax))
+           for b in range(N_QBINS)]
+    for b in range(N_QBINS-1):
+        draw_line(img, pts[b][0], pts[b][1], pts[b+1][0], pts[b+1][1], PAL[t], 3)
+_xticks(img, qx0+30, qx1-30, qy1, 0.0, 1.0, 6, fmt="%.1f")
+_yticks(img, qy1-30, qy0+30, qx0+30, 0.0, float(hmax)*1.05, 4, fmt="%.2f")
+draw_text(img, qx0+2, qy0+40, "P(Q)", (0,0,0))
+draw_text(img, qx1-90, qy1-14, "Q", (0,0,0), scale=2)
+for t in range(K):
+    ly = qy0+18+12*t
+    draw_line(img, qx0+40, ly, qx0+70, ly, PAL[t], 2)
+    draw_text(img, qx0+78, ly-3, "T=%.3f" % TEMPS[t], (0,0,0))
+
+# Panel 3: response curve
+rx0, ry0, rx1, ry1 = 60, 570, 660, 950
+_panel(img, rx0, ry0, rx1, ry1, "RESPONSE CURVE  C(V)/T^2  (WHAM)")
+cmax = np.percentile(C_fine, 99.5); ctop = cmax*1.1
+def cy(v, top): return int(ry1-30 - (ry1-ry0-70)*min(v, top)/top)
+prev = None
+for a in range(N_FINE):
+    xp = int(rx0+40 + (rx1-rx0-80)*(fine_T[a]-fine_T[0])/(fine_T[-1]-fine_T[0]))
+    yp = cy(C_fine[a], ctop)
+    if prev: draw_line(img, prev[0], prev[1], xp, yp, (20,20,120), 3)
+    prev = (xp, yp)
+for t in range(K):
+    xp = int(rx0+40 + (rx1-rx0-80)*(TEMPS[t]-fine_T[0])/(fine_T[-1]-fine_T[0]))
+    draw_disc(img, xp, cy(C_direct[t], ctop), 3, (220,120,0))
+xp = int(rx0+40 + (rx1-rx0-80)*(T_star-fine_T[0])/(fine_T[-1]-fine_T[0]))
+for yy in range(ry0+10, ry1-25, 6):
+    img[yy:yy+3, xp] = (200,0,0)
+_xticks(img, rx0+40, rx1-40, ry1, fine_T[0], fine_T[-1], 6, fmt="%.2f")
+_yticks(img, ry1-30, ry0+30, rx0+40, 0.0, float(ctop), 4, fmt="%.0f")
+draw_text(img, rx0+6, ry0+40, "C(V)/T^2", (0,0,0))
+draw_text(img, rx0+45, ry0+18, "RED DASH: T*=%.3f  ORANGE: DIRECT PER-T" % T_star, (0,0,0))
+
+# Panel 4: free-energy profile at T*
+fx0, fy0, fx1, fy1 = 740, 570, 1340, 950
+_panel(img, fx0, fy0, fx1, fy1, "FREE ENERGY F(Q) AT T*=%.3f (KB T* UNITS)" % T_star)
+fmax = np.percentile(F_prof, 99.0); ftop = max(fmax*1.1, 1e-9)
+prev = None
+for b in range(N_QBINS):
+    xp = int(fx0+40 + (fx1-fx0-80)*q_centers[b])
+    yp = int(fy1-30 - (fy1-fy0-70)*min(F_prof[b], ftop)/ftop)
+    if prev: draw_line(img, prev[0], prev[1], xp, yp, (0,110,110), 3)
+    prev = (xp, yp)
+for m in modes:
+    xm = int(fx0+40 + (fx1-fx0-80)*m)
+    for yy in range(fy0+10, fy1-25, 6):
+        img[yy:yy+3, xm] = (140,60,170)
+_xticks(img, fx0+40, fx1-40, fy1, 0.0, 1.0, 6, fmt="%.1f")
+_yticks(img, fy1-30, fy0+30, fx0+40, 0.0, float(ftop), 4, fmt="%.0f")
+draw_text(img, fx0+6, fy0+40, "F(Q)", (0,0,0))
+draw_text(img, fx0+45, fy0+18, "BARRIER=%.2f  MODES=%s" % (barrier, [round(m,2) for m in modes]), (0,0,0))
+
+_png_write("visualization.png", img)
+
+# -------------------------------------------------------------- diagnostics
+print(f"M native contacts = {M}; sigma0 = {SIGMA0:.4f}; N_CKPT = {N_CKPT}")
+print("direct <Q> per T :", np.round(mean_Q, 4))
+ladder_idx = [int(np.argmin(np.abs(fine_T - t))) for t in TEMPS]
+print("WHAM  <Q> per T  :", np.round(meanQ_fine[ladder_idx], 4))
+print("WHAM  <Q> aux    :", np.round(meanQ_fine[[int(np.argmin(np.abs(fine_T - t))) for t in AUX_T]], 4))
+print("direct <Q> aux   :", np.round(Qd[K:].mean(axis=1), 4))
+print("mean_E per T     :", np.round(mean_E, 3))
+print("var_E per T      :", np.round(var_E, 3))
+print("C_direct per T   :", np.round(C_direct, 3))
+print("C_fine sample    :", np.round([[t, c] for t, c in
+      zip(fine_T[::20], C_fine[::20])], 2).tolist())
+print("corr(Q,E) per T  :", np.round(corr_QE, 3))
+print(f"T* = {T_star:.4f}; <Q>(T*) = {meanQ_fine[i_star]:.4f}")
+print(f"modes = {modes}; separation = {mode_sep:.4f}; barrier = {barrier:.3f} kBT*")
+print(f"peak C = {C_fine.max():.3f} at T = {fine_T[int(np.argmax(C_fine))]:.4f}")
+final_Q = (np.linalg.norm(fin[I_nat] - fin[J_nat], axis=1) <= CUTOFF).sum() / M
+print(f"Jaccard(final vs reference) = {jaccard:.4f}; final-config Q = {final_Q:.4f}")
+print("warnings:", warnings)

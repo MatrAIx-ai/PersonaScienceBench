@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""
+analysis.py - Deterministic target-tracking audit for data/measurements.npz
+
+Public inputs : data/measurements.npz  {Y (95,2), t (95,), mask (95,2), metadata}
+Outputs       : results/state_estimates.csv, results/filter_diagnostics.csv,
+                results/summary.json, results/overview.png, results/conclusion.txt
+
+Method (data-inferred; full audit trail in conclusion.txt):
+  * Channel semantics inferred from magnitudes: ch0 = range-like (strictly
+    positive, 0.52..4.09), ch1 = bearing-like (confined to [-pi, pi]).
+  * Bootstrap particle filter (N=1200 <= 1500), fixed seed, log-domain weights
+    throughout (used_log_weights = true).
+  * Motion: constant velocity + small random-walk acceleration, with an
+    "IMM-lite" proposal mixture (CV branch + coordinated-turn branch) and
+    NIS-triggered adaptive process-noise inflation for maneuver intervals.
+  * Measurement: h(x) = [hypot(px,py), atan2(py,px)]; wrap-aware bearing
+    residual; per-channel mixture likelihood (95% Gaussian + 5% broad
+    heavy tail) for impulsive-outlier robustness; masked channels are SKIPPED
+    in the likelihood (pure prediction for that channel).
+  * Two variants are run and compared (bearing-bias state augmentation vs
+    process-noise inflation only); the winner is selected by innovation
+    whiteness (lag-1 autocorrelation of the per-step bearing residual series)
+    and the winner's artifacts are written to results/.
+  * IMPORTANT: the true trajectory is private. rmse_pos / rmse_vel / nees are
+    PROXIES computed against a robust smooth-trajectory reference fitted to
+    the public measurements (piecewise-constant acceleration, robust loss),
+    NOT absolute errors. Stated prominently in conclusion.txt.
+  * overview.png is rendered WITHOUT matplotlib (not installed, no network):
+    a pure-stdlib PNG encoder (zlib + struct) writes a 2x2 diagnostic panel;
+    the encoded file is re-parsed and verified decodable before exit.
+"""
+
+import json
+import math
+import os
+import struct
+import zlib
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+SEED = 20260117
+N_PARTICLES = 1500          # <= 1500 per task contract
+SIGMA_R = 0.03              # range likelihood width (second-difference/regularized-fit estimate ~0.03)
+SIGMA_B = 0.02              # bearing likelihood width (regularized-fit residual std ~0.015)
+OUTLIER_MIX_WEIGHT = 0.05   # broad heavy-tail component weight
+OUTLIER_MIX_SCALE = 8.0     # broad component = 8x sigma
+SIGMA_A_BASE = 0.05         # base random-walk acceleration std
+Q_MULT_MAX = 8.0            # max adaptive process-noise inflation
+Q_MULT_UP = 1.7             # inflation factor when NIS fires
+Q_MULT_DECAY = 0.85         # per-step decay of inflation toward 1
+NIS_TRIGGER = 9.0           # ~chi2(2) 99% quantile for 2 available channels
+TEMPER_GAMMA = 0.8   # likelihood tempering vs predicted spread
+P_CT = 0.15                 # probability of coordinated-turn proposal branch
+SIGMA_W = 0.06              # turn-rate std of CT branch (rad / step)
+SIGMA_INIT_POS = 0.15
+SIGMA_INIT_VEL = 0.30
+SIGMA_JITTER = 0.02         # post-resampling roughening
+SIGMA_BIAS_STEP = 0.012     # bearing-bias random-walk std (variant 'bias')
+SIGMA_BIAS_INIT = 0.05
+ESS_RESAMPLE_FRAC = 0.5
+LOGW_FLOOR = -690.0         # keep all log weights finite (never -inf)
+
+DATA_PATH = "data/measurements.npz"
+RESULTS_DIR = "results"
+
+
+def wrap_angle(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def load_data(path=DATA_PATH):
+    d = np.load(path, allow_pickle=True)
+    Y = np.asarray(d["Y"], dtype=float)
+    t = np.asarray(d["t"], dtype=float)
+    mask = np.asarray(d["mask"], dtype=bool)
+    meta = str(d["metadata"]) if "metadata" in d.files else ""
+    return Y, t, mask, meta
+
+
+def count_wrap_events(Y, mask):
+    """Measured bearing jumps larger than pi between consecutive valid samples."""
+    b, m = Y[:, 1], mask[:, 1]
+    events = []
+    for i in range(len(b) - 1):
+        if m[i] and m[i + 1] and abs(b[i + 1] - b[i]) > np.pi:
+            events.append((int(i), float(b[i]), float(b[i + 1])))
+    return len(events), events
+
+
+# ----------------------------------------------------------------------------
+# Robust smooth-trajectory reference (proxy ground truth)
+# ----------------------------------------------------------------------------
+def robust_reference(Y, mask, seg=4, lam=3.0):
+    """Regularized piecewise-constant acceleration trajectory fit (robust loss,
+    acceleration-roughness penalty). Used ONLY as a reference for proxy error
+    metrics; the true state is not public."""
+    n = len(Y)
+    nseg = (n + seg - 1) // seg
+    mr, mb = mask[:, 0], mask[:, 1]
+    r, b = Y[:, 0], Y[:, 1]
+
+    def build(p):
+        x0, y0, vx0, vy0 = p[0:4]
+        ax = p[4:4 + nseg]
+        ay = p[4 + nseg:4 + 2 * nseg]
+        x = np.zeros(n); y = np.zeros(n)
+        vx = np.zeros(n); vy = np.zeros(n)
+        X, Yc, Vx, Vy = x0, y0, vx0, vy0
+        for i in range(n):
+            x[i] = X; y[i] = Yc; vx[i] = Vx; vy[i] = Vy
+            k = min(i // seg, nseg - 1)
+            Vx += ax[k]; Vy += ay[k]
+            X += Vx; Yc += Vy
+        return x, y, vx, vy
+
+    def resid(p):
+        x, y, vx, vy = build(p)
+        rr = np.hypot(x, y)
+        bb = np.arctan2(y, x)
+        acc = np.concatenate([np.diff(vx), np.diff(vy)])
+        return np.concatenate([(rr[mr] - r[mr]) / 0.05,
+                               wrap_angle(bb[mb] - b[mb]) / 0.05,
+                               lam * acc / 0.05])
+
+    p0 = np.zeros(4 + 2 * nseg)
+    i0 = int(np.argmax(mask[:, 0] & mask[:, 1]))
+    p0[0] = r[i0] * np.cos(b[i0])
+    p0[1] = r[i0] * np.sin(b[i0])
+    sol = least_squares(resid, p0, loss="soft_l1", f_scale=1.0, max_nfev=4000)
+    x, y, vx, vy = build(sol.x)
+    rr = np.hypot(x, y)
+    bb = np.arctan2(y, x)
+    res_r = np.where(mr, rr - r, 0.0)
+    res_b = np.where(mb, wrap_angle(bb - b), 0.0)
+    return dict(x=x, y=y, vx=vx, vy=vy, res_r=res_r, res_b=res_b)
+
+
+# ----------------------------------------------------------------------------
+# Particle filter
+# ----------------------------------------------------------------------------
+def mixture_loglik(res, sigma):
+    """Per-channel robust log-likelihood: 95% Gaussian + 5% broad heavy tail."""
+    a = -0.5 * (res / sigma) ** 2 - math.log(sigma) - 0.5 * math.log(2 * math.pi)
+    s = OUTLIER_MIX_SCALE * sigma
+    c = -0.5 * (res / s) ** 2 - math.log(s) - 0.5 * math.log(2 * math.pi)
+    la = a + math.log(1.0 - OUTLIER_MIX_WEIGHT)
+    lc = c + math.log(OUTLIER_MIX_WEIGHT)
+    mx = np.maximum(la, lc)
+    return mx + np.log(np.exp(la - mx) + np.exp(lc - mx))
+
+
+def _normalize_logw(logw):
+    mx = float(np.max(logw))
+    tot = float(np.sum(np.exp(logw - mx)))
+    logw_norm = np.maximum(logw - (mx + math.log(tot)), LOGW_FLOOR)
+    w = np.exp(logw_norm)
+    w /= w.sum()
+    return w, logw_norm
+
+
+def _systematic_resample(w, rng):
+    n = len(w)
+    pos = (rng.random() + np.arange(n)) / n
+    cs = np.cumsum(w)
+    cs[-1] = 1.0
+    return np.clip(np.searchsorted(cs, pos), 0, n - 1)
+
+
+def innovation_whiteness(res_series, valid):
+    """Lag-1 autocorrelation and mean of the per-step bearing residual series."""
+    v = np.asarray(res_series)[valid]
+    v = v[np.isfinite(v)]
+    if len(v) < 3:
+        return 0.0, float(v.mean()) if len(v) else 0.0
+    vc = v - v.mean()
+    denom = max(float(np.dot(vc, vc)), 1e-300)
+    return float(np.dot(vc[:-1], vc[1:]) / denom), float(v.mean())
+
+
+def _init_velocity(Y, mask, i0, k_use=6):
+    """Rough initial velocity + spread from a short CV fit to early data."""
+    idx = [i for i in range(i0, min(len(Y), i0 + k_use)) if mask[i, 0] and mask[i, 1]]
+    if len(idx) < 3:
+        return np.array([0.0, 0.0]), SIGMA_INIT_VEL
+    tt = np.arange(i0, i0 + k_use, dtype=float)
+    idx = np.array(idx, dtype=int)
+    r, b = Y[idx, 0], Y[idx, 1]
+    xs, ys = r * np.cos(b), r * np.sin(b)
+    A = np.vstack([np.ones(len(idx)), tt[idx] - i0]).T
+    vx = float(np.linalg.lstsq(A, xs, rcond=None)[0][1])
+    vy = float(np.linalg.lstsq(A, ys, rcond=None)[0][1])
+    return np.array([vx, vy]), 0.15
+
+
+def run_pf(Y, mask, t, variant="inflation", seed=SEED, n=N_PARTICLES,
+           sigma_r=SIGMA_R, sigma_b=SIGMA_B):
+    """Bootstrap particle filter with adaptive maneuver handling.
+
+    variant='inflation' : 4-D state, NIS-triggered process-noise inflation.
+    variant='bias'      : 5-D state (+ slowly varying bearing bias), same
+                          inflation machinery, so the variant comparison
+                          isolates the benefit of the bias state.
+    """
+    rng = np.random.default_rng(seed)
+    n_steps = len(t)
+    dim = 5 if variant == "bias" else 4
+
+    i0 = int(np.argmax(mask[:, 0] & mask[:, 1]))
+    r0, b0 = Y[i0, 0], Y[i0, 1]
+    # data-driven initial velocity: short-horizon CV fit to the first valid
+    # measurements (no ground-truth leakage; uses only public observations)
+    v0, v0_std = _init_velocity(Y, mask, i0)
+    P = np.zeros((n, dim))
+    P[:, 0] = r0 * np.cos(b0) + SIGMA_INIT_POS * rng.standard_normal(n)
+    P[:, 1] = r0 * np.sin(b0) + SIGMA_INIT_POS * rng.standard_normal(n)
+    P[:, 2] = v0[0] + v0_std * rng.standard_normal(n)
+    P[:, 3] = v0[1] + v0_std * rng.standard_normal(n)
+    if dim == 5:
+        P[:, 4] = SIGMA_BIAS_INIT * rng.standard_normal(n)
+    logw = np.full(n, -math.log(n))
+
+    est = np.zeros((n_steps, 4))
+    cov = np.zeros((n_steps, 4))
+    names = ("rmse_pos", "rmse_vel", "nees", "ess", "resampled",
+             "weight_entropy", "max_log_weight", "min_log_weight",
+             "bearing_residual_mean", "bearing_residual_std",
+             "nis", "q_mult", "ct_frac")
+    diag = {k: np.zeros(n_steps) for k in names}
+    adapt_events = []
+    resample_count = 0
+
+    for k in range(n_steps):
+        ct_branch = np.zeros(n, dtype=bool)
+        if k > 0:
+            # ---- adaptive process noise ----
+            q_prev = diag["q_mult"][k - 1]
+            if diag["nis"][k - 1] > NIS_TRIGGER:
+                q_new = min(Q_MULT_MAX, q_prev * Q_MULT_UP)
+                if q_new >= 1.5 and (not adapt_events
+                                     or adapt_events[-1][0] != k - 1):
+                    adapt_events.append((k - 1, float(t[k - 1]),
+                                         "nis_inflation", float(q_new)))
+            else:
+                q_new = max(1.0, q_prev * Q_MULT_DECAY)
+            diag["q_mult"][k] = q_new
+            sigma_a = SIGMA_A_BASE * q_new
+
+            # ---- IMM-lite propagation ----
+            dt = float(t[k] - t[k - 1])
+            ct_branch = rng.random(n) < P_CT
+            w_turn = np.clip(SIGMA_W * rng.standard_normal(n), -0.2, 0.2)
+            w_turn = np.sign(w_turn) * np.maximum(np.abs(w_turn), 0.02)
+            th = w_turn * dt
+            sin_t, cos_t = np.sin(th), np.cos(th)
+            vx0, vy0 = P[:, 2].copy(), P[:, 3].copy()
+            x_ct = P[:, 0] + (vx0 * sin_t + vy0 * (1.0 - cos_t)) / w_turn
+            y_ct = P[:, 1] + (vy0 * sin_t - vx0 * (1.0 - cos_t)) / w_turn
+            vx_rot = vx0 * cos_t - vy0 * sin_t
+            vy_rot = vx0 * sin_t + vy0 * cos_t
+            x_lin = P[:, 0] + vx0 * dt
+            y_lin = P[:, 1] + vy0 * dt
+            P[:, 0] = np.where(ct_branch, x_ct, x_lin)
+            P[:, 1] = np.where(ct_branch, y_ct, y_lin)
+            P[:, 2] = np.where(ct_branch, vx_rot, vx0) + sigma_a * rng.standard_normal(n)
+            P[:, 3] = np.where(ct_branch, vy_rot, vy0) + sigma_a * rng.standard_normal(n)
+            if dim == 5:
+                P[:, 4] += SIGMA_BIAS_STEP * rng.standard_normal(n)
+
+            # ---- measurement update (masked channels skipped) ----
+            bias = P[:, 4] if dim == 5 else 0.0
+            r_pred = np.hypot(P[:, 0], P[:, 1])
+            b_pred = np.arctan2(P[:, 1], P[:, 0]) + bias
+            loglik = np.zeros(n)
+            res_b_particles = None
+            sigma_eff = {}
+            w_pre, _ = _normalize_logw(logw)
+            prior_mean = (w_pre[:, None] * P).sum(axis=0)
+            prior_r = math.hypot(prior_mean[0], prior_mean[1])
+            prior_b = math.atan2(prior_mean[1], prior_mean[0]) + (
+                prior_mean[4] if dim == 5 else 0.0)
+            if mask[k, 0]:
+                res_r = Y[k, 0] - r_pred
+                # tempering: never let the likelihood be sharper than a fixed
+                # fraction of the predicted cloud spread (EnKF-like gain
+                # limit; prevents chronic weight degeneracy)
+                spread_r = math.sqrt(max(float(np.sum(w_pre * (r_pred - prior_r) ** 2)), 0.0))
+                s_eff = max(sigma_r, TEMPER_GAMMA * spread_r)
+                sigma_eff[0] = s_eff
+                loglik += mixture_loglik(res_r, s_eff)
+            if mask[k, 1]:
+                res_b_particles = wrap_angle(Y[k, 1] - b_pred)
+                spread_b = math.sqrt(max(float(np.sum(w_pre * wrap_angle(b_pred - prior_b) ** 2)), 0.0))
+                s_eff = max(sigma_b, TEMPER_GAMMA * spread_b)
+                sigma_eff[1] = s_eff
+                loglik += mixture_loglik(res_b_particles, s_eff)
+            logw = logw + loglik
+
+        w, logw_norm = _normalize_logw(logw)
+        mean5 = (w[:, None] * P).sum(axis=0)
+        mean = mean5[:4]
+
+        # ---- NIS from the PRIOR predictive mean ----
+        if k > 0:
+            nis = 0.0
+            innov_r = innov_b = 0.0
+            if mask[k, 0]:
+                innov_r = float(Y[k, 0] - math.hypot(prior_mean[0], prior_mean[1]))
+                nis += (innov_r / sigma_eff.get(0, sigma_r)) ** 2
+            if mask[k, 1]:
+                b_pri = math.atan2(prior_mean[1], prior_mean[0]) + (
+                    prior_mean[4] if dim == 5 else 0.0)
+                innov_b = float(wrap_angle(Y[k, 1] - b_pri))
+                nis += (innov_b / sigma_eff.get(1, sigma_b)) ** 2
+            diag["nis"][k] = nis
+
+            if res_b_particles is not None:
+                bm = float((w * res_b_particles).sum())
+                bv = math.sqrt(max(float((w * (res_b_particles - bm) ** 2).sum()), 0.0))
+                diag["bearing_residual_mean"][k] = bm
+                diag["bearing_residual_std"][k] = bv
+            else:
+                # documented finite fallback when the angular channel is missing
+                diag["bearing_residual_mean"][k] = 0.0
+                diag["bearing_residual_std"][k] = 0.0
+        else:
+            if mask[k, 1]:
+                b_pred0 = np.arctan2(P[:, 1], P[:, 0]) + (P[:, 4] if dim == 5 else 0.0)
+                res_b = wrap_angle(Y[k, 1] - b_pred0)
+                bm = float((w * res_b).sum())
+                diag["bearing_residual_mean"][k] = bm
+                diag["bearing_residual_std"][k] = math.sqrt(
+                    max(float((w * (res_b - bm) ** 2).sum()), 0.0))
+            else:
+                diag["bearing_residual_mean"][k] = 0.0
+                diag["bearing_residual_std"][k] = 0.0
+
+        # ---- weights / ESS statistics ----
+        ess = 1.0 / max(float(np.sum(w ** 2)), 1e-300)
+        diag["ess"][k] = ess
+        diag["ct_frac"][k] = float((w * ct_branch.astype(float)).sum())
+        diag["weight_entropy"][k] = -float(np.sum(w * np.log(np.maximum(w, 1e-300))))
+        diag["max_log_weight"][k] = float(np.max(logw_norm))
+        diag["min_log_weight"][k] = float(np.min(logw_norm))
+
+        # ---- weighted covariance ----
+        d4 = P[:, :4] - mean
+        cov4 = (d4 * w[:, None]).T @ d4 + 1e-9 * np.eye(4)
+        est[k] = mean
+        cov[k] = [cov4[0, 0], cov4[1, 1], cov4[2, 2], cov4[3, 3]]
+
+        # ---- resampling / degeneracy revival ----
+        if ess < ESS_RESAMPLE_FRAC * n:
+            idx = _systematic_resample(w, rng)
+            P = P[idx].copy()
+            # mild roughening proportional to the posterior spread
+            s_pos = max(0.25 * float(np.std(P[:, 0])), SIGMA_JITTER)
+            s_vel = max(0.25 * float(np.std(P[:, 2])), SIGMA_JITTER)
+            P[:, 0] += s_pos * rng.standard_normal(n)
+            P[:, 1] += s_pos * rng.standard_normal(n)
+            P[:, 2] += s_vel * rng.standard_normal(n)
+            P[:, 3] += s_vel * rng.standard_normal(n)
+            logw = np.full(n, -math.log(n))
+            diag["resampled"][k] = 1.0
+            resample_count += 1
+            # ---- revival injection on near-total collapse ----
+            # When the particle cloud is far too narrow to explain the current
+            # measurement (e.g. the fast bearing sweep at the close pass),
+            # re-inject particles directly at the measurement-implied
+            # position with a dispersed velocity. This restores diversity
+            # without inventing observations (uses only the measured values).
+            bearing_sweep = (abs(innov_b) > 0.5) and (abs(innov_r) < 0.2)
+            if (ess < 0.05 * n and mask[k, 0] and mask[k, 1]
+                    and bearing_sweep):
+                rm, bm = Y[k, 0], Y[k, 1]
+                half = n // 2
+                P[:half, 0] = rm * np.cos(bm) + 0.1 * rng.standard_normal(half)
+                P[:half, 1] = rm * np.sin(bm) + 0.1 * rng.standard_normal(half)
+                P[:half, 2] = mean[2] + 0.25 * rng.standard_normal(half)
+                P[:half, 3] = mean[3] + 0.25 * rng.standard_normal(half)
+                if dim == 5:
+                    P[:half, 4] = 0.0
+                adapt_events.append((k, float(t[k]), "revival_injection",
+                                     float(ess)))
+        else:
+            logw = logw_norm
+
+    return dict(est=est, cov=cov, diag=diag, resample_count=resample_count,
+                adapt_events=adapt_events, variant=variant)
+
+
+# ----------------------------------------------------------------------------
+# Proxy error metrics vs the robust smooth reference
+# ----------------------------------------------------------------------------
+def proxy_diagnostics(res, ref):
+    est = res["est"]
+    d_pos = np.hypot(est[:, 0] - ref["x"], est[:, 1] - ref["y"])
+    d_vel = np.hypot(est[:, 2] - ref["vx"], est[:, 3] - ref["vy"])
+    nees = np.zeros(len(est))
+    for k in range(len(est)):
+        Pm = np.zeros((4, 4))
+        Pm[0, 0] = res["cov"][k, 0]
+        Pm[1, 1] = res["cov"][k, 1]
+        Pm[2, 2] = res["cov"][k, 2]
+        Pm[3, 3] = res["cov"][k, 3]
+        # off-diagonals are not stored; regularized diagonal approximation
+        Pm += np.eye(4) * (1e-3 + 0.05 * np.trace(Pm) / 4.0)
+        diff = est[k] - np.array([ref["x"][k], ref["y"][k],
+                                  ref["vx"][k], ref["vy"][k]])
+        try:
+            val = float(diff @ np.linalg.solve(Pm, diff))
+        except np.linalg.LinAlgError:
+            val = 1e4
+        nees[k] = min(max(val, 0.0), 1e4)
+    return d_pos, d_vel, nees
+
+
+def variant_score(res, ref, mask):
+    """Innovation-whiteness score: |lag-1 autocorr| of bearing residuals,
+    tie-broken by |residual mean|. Smaller is better."""
+    rho1, mu = innovation_whiteness(res["diag"]["bearing_residual_mean"],
+                                    mask[:, 1])
+    return dict(rho1=rho1, mean=mu, score=abs(rho1) + 0.5 * abs(mu))
+
+
+# ----------------------------------------------------------------------------
+# Pure-stdlib PNG writer (matplotlib is unavailable in this environment)
+# ----------------------------------------------------------------------------
+FONT = {
+    'A': ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    'B': ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    'C': ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    'D': ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    'E': ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    'F': ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    'G': ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+    'H': ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    'I': ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+    'J': ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+    'K': ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+    'L': ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    'M': ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    'N': ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    'O': ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    'P': ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+    'Q': ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+    'R': ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    'S': ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    'T': ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    'U': ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    'V': ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+    'W': ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+    'X': ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+    'Y': ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    'Z': ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+    '0': ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    '1': ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    '2': ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+    '3': ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    '4': ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    '5': ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    '6': ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    '7': ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    '8': ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    '9': ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    '-': ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    '+': ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+    '.': ["00000", "00000", "00000", "00000", "00000", "00000", "00100"],
+    ':': ["00000", "00100", "00100", "00000", "00100", "00100", "00000"],
+    '/': ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+    '(': ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+    ')': ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
+    ' ': ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
+
+
+def write_png(path, rgb):
+    """Minimal PNG encoder: 8-bit RGB, filter type 0 per row."""
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[i].tobytes() for i in range(h))
+    comp = zlib.compress(raw, 6)
+
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", comp)
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+    return len(png)
+
+
+def verify_png(path):
+    """Re-parse the PNG and verify structure + decode the raster."""
+    with open(path, "rb") as f:
+        data = f.read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "bad PNG signature"
+    pos, idat, ihdr, iend = 8, b"", None, False
+    while pos < len(data):
+        (ln,) = struct.unpack(">I", data[pos:pos + 4])
+        typ = data[pos + 4:pos + 8]
+        payload = data[pos + 8:pos + 8 + ln]
+        (crc,) = struct.unpack(">I", data[pos + 8 + ln:pos + 12 + ln])
+        assert crc == (zlib.crc32(typ + payload) & 0xFFFFFFFF), "bad CRC"
+        if typ == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", payload)
+        elif typ == b"IDAT":
+            idat += payload
+        elif typ == b"IEND":
+            iend = True
+        pos += 12 + ln
+    assert ihdr is not None and iend, "missing IHDR/IEND"
+    w, h, depth, ctype, _, _, _ = ihdr
+    assert depth == 8 and ctype == 2, "unexpected pixel format"
+    raw = zlib.decompress(idat)
+    assert len(raw) == h * (w * 3 + 1), "decompressed size mismatch"
+    stride = w * 3
+    rows = []
+    for i in range(h):
+        row = raw[i * (stride + 1):(i + 1) * (stride + 1)]
+        assert row[0] == 0, "unexpected row filter"
+        rows.append(np.frombuffer(row[1:], dtype=np.uint8))
+    rgb = np.stack(rows).reshape(h, w, 3)
+    return dict(width=w, height=h, size_bytes=len(data), raster=rgb)
+
+
+# ----------------------------------------------------------------------------
+# Panel rendering (numpy raster + 5x7 bitmap font)
+# ----------------------------------------------------------------------------
+def draw_text(canvas, x, y, text, color, scale=2):
+    for ch in text.upper():
+        glyph = FONT.get(ch, FONT[' '])
+        for r, rowbits in enumerate(glyph):
+            for c, bit in enumerate(rowbits):
+                if bit == '1':
+                    y0 = y + r * scale
+                    x0 = x + c * scale
+                    canvas[y0:y0 + scale, x0:x0 + scale] = color
+        x += 6 * scale
+
+
+class Panel:
+    def __init__(self, canvas, x0, y0, w, h, xlim, ylim, xlabel="", title=""):
+        self.c = canvas
+        self.x0, self.y0, self.w, self.h = x0, y0, w, h
+        self.xlim, self.ylim = xlim, ylim
+        self.xlabel, self.title = xlabel, title
+        # frame
+        canvas[y0:y0 + h, x0] = 60
+        canvas[y0:y0 + h, x0 + w - 1] = 60
+        canvas[y0, x0:x0 + w] = 60
+        canvas[y0 + h - 1, x0:x0 + w] = 60
+        # ticks (5 evenly spaced)
+        for i in range(5):
+            frac = i / 4.0
+            xt = x0 + int(frac * (w - 1))
+            yt = y0 + h - 1 - int(frac * (h - 1))
+            canvas[y0 + h - 1: y0 + h + 3, xt] = 60
+            canvas[yt - 2:yt + 1, x0 - 3:x0] = 60
+            lo, hi = ylim
+            v = lo + frac * (hi - lo)
+            draw_text(canvas, x0 - 34, yt - 3, f"{v:.1f}" if abs(v) >= 0.1 else f"{v:.2f}", 60, 1)
+            lo2, hi2 = xlim
+            v2 = lo2 + frac * (hi2 - lo2)
+            draw_text(canvas, xt - 8, y0 + h + 4, f"{v2:.0f}", 60, 1)
+        if xlabel:
+            draw_text(canvas, x0 + w // 2 - 3 * len(xlabel), y0 + h + 14, xlabel, 60, 1)
+        if title:
+            draw_text(canvas, x0, y0 - 12, title, 0, 2)
+
+    def to_px(self, xs, ys):
+        lo, hi = self.xlim
+        lo2, hi2 = self.ylim
+        fx = (np.asarray(xs, dtype=float) - lo) / max(hi - lo, 1e-12)
+        fy = (np.asarray(ys, dtype=float) - lo2) / max(hi2 - lo2, 1e-12)
+        fx = np.clip(fx, -0.02, 1.02)
+        fy = np.clip(fy, -0.02, 1.02)
+        px = self.x0 + 1 + fx * (self.w - 3)
+        py = self.y0 + self.h - 2 - fy * (self.h - 3)
+        return px, py
+
+    def line(self, xs, ys, color, thick=1):
+        px, py = self.to_px(xs, ys)
+        for j in range(len(px) - 1):
+            n = max(int(max(abs(px[j + 1] - px[j]), abs(py[j + 1] - py[j]))) + 1, 2)
+            xsamp = np.linspace(px[j], px[j + 1], n)
+            ysamp = np.linspace(py[j], py[j + 1], n)
+            xi = np.clip(np.round(xsamp).astype(int), self.x0 + 1, self.x0 + self.w - 2)
+            yi = np.clip(np.round(ysamp).astype(int), self.y0 + 1, self.y0 + self.h - 2)
+            if thick <= 1:
+                self.c[yi, xi] = color
+            else:
+                for o in range(thick):
+                    self.c[np.clip(yi + o, 0, self.c.shape[0] - 1), xi] = color
+
+    def dots(self, xs, ys, color, s=2):
+        px, py = self.to_px(xs, ys)
+        xi = np.clip(np.round(px).astype(int), self.x0 + 1, self.x0 + self.w - 2)
+        yi = np.clip(np.round(py).astype(int), self.y0 + 1, self.y0 + self.h - 2)
+        self.c[yi, xi] = color
+        if s > 1:
+            self.c[np.clip(yi + 1, 0, self.c.shape[0] - 1), xi] = color
+
+
+def make_overview(t, Y, mask, ref, res, out_path):
+    """2x2 panels: (1) trajectory, (2) range fit, (3) bearing fit,
+    (4) ESS + resampling + NEES proxy."""
+    W, H = 1280, 980
+    canvas = np.full((H, W), 255, dtype=np.uint8)
+    pw, ph = 560, 400
+    positions = [(70, 120), (680, 120), (70, 580), (680, 580)]
+
+    # Panel 1: trajectory
+    p1 = Panel(canvas, *positions[0], pw, ph,
+               xlim=(min(ref["x"].min(), res["est"][:, 0].min()) - 0.4,
+                     max(ref["x"].max(), res["est"][:, 0].max()) + 0.4),
+               ylim=(min(ref["y"].min(), res["est"][:, 1].min()) - 0.4,
+                     max(ref["y"].max(), res["est"][:, 1].max()) + 0.4),
+               xlabel="PX", title="TRAJECTORY: PF MEAN VS REF")
+    # reference as gray dots, PF mean as dark line
+    step = 2
+    p1.dots(ref["x"][::step], ref["y"][::step], 150)
+    p1.line(res["est"][:, 0], res["est"][:, 1], 20, thick=2)
+    draw_text(canvas, positions[0][0] + 10, positions[0][1] + ph - 28,
+              "GRAY DOTS: REF", 150, 1)
+    draw_text(canvas, positions[0][0] + 10, positions[0][1] + ph - 14,
+              "DARK: PF MEAN", 20, 1)
+
+    # Panel 2: range
+    mv = mask[:, 0]
+    p2 = Panel(canvas, *positions[1], pw, ph, xlim=(t[0], t[-1]),
+               ylim=(0.0, float(Y[:, 0][mv].max()) * 1.15),
+               xlabel="T", title="RANGE: MEAS VS PF PRED")
+    r_pred = np.hypot(res["est"][:, 0], res["est"][:, 1])
+    ti = np.where(mv)[0]
+    p2.dots(t[ti], Y[ti, 0], 150)
+    p2.line(t, r_pred, 200, thick=2)
+    draw_text(canvas, positions[1][0] + 10, positions[1][1] + ph - 28,
+              "GRAY: MEAS (GAPS SKIPPED)", 150, 1)
+    draw_text(canvas, positions[1][0] + 10, positions[1][1] + ph - 14,
+              "DARK: PF PREDICTED", 200, 1)
+
+    # Panel 3: bearing
+    mbv = mask[:, 1]
+    p3 = Panel(canvas, *positions[2], pw, ph, xlim=(t[0], t[-1]),
+               ylim=(-np.pi - 0.2, np.pi + 0.2),
+               xlabel="T", title="BEARING: MEAS VS PF PRED")
+    b_pred = wrap_angle(np.arctan2(res["est"][:, 1], res["est"][:, 0]))
+    ti = np.where(mbv)[0]
+    p3.dots(t[ti], Y[ti, 1], 150)
+    p3.line(t, b_pred, 200, thick=2)
+    draw_text(canvas, positions[2][0] + 10, positions[2][1] + ph - 14,
+              "WRAP-AWARE; GAPS SKIPPED", 150, 1)
+
+    # Panel 4: ESS + resampling + NEES proxy
+    p4 = Panel(canvas, *positions[3], pw, ph, xlim=(t[0], t[-1]),
+               ylim=(0.0, N_PARTICLES * 1.05),
+               xlabel="T", title="ESS, RESAMPLING, NEES PROXY (X100)")
+    p4.line(t, res["diag"]["ess"], 20, thick=2)
+    nees100 = np.clip(res["diag"]["nees"], 0, N_PARTICLES) 
+    p4.line(t, nees100, 0, thick=1)
+    rs = np.where(res["diag"]["resampled"] > 0)[0]
+    for i in rs:
+        xi = p4.to_px(np.array([t[i]]), np.array([0.0]))[0][0]
+        xi = int(np.clip(xi, p4.x0 + 1, p4.x0 + p4.w - 2))
+        canvas[p4.y0:p4.y0 + 12, xi] = 200
+    draw_text(canvas, positions[3][0] + 10, positions[3][1] + ph - 42,
+              "DARK: ESS", 20, 1)
+    draw_text(canvas, positions[3][0] + 10, positions[3][1] + ph - 28,
+              "BLACK: NEESX100", 0, 1)
+    draw_text(canvas, positions[3][0] + 10, positions[3][1] + ph - 14,
+              "TICKS: RESAMPLE", 200, 1)
+
+    return write_png(out_path, np.repeat(canvas[:, :, None], 3, axis=2))
+
+
+# ----------------------------------------------------------------------------
+# Finite-value sanitization
+# ----------------------------------------------------------------------------
+def finite(a, fallback=0.0):
+    a = np.asarray(a, dtype=float).copy()
+    bad = ~np.isfinite(a)
+    if bad.any():
+        a[bad] = fallback
+    return a
+
+
+def sanitize_df(df):
+    for c in df.columns:
+        df[c] = finite(df[c].to_numpy(dtype=float), 0.0)
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    Y, t, mask, meta = load_data()
+    n_steps = len(t)
+
+    # ---- data-inferred structure ----
+    wrap_count, wrap_events = count_wrap_events(Y, mask)
+    print(f"[data] Y {Y.shape}, t {t[0]}..{t[-1]} (dt uniform), "
+          f"ch0 valid {int(mask[:,0].sum())}/{n_steps}, "
+          f"ch1 valid {int(mask[:,1].sum())}/{n_steps}")
+    print(f"[data] wrap events: {wrap_count} {wrap_events}")
+
+    # ---- robust smooth reference (proxy ground truth) ----
+    ref = robust_reference(Y, mask, seg=4)
+    print(f"[ref]  robust smooth fit: |res_r| mean {np.abs(ref['res_r'][mask[:,0]]).mean():.4f}, "
+          f"|res_b| mean {np.abs(ref['res_b'][mask[:,1]]).mean():.4f}")
+
+    # ---- run both variants and compare by innovation whiteness ----
+    variants = {}
+    for name in ("inflation", "bias"):
+        variants[name] = run_pf(Y, mask, t, variant=name)
+        s = variant_score(variants[name], ref, mask)
+        print(f"[pf]   variant={name:9s} rho1={s['rho1']:+.4f} "
+              f"resid_mean={s['mean']:+.4f} score={s['score']:.4f}")
+    scores = {k: variant_score(v, ref, mask) for k, v in variants.items()}
+    winner = min(scores, key=lambda k: scores[k]["score"])
+    print(f"[pf]   winner by innovation whiteness: {winner}")
+    res = variants[winner]
+
+    # ---- proxy diagnostics vs the smooth reference ----
+    d_pos, d_vel, nees = proxy_diagnostics(res, ref)
+    dg = res["diag"]
+    diag_out = pd.DataFrame({
+        "t": t,
+        "rmse_pos": d_pos,
+        "rmse_vel": d_vel,
+        "nees": nees,
+        "ess": dg["ess"],
+        "resampled": dg["resampled"],
+        "weight_entropy": dg["weight_entropy"],
+        "max_log_weight": dg["max_log_weight"],
+        "min_log_weight": dg["min_log_weight"],
+        "bearing_residual_mean": dg["bearing_residual_mean"],
+        "bearing_residual_std": dg["bearing_residual_std"],
+    })
+    diag_out = sanitize_df(diag_out)
+    diag_out.to_csv(os.path.join(RESULTS_DIR, "filter_diagnostics.csv"), index=False)
+
+    state_out = pd.DataFrame({
+        "t": t,
+        "px": res["est"][:, 0], "py": res["est"][:, 1],
+        "vx": res["est"][:, 2], "vy": res["est"][:, 3],
+        "cov_px": res["cov"][:, 0], "cov_py": res["cov"][:, 1],
+        "cov_vx": res["cov"][:, 2], "cov_vy": res["cov"][:, 3],
+    })
+    state_out = sanitize_df(state_out)
+    state_out.to_csv(os.path.join(RESULTS_DIR, "state_estimates.csv"), index=False)
+
+    # ---- summary.json ----
+    ess = diag_out["ess"].to_numpy()
+    pos_rmse = float(np.sqrt(np.mean(d_pos ** 2)))
+    vel_rmse = float(np.sqrt(np.mean(d_vel ** 2)))
+    degeneracy = bool(ess.min() < N_PARTICLES / 20.0)
+    summary = {
+        "pos_rmse": pos_rmse,
+        "vel_rmse": vel_rmse,
+        "mean_nees": float(nees.mean()),
+        "median_nees": float(np.median(nees)),
+        "ess_min": float(ess.min()),
+        "ess_mean": float(ess.mean()),
+        "resampling_count": int(res["resample_count"]),
+        "weight_degeneracy_detected": bool(degeneracy),
+        "used_log_weights": True,
+        "angle_wrapping_detected": bool(wrap_count > 0),
+        "angle_wrap_event_count": int(wrap_count),
+    }
+    for k, v in summary.items():
+        if isinstance(v, float) and not math.isfinite(v):
+            summary[k] = 0.0
+    with open(os.path.join(RESULTS_DIR, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # ---- overview.png (stdlib encoder) + decodability verification ----
+    png_path = os.path.join(RESULTS_DIR, "overview.png")
+    nbytes = make_overview(t, Y, mask, ref, res, png_path)
+    info = verify_png(png_path)
+    print(f"[png]  overview.png written: {nbytes} bytes; verified decodable: "
+          f"{info['width']}x{info['height']}, {info['size_bytes']} bytes on disk")
+
+    # ---- conclusion.txt ----
+    adapt = res["adapt_events"]
+    other = "bias" if winner == "inflation" else "inflation"
+    lines = [
+        "CONCLUSION - deterministic target-tracking audit",
+        "=" * 60,
+        "",
+        "!!! IMPORTANT DISCLAIMER ON THE ERROR METRICS !!!",
+        "The true target trajectory is NOT public. The rmse_pos / rmse_vel /",
+        "nees columns in filter_diagnostics.csv and the pos_rmse / vel_rmse /",
+        "mean_nees keys in summary.json are PROXIES computed against a robust",
+        "smooth-trajectory reference fitted to the public measurements",
+        "(piecewise-constant acceleration every 4 steps, soft-L1 loss). They",
+        "quantify agreement with that reference and internal statistical",
+        "consistency - they are NOT absolute errors against ground truth.",
+        "",
+        "DATA-INFERRED STRUCTURE",
+        f"* t: {t[0]:.0f}..{t[-1]:.0f}, uniform dt = 1.0 ({n_steps} steps).",
+        "* ch0 = range-like (all values positive, 0.523..4.085),",
+        "  ch1 = bearing-like (all values in [-pi, pi], radians).",
+        f"* Missing observations: ch0 at steps 22-31 (10 steps), ch1 at steps",
+        "  55-63 (9 steps); masked channels are skipped in the likelihood and",
+        "  bearing_residual_mean/std fall back to the documented finite 0.0",
+        "  proxy there (never NaN/inf in any output field).",
+        f"* Angle wrapping detected: {wrap_count} event(s): "
+        + "; ".join(f"t={e[0]}->{e[0]+1} ({e[1]:+.3f}->{e[2]:+.3f})"
+                    for e in wrap_events)
+        + ". Wrap-aware residuals used throughout.",
+        "* ~5 isolated joint impulsive outliers (near steps 17, 41, 49, 72, 79)",
+        "  handled by the 95%/5% Gaussian/heavy-tail mixture likelihood",
+        "  (8x broadened component), so no observations are deleted or replaced.",
+        "* Maneuvering: NOT a single constant-velocity trajectory. A global CV",
+        "  fit leaves strongly structured residuals; a close pass at t~34-38",
+        "  (range minimum 0.523 with a genuine ~1.7 rad bearing sweep per step)",
+        "  and a bearing-rate reversal after t~55 are present. The filter",
+        "  adapts via an IMM-lite CV/CT proposal mixture plus NIS-triggered",
+        "  process-noise inflation.",
+        "",
+        "VARIANT COMPARISON (bias state vs process-noise inflation)",
+        f"* inflation variant: lag-1 residual autocorr = {scores['inflation']['rho1']:+.4f}, "
+        f"mean = {scores['inflation']['mean']:+.4f}",
+        f"* bias variant     : lag-1 residual autocorr = {scores['bias']['rho1']:+.4f}, "
+        f"mean = {scores['bias']['mean']:+.4f}",
+        f"* WINNER: '{winner}' - smaller |lag-1 autocorrelation| (and smaller",
+        "  |mean| as tie-break) of the per-step bearing residual series, i.e.",
+        "  the more innovation-white / consistent filter. Rationale: white",
+        "  residuals indicate the filter's process/measurement models have",
+        "  absorbed the systematic effects; persistent autocorrelation would",
+        "  indicate unmodeled structure (drift or unmodeled dynamics).",
+        "",
+        "DIAGNOSTICS SUMMARY",
+        f"* particles: {N_PARTICLES} (<= 1500), fixed seed {SEED}, log-domain",
+        "  weights throughout (used_log_weights = true).",
+        f"* ESS: min {summary['ess_min']:.1f}, mean {summary['ess_mean']:.1f} "
+        f"(N = {N_PARTICLES}).",
+        f"* resampling events: {summary['resampling_count']} "
+        f"(systematic, triggered when ESS < {int(ESS_RESAMPLE_FRAC*N_PARTICLES)}).",
+        f"* weight degeneracy detected: {summary['weight_degeneracy_detected']}",
+        "  (criterion: min ESS < N/20).",
+        f"* proxy pos RMSE {pos_rmse:.4f}, proxy vel RMSE {vel_rmse:.4f},",
+        f"* proxy NEES mean {summary['mean_nees']:.2f}, median "
+        f"{summary['median_nees']:.2f} (regularized diagonal covariance",
+        "  approximation; a proxy consistency check, not a true NEES).",
+        f"* maneuver adaptation events (NIS-triggered inflations): {len(adapt)}",
+    ]
+    for ev in adapt[:25]:
+        lines.append(f"    - step {ev[0]:2d} (t={ev[1]:.0f}): {ev[2]} q_mult -> {ev[3]:.2f}")
+    if len(adapt) > 25:
+        lines.append(f"    - ... and {len(adapt) - 25} more (see stdout log)")
+    lines += [
+        "",
+        "REPRODUCIBILITY",
+        f"* analysis.py, no command-line arguments, seed {SEED}, N = {N_PARTICLES}.",
+        "* overview.png rendered by a pure-stdlib PNG encoder (zlib + struct)",
+        "  because matplotlib is unavailable in this environment; the encoded",
+        "  file is re-parsed and verified decodable (signature, IHDR/IDAT/IEND,",
+        "  CRCs, decompressed raster size) before this script exits.",
+    ]
+    with open(os.path.join(RESULTS_DIR, "conclusion.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"[out]  pos_rmse(proxy)={pos_rmse:.4f} vel_rmse(proxy)={vel_rmse:.4f} "
+          f"mean_nees(proxy)={summary['mean_nees']:.2f} "
+          f"ess_min={summary['ess_min']:.1f} resamples={summary['resampling_count']}")
+    print("[out]  all required artifacts written under results/")
+
+
+if __name__ == "__main__":
+    main()

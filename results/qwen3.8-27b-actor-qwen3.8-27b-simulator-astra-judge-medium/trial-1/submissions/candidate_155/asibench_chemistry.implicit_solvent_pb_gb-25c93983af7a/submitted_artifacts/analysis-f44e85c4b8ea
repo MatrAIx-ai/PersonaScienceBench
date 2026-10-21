@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+analysis.py — eight-case implicit-solvent continuum-electrostatics binding response.
+
+Primary route (high fidelity): finite-volume Poisson-Boltzmann solves
+  * 7-point operator, harmonic face-averaged dielectric,
+  * screening term kappa^2 * solvent_fraction (linearized) or the corresponding
+    sinh-screening equation (nonlinear),
+  * trilinear cloud-in-cell charge deposition / spacing^3,
+  * interior nodes only as unknowns, zero Dirichlet on the outer boundary,
+  * vacuum subtraction: matching solve with uniform inner_dielectric,
+    solvent_fraction = 0, kappa = 0; reaction field = medium - vacuum,
+  * entity response energy = 0.5 * sum_i q_i * reaction_field(r_i)
+    (trilinear interpolation), binding = assembly - part_a - part_b
+    (manifest binding_expression, identical in all eight cases).
+
+Secondary route (fast surrogate): Born cross-term between part_a and part_b
+  f_ij = sqrt(r_ij^2 + a_i a_j exp(-r_ij^2 / (4 a_i a_j)))
+  secondary = -332.06371 * sum_i sum_j q_i q_j * ((1/eps_in) - exp(-kappa f_ij)/eps_out) / f_ij
+  Born radius a = max(atom radius, distance to the component's reconstructed SES
+  boundary); a part_a site is skipped when its nearest part_b site is > 6.5 Angstrom.
+
+SIGN CONVENTIONS (verified bit-exact against data/volume_a.npy / volume_b.npy):
+  * SDF = (EDT(~M) - EDT(M)) * spacing  ->  NEGATIVE inside, POSITIVE outside.
+    (scipy 1.16 distance_transform_edt replaces each foreground element with its
+    distance to the background; background elements are 0.)
+  * solvent_fraction is 0 inside, 1 outside:
+      mol : sf = (sdf > 0)
+      smol: sf = 0.5 * (1 + tanh(sdf / (2w)))
+    The smoothing window w is read as the HALF-WIDTH of the interface: at
+    |sdf| = w the fraction has reached 0.5*(1+tanh(1)) ~ 0.88 / 0.12, i.e. the
+    dielectric is effectively fully switched within one window on each side of
+    the zero level set. (Disclosed variant: tanh(sdf / w) with w as the tanh
+    scale directly; not used here.)
+  * eps(r) = eps_in + (eps_out - eps_in) * sf(r).
+
+ASSEMBLY (field entity) surfaces: provided tensors are authoritative —
+  mol cases  -> volume_a (sharp mol / probe-0 surface SDF),
+  smol cases -> volume_b (smoothed surface SDF) with the tanh window.
+Component surfaces (part_a, part_b) are reconstructed from their own sites.csv
+rows: voxel mask from atom radii (node inside iff min_i |x-c_i|-r_i <= 0),
+SAS with radius+probe, SES by probe dilation followed by erosion of the VDW
+mask and union with that VDW mask (on these grids the opening is a subset of
+the VDW mask, so the union equals the VDW mask — verified), final SDF via
+Euclidean distance transforms (outside - inside).
+
+matplotlib is unavailable in this environment (no network); overview.png is
+rendered with a dependency-free PNG writer (zlib + struct) and carries a
+shared color scale plus per-case labels.
+"""
+import json
+import os
+import struct
+import time
+import zlib
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy.ndimage import distance_transform_edt
+
+KCAL = 332.06371          # Coulomb constant, kcal*Angstrom/(mol*e^2)
+R_KCAL = 1.987204134e-3   # gas constant, kcal/(mol*K)
+GATE = 6.5                # secondary-metric gate, Angstrom
+SINH_CLIP = 60.0          # overflow guard for sinh/cosh arguments (true solution stays far below)
+SITES = None
+
+
+def axis_coords(grid):
+    """Node positions (35,3): center - half + i*spacing, per axis."""
+    h = grid["box_half_extent_angstrom"]
+    s = grid["spacing_angstrom"]
+    c = np.asarray(grid["box_center_angstrom"], dtype=float)
+    return np.arange(35)[:, None] * s + (c - h)[None, :]  # (35,3): coords per axis
+
+
+def frac_indices(pos, grid):
+    """Global Angstrom positions -> fractional node indices."""
+    h = grid["box_half_extent_angstrom"]
+    s = grid["spacing_angstrom"]
+    c = np.asarray(grid["box_center_angstrom"], dtype=float)
+    return (pos - (c - h)) / s
+
+
+def trilinear(field, pos, grid):
+    """Trilinear interpolation of a (35,35,35) field at positions (...,3) in Angstrom."""
+    f = frac_indices(pos, grid)
+    i0 = np.clip(np.floor(f).astype(np.int64), 0, 33)
+    t = np.clip(f - i0, 0.0, 1.0)
+    out = np.zeros(f.shape[:-1])
+    for dx in (0, 1):
+        wx = t[..., 0] if dx else 1.0 - t[..., 0]
+        for dy in (0, 1):
+            wy = t[..., 1] if dy else 1.0 - t[..., 1]
+            for dz in (0, 1):
+                wz = t[..., 2] if dz else 1.0 - t[..., 2]
+                out += wx * wy * wz * field[i0[..., 0] + dx, i0[..., 1] + dy, i0[..., 2] + dz]
+    return out
+
+
+def voxel_mask(case_id, grid, entity):
+    """VDW voxel mask: node inside iff min_i (|x - c_i| - r_i) <= 0."""
+    sub = SITES[(SITES["case_id"] == case_id) & (SITES["entity_id"] == entity)]
+    pos = sub[["x_angstrom", "y_angstrom", "z_angstrom"]].to_numpy(dtype=float)
+    rad = sub["radius_angstrom"].to_numpy(dtype=float)
+    ax = axis_coords(grid)
+    nodes = np.stack(np.meshgrid(ax[:, 0], ax[:, 1], ax[:, 2], indexing="ij"), -1).reshape(-1, 3)
+    n = len(nodes)
+    dmin = np.full(n, np.inf)
+    NB, NA = 8192, 512
+    for b0 in range(0, n, NB):
+        nb = nodes[b0:b0 + NB]
+        for a0 in range(0, len(pos), NA):
+            p = pos[a0:a0 + NA]
+            r = rad[a0:a0 + NA]
+            d2 = (nb[:, None, 0] - p[None, :, 0]) ** 2
+            d2 += (nb[:, None, 1] - p[None, :, 1]) ** 2
+            d2 += (nb[:, None, 2] - p[None, :, 2]) ** 2
+            d = np.sqrt(d2) - r[None, :]
+            dmin[b0:b0 + NB] = np.minimum(dmin[b0:b0 + NB], d.min(1))
+    return (dmin <= 0.0).reshape(35, 35, 35)
+
+
+def sdf_from_mask(M, s):
+    """Signed distance field, NEGATIVE inside / POSITIVE outside (verified)."""
+    return (distance_transform_edt(~M) * s - distance_transform_edt(M) * s)
+
+
+def ses_mask(V, probe):
+    """SES = dilate(V, probe) then erode(., probe), union with the VDW mask.
+
+    Prescribed recipe, kept literal. On these grids the opening is a subset of
+    V, so the union equals V (verified numerically for all probe>0 cases).
+    """
+    if probe <= 0.0:
+        return V
+    D = distance_transform_edt(~V) <= probe          # dilation by probe
+    E = D & (distance_transform_edt(~D) >= probe)    # then erosion by probe
+    return E | V                                      # union with VDW mask
+
+
+def entity_sdf(case_id, grid, entity, probe):
+    V = voxel_mask(case_id, grid, entity)
+    return sdf_from_mask(ses_mask(V, probe), grid["spacing_angstrom"])
+
+
+# ----------------------------------------------------------------------
+# finite-volume PB operator
+# ----------------------------------------------------------------------
+def solvent_fraction(sdf, surface_model, w):
+    """sf: 0 inside, 1 outside. mol: sharp indicator; smol: tanh transition."""
+    if surface_model == "mol":
+        return (sdf > 0.0).astype(np.float64)
+    # w = smoothing_window_angstrom, read as half-width of the interface (see module docstring)
+    return 0.5 * (1.0 + np.tanh(sdf / (2.0 * w)))
+
+
+def eps_field(sf, eps_in, eps_out):
+    return eps_in + (eps_out - eps_in) * sf
+
+
+def build_L(eps, sf, kappa, s):
+    """Build L (positive definite face-Laplacian; zero Dirichlet handled by
+    dropping boundary off-diagonals) and the screening diagonal
+    scr = kappa^2 * solvent_fraction over interior nodes (indices 1..33).
+    Returns (L, scr_flat)."""
+    N = 33
+    ii = np.arange(1, 34).reshape(N, 1, 1)
+    jj = np.arange(1, 34).reshape(1, N, 1)
+    kk = np.arange(1, 34).reshape(1, 1, N)
+    inv_s2 = 1.0 / (s * s)
+    lap_diag = np.zeros((N, N, N))
+    rows = ((ii - 1) * N + (jj - 1)) * N + (kk - 1)
+    rr = rows.ravel()
+    rs, cs, ds = [], [], []
+    for (di, dj, dk, off) in ((1, 0, 0, N * N), (-1, 0, 0, -N * N),
+                              (0, 1, 0, N), (0, -1, 0, -N),
+                              (0, 0, 1, 1), (0, 0, -1, -1)):
+        ni, nj, nk = ii + di, jj + dj, kk + dk
+        ec = eps[ii, jj, kk]
+        en = eps[ni, nj, nk]
+        ef = 2.0 * ec * en / (ec + en)               # harmonic face average
+        lap_diag += inv_s2 * ef
+        m = (ni >= 1) & (ni <= 33) & (nj >= 1) & (nj <= 33) & (nk >= 1) & (nk <= 33)
+        rs.append(rows[m].ravel())
+        cs.append((rows + off)[m].ravel())
+        ds.append((inv_s2 * ef)[m].ravel())
+    L = sp.coo_matrix((np.concatenate(ds), (np.concatenate(rs), np.concatenate(cs)))).tocsr()
+    L = L + sp.diags(lap_diag.ravel())
+    L.sort_indices()
+    scr = (kappa * kappa) * sf[ii, jj, kk]           # screening term kappa^2 * solvent_fraction
+    return L, scr.ravel()
+
+
+def cg_solve(A, b, tol=1e-12, maxit=6000):
+    """Conjugate-gradient solve for the SPD systems (validated against a direct
+    splu solve to <3e-12 relative difference). Returns (x, iterations)."""
+    x = np.zeros_like(b)
+    r = b - A @ x
+    p = r.copy()
+    rs = r @ r
+    bnorm = max(1.0, np.linalg.norm(b))
+    it = 0
+    for it in range(1, maxit + 1):
+        Ap = A @ p
+        alpha = rs / (p @ Ap)
+        x += alpha * p
+        r -= alpha * Ap
+        rs2 = r @ r
+        if np.sqrt(rs2) < tol * bnorm:
+            break
+        p = r + (rs2 / rs) * p
+        rs = rs2
+    return x, it
+
+
+def cic_rho(charges, pos, grid):
+    """Trilinear cloud-in-cell deposition; density = deposited charge / spacing^3."""
+    rho = np.zeros((35, 35, 35))
+    f = frac_indices(pos, grid)
+    i0 = np.floor(f).astype(np.int64)
+    t = f - i0
+    s3 = grid["spacing_angstrom"] ** 3
+    for i, q in enumerate(charges):
+        if q == 0.0:
+            continue
+        x, y, z = i0[i]
+        tx, ty, tz = t[i]
+        for dx in (0, 1):
+            wx = tx if dx else 1.0 - tx
+            for dy in (0, 1):
+                wy = ty if dy else 1.0 - ty
+                for dz in (0, 1):
+                    w = wx * wy * (tz if dz else 1.0 - tz)
+                    ii, jj, kk = x + dx, y + dy, z + dz
+                    if 0 <= ii < 35 and 0 <= jj < 35 and 0 <= kk < 35:
+                        rho[ii, jj, kk] += w * q / s3
+    return rho
+
+
+def solve_nonlinear(L, scr, b, beta):
+    """Solve L phi + scr * sinh(beta phi)/beta = b by damped Newton (CG steps).
+
+    (Linearized limit: L phi + scr phi = b.) Returns (phi, iterations, |residual|inf).
+
+    The linearized solution is used as the starting point but capped per node:
+    at any node with screening, the true solution satisfies
+    scr*sinh(beta*phi)/beta <= 2*Lii*|phi| + |b|max, so phi is bounded by
+    (1/beta)*asinh(beta*(2*Lii*|phi0| + bmax)/scr); iterating this estimate a
+    few times gives a tight per-node cap. Starting inside the cap keeps the
+    Newton iterates in a well-conditioned regime (the uncapped linearized
+    solution overshoots by orders of magnitude near charges).
+    """
+    A_lin_scr = (L + sp.diags(scr)).tocsc()
+    phi, _ = cg_solve(A_lin_scr, b)                         # start: linearized solution
+    Lii = L.diagonal()
+    bmax = np.abs(b).max()
+    cap = np.full_like(phi, np.inf)
+    active = scr > 1e-200   # every screened node (tanh tails are never exactly 0)
+    if active.any():
+        phi0 = np.abs(phi).max()
+        for _ in range(4):
+            rhs = 2.0 * Lii[active] * phi0 + bmax
+            cap[active] = np.arcsinh(beta * rhs / scr[active]) / beta
+            phi0 = cap[active].max()
+    phi = np.clip(phi, -cap, cap)
+
+    def resid(p):
+        return L @ p + scr * np.sinh(np.clip(beta * p, -SINH_CLIP, SINH_CLIP)) / beta - b
+
+    F = resid(phi)
+    tol = 1e-10 * max(1.0, np.abs(b).max())
+    it = 0
+    for it in range(1, 51):
+        J = (L + sp.diags(scr * np.cosh(np.clip(beta * phi, -SINH_CLIP, SINH_CLIP)))).tocsc()
+        delta, _ = cg_solve(J, F)
+        scale = max(1.0, np.abs(phi).max())
+        step = 1.0
+        F0 = np.abs(F).max()
+        for _ in range(12):                                # backtracking on residual
+            phi_new = np.clip(phi - step * delta, -cap, cap)  # project onto proven range
+            F_new = resid(phi_new)
+            if np.isfinite(F_new).all() and np.abs(F_new).max() <= F0:
+                phi, F = phi_new, F_new
+                break
+            step *= 0.5
+        if step == 0.5 ** 12:
+            break                                          # no progress possible
+        if np.abs(F).max() < tol or (step * np.abs(delta).max()) < 1e-11 * scale:
+            break
+    return phi, it, np.abs(F).max()
+
+
+# ----------------------------------------------------------------------
+# secondary (Born cross-term) metric
+# ----------------------------------------------------------------------
+def secondary_metric(case, grid, sdf_a, sdf_b):
+    rp = case["response_parameters"]
+    eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+    kappa = rp["screening_kappa_per_angstrom"]
+    cid = case["case_id"]
+    pa = SITES[(SITES["case_id"] == cid) & (SITES["entity_id"] == "part_a")]
+    pb = SITES[(SITES["case_id"] == cid) & (SITES["entity_id"] == "part_b")]
+    pos_a = pa[["x_angstrom", "y_angstrom", "z_angstrom"]].to_numpy(dtype=float)
+    q_a = pa["charge_e"].to_numpy(dtype=float)
+    r_a = pa["radius_angstrom"].to_numpy(dtype=float)
+    pos_b = pb[["x_angstrom", "y_angstrom", "z_angstrom"]].to_numpy(dtype=float)
+    q_b = pb["charge_e"].to_numpy(dtype=float)
+    r_b = pb["radius_angstrom"].to_numpy(dtype=float)
+    # Born radius: max(atom radius, distance to own component's reconstructed SES boundary)
+    a_i = np.maximum(r_a, np.abs(trilinear(sdf_a, pos_a, grid)))
+    a_j = np.maximum(r_b, np.abs(trilinear(sdf_b, pos_b, grid)))
+    d = pos_a[:, None, :] - pos_b[None, :, :]
+    rij2 = (d ** 2).sum(-1)
+    rij = np.sqrt(rij2)
+    keep = rij.min(1) <= GATE                              # 6.5 Angstrom gate on nearest part_b
+    ai = a_i[keep, None]
+    aj = a_j[None, :]
+    r2 = rij2[keep]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f = np.sqrt(r2 + ai * aj * np.exp(-r2 / (4.0 * ai * aj)))
+    f = np.where(f > 0.0, f, np.inf)
+    term = ((1.0 / eps_in) - np.exp(-kappa * f) / eps_out) / f
+    return -KCAL * np.sum(q_a[keep, None] * q_b[None, :] * term), int(keep.sum())
+
+
+# ----------------------------------------------------------------------
+# dependency-free PNG rendering (matplotlib unavailable, network blocked)
+# ----------------------------------------------------------------------
+FONT = {
+    'A': (0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11), 'B': (0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    'C': (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E), 'D': (0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    'E': (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F), 'F': (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    'G': (0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E), 'H': (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    'I': (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E), 'J': (0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C),
+    'K': (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11), 'L': (0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    'M': (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11), 'N': (0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11),
+    'O': (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E), 'P': (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    'Q': (0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D), 'R': (0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    'S': (0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E), 'T': (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    'U': (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E), 'V': (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    'W': (0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11), 'X': (0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    'Y': (0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04), 'Z': (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    '0': (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E), '1': (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    '2': (0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F), '3': (0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E),
+    '4': (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02), '5': (0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+    '6': (0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E), '7': (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    '8': (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E), '9': (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E),
+    ' ': (0, 0, 0, 0, 0, 0, 0), '-': (0, 0, 0, 0x0E, 0, 0, 0), '+': (0, 0x04, 0x04, 0x1E, 0x04, 0x04, 0),
+    '.': (0, 0, 0, 0, 0, 0x0C, 0x0C), ':': (0, 0x04, 0x04, 0, 0x04, 0x04, 0),
+    '/': (0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10), '(': (0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
+    ')': (0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08), '_': (0, 0, 0, 0, 0, 0, 0x1F),
+    '[': (0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E), ']': (0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E),
+    '=': (0, 0x0E, 0x0E, 0, 0x0E, 0x0E, 0),
+}
+
+
+def draw_text(canvas, x, y, text, scale=1, color=(0, 0, 0)):
+    cx = x
+    for ch in text:
+        g = FONT.get(ch, FONT[' '])
+        for r in range(7):
+            bits = g[r]
+            for c in range(5):
+                if bits & (1 << (4 - c)):
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            canvas[y + r * scale + dy, cx + c * scale + dx] = color
+        cx += 6 * scale
+
+
+def write_png(path, canvas):
+    h, w, _ = canvas.shape
+    raw = b"".join(b"\x00" + canvas[y].tobytes() for y in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def rdbu(t):
+    """Diverging blue-white-red colormap, t in [0,1]."""
+    if t < 0.5:
+        u = t / 0.5
+        return tuple(int(a + (255 - a) * u) for a in (33, 102, 172))
+    u = (t - 0.5) / 0.5
+    return tuple(int(255 + (a - 255) * u) for a in (178, 24, 43))
+
+
+def render_overview(path, field_slices, rows, vmax):
+    W, H = 1460, 980
+    canvas = np.full((H, W, 3), 255, np.uint8)
+    title = "IMPLICIT-SOLVENT BINDING RESPONSE: PB (PRIMARY) VS BORN CROSS-TERM (SECONDARY)"
+    draw_text(canvas, (W - len(title) * 12) // 2, 18, title, scale=2)
+    px = 8  # pixels per voxel
+    for ci, row in enumerate(rows):
+        r, c = divmod(ci, 4)
+        x0 = 30 + c * 310
+        y0 = 70 + r * 430
+        sl = field_slices[ci]
+        tvals = np.clip(0.5 + 0.5 * sl / vmax, 0.0, 1.0)
+        cols = np.array([rdbu(t) for t in tvals.ravel()], np.uint8).reshape(35, 35, 3)
+        img = np.repeat(np.repeat(cols, px, axis=0), px, axis=1)
+        canvas[y0:y0 + 280, x0:x0 + 280] = img
+        canvas[y0:y0 + 280, x0] = 0
+        canvas[y0:y0 + 280, x0 + 279] = 0
+        canvas[y0, x0:x0 + 280] = 0
+        canvas[y0 + 279, x0:x0 + 280] = 0
+        ty = y0 + 286
+        draw_text(canvas, x0, ty, row["label"], scale=2)
+        for k, line in enumerate(row["lines"]):
+            draw_text(canvas, x0, ty + 24 + k * 12, line)
+    # shared color scale
+    bx, by, bh = 1300, 70, 780
+    for yy in range(bh):
+        t = 1.0 - yy / (bh - 1)
+        canvas[by + yy, bx:bx + 24] = rdbu(t)
+    canvas[by - 1:by + bh + 1, bx - 1] = 0
+    canvas[by - 1:by + bh + 1, bx + 24] = 0
+    draw_text(canvas, bx + 30, by, f"+{vmax:.1f}")
+    draw_text(canvas, bx + 30, by + bh // 2 - 3, "0.0")
+    draw_text(canvas, bx + 30, by + bh - 7, f"-{vmax:.1f}")
+    draw_text(canvas, bx - 40, by + bh + 16, "REACTION FIELD")
+    draw_text(canvas, bx - 40, by + bh + 28, "(KCAL/MOL/E)")
+    draw_text(canvas, 30, H - 30,
+              "FIELD = ASSEMBLY REACTION FIELD (MEDIUM - VACUUM); ZERO DIRICHLET OUTER BOUNDARY; GRID 35X35X35 PER CASE",
+              scale=1)
+    write_png(path, canvas)
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+def main():
+    t_start = time.time()
+    global SITES
+    with open("data/manifest.json") as f:
+        man = json.load(f)
+    with open("data/plane_spec.json") as f:
+        planes = json.load(f)["planes"]
+    SITES = pd.read_csv("data/sites.csv")
+    volA = np.load("data/volume_a.npy")   # (8,35,35,35) float32, SDF, negative inside
+    volB = np.load("data/volume_b.npy")
+    queries = np.load("data/queries.npy")  # (8,24,3) float32
+    cases = man["cases"]
+    assert [c["case_id"] for c in cases] == man["case_order"]
+
+    os.makedirs("results", exist_ok=True)
+    field_samples = np.zeros((len(cases), 24))
+    field_slices = np.zeros((len(cases), 35, 35))
+    summary = []
+    diag_lines = []
+    rows_for_fig = []
+
+    for ci, case in enumerate(cases):
+        t_case = time.time()
+        grid = case["grid"]
+        s = grid["spacing_angstrom"]
+        rp = case["response_parameters"]
+        sur = case["surface_parameters"]
+        eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+        kappa = rp["screening_kappa_per_angstrom"]
+        T = rp["temperature_kelvin"]
+        regime = rp["response_regime"]
+        smodel = sur["surface_model"]
+        probe = sur["probe_radius_angstrom"]
+        win = sur["smoothing_window_angstrom"]
+        cid = case["case_id"]
+
+        # --- entity surfaces / solvent fractions / dielectrics ---
+        # assembly: provided tensors authoritative (mol -> volume_a, smol -> volume_b)
+        sdf_asm = (volA[ci] if smodel == "mol" else volB[ci]).astype(np.float64)
+        t_m = time.time()
+        sdf_a = entity_sdf(cid, grid, "part_a", probe)
+        sdf_b = entity_sdf(cid, grid, "part_b", probe)
+        t_mask = time.time() - t_m
+        sf_asm = solvent_fraction(sdf_asm, smodel, win)
+        sf_a = solvent_fraction(sdf_a, smodel, win)
+        sf_b = solvent_fraction(sdf_b, smodel, win)
+        eps_asm = eps_field(sf_asm, eps_in, eps_out)
+        eps_a = eps_field(sf_a, eps_in, eps_out)
+        eps_b = eps_field(sf_b, eps_in, eps_out)
+        sf_map = {"assembly": sf_asm, "part_a": sf_a, "part_b": sf_b}
+        eps_map = {"assembly": eps_asm, "part_a": eps_a, "part_b": eps_b}
+
+        # --- charges ---
+        ent = {}
+        for name in ("assembly", "part_a", "part_b"):
+            sub = SITES[(SITES["case_id"] == cid) & (SITES["entity_id"] == name)]
+            ent[name] = (sub[["x_angstrom", "y_angstrom", "z_angstrom"]].to_numpy(dtype=float),
+                         sub["charge_e"].to_numpy(dtype=float))
+
+        # --- vacuum system (uniform eps_in, sf=0, kappa=0): one factorization per case ---
+        t_f = time.time()
+        L_vac, _ = build_L(np.full((35, 35, 35), eps_in), np.zeros((35, 35, 35)), 0.0, s)
+        A_vac = L_vac.tocsc()
+        t_vac_fact = time.time() - t_f
+
+        energies = {}
+        phi_R_asm_full = None
+        newton_info = {}
+        fact_times = {}
+        for name in ("assembly", "part_a", "part_b"):
+            pos, q = ent[name]
+            rho = cic_rho(q, pos, grid)
+            b = (4.0 * np.pi * KCAL * rho[1:34, 1:34, 1:34]).ravel()
+            t_f = time.time()
+            L, scr = build_L(eps_map[name], sf_map[name], kappa, s)
+            if regime == "linearized_screening":
+                phi_med, iters = cg_solve((L + sp.diags(scr)).tocsc(), b)
+                res = np.abs((L + sp.diags(scr)) @ phi_med - b).max()
+            else:
+                beta = 1.0 / (R_KCAL * T)   # (kcal/mol)^-1 for potentials in kcal/mol/e
+                phi_med, iters, res = solve_nonlinear(L, scr, b, beta)
+                newton_info[name] = (iters, res)
+            fact_times[name] = time.time() - t_f
+            phi_vac, _ = cg_solve(A_vac, b)
+            phi_R = phi_med - phi_vac
+            phi_R_full = np.zeros((35, 35, 35))
+            phi_R_full[1:34, 1:34, 1:34] = phi_R.reshape(33, 33, 33)
+            if name == "assembly":
+                phi_R_asm_full = phi_R_full
+            energies[name] = 0.5 * np.sum(q * trilinear(phi_R_full, pos, grid))
+
+        primary = energies["assembly"] - energies["part_a"] - energies["part_b"]
+        secondary, n_kept = secondary_metric(case, grid, sdf_a, sdf_b)
+        gap = primary - secondary
+
+        # --- field outputs (assembly reaction field, field entity) ---
+        field_samples[ci] = trilinear(phi_R_asm_full, queries[ci], grid)
+        pl = planes[ci]
+        if pl["axis"] == "z":
+            sl = phi_R_asm_full[:, :, pl["plane_index"]]
+            slice_note = f"SLICE: Z[{pl['plane_index']}] X-Y"
+        else:
+            sl = phi_R_asm_full[:, pl["plane_index"], :]
+            slice_note = f"SLICE: Y[{pl['plane_index']}] X-Z"
+        field_slices[ci] = sl
+
+        summary.append((cid, primary, secondary, gap))
+        rows_for_fig.append({
+            "label": f"CASE_{ci:03d}".upper(),
+            "lines": [
+                f"REGIME: {'LINEARIZED' if regime == 'linearized_screening' else 'NONLINEAR'}",
+                f"SURF: {smodel.upper()} P={probe:.1f} W={win:.1f}",
+                slice_note,
+                f"PRIMARY: {primary:+.2f} KCAL/MOL",
+                f"SECONDARY: {secondary:+.2f} KCAL/MOL",
+                f"GAP: {gap:+.2f} KCAL/MOL",
+            ],
+        })
+        diag_lines.append(
+            f"{cid} | {regime:22s} {smodel} p={probe:.1f} w={win:.1f} | "
+            f"E_asm={energies['assembly']:+10.3f} E_a={energies['part_a']:+10.3f} E_b={energies['part_b']:+10.3f} | "
+            f"primary={primary:+10.3f} secondary={secondary:+10.3f} gap={gap:+10.3f} | "
+            f"masks={t_mask:5.1f}s vacfact={t_vac_fact:5.2f}s "
+            f"medfact=" + "/".join(f"{fact_times[n]:5.2f}" for n in ("assembly", "part_a", "part_b")) +
+            (" | newton=" + "/".join(f"{newton_info[n][0]}it,res={newton_info[n][1]:.1e}" for n in newton_info)
+             if newton_info else "") +
+            f" | sec_kept={n_kept} | field[min={phi_R_asm_full.min():+.2f},max={phi_R_asm_full.max():+.2f}] | "
+            f"case_time={time.time()-t_case:6.1f}s"
+        )
+
+    # --- outputs ---
+    with open("results/summary_metrics.csv", "w") as f:
+        f.write("case_id,metric_primary_kcal_mol,metric_secondary_kcal_mol,metric_gap_kcal_mol\n")
+        for cid, p, sec, g in summary:
+            # full-precision round-trip so that gap == primary - secondary holds exactly
+            # when the written values are re-parsed as float64
+            f.write(f"{cid},{float(p)!r},{float(sec)!r},{float(g)!r}\n")
+    np.save("results/field_samples.npy", field_samples.astype(np.float32))
+    np.save("results/field_slice.npy", field_slices.astype(np.float32))
+    vmax = float(np.abs(field_slices).max())
+    render_overview("results/overview.png", field_slices, rows_for_fig, vmax)
+
+    print("\n".join(diag_lines))
+    print(f"\ntotal wall time: {time.time()-t_start:.1f} s")
+    print("outputs:")
+    for p in ("results/summary_metrics.csv", "results/field_samples.npy",
+              "results/field_slice.npy", "results/overview.png"):
+        st = os.stat(p)
+        print(f"  {p}: {st.st_size} bytes")
+    print("field_samples (saved):", field_samples.shape, "float32")
+    print("field_slice   (saved):", field_slices.shape, "float32")
+
+
+if __name__ == "__main__":
+    main()

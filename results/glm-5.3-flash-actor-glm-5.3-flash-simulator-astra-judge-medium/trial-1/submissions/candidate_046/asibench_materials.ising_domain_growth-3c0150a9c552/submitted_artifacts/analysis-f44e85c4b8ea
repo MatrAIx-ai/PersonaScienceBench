@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+B3: Hidden Binary-Grid Time Evolution.
+
+Inferred model (all semantic choices documented in the JSON 'notes'):
+  2D Ising model, J = 1, single-spin-flip Metropolis dynamics with
+  inverse temperature beta = parameters['control'] (deep quench:
+  beta_c = ln(1+sqrt(2))/2 ~ 0.4407 for J=1, so beta = 2.0236 is far
+  below Tc -> domain coarsening from the disordered initial state).
+  Periodic boundaries. 1 time unit = 1 Monte Carlo sweep =
+  grid_size^2 single-spin attempts, implemented as two vectorized
+  checkerboard half-updates per sweep. RNG:
+  numpy.random.default_rng(dynamics_seed), drawn once at start.
+
+Outputs (all float64 and finite):
+  seriesA.npy [2, n_measurements]  row0 = magnetization per site m(t)
+                                   row1 = energy per site e(t)
+  seriesB.npy [2, n_measurements]  row0 = domain length L(t) (first zero
+                                   crossing of connected correlation),
+                                   row1 = interface (unlike-bond) density
+  stackC.npy  [n_snapshots, max_r] angularly averaged G(r,t), r=0..max_r-1
+  stackD.npy  [n_snapshots, grid_size] row-averaged spin profile
+  stackE.npy  [n_snapshots, 2, grid_size] two axial averages per snapshot
+  metadataA.json  scaling-collapse diagnostics
+  metadataB.json  power-law fit L(t) = A * t**theta
+  figure.png      diagnostic figure (matplotlib if available, otherwise a
+                  dependency-free PNG renderer using only numpy + stdlib)
+"""
+import json
+import numpy as np
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
+
+PARAMS_PATH = "data/parameters.json"
+STATE_PATH = "data/initial_state.npy"
+
+
+def neighbor_sum(s):
+    return (np.roll(s, 1, 0) + np.roll(s, -1, 0)
+            + np.roll(s, 1, 1) + np.roll(s, -1, 1))
+
+
+def run_dynamics(s0, grid_size, beta, n_steps, meas_times_i, snap_times_i, rng):
+    """Checkerboard Metropolis; returns seriesA rows, interface density,
+    the full lattice state at every measurement time and at every
+    snapshot time (snapshot times need not coincide with measurements)."""
+    s = s0.copy()
+    N2 = grid_size * grid_size
+    meas_index = {t: i for i, t in enumerate(meas_times_i)}
+    snap_set = set(snap_times_i)
+    seriesA = np.full((2, len(meas_times_i)), np.nan)
+    rho_t = np.full(len(meas_times_i), np.nan)
+    states = [None] * len(meas_times_i)
+    snap_states = [None] * len(snap_times_i)
+    g = np.add.outer(np.arange(grid_size), np.arange(grid_size)) % 2 == 0
+    for sweep in range(1, n_steps + 1):
+        for parity in (0, 1):
+            mask = g if parity == 0 else ~g
+            nb = neighbor_sum(s)
+            dE = 2.0 * s * nb
+            p_acc = np.exp(-beta * np.maximum(dE, 0.0))   # p = 1 if dE <= 0
+            flip = mask & (rng.random((grid_size, grid_size)) < p_acc)
+            s[flip] = -s[flip]
+        if sweep in meas_index:
+            i = meas_index[sweep]
+            seriesA[0, i] = float(s.sum()) / N2
+            seriesA[1, i] = -float((s * neighbor_sum(s)).sum()) / (2.0 * N2)
+            r = (s != np.roll(s, 1, 0)).sum() + (s != np.roll(s, 1, 1)).sum()
+            rho_t[i] = float(r) / (2.0 * N2)
+            states[i] = s.copy()
+        if sweep in snap_set:
+            snap_states[snap_times_i.index(sweep)] = s.copy()
+    assert not np.isnan(seriesA).any() and not np.isnan(rho_t).any()
+    assert all(st is not None for st in states)
+    assert all(st is not None for st in snap_states)
+    return seriesA, rho_t, states, snap_states
+
+
+def radial_correlation(s, max_r):
+    """Angularly averaged <s(0) s(r)>: FFT autocorrelation averaged over
+    origins, ring = all displacements with round(distance) == r."""
+    n = s.shape[0]
+    F = np.fft.rfft2(s.astype(np.float64))
+    ac = np.fft.irfft2(F * np.conj(F), s=s.shape) / (n * n)
+    yy, xx = np.mgrid[0:n, 0:n]
+    dx = np.minimum(xx, n - xx)
+    dy = np.minimum(yy, n - yy)
+    d = np.rint(np.sqrt(dx ** 2 + dy ** 2)).astype(int)
+    return np.array([ac[d == r].mean() for r in range(max_r)])
+
+
+def length_from_correlation(G, m2, grid_size):
+    """L = first zero crossing of C(r) = G(r) - m^2 (linear interpolation
+    between bracketing integer r). Fallback: half-height crossing of G
+    between G(0)=1 and the plateau m^2. Returns (L, method)."""
+    C = G - m2
+    if C[1] > 0.0:
+        for r in range(2, len(C)):
+            if C[r] <= 0.0:
+                c0, c1 = C[r - 1], C[r]
+                frac = (0.0 - c0) / (c1 - c0) if c1 != c0 else 0.5
+                return (r - 1) + frac, "zero-crossing of C(r)=G(r)-m^2"
+    half = 0.5 * (1.0 + m2)
+    for r in range(1, len(G)):
+        if G[r] <= half:
+            g0, g1 = G[r - 1], G[r]
+            frac = (half - g0) / (g1 - g0) if g1 != g0 else 0.5
+            return (r - 1) + frac, "half-height crossing of G(r) (fallback)"
+    return float(grid_size), "no crossing within max_r (saturated)"
+
+
+def power_law_fit(t, L, t_min, t_max):
+    """OLS fit log L = log A + theta log t on the window [t_min, t_max]."""
+    sel = (t >= t_min) & (t <= t_max)
+    x, y = np.log(t[sel]), np.log(L[sel])
+    n = int(len(x))
+    if n < 3:
+        return dict(exponent=float("nan"), exponent_std_error=float("nan"),
+                    amplitude=float("nan"), r_squared=float("nan"), n=n)
+    theta, logA = np.polyfit(x, y, 1)
+    yhat = theta * x + logA
+    ss_res = float(((y - yhat) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    dof = n - 2
+    s_err = (float(np.sqrt(ss_res / dof / ((x - x.mean()) ** 2).sum()))
+             if dof > 0 else float("nan"))
+    return dict(exponent=float(theta), exponent_std_error=s_err,
+                amplitude=float(np.exp(logA)), r_squared=float(r2), n=n)
+
+
+# ------------------------------------------------- fallback PNG renderer
+# Used only if matplotlib is unavailable in the runtime. Pure numpy +
+# stdlib zlib PNG writer; content mirrors the matplotlib figure.
+_PNG_FONT = {  # 5x7 glyphs, rows as 5-bit ints (MSB left)
+ 'A':(0x0E,0x11,0x11,0x1F,0x11,0x11,0x11),'B':(0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E),
+ 'C':(0x0E,0x11,0x10,0x10,0x10,0x11,0x0E),'D':(0x1E,0x11,0x11,0x11,0x11,0x11,0x1E),
+ 'E':(0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F),'F':(0x1F,0x10,0x10,0x1E,0x10,0x10,0x10),
+ 'G':(0x0E,0x11,0x10,0x17,0x11,0x11,0x0F),'H':(0x11,0x11,0x11,0x1F,0x11,0x11,0x11),
+ 'I':(0x0E,0x04,0x04,0x04,0x04,0x04,0x0E),'K':(0x11,0x12,0x14,0x18,0x14,0x12,0x11),
+ 'L':(0x10,0x10,0x10,0x10,0x10,0x10,0x1F),'M':(0x11,0x1B,0x15,0x15,0x11,0x11,0x11),
+ 'N':(0x11,0x19,0x15,0x13,0x11,0x11,0x11),'O':(0x0E,0x11,0x11,0x11,0x11,0x11,0x0E),
+ 'P':(0x1E,0x11,0x11,0x1E,0x10,0x10,0x10),'R':(0x1E,0x11,0x11,0x1E,0x14,0x12,0x11),
+ 'S':(0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E),'T':(0x1F,0x04,0x04,0x04,0x04,0x04,0x04),
+ 'U':(0x11,0x11,0x11,0x11,0x11,0x11,0x0E),'V':(0x11,0x11,0x11,0x11,0x11,0x0A,0x04),
+ 'W':(0x11,0x11,0x11,0x15,0x15,0x1B,0x11),'X':(0x11,0x11,0x0A,0x04,0x0A,0x11,0x11),
+ 'Y':(0x11,0x11,0x0A,0x04,0x04,0x04,0x04),'Z':(0x1F,0x01,0x02,0x04,0x08,0x10,0x1F),
+ '0':(0x0E,0x11,0x13,0x15,0x19,0x11,0x0E),'1':(0x04,0x0C,0x04,0x04,0x04,0x04,0x0E),
+ '2':(0x0E,0x11,0x01,0x02,0x04,0x08,0x1F),'3':(0x1F,0x02,0x04,0x02,0x01,0x11,0x0E),
+ '4':(0x02,0x06,0x0A,0x12,0x1F,0x02,0x02),'5':(0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E),
+ '6':(0x06,0x08,0x10,0x1E,0x11,0x11,0x0E),'7':(0x1F,0x01,0x02,0x04,0x08,0x08,0x08),
+ '8':(0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E),'9':(0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C),
+ '.':(0x00,0x00,0x00,0x00,0x00,0x0C,0x0C),',':(0x00,0x00,0x00,0x00,0x0C,0x04,0x08),
+ '-':(0x00,0x00,0x00,0x1F,0x00,0x00,0x00),'=':(0x00,0x00,0x1F,0x00,0x1F,0x00,0x00),
+ '(':(0x02,0x04,0x08,0x08,0x08,0x04,0x02),')':(0x08,0x04,0x02,0x02,0x02,0x04,0x08),
+ '/':(0x01,0x02,0x02,0x04,0x08,0x10,0x10),'+':(0x00,0x04,0x04,0x1F,0x04,0x04,0x00),
+ ':':(0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00),' ':(0,0,0,0,0,0,0),
+}
+
+
+def _png_write(path, rgb):
+    import struct, zlib
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def _txt(cv, x, y, s, color=(0, 0, 0), scale=2):
+    x = int(max(0, x)); y = int(max(0, y))
+    H, W = cv.shape[:2]
+    for ch in s.upper():
+        glyph = _PNG_FONT.get(ch, _PNG_FONT[' '])
+        for ry, row in enumerate(glyph):
+            for rx in range(5):
+                if row >> (4 - rx) & 1:
+                    yy, xx2 = y + ry * scale, x + rx * scale
+                    if yy + scale <= H and xx2 + scale <= W:
+                        cv[yy:yy + scale, xx2:xx2 + scale] = color
+        x += 6 * scale
+
+
+def _line(cv, x0, y0, x1, y1, color, thick=1):
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    for i in range(n):
+        a = int(round(x0 + (x1 - x0) * i / max(n - 1, 1)))
+        b = int(round(y0 + (y1 - y0) * i / max(n - 1, 1)))
+        cv[max(b - 1, 0):b + thick, max(a - 1, 0):a + thick] = color
+
+
+def _imshow_panel(cv, x0, y0, w, h, state, title):
+    """Diverging blue-white-red rendering of a spin state."""
+    ri = (np.arange(h) * state.shape[0] // h)
+    ci = (np.arange(w) * state.shape[1] // w)
+    img = state[np.ix_(ri, ci)]
+    inner = np.full((h, w, 3), 255, np.uint8)
+    t = (img + 1) / 2.0
+    inner[..., 0] = (255 * np.clip(2 * t, 0, 1)).astype(np.uint8)     # red for +1
+    inner[..., 2] = (255 * np.clip(2 * (1 - t), 0, 1)).astype(np.uint8)  # blue for -1
+    cv[y0:y0 + h, x0:x0 + w] = inner
+    _rect(cv, x0, y0, w, h)
+    _txt(cv, x0, y0 + h + 4, title)
+
+
+def _rect(cv, x0, y0, w, h, color=(60, 60, 60)):
+    cv[y0:y0 + h, x0] = color; cv[y0:y0 + h, x0 + w - 1] = color
+    cv[y0, x0:x0 + w] = color; cv[y0 + h - 1, x0:x0 + w] = color
+
+
+def _plot_panel(cv, x0, y0, w, h, title, xlabel, curves, logx=False, logy=False):
+    """curves: list of (xs, ys, color). Values are pre-scaled positive-safe."""
+    _rect(cv, x0, y0, w, h)
+    _txt(cv, x0, y0 - 16, title)
+    _txt(cv, x0 + w // 2 - 20, y0 + h + 4, xlabel)
+    xs = np.concatenate([np.asarray(c[0], float) for c in curves])
+    ys = np.concatenate([np.asarray(c[1], float) for c in curves])
+    xs = np.log10(xs) if logx else xs
+    ys = np.log10(ys) if logy else ys
+    xmin, xmax, ymin, ymax = xs.min(), xs.max(), ys.min(), ys.max()
+    if xmax == xmin: xmax += 1
+    if ymax == ymin: ymax += 1
+    pad = 0.05 * (ymax - ymin); ymin -= pad; ymax += pad
+    px = lambda v: int(x0 + 2 + (v - xmin) / (xmax - xmin) * (w - 4))
+    py = lambda v: int(y0 + h - 2 - (v - ymin) / (ymax - ymin) * (h - 4))
+    for xs_, ys_, col in curves:
+        xv = np.log10(np.asarray(xs_, float)) if logx else np.asarray(xs_, float)
+        yv = np.log10(np.asarray(ys_, float)) if logy else np.asarray(ys_, float)
+        for i in range(len(xv) - 1):
+            _line(cv, px(xv[i]), py(yv[i]), px(xv[i + 1]), py(yv[i + 1]), col)
+    # tick labels
+    for v in np.linspace(xmin, xmax, 3):
+        lab = f"{10 ** v:.0f}" if logx else f"{v:.0f}"
+        _txt(cv, px(v) - 8, y0 + h + 14, lab, scale=1)
+    for v in np.linspace(ymin, ymax, 3):
+        lab = f"{10 ** v:.2f}" if logy else f"{v:.2f}"
+        _txt(cv, max(1, x0 - 34), py(v) - 3, lab, scale=1)
+
+
+def _figure_fallback(path, s0, states, snap_states, snap_times, stackC, L_t,
+                     seriesA, seriesB, tt, x_lo, x_hi, C0, m_snap, max_r, fit,
+                     t_min_f, t_max_f, n_steps, quality, L_snap):
+    COL = [(228, 26, 28), (55, 126, 184), (77, 175, 74), (152, 78, 163),
+           (255, 127, 0), (166, 86, 40)]
+    W, H, PW, PH, MG = 1660, 940, 380, 240, 26
+    cv = np.full((H, W, 3), 255, np.uint8)
+    _txt(cv, 26, 6, "B3 ISING DOMAIN GROWTH: BETA = CONTROL = 2.0236, GRID 100X100, "
+         f"{n_steps} MC SWEEPS", (0, 0, 0), 2)
+
+    def cell(r, c):
+        return MG + c * (PW + MG), 34 + r * (PH + 44)
+
+    # row 0: images, G(r,t), collapse
+    x0, y0 = cell(0, 0); _imshow_panel(cv, x0, y0, PW, PH, s0, "INITIAL STATE")
+    x0, y0 = cell(0, 1)
+    _imshow_panel(cv, x0, y0, PW, PH, states[-1], f"FINAL STATE T={n_steps}")
+    x0, y0 = cell(0, 2)
+    curves = [(np.arange(max_r), stackC[k], COL[k % 6]) for k in range(len(snap_states))]
+    _plot_panel(cv, x0, y0, PW, PH, "RADIAL CORRELATION G(R,T)", "R", curves)
+    x0, y0 = cell(0, 3)
+    curves = []
+    for k in range(len(snap_states)):
+        Lk = L_snap[k] if 'L_snap' in dir() else L_t[k]; Ck = stackC[k] - m_snap[k] ** 2
+        rr = np.arange(1, max_r)
+        curves.append((rr / Lk, Ck[1:] / C0[k], COL[k % 6]))
+    _plot_panel(cv, x0, y0, PW, PH, f"COLLAPSE C/C0 VS R/L (Q={quality:.3f})",
+                "R/L", curves)
+
+    # row 1: m(t), e(t), rho(t), L(t) + fit
+    x0, y0 = cell(1, 0)
+    _plot_panel(cv, x0, y0, PW, PH, "MAGNETIZATION M(T)", "T (LOG10)",
+                [(tt, seriesA[0], COL[0])], logx=True)
+    x0, y0 = cell(1, 1)
+    _plot_panel(cv, x0, y0, PW, PH, "ENERGY PER SITE E(T)", "T (LOG10)",
+                [(tt, seriesA[1], COL[1])], logx=True)
+    x0, y0 = cell(1, 2)
+    _plot_panel(cv, x0, y0, PW, PH, "INTERFACE DENSITY RHO(T)", "T (LOG10)",
+                [(tt, seriesB[1], COL[2])], logx=True)
+    x0, y0 = cell(1, 3)
+    curves = [(tt, seriesB[0], COL[3])]
+    if fit["n"] >= 3 and np.isfinite(fit["exponent"]):
+        tf = np.array([t_min_f, t_max_f])
+        curves.append((tf, fit["amplitude"] * tf ** fit["exponent"], (0, 0, 0)))
+    _plot_panel(cv, x0, y0, PW, PH,
+                f"L(T), THETA={fit['exponent']:.3f}+-{fit['exponent_std_error']:.3f}",
+                "T (LOG10)", curves, logx=True, logy=True)
+
+    # row 2: snapshots
+    for j in range(4):
+        k = min(j, len(snap_states) - 1)
+        x0, y0 = cell(2, j)
+        _imshow_panel(cv, x0, y0, PW, PH, snap_states[k],
+                      f"SNAPSHOT T={snap_times[k]:.0f}")
+    _png_write(path, cv)
+
+
+def _figure_mpl(path, s0, states, snap_states, snap_times, stackC, L_t,
+                seriesA, seriesB, tt, x_lo, x_hi, C0, m_snap, max_r, fit,
+                t_min_f, t_max_f, n_steps, quality, L_snap):
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(3, 4, hspace=0.5, wspace=0.35)
+    ax = fig.add_subplot(gs[0, 0])
+    ax.imshow(s0, cmap="coolwarm", vmin=-1, vmax=1); ax.set_title("initial state")
+    ax = fig.add_subplot(gs[0, 1])
+    ax.imshow(states[-1], cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_title(f"final state t={n_steps}")
+    ax = fig.add_subplot(gs[0, 2])
+    for k, t in enumerate(snap_times):
+        ax.plot(np.arange(max_r), stackC[k], label=f"t={t:.0f}")
+    ax.set_xlabel("r"); ax.set_ylabel("G(r,t)")
+    ax.set_title("radial correlation"); ax.legend(fontsize=6)
+    ax = fig.add_subplot(gs[0, 3])
+    for k in range(len(snap_states)):
+        Lk = L_snap[k]; Ck = stackC[k] - m_snap[k] ** 2
+        ax.plot(np.arange(1, max_r) / Lk, Ck[1:] / C0[k],
+                label=f"t={snap_times[k]:.0f}")
+    ax.axvspan(x_lo, x_hi, alpha=0.15, color="k")
+    ax.set_xlabel("r/L"); ax.set_ylabel("C(r,t)/C(0,t)")
+    ax.set_title(f"collapse (quality={quality:.3f})"); ax.legend(fontsize=6)
+
+    ax = fig.add_subplot(gs[1, 0]); ax.plot(tt, seriesA[0]); ax.set_xscale("log")
+    ax.set_xlabel("t"); ax.set_ylabel("m(t)"); ax.set_title("magnetization")
+    ax = fig.add_subplot(gs[1, 1]); ax.plot(tt, seriesA[1]); ax.set_xscale("log")
+    ax.set_xlabel("t"); ax.set_ylabel("e(t)"); ax.set_title("energy per site")
+    ax = fig.add_subplot(gs[1, 2]); ax.plot(tt, seriesB[1]); ax.set_xscale("log")
+    ax.set_xlabel("t"); ax.set_ylabel("rho(t)"); ax.set_title("interface density")
+    ax = fig.add_subplot(gs[1, 3]); ax.loglog(tt, seriesB[0], "o-", ms=3)
+    if fit["n"] >= 3 and np.isfinite(fit["exponent"]):
+        tf = np.array([t_min_f, t_max_f])
+        ax.loglog(tf, fit["amplitude"] * tf ** fit["exponent"], "k--",
+                  label=f"theta={fit['exponent']:.3f}+-{fit['exponent_std_error']:.3f}")
+        ax.legend(fontsize=8)
+    ax.set_xlabel("t"); ax.set_ylabel("L(t)"); ax.set_title("domain growth")
+    for j in range(4):
+        k = min(j, len(snap_states) - 1)
+        ax = fig.add_subplot(gs[2, j])
+        ax.imshow(snap_states[k], cmap="coolwarm", vmin=-1, vmax=1)
+        ax.set_title(f"snapshot t={snap_times[k]:.0f}")
+    fig.suptitle("B3 Ising domain growth: beta = control = 2.0236, "
+                 f"grid 100x100, {n_steps} MC sweeps")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main():
+    with open(PARAMS_PATH) as f:
+        P = json.load(f)
+    grid_size = int(P["grid_size"]); beta = float(P["control"])
+    n_steps = int(P["n_steps"]); n_snapshots = int(P["n_snapshots"])
+    n_meas = int(P["n_measurements"]); max_r = int(P["max_r"])
+    snap_times = [float(t) for t in P["snapshot_times"]]
+    meas_times = [float(t) for t in P["measurement_times"]]
+    seed = int(P["dynamics_seed"])
+    meas_times_i = [int(t) for t in meas_times]
+    snap_times_i = [int(t) for t in snap_times]
+    tt = np.asarray(meas_times)
+
+    s0 = np.load(STATE_PATH)
+    assert s0.shape == (grid_size, grid_size)
+
+    # schedule verification: integral, unique, ordered, in range,
+    # snapshots subset of measurement times, final time = n_steps
+    assert len(meas_times_i) == n_meas and len(snap_times_i) == n_snapshots
+    assert len(set(meas_times_i)) == n_meas
+    assert all(1 <= t <= n_steps for t in meas_times_i)
+    assert max(meas_times_i) == n_steps == max(snap_times_i)
+    n_coincide = len(set(snap_times_i) & set(meas_times_i))
+    print(f"[check] schedules OK: 170 unique integral measurement times, "
+          f"6 snapshot times (of which {n_coincide} coincide with "
+          f"measurement times; snapshots are sampled independently), "
+          f"max time = n_steps = {n_steps}")
+
+    rng = np.random.default_rng(seed)
+    seriesA, rho_t, states, snap_states = run_dynamics(
+        s0, grid_size, beta, n_steps, meas_times_i, snap_times_i, rng)
+
+    # G(r,t) at every measurement time (for L(t)) and at snapshot times
+    stackC = np.zeros((n_snapshots, max_r))
+    G_meas = np.zeros((n_meas, max_r))
+    for i in range(n_meas):
+        G_meas[i] = radial_correlation(states[i], max_r)
+    for k in range(n_snapshots):
+        stackC[k] = radial_correlation(snap_states[k], max_r)
+
+    m2_t = seriesA[0] ** 2
+    L_t = np.zeros(n_meas); L_methods = set()
+    for i in range(n_meas):
+        L_t[i], meth = length_from_correlation(G_meas[i], m2_t[i], grid_size)
+        L_methods.add(meth)
+    seriesB = np.vstack([L_t, rho_t]).astype(np.float64)
+
+    stackD = np.array([snap_states[k].mean(axis=0)
+                       for k in range(n_snapshots)], dtype=np.float64)
+    stackE = np.array([[snap_states[k].mean(axis=0), snap_states[k].mean(axis=1)]
+                       for k in range(n_snapshots)], dtype=np.float64)
+
+    for arr, name in [(seriesA, "seriesA"), (seriesB, "seriesB"),
+                      (stackC, "stackC"), (stackD, "stackD"), (stackE, "stackE")]:
+        assert np.isfinite(arr).all(), name
+        np.save(f"{name}.npy", arr.astype(np.float64))
+    print("[check] all arrays saved, shapes:",
+          seriesA.shape, seriesB.shape, stackC.shape, stackD.shape, stackE.shape)
+
+    # ---------------- metadataA: scaling collapse ----------------
+    m_snap = np.array([st.mean() for st in snap_states])
+    L_snap = np.array([length_from_correlation(stackC[k], m_snap[k] ** 2,
+                                               grid_size)[0]
+                       for k in range(n_snapshots)])
+    C0 = 1.0 - m_snap ** 2
+    x_all, y_all = [], []
+    for k in range(n_snapshots):
+        Ck = stackC[k] - m_snap[k] ** 2
+        Lk = L_snap[k]
+        xk = np.arange(max_r) / Lk
+        for r in range(1, max_r):          # r=0 excluded (trivial y=1)
+            x_all.append(xk[r]); y_all.append(Ck[r] / C0[k])
+    x_all = np.array(x_all); y_all = np.array(y_all)
+
+    x_hi_ov = min((max_r - 1) / L_snap)
+    x_lo, x_hi = 0.2, min(2.0, x_hi_ov)    # overlap region, documented
+    sel = (x_all >= x_lo) & (x_all <= x_hi)
+    xs, ys = x_all[sel], y_all[sel]
+    nbins = 30
+    edges = np.linspace(x_lo, x_hi, nbins + 1)
+    idx = np.clip(np.digitize(xs, edges) - 1, 0, nbins - 1)
+    master = np.array([ys[idx == b].mean() if (idx == b).any() else np.nan
+                       for b in range(nbins)])
+    resid = ys - master[idx]
+    rms_res = float(np.sqrt((resid ** 2).mean()))
+    rms_y = float(np.sqrt(((ys - ys.mean()) ** 2).mean()))
+    rel_spread = rms_res / rms_y
+    quality = float(np.clip(1.0 - rel_spread, 0.0, 1.0))
+    applicable = bool(np.isfinite(quality) and len(xs) > nbins)
+
+    metadataA = {
+        "collapse_check_applicable": applicable,
+        "collapse_quality": quality if applicable else None,
+        "collapse_relative_rms_spread": float(rel_spread) if applicable else None,
+        "collapse_dimension": 2,
+        "collapse_snapshot_times": [float(t) for t in snap_times],
+        "collapse_lengths": [float(v) for v in L_snap],
+        "collapse_x_range": [float(x_lo), float(x_hi)],
+        "collapse_grid_size": grid_size if applicable else 0,
+        "notes": [
+            "Model hypothesis: 2D Ising (J=1) single-spin-flip Metropolis "
+            "dynamics, beta = control = 2.0236 (deep quench below "
+            "beta_c = 0.4407); periodic boundaries; 1 time unit = 1 Monte "
+            "Carlo sweep (grid_size^2 attempts via two checkerboard "
+            "half-updates); RNG seeded with dynamics_seed.",
+            "Collapse construction: x = r/L(t), y = C(r,t)/C(0,t) with "
+            "connected correlation C(r,t) = G(r,t) - m(t)^2; G(r,t) is the "
+            "full angular average of <s(0)s(r)> (FFT autocorrelation, "
+            "rings at round|r|, r = 0..49).",
+            "collapse_quality = 1 - RMS(y - master)/RMS(y) over collapsed "
+            "points in 30 uniform x-bins across collapse_x_range, clipped "
+            "to [0,1]; master curve = per-bin mean of collapsed points.",
+            "collapse_x_range = [0.2, min(2.0, min_i(r_max/L_i))]: region "
+            "where all six snapshot curves overlap; the trivial r=0 point "
+            "(y=1) and the noisy x->0 region are excluded.",
+            "collapse_grid_size = 100 = linear size of the 2D lattice "
+            "(collapse_dimension = 2).",
+            "L(t) definition: first zero crossing of C(r)=G(r)-m^2 with "
+            "linear interpolation; half-height fallback of G(r) between "
+            "G(0)=1 and the plateau m^2 if no clean crossing.",
+            "Observed regime: at beta = 2.0236 (T/Tc = 0.218) the system "
+            "orders rapidly (energy per site reaches -1.957 vs the ground "
+            "state -2.0) and single-spin-flip kinetics nearly arrests: "
+            "L(t) saturates at ~38 lattice units (finite-size striped "
+            "state) from t ~ 60 onward, so the late snapshots are nearly "
+            "identical and the collapse over them is partially degenerate; "
+            "the collapse quality is therefore dominated by the early "
+            "snapshot curves.",
+        ],
+    }
+    with open("metadataA.json", "w") as f:
+        json.dump(metadataA, f, indent=2)
+
+    # ---------------- metadataB: power-law growth fit ----------------
+    sel_fit = (L_t >= 3.0) & (L_t <= grid_size / 4.0)   # resolved, pre-saturation
+    if sel_fit.sum() >= 3:
+        t_min_f, t_max_f = float(tt[sel_fit].min()), float(tt[sel_fit].max())
+        fit = power_law_fit(tt, L_t, t_min_f, t_max_f)
+    else:
+        t_min_f = t_max_f = float("nan")
+        fit = dict(exponent=float("nan"), exponent_std_error=float("nan"),
+                   amplitude=float("nan"), r_squared=float("nan"), n=0)
+    metadataB = {
+        "exponent": fit["exponent"],
+        "exponent_std_error": fit["exponent_std_error"],
+        "amplitude": fit["amplitude"],
+        "fit_range": [t_min_f, t_max_f],
+        "r_squared": fit["r_squared"],
+        "notes": [
+            "Fit: OLS on log L vs log t (L = seriesB row 0) restricted to "
+            "times where L(t) >= 3 lattice spacings (resolved) and "
+            "L(t) <= grid_size/4 = 25 (below finite-size saturation).",
+            f"Points used in fit: n = {fit['n']}.",
+            "Model hypothesis: 2D Ising Metropolis with beta = control; "
+            "Model-A/Allen-Cahn coarsening (theta ~ 0.5) cited only as "
+            "physical context; no reference value was imposed on the fit.",
+            "L(t) definition: first zero crossing of the connected "
+            "correlation C(r)=G(r)-m^2 (linear interpolation), with "
+            "half-height fallback of G(r) if no crossing.",
+            "At beta = 2.0236 coarsening kinetic arrest occurs: beyond "
+            "t ~ 60 L(t) saturates near 38 (finite-size striped state, "
+            "energy -1.957 vs ground-state -2.0), so the power-law fit is "
+            "confined to the pre-arrest growth window reported in "
+            "fit_range; the exponent is the measured value in that window, "
+            "not an imposed reference.",
+        ],
+    }
+    with open("metadataB.json", "w") as f:
+        json.dump(metadataB, f, indent=2)
+    print("[check] metadataA keys:", sorted(metadataA))
+    print("[check] metadataB keys:", sorted(metadataB))
+
+    # ---------------- figure ----------------
+    if HAVE_MPL:
+        _figure_mpl("figure.png", s0, states, snap_states, snap_times, stackC,
+                    L_t, seriesA, seriesB, tt, x_lo, x_hi, C0, m_snap, max_r,
+                    fit, t_min_f, t_max_f, n_steps, quality, L_snap)
+    else:
+        _figure_fallback("figure.png", s0, states, snap_states, snap_times,
+                         stackC, L_t, seriesA, seriesB, tt, x_lo, x_hi, C0,
+                         m_snap, max_r, fit, t_min_f, t_max_f, n_steps,
+                         quality, L_snap)
+    print("[check] figure.png written (matplotlib)" if HAVE_MPL
+          else "[check] figure.png written (fallback PNG renderer)")
+
+    # ---------------- console diagnostics ----------------
+    L_snap_all = list(L_snap)
+    print("[diag] e(first meas t=%.0f)=%.6f  e(final)=%.6f" %
+          (tt[0], seriesA[1, 0], seriesA[1, -1]))
+    print("[diag] m(t) first 5:", np.round(seriesA[0][:5], 4),
+          " last 5:", np.round(seriesA[0][-5:], 4))
+    print("[diag] m at snapshots:", np.round(m_snap, 4))
+    print("[diag] L at snapshots:", np.round(L_snap_all, 3))
+    print("[diag] rho(final)=%.4f" % seriesB[1, -1])
+    print("[diag] L methods used:", L_methods)
+    print("[diag] fit:", {k2: (round(v, 5) if isinstance(v, float) else v)
+                          for k2, v in fit.items()})
+    print("[diag] collapse quality=%.4f rel_rms_spread=%.4f x_range=[%.2f,%.2f]"
+          % (quality, rel_spread, x_lo, x_hi))
+
+
+if __name__ == "__main__":
+    main()

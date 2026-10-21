@@ -1,0 +1,142 @@
+"""Model-free online optimistic Q-learning for finite-horizon episodic MDPs.
+
+Design: "Monte-Carlo-anchored optimistic Q-learning with quota + Bernstein bonus".
+
+Two horizon-indexed value sequences (each O(H*S*A)):
+
+- `anchor` (slow, delayed-credit): updated at episode end from the single
+  bounded episode trace with the *realized return to the end of the episode*
+      T_i = sum_{j=i}^{H-1} r_j .
+  No bootstrap at all: the target is pure observed data, so it carries no
+  drifting value-estimate bias. This is the delayed-credit component that
+  removes the finite-sample burn-in of plain one-step UCB-B, whose sampled
+  next-value targets drift while downstream Q estimates are learned.
+
+- `Q1` (fast, one-step): updated online at observe() with
+      t = r + (done ? 0 : max_a anchor(h+1, s'))
+  i.e. a one-step target whose bootstrap comes from the unbiased anchor
+  (cross-bootstrapping: low variance AND no self-referential overestimation).
+
+Selection: argmax_a [ Q1(h,s,a) + B(h,s,a) ] (ties -> smallest index), with
+    B = c1 * sqrt(max(var,0) / max(n,1))          (empirical-variance term)
+      + c2 * log(1+K*H*S*A) / max(n,1)            (1/n tail term)
+      + c3 * rho_h * max(0, 1 - n/qmin)           (linear quota term)
+where (n, m, v) are the per-(h,s,a) visit count, running mean and second
+moment of the one-step targets (var = v - m^2 is clamped at 0), and
+rho_h = H-h+1 is the remaining-horizon range of Q at step h.
+
+The quota term forces balanced early exploration (round-robin-like) until
+each action has qmin visits, so the action ranking is decided by a
+reasonably sized sample instead of an early noisy coin flip; it vanishes
+linearly at n = qmin and is automatically bypassed for actions whose gap
+already exceeds c3*rho_h.
+
+Storage: 2*H*S*A values + 3*H*S*A scalars (n, m, v) + 2*H*S*A anchor scalars
++ O(H) episode trace. No transition model, no H*S*A*S tensor, no replay, no
+planning, no enumeration of next states.
+
+Interface: make_agent(env_spec, seed) -> agent with act(h, state) /
+observe(h, state, action, reward, next_state, done). h is 1..H.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Frozen shared configuration (tuned once on the public calibration suite;
+# identical for every hidden family; no case/dimension-specific branching).
+# ---------------------------------------------------------------------------
+CFG = {
+    "c1": 1.0,     # empirical-variance bonus coefficient
+    "c2": 0.2,     # 1/n tail bonus coefficient (per-step scale, log(1+K*H*S*A))
+    "c3": 1.0,     # quota bonus coefficient (forced early exploration)
+    "qmin": 20,    # per-(h,s,a) visit quota before the quota bonus vanishes
+    "q_init": 0.0, # initial Q values (quota/bonus cover unvisited actions)
+}
+
+
+class Agent:
+    def __init__(self, env_spec: dict, seed: int) -> None:
+        self.H = int(env_spec["H"])
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.K = int(env_spec.get("K", 0))
+        H, S, A = self.H, self.S, self.A
+        q0 = float(CFG["q_init"])
+        self.Q1 = np.full((H, S, A), q0, dtype=np.float64)     # fast one-step
+        self.anchor = np.full((H, S, A), q0, dtype=np.float64)  # MC anchor
+        self.n = np.zeros((H, S, A), dtype=np.int64)      # Q1 visit counts
+        self.m = np.zeros((H, S, A), dtype=np.float64)    # running mean, Q1 target
+        self.v = np.zeros((H, S, A), dtype=np.float64)    # 2nd moment, Q1 target
+        self.n_a = np.zeros((H, S, A), dtype=np.int64)    # anchor update counts
+        self.c1 = float(CFG["c1"])
+        self.c2 = float(CFG["c2"])
+        self.c3 = float(CFG["c3"])
+        self.qmin = max(1, int(CFG["qmin"]))
+        self.log_term = math.log1p(max(1, self.K * H * S * A))
+        self.trace: list[tuple[int, int, int, float]] = []
+
+    # -- required interface ---------------------------------------------------
+    def act(self, h: int, state: int) -> int:
+        h0 = int(h) - 1
+        rho = float(self.H - h0)  # remaining-horizon range for Q at this step
+        n = self.n[h0, state]
+        n_safe = np.maximum(n, 1)
+        var = np.maximum(self.v[h0, state] - self.m[h0, state] ** 2, 0.0)
+        quota = np.maximum(1.0 - n / float(self.qmin), 0.0)
+        bonus = (
+            self.c1 * np.sqrt(var / n_safe)
+            + self.c2 * self.log_term / n_safe
+            + self.c3 * rho * quota
+        )
+        score = self.Q1[h0, state] + bonus
+        return int(np.argmax(score))  # argmax returns the first (smallest) max
+
+    def observe(self, h: int, state: int, action: int, reward: float,
+                next_state: int, done: bool) -> None:
+        h0 = int(h) - 1
+        reward = float(reward)
+        if done:
+            t = reward  # terminal next_state is meaningless: bootstrap 0
+        else:
+            t = reward + float(np.max(self.anchor[h0 + 1, next_state]))
+        key = (h0, state, action)
+        nn = int(self.n[key]) + 1
+        self.n[key] = nn
+        self.m[key] += (t - self.m[key]) / nn
+        self.v[key] += (t * t - self.v[key]) / nn
+        self.Q1[key] += (1.0 / nn) * (t - self.Q1[key])
+        self.trace.append((h0, state, action, reward))
+
+    # -- optional runner hooks -------------------------------------------------
+    def reset_episode(self, episode: int, state: int) -> None:
+        self.trace = []
+
+    def end_episode(self, episode: int, episode_reward: float) -> None:
+        tr = self.trace
+        ntr = len(tr)
+        if ntr == 0:
+            return
+        rs = np.array([t[3] for t in tr], dtype=np.float64)
+        total = float(rs.sum())  # return to horizon end (terminal bootstrap = 0)
+        prefix = 0.0
+        for i in range(ntr):
+            h0, s, a, r = tr[i]
+            target = total - prefix  # sum of rewards from i to end of episode
+            prefix += r
+            key = (h0, s, a)
+            nn = int(self.n_a[key]) + 1
+            self.n_a[key] = nn
+            self.anchor[key] += (1.0 / nn) * (target - self.anchor[key])
+        self.trace = []
+
+
+def make_agent(env_spec: dict, seed: int) -> Agent:
+    return Agent(env_spec, seed)
+
+
+# Aliases accepted by the runner.
+create_agent = make_agent
+build_agent = make_agent

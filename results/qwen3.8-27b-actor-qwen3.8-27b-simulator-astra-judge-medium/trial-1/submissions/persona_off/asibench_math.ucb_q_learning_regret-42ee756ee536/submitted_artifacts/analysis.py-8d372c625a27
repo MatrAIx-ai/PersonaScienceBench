@@ -1,0 +1,218 @@
+"""Optimistic Q-learning with de-leveled (drift-corrected) targets (DLC-UCB).
+
+Research constraint addressed
+-----------------------------
+In plain UCB-B the one-step target r + max_{a'} Q(h+1, s', a') drifts while Q
+is being learned: early targets are built on badly estimated next-state values
+and later targets on well estimated ones, so a running-mean estimate chases a
+moving target.  A tuple that stops being visited keeps its early (stale)
+estimate, which can be far from the truth and can permanently mis-rank
+actions.
+
+This agent removes that drift model-free:
+
+* Every target t for (h, s, a) is *de-leveled*: d = t - lev(h), where
+  lev(h) = max_{s', a'} Q(h+1, s', a') is the (current) maximum next-state
+  value.  The de-leveled target d = r + Q(h+1, s') - max_{s''} Q(h+1, s'')
+  is stationary over time: the unknown global value level cancels, leaving
+  only the state-to-state spread, which is exactly what differs between
+  actions.  d is bounded in [-L(h), L(h)], L(h) = H - h + 1.
+
+* Per (h, s, a) the agent keeps only scalar statistics: the visit count N,
+  the running sum M1 and sum of squares M2 of the de-leveled targets.  The
+  value estimate is re-anchored to the *current* level:
+      Q(h, s, a) = mean(d) + lev_now(h)
+  so estimates never go stale as the value function converges.  lev_now is
+  obtained by a short O((H-h) S A) backward recursion over the current
+  estimates (no model, no next-state enumeration, only scalar statistics).
+
+* Explicit optimism: Bernstein bonus on the de-leveled targets,
+      B = sqrt(2 v_hat ln(C/N)/N) + 2 L(h) ln(C/N) / (3 N),
+  with v_hat the empirical variance of d (capped at L(h)^2, the maximal
+  variance of a [-L, L]-bounded variable) and C = ln(2 H S A K / DELTA).
+  Unvisited tuples are fully optimistic (value L(h)).
+
+* Selection: argmax_a (Q(h, s, a) + B(h, s, a)), values clipped to the valid
+  remaining-horizon range [0, L(h)]; deterministic tie-breaking.
+
+Storage: 4 * H * S * A scalars (N, M1, M2, D) plus one bounded trace (<= H entries) of the
+current episode.  No transition model, no H*S*A*S tensor, no replay, no
+planning, no agent-side randomness.
+"""
+from __future__ import annotations
+
+import math
+
+# --- shared hyperparameters (one configuration for every MDP) ---
+DELTA = 0.05   # confidence level for the Bernstein bonus
+C_MULT = 3.0   # exploration/commitment constant multiplier on C
+EW_GAMMA = 0.0  # 0 = plain running mean; >0 = exponentially weighted (faster tracking)
+EW_C = 1.0      # EWMA step-size scale: alpha = min(1, EW_C / n**EW_GAMMA)
+B_RANGE = 1.0   # 1.0 => use reward range (tight) for the rare-deviation term;
+                # 2.0 => use the full [-L,L] range of the de-leveled target
+
+
+class _Agent:
+    def __init__(self, env_spec, seed):
+        self.H = int(env_spec["H"])
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        K = int(env_spec.get("K", 1))
+        self.C = C_MULT * math.log(2.0 * self.H * self.S * self.A * max(K, 1) / DELTA)
+        H, S, A = self.H, self.S, self.A
+
+        def zeros():
+            return [[0.0] * A for _ in range(S)]
+
+        self.N = [[[0] * A for _ in range(S)] for _ in range(H)]   # visit counts
+        self.M1 = [zeros() for _ in range(H)]   # running sum of de-leveled targets
+        self.M2 = [zeros() for _ in range(H)]   # running sum of squares
+        self.D = [zeros() for _ in range(H)]    # EWMA mean of de-leveled targets
+        self._trace = []  # bounded trace of the current episode (<= H entries)
+
+    # ---- optional protocol hooks (safe if the scorer never calls them) ----
+    def reset_episode(self, episode, state):
+        self._trace = []
+
+    start_episode = reset_episode
+    new_episode = reset_episode
+
+    def end_episode(self, episode, episode_reward):
+        pass
+
+    # ---- internals ----
+    def _V(self, h0, s, lev):
+        """Corrected state value V(h0, s) = clip(max_a dbar + lev[h0], 0, L).
+
+        Returns (value, visited): visited states contribute to level maxima;
+        unvisited states have a neutral (0, False) entry.
+        """
+        L = self.H - h0
+        drow = self.D[h0][s]
+        nrow = self.N[h0][s]
+        A = self.A
+        best = -1e18
+        visited = False
+        for a in range(A):
+            n = nrow[a]
+            if n:
+                visited = True
+                v = drow[a] + lev[h0]
+                if v > best:
+                    best = v
+        if not visited:
+            return 0.0, False
+        if best < 0.0:
+            best = 0.0
+        elif best > L:
+            best = L
+        return best, True
+
+    def _levels(self):
+        """lev[h0] = max over *visited* s' of V(h0+1, s') (0 if none visited).
+
+        Restricting the maximum to visited states keeps the de-leveled targets
+        t - lev[h0] stationary: the level never jumps to the surrogate value of
+        an unvisited state, so the global value level cancels exactly and only
+        the (time-invariant) state-to-state spread remains in the targets.
+        """
+        H, S = self.H, self.S
+        lev = [0.0] * H
+        for h0 in range(H - 1, -1, -1):
+            if h0 + 1 < H:
+                best = 0.0
+                for s in range(S):
+                    v, vis = self._V(h0 + 1, s, lev)
+                    if vis and v > best:
+                        best = v
+            else:
+                best = 0.0
+            lev[h0] = best
+        return lev
+
+    def _update(self, h0, s, a, d):
+        n = self.N[h0][s][a] + 1
+        self.N[h0][s][a] = n
+        self.M1[h0][s][a] += d
+        self.M2[h0][s][a] += d * d
+        if EW_GAMMA <= 0.0:
+            alpha = 1.0 / n
+        else:
+            alpha = min(1.0, EW_C / (n ** EW_GAMMA))
+        self.D[h0][s][a] += alpha * (d - self.D[h0][s][a])
+
+    # ---- required interface ----
+    def act(self, h, state):
+        h0 = h - 1
+        if h0 == 0:
+            self._trace = []
+        s = int(state)
+        lev = self._levels()
+        L = self.H - h0
+        drow = self.D[h0][s]
+        nrow = self.N[h0][s]
+        m1row = self.M1[h0][s]
+        m2row = self.M2[h0][s]
+        C = self.C
+        lh = lev[h0]
+        best_a, best_u = 0, -1.0
+        for a in range(self.A):
+            n = nrow[a]
+            if n == 0:
+                u = L  # fully optimistic for unvisited tuples
+            else:
+                m = drow[a]  # EWMA mean of de-leveled targets (base estimate)
+                base = m + lh
+                if base < 0.0:
+                    base = 0.0
+                elif base > L:
+                    base = L
+                lt = math.log(C / n) if n < C else 0.0
+                if lt <= 0.0:
+                    u = base
+                else:
+                    mfull = m1row[a] / n
+                    v = m2row[a] / n - mfull * mfull
+                    vmax = L * L  # max variance of a [-L, L]-bounded variable
+                    if v > vmax:
+                        v = vmax
+                    elif v < 0.0:
+                        v = 0.0
+                    rr = (L if B_RANGE >= 2.0 else 1.0)
+                    u = base + math.sqrt(2.0 * v * lt / n) + (rr * lt) / (3.0 * n)
+                    if u > L:
+                        u = L
+            if u > best_u:  # strict '>' keeps the smallest index on ties
+                best_u, best_a = u, a
+        return best_a
+
+    def observe(self, h, state, action, reward, next_state, done):
+        h0 = h - 1
+        s = int(state)
+        a = int(action)
+        ns = int(next_state)
+        r = float(reward)
+        self._trace.append((h0, s, a, r, ns))  # bounded episode trace (<= H)
+        final = bool(done) or h0 == self.H - 1
+        lev = self._levels()
+        L = self.H - h0
+        if final:
+            boot = 0.0
+            valid = True
+        else:
+            boot, valid = self._V(h0 + 1, ns, lev)  # corrected next-state value
+        if not valid:
+            # next state not yet visited: the bootstrap is a surrogate (0) and
+            # the de-leveled target would be a biased outlier -> skip update.
+            return
+        t = r + boot
+        if t < 0.0:
+            t = 0.0
+        elif t > L:
+            t = L
+        d = t - lev[h0]  # de-leveled target (stationary over time)
+        self._update(h0, s, a, d)
+
+
+def make_agent(env_spec, seed):
+    return _Agent(env_spec, seed)

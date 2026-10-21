@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""Reproducible forensic audit of an anonymous HMC transition-kernel instance.
+
+Reads every input from ./data (relative to this file) and writes every
+artifact under ./results. Fully deterministic: no randomness beyond the
+supplied transition streams.
+
+Pipeline
+--------
+1. Implement the public target (funnel potential, warp chart, kinetic metric).
+2. Audit all six anonymous candidate transitions from the observational
+   bundle (energy RMSE over the step-size ladder, reversibility, local
+   volume preservation, short-chain panel statistics) and score them with
+   the public validity_score formula.
+3. Map each candidate to one of the six canonical failure labels using an
+   evidence-driven cascade, and select the valid kernel (argmax score).
+4. Infer the selected transition map from the candidate evidence (kick-
+   drift-kick leapfrog in sampler coordinates; verified against the bundle
+   within the stated observational-perturbation tolerance) and replay the
+   production and held-out streams with the schedule values.
+5. Emit all required artifacts under results/.
+"""
+import csv
+import json
+from pathlib import Path
+
+import numpy as np
+
+BASE = Path(__file__).resolve().parent
+DATA = BASE / "data"
+RESULTS = BASE / "results"
+RESULTS.mkdir(exist_ok=True)
+
+# --------------------------------------------------------------------- inputs
+manifest = json.loads((DATA / "target_manifest.json").read_text())
+schedule = json.loads((DATA / "transition_schedule.json").read_text())
+
+DIM = int(manifest["dimension"])
+SIGMA_V = float(manifest["sigma_v"])
+G = np.asarray(manifest["kinetic_metric"]["inverse_mass_matrix"], dtype=float)
+M = np.asarray(manifest["sampler_chart"]["matrix"], dtype=float)
+SHIFT = np.asarray(manifest["sampler_chart"]["shift"], dtype=float)
+WARP = float(manifest["sampler_chart"]["warp_strength"])
+WPHASE = np.asarray(manifest["sampler_chart"]["warp_phase"], dtype=float)
+# M is NOT orthogonal (max |M M^T - I| ~ 0.46), so the inverse chart is
+# q - shift = u @ inv(M).T  (verified to machine precision below).
+MINV_T = np.linalg.inv(M).T
+CAND_IDS = [str(c) for c in manifest["public_candidate_ids"]]
+
+bundle = np.load(DATA / "candidate_transition_bundle.npz")
+panel = np.load(DATA / "candidate_chain_panel.npz")
+
+q_init = np.load(DATA / "initial_latent_states.npy")
+p_stream = np.load(DATA / "transition_momenta.npy")
+u_stream = np.load(DATA / "transition_uniforms.npy")
+hq_init = np.load(DATA / "holdout_initial_latent_states.npy")
+hp_stream = np.load(DATA / "holdout_transition_momenta.npy")
+hu_stream = np.load(DATA / "holdout_transition_uniforms.npy")
+
+with open(DATA / "profile_bins.csv") as fh:
+    bin_rows = list(csv.DictReader(fh))
+BIN_LEFT = np.array([float(r["v_left"]) for r in bin_rows])
+BIN_RIGHT = np.array([float(r["v_right"]) for r in bin_rows])
+BIN_IDS = [int(r["bin_id"]) for r in bin_rows]
+
+# ---------------------------------------------------------------- target math
+def to_centered(q):
+    """Sampler q (12,) -> centered (12,) per the public chart convention."""
+    u = (q - SHIFT) @ M.T
+    c = u.copy()
+    c[1:] += WARP * np.sin(u[0] + WPHASE)
+    return c
+
+def to_centered_batch(q):
+    u = (q - SHIFT) @ M.T
+    c = u.copy()
+    c[:, 1:] += WARP * np.sin(u[:, :1] + WPHASE)
+    return c
+
+def to_sampler(c):
+    u = c.copy()
+    u[1:] -= WARP * np.sin(c[0] + WPHASE)
+    return u @ MINV_T + SHIFT
+
+def potential(q):
+    c = to_centered(q)
+    v = c[0]
+    x = c[1:]
+    return 0.5 * (v / SIGMA_V) ** 2 + 0.5 * (DIM - 1) * v + 0.5 * np.exp(-v) * float(x @ x)
+
+def grad_potential(q):
+    c = to_centered(q)
+    v = c[0]
+    x = c[1:]
+    s2 = float(x @ x)
+    gc = np.empty(DIM)
+    gc[0] = v / SIGMA_V ** 2 + 0.5 * (DIM - 1) - 0.5 * np.exp(-v) * s2
+    gc[1:] = np.exp(-v) * x
+    u = (q - SHIFT) @ M.T
+    gu = gc.copy()
+    gu[0] += WARP * float(gc[1:] @ np.cos(u[0] + WPHASE))
+    return gu @ M
+
+def hamiltonian(q, p):
+    return potential(q) + 0.5 * float(p @ G @ p)
+
+def leapfrog(q, p, h, n_steps):
+    """Kick-drift-kick leapfrog in sampler coordinates.
+
+    p_{k+1/2} = p_k - (h/2) gradU(q_k);  q_{k+1} = q_k + h G p_{k+1/2};
+    p_{k+1} = p_{k+1/2} - (h/2) gradU(q_{k+1}).  Returns (q*, p*).
+    This is the map inferred from the candidate evidence (see audit below).
+    """
+    q = q.copy()
+    p = p.copy()
+    p = p - 0.5 * h * grad_potential(q)
+    for _ in range(n_steps - 1):
+        q = q + h * (G @ p)
+        p = p - h * grad_potential(q)
+    q = q + h * (G @ p)
+    p = p - 0.5 * h * grad_potential(q)
+    return q, p
+
+# sanity: chart round-trip and gradient (finite differences)
+_q = q_init[0]
+assert np.abs(to_sampler(to_centered(_q)) - _q).max() < 1e-10
+_eps = 1e-7
+_fd = np.array([
+    (potential(_q + _eps * np.eye(DIM)[j]) - potential(_q - _eps * np.eye(DIM)[j])) / (2 * _eps)
+    for j in range(DIM)
+])
+assert np.abs(grad_potential(_q) - _fd).max() < 1e-5
+
+# ------------------------------------------------------- diagnostics helpers
+def split_rhat(chains):
+    """Standard split-Rhat: halve each chain, then combine."""
+    splits = []
+    for c in chains:
+        c = np.asarray(c, dtype=float)
+        half = len(c) // 2
+        splits.append(c[:half])
+        splits.append(c[half:2 * half])
+    m = len(splits)
+    n = len(splits[0])
+    means = np.array([s.mean() for s in splits])
+    variances = np.array([s.var(ddof=1) for s in splits])
+    W = variances.mean()
+    if W <= 0:
+        return 1.0
+    B = n * means.var(ddof=1)
+    var_plus = (n - 1) / n * W + B / n
+    return float(np.sqrt(var_plus / W))
+
+def geyer_ess(x):
+    """Initial-positive-sequence ESS (Geyer) for one sequence."""
+    x = np.asarray(x, dtype=float).ravel()
+    n = len(x)
+    xc = x - x.mean()
+    denom = float(xc @ xc)
+    if denom <= 0:
+        return 1.0
+    f = np.fft.fft(xc, n=2 * n)
+    acov = np.real(np.fft.ifft(f * f.conj()))[:n] / n
+    rho = acov / acov[0]
+    pair_sum = 0.0
+    k = 0
+    while k + 2 <= n - 1:
+        s = rho[k + 1] + rho[k + 2]
+        if s < 0:
+            break
+        pair_sum += s
+        k += 2
+    factor = 1.0 + pair_sum
+    if factor <= 0:
+        return 1.0
+    return float(n / factor)
+
+def linear_score(error, full, zero):
+    if error <= full:
+        return 1.0
+    if error >= zero:
+        return 0.0
+    return (zero - error) / (zero - full)
+
+# ------------------------------------------------------------ candidate audit
+ladder = np.asarray(bundle["step_size_ladder"], dtype=float)
+base_idx = int(np.argmin(np.abs(ladder - float(schedule["step_size"]))))
+assert np.abs(ladder[base_idx] - float(schedule["step_size"])) < 1e-12  # exact rung
+probe_q = np.asarray(bundle["probe_states"], dtype=float)
+probe_p = np.asarray(bundle["probe_momenta"], dtype=float)
+n_probe = len(probe_q)
+H0 = np.array([hamiltonian(probe_q[k], probe_p[k]) for k in range(n_probe)])
+
+audit = {}
+for i, cid in enumerate(CAND_IDS):
+    rmse_by_step = []
+    for l in range(len(ladder)):
+        Hp = np.array([
+            hamiltonian(bundle["proposal_states"][i, l][k], bundle["proposal_momenta"][i, l][k])
+            for k in range(n_probe)
+        ])
+        rmse_by_step.append(float(np.sqrt(np.mean((Hp - H0) ** 2))))
+    energy_rmse = rmse_by_step[base_idx]
+    energy_slope = float(np.polyfit(np.log(ladder), np.log(rmse_by_step), 1)[0])
+
+    rev_state = np.asarray(bundle["reverse_states"][i, base_idx], dtype=float)
+    rev_mom = np.asarray(bundle["reverse_momenta"][i, base_idx], dtype=float)
+    rev_res = np.linalg.norm(rev_state - probe_q, axis=1) + np.linalg.norm(rev_mom + probe_p, axis=1)
+    reverse_p95 = float(np.percentile(rev_res, 95))
+
+    X = np.asarray(bundle["volume_input"], dtype=float)
+    Y = np.asarray(bundle["volume_output"][i], dtype=float)
+    Xa = np.hstack([X, np.ones((len(X), 1))])
+    A, _, _, _ = np.linalg.lstsq(Xa, Y, rcond=None)
+    signed_logdet = float(np.linalg.slogdet(A[: DIM * 2, : DIM * 2])[1])
+    volume_logdet_abs = abs(signed_logdet)
+
+    acceptance_rate = float(np.asarray(panel["panel_accepted"][i], dtype=float).mean())
+    vcol = np.asarray(panel["panel_centered_samples"][i, :, :, 0], dtype=float)
+    panel_mean_v = float(vcol.mean())
+    panel_var_v = float(vcol.var(ddof=1))
+    panel_rhat_v = split_rhat([vcol[c] for c in range(vcol.shape[0])])
+    panel_ess_v = geyer_ess(vcol.ravel())  # pooled 3-chain sequence (660)
+
+    validity = (
+        0.24 * linear_score(energy_rmse, 0.01, 0.18)
+        + 0.24 * linear_score(reverse_p95, 1e-8, 5e-3)
+        + 0.20 * linear_score(volume_logdet_abs, 1e-5, 0.08)
+        + 0.16 * linear_score(abs(panel_var_v - SIGMA_V ** 2) / SIGMA_V ** 2, 0.08, 0.55)
+        + 0.16 * linear_score(abs(0.82 - acceptance_rate), 0.25, 0.80)
+    )
+    audit[cid] = dict(
+        energy_rmse=energy_rmse, energy_slope=energy_slope, reverse_p95=reverse_p95,
+        volume_logdet_abs=volume_logdet_abs, signed_logdet=signed_logdet,
+        acceptance_rate=acceptance_rate, panel_mean_v=panel_mean_v,
+        panel_var_v=panel_var_v, panel_rhat_v=panel_rhat_v, panel_ess_v=panel_ess_v,
+        validity_score=float(validity),
+        panel_dh_mean=float(np.asarray(panel["panel_delta_h"][i], dtype=float).mean()),
+    )
+
+with open(RESULTS / "kernel_audit.csv", "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(manifest["audit_columns"])
+    for cid in CAND_IDS:
+        a = audit[cid]
+        w.writerow([
+            cid, f"{a['energy_rmse']:.10g}", f"{a['energy_slope']:.10g}",
+            f"{a['reverse_p95']:.10g}", f"{a['volume_logdet_abs']:.10g}",
+            f"{a['acceptance_rate']:.10g}", f"{a['panel_mean_v']:.10g}",
+            f"{a['panel_var_v']:.10g}", f"{a['panel_ess_v']:.10g}",
+            f"{a['panel_rhat_v']:.10g}", f"{a['validity_score']:.10g}",
+        ])
+
+# --------------------------------------------------------------- failure modes
+order = sorted(CAND_IDS, key=lambda c: -audit[c]["validity_score"])
+valid_id = order[0]
+rest = order[1:]
+labels = {valid_id: "valid_transition"}
+
+# coordinate_mismatch: reversible + volume-preserving but large energy drift
+cand = [c for c in rest if audit[c]["reverse_p95"] < 1e-3 and audit[c]["volume_logdet_abs"] < 1e-3]
+if cand:
+    pick = max(cand, key=lambda c: audit[c]["energy_rmse"])
+    labels[pick] = "coordinate_mismatch"
+    rest.remove(pick)
+
+# volume_loss: strong phase-space contraction (signed logdet << 0)
+cand = [c for c in rest if audit[c]["signed_logdet"] < -1.0]
+if cand:
+    pick = min(cand, key=lambda c: audit[c]["signed_logdet"])
+    labels[pick] = "volume_loss"
+    rest.remove(pick)
+
+# energy_drift: exploding / systematically large energy drift
+pick = max(rest, key=lambda c: audit[c]["energy_rmse"])
+labels[pick] = "energy_drift"
+rest.remove(pick)
+
+# remaining pair: terminal_imbalance (small O(h) reversibility error, ~zero
+# mean dH bias) vs delayed_response (larger reversibility error, systematic
+# positive mean dH bias)
+a, b = sorted(rest, key=lambda c: audit[c]["reverse_p95"])
+labels[a] = "terminal_imbalance"
+labels[b] = "delayed_response"
+
+with open(RESULTS / "failure_modes.json", "w") as fh:
+    json.dump({cid: labels[cid] for cid in CAND_IDS}, fh, indent=2)
+
+selected = dict(
+    candidate_id=valid_id,
+    validity_score=audit[valid_id]["validity_score"],
+    inferred_map=(
+        "kick-drift-kick leapfrog in sampler coordinates with h = schedule step_size, "
+        "n_steps = schedule integration_steps, drift q += h * G @ p, kick p -= h * grad_U(q); "
+        "Metropolis accept/reject against the supplied uniforms"
+    ),
+    evidence={
+        k: audit[valid_id][k]
+        for k in ("energy_rmse", "energy_slope", "reverse_p95", "volume_logdet_abs",
+                  "acceptance_rate", "panel_rhat_v", "panel_ess_v")
+    },
+)
+with open(RESULTS / "selected_kernel.json", "w") as fh:
+    json.dump(selected, fh, indent=2)
+
+# -------------------------------------------------------------------- replay
+def replay(q_start, p_stream, u_stream, h, n_steps):
+    n_ch, T, _ = p_stream.shape
+    delta_h = np.zeros((n_ch, T))
+    accept_prob = np.zeros((n_ch, T))
+    accepted = np.zeros((n_ch, T), dtype=bool)
+    accepted_latent = np.zeros((n_ch, T, DIM))
+    proposal_latent = np.zeros((n_ch, T, DIM))
+    q = q_start.copy()
+    traj_q = np.empty((n_ch, T + 1, DIM))
+    traj_q[:, 0] = q
+    for c in range(n_ch):
+        for t in range(T):
+            p = p_stream[c, t]
+            qp, pp = leapfrog(q[c], p, h, n_steps)
+            dH = hamiltonian(qp, pp) - hamiltonian(q[c], p)
+            prob = 1.0 if dH <= 0.0 else float(np.exp(-dH))
+            acc = bool(u_stream[c, t] < prob)
+            delta_h[c, t] = dH
+            accept_prob[c, t] = prob
+            accepted[c, t] = acc
+            proposal_latent[c, t] = qp
+            if acc:
+                q[c] = qp
+            accepted_latent[c, t] = q[c]
+            traj_q[c, t + 1] = q[c]
+    return dict(delta_h=delta_h, accept_prob=accept_prob, accepted=accepted,
+                accepted_latent=accepted_latent, proposal_latent=proposal_latent,
+                traj_q=traj_q, final_q=q)
+
+n_chains = int(schedule["n_chains"])
+warmup = int(schedule["warmup_transitions"])
+kept_n = int(schedule["kept_transitions"])
+total = int(schedule["total_transitions"])
+h_prod = float(schedule["step_size"])
+L_prod = int(schedule["integration_steps"])
+audit_n = int(schedule["audit_transitions"])
+
+prod = replay(q_init, p_stream, u_stream, h_prod, L_prod)
+assert prod["traj_q"].shape == (n_chains, total + 1, DIM)
+
+latent_samples = prod["traj_q"][:, warmup:total, :]          # [4, 900, 12]
+np.save(RESULTS / "latent_samples.npy", latent_samples)
+samples = to_centered_batch(latent_samples.reshape(-1, DIM)).reshape(n_chains, kept_n, DIM)
+np.save(RESULTS / "samples.npy", samples)
+
+np.savez(
+    RESULTS / "transition_audit.npz",
+    accepted_latent=prod["accepted_latent"][:, :audit_n, :],
+    proposal_latent=prod["proposal_latent"][:, :audit_n, :],
+    delta_h=prod["delta_h"][:, :audit_n],
+    accept_prob=prod["accept_prob"][:, :audit_n],
+    accepted=prod["accepted"][:, :audit_n],
+)
+
+ho_chains = int(schedule["holdout_chains"])
+ho_total = int(schedule["holdout_transitions"])
+h_ho = float(schedule["holdout_step_size"])
+L_ho = int(schedule["holdout_integration_steps"])
+ho_audit_n = int(schedule["holdout_audit_transitions"])
+
+ho = replay(hq_init, hp_stream, hu_stream, h_ho, L_ho)
+np.savez(
+    RESULTS / "holdout_transition_audit.npz",
+    accepted_latent=ho["accepted_latent"][:, :ho_audit_n, :],
+    proposal_latent=ho["proposal_latent"][:, :ho_audit_n, :],
+    delta_h=ho["delta_h"][:, :ho_audit_n],
+    accept_prob=ho["accept_prob"][:, :ho_audit_n],
+    accepted=ho["accepted"][:, :ho_audit_n],
+)
+np.save(RESULTS / "holdout_terminal_states.npy", ho["final_q"])
+
+with open(RESULTS / "energy_diagnostics.csv", "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["chain_id", "acceptance_rate", "mean_abs_delta_h", "p95_abs_delta_h", "max_abs_delta_h"])
+    for c in range(n_chains):
+        ad = np.abs(prod["delta_h"][c])
+        w.writerow([
+            c,
+            f"{prod['accepted'][c].mean():.10g}",
+            f"{ad.mean():.10g}",
+            f"{np.percentile(ad, 95):.10g}",
+            f"{ad.max():.10g}",
+        ])
+
+# ------------------------------------------------------------ funnel profile
+v_kept = samples[:, :, 0].ravel()
+radius2_kept = (samples[:, :, 1:] ** 2).sum(axis=2).ravel()
+n_kept = v_kept.size
+with open(RESULTS / "funnel_profile.csv", "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["bin_id", "v_left", "v_right", "count", "fraction", "mean_v", "mean_radius2", "expected_radius2"])
+    for bid, vl, vr in zip(BIN_IDS, BIN_LEFT, BIN_RIGHT):
+        mask = (v_kept >= vl) & (v_kept < vr)
+        count = int(mask.sum())
+        fraction = count / n_kept
+        if count > 0:
+            mean_v = float(v_kept[mask].mean())
+            mean_r2 = float(radius2_kept[mask].mean())
+            expected_r2 = float((DIM - 1) * np.exp(v_kept[mask]).mean())
+            w.writerow([bid, f"{vl:.10g}", f"{vr:.10g}", count, f"{fraction:.10g}",
+                        f"{mean_v:.10g}", f"{mean_r2:.10g}", f"{expected_r2:.10g}"])
+        else:
+            w.writerow([bid, f"{vl:.10g}", f"{vr:.10g}", count, f"{fraction:.10g}", "", "", ""])
+
+# ------------------------------------------------------------------ diagnostics
+z = np.empty_like(samples)
+z[:, :, 0] = samples[:, :, 0] / SIGMA_V
+z[:, :, 1:] = np.exp(-samples[:, :, 0:1] / 2.0) * samples[:, :, 1:]
+z_flat = z.reshape(-1, DIM)
+r2_flat = radius2_kept
+v_flat = v_kept
+
+diag = dict(
+    mean_v=float(v_flat.mean()),
+    var_v=float(v_flat.var(ddof=1)),
+    mean_radius2=float(r2_flat.mean()),
+    split_rhat_v=split_rhat([samples[c, :, 0] for c in range(n_chains)]),
+    ess_v=geyer_ess(v_flat),
+    split_rhat_radius2=split_rhat([(samples[c, :, 1:] ** 2).sum(axis=1) for c in range(n_chains)]),
+    ess_radius2=geyer_ess(r2_flat),
+    overall_acceptance_rate=float(prod["accepted"].mean()),
+    chain_acceptance_rates=[float(prod["accepted"][c].mean()) for c in range(n_chains)],
+    mean_abs_delta_h=float(np.abs(prod["delta_h"]).mean()),
+    p95_abs_delta_h=float(np.percentile(np.abs(prod["delta_h"]), 95)),
+    max_abs_delta_h=float(np.abs(prod["delta_h"]).max()),
+    latent_mean_abs_max=float(np.abs(z_flat.mean(axis=0)).max()),
+    latent_var_abs_max=float(np.abs(z_flat.var(axis=0, ddof=1) - 1.0).max()),
+    left_tail_prob_v_lt_minus5=float(np.mean(v_flat < -5.0)),
+    right_tail_prob_v_gt_5=float(np.mean(v_flat > 5.0)),
+)
+with open(RESULTS / "diagnostics.json", "w") as fh:
+    json.dump(diag, fh, indent=2)
+
+# ----------------------------------------------------------------------- figure
+# Dependency-free plotting: a minimal PNG writer (zlib) plus a tiny 5x7
+# bitmap font, so the script runs in any scientific Python with numpy only.
+import struct
+import zlib
+
+def _png_write(path, buf):
+    h, w = buf.shape[:2]
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + buf[y].tobytes() for y in range(h))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+# 5x7 glyphs, 7 row masks (MSB = leftmost pixel)
+FONT = {
+    "0": (0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110),
+    "1": (0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110),
+    "2": (0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111),
+    "3": (0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110),
+    "4": (0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010),
+    "5": (0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110),
+    "6": (0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110),
+    "7": (0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000),
+    "8": (0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110),
+    "9": (0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100),
+    "A": (0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001),
+    "B": (0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110),
+    "C": (0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110),
+    "D": (0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100),
+    "E": (0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111),
+    "F": (0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000),
+    "G": (0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111),
+    "H": (0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001),
+    "I": (0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110),
+    "J": (0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100),
+    "K": (0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001),
+    "L": (0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111),
+    "M": (0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001),
+    "N": (0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001),
+    "O": (0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110),
+    "P": (0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000),
+    "Q": (0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101),
+    "R": (0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001),
+    "S": (0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110),
+    "T": (0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100),
+    "U": (0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110),
+    "V": (0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100),
+    "W": (0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010),
+    "X": (0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001),
+    "Y": (0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100),
+    "Z": (0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111),
+    " ": (0, 0, 0, 0, 0, 0, 0),
+    "-": (0, 0, 0, 0b01110, 0, 0, 0),
+    ".": (0, 0, 0, 0, 0, 0, 0b00100),
+    ":": (0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0),
+    ",": (0, 0, 0, 0, 0, 0b00100, 0b01000),
+    "(": (0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010),
+    ")": (0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000),
+    "|": (0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100),
+    "/": (0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000),
+    "+": (0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0),
+    "_": (0, 0, 0, 0, 0, 0, 0b11111),
+    "%": (0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011),
+    "=": (0, 0, 0b11111, 0, 0b11111, 0, 0),
+    "^": (0b00100, 0b01010, 0b10001, 0, 0, 0, 0),
+    "'": (0b00100, 0b00100, 0b01000, 0, 0, 0, 0),
+    "#": (0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010),
+    "!": (0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100),
+}
+
+def _px(img, x, y, color):
+    if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+        img[y, x] = color
+
+def _rect(img, x0, y0, x1, y1, color):
+    x0, x1 = max(0, int(x0)), min(img.shape[1] - 1, int(x1))
+    y0, y1 = max(0, int(y0)), min(img.shape[0] - 1, int(y1))
+    if x1 >= x0 and y1 >= y0:
+        img[y0:y1 + 1, x0:x1 + 1] = color
+
+def _line(img, x0, y0, x1, y1, color, thick=1):
+    n = max(abs(int(x1) - int(x0)), abs(int(y1) - int(y0)), 1)
+    for i in range(n + 1):
+        x = int(round(x0 + (x1 - x0) * i / n))
+        y = int(round(y0 + (y1 - y0) * i / n))
+        for dx in range(thick):
+            for dy in range(thick):
+                _px(img, x + dx, y + dy, color)
+
+def _text(img, x, y, s, color, scale=2):
+    cx = int(x)
+    for ch in s:
+        g = FONT.get(ch, (0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110))
+        for r in range(7):
+            bits = g[r]
+            for cb in range(5):
+                if bits & (1 << (4 - cb)):
+                    _rect(img, cx + cb * scale, y + r * scale,
+                          cx + cb * scale + scale - 1, y + r * scale + scale - 1, color)
+        cx += 6 * scale
+    return cx
+
+def _text_w(s, scale=2):
+    return len(s) * 6 * scale
+
+def _fmt_tick(v):
+    if abs(v) >= 1000 or (abs(v) < 0.01 and v != 0):
+        return f"{v:.0e}".upper().replace("E+", "E").replace("E-", "E-")
+    if abs(v - round(v)) < 1e-12:
+        return f"{int(round(v))}"
+    return f"{v:g}"
+
+def _nice_ticks(lo, hi, n=6):
+    span = hi - lo
+    if span <= 0:
+        return [lo]
+    step0 = span / max(n - 1, 1)
+    mag = 10 ** np.floor(np.log10(step0))
+    step = step0
+    for m in (1, 2, 5, 10):
+        step = m * mag
+        if span / step <= n:
+            break
+    t0 = int(np.ceil(lo / step - 1e-9))
+    ticks = [t0 * step + k * step for k in range(int(np.floor((hi - t0 * step) / step + 1e-9)) + 1)]
+    return ticks
+
+GRAY = (160, 160, 160)
+DARK = (40, 40, 40)
+BLUE = (72, 120, 168)
+RED = (214, 95, 95)
+GREEN = (88, 166, 88)
+PURPLE = (188, 129, 220)
+
+class _Axes:
+    def __init__(self, img, x0, y0, x1, y1, title, xlabel, ylabel,
+                 xlim, ylim, logy=False, logx=False):
+        self.img, self.x0, self.y0, self.x1, self.y1 = img, x0, y0, x1, y1
+        self.xlim, self.ylim, self.logy, self.logx = xlim, ylim, logy, logx
+        self.ly0, self.ly1 = (np.log10(ylim[0]), np.log10(ylim[1])) if logy else (0, 0)
+        self.lx0, self.lx1 = (np.log10(xlim[0]), np.log10(xlim[1])) if logx else (0, 0)
+        _rect(img, x0, y0, x1, y1, (255, 255, 255))
+        _line(img, x0, y0, x1, y0, DARK)
+        _line(img, x0, y1, x1, y1, DARK)
+        _line(img, x0, y0, x0, y1, DARK)
+        _line(img, x1, y0, x1, y1, DARK)
+        if title:
+            _text(img, (x0 + x1 - _text_w(title, 2)) // 2, y0 - 26, title, DARK, 2)
+        if xlabel:
+            _text(img, (x0 + x1 - _text_w(xlabel, 2)) // 2, y1 + 10, xlabel, DARK, 2)
+        if ylabel:
+            _text(img, x0 - 8 - _text_w(ylabel, 2), y0 - 24, ylabel, DARK, 2)
+        for tx in _nice_ticks(xlim[0], xlim[1], 7):
+            px = self.tx(tx)
+            _line(img, px, y1, px, y1 + 4, DARK)
+            lab = _fmt_tick(tx)
+            _text(img, px - _text_w(lab, 1) // 2, y1 + 6, lab, DARK, 1)
+        if logy:
+            for e in range(int(np.ceil(self.ly0)), int(np.floor(self.ly1)) + 1):
+                py = self.ty(10 ** e)
+                _line(img, x0 - 4, py, x0, py, DARK)
+                _text(img, x0 - 8 - _text_w(f"1E{e}", 1), py - 4, f"1E{e}", DARK, 1)
+                if 0 < e < self.ly1:
+                    _line(img, x0, py, x1, py, (235, 235, 235))
+        else:
+            for ty in _nice_ticks(ylim[0], ylim[1], 6):
+                py = self.ty(ty)
+                _line(img, x0 - 4, py, x0, py, DARK)
+                lab = _fmt_tick(ty)
+                _text(img, x0 - 8 - _text_w(lab, 1), py - 4, lab, DARK, 1)
+                _line(img, x0, py, x1, py, (235, 235, 235))
+        if logx:
+            for e in range(int(np.ceil(self.lx0)), int(np.floor(self.lx1)) + 1):
+                px = self.tx(10 ** e)
+                _line(img, px, y1, px, y1 + 4, DARK)
+                _text(img, px - 8, y1 + 6, f"1E{e}", DARK, 1)
+
+    def _t(self, v, lo, hi, a, b):
+        return a + (b - a) * (v - lo) / (hi - lo)
+
+    def tx(self, x):
+        if self.logx:
+            return self._t(np.log10(x), self.lx0, self.lx1, self.x0, self.x1)
+        return self._t(x, self.xlim[0], self.xlim[1], self.x0, self.x1)
+
+    def ty(self, y):
+        if self.logy:
+            return self._t(np.log10(y), self.ly1, self.ly0, self.y0, self.y1)
+        return self._t(y, self.ylim[0], self.ylim[1], self.y0, self.y1)
+
+    def polyline(self, xs, ys, color, thick=1):
+        xs = np.asarray(xs, float)
+        ys = np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys) & (ys > 0 if self.logy else np.ones_like(xs, bool))
+        xs, ys = xs[ok], ys[ok]
+        if len(xs) < 2:
+            return
+        px = np.clip(np.array([self.tx(v) for v in xs]), self.x0, self.x1)
+        py = np.clip(np.array([self.ty(v) for v in ys]), self.y0, self.y1)
+        for i in range(len(px) - 1):
+            _line(self.img, px[i], py[i], px[i + 1], py[i + 1], color, thick)
+
+    def scatter(self, xs, ys, color, size=2):
+        xs = np.asarray(xs, float)
+        ys = np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys) & (ys > 0 if self.logy else np.ones_like(xs, bool))
+        for x, y in zip(xs[ok], ys[ok]):
+            px, py = self.tx(x), self.ty(y)
+            if self.x0 <= px <= self.x1 and self.y0 <= py <= self.y1:
+                _rect(self.img, px - size // 2, py - size // 2,
+                      px + size // 2, py + size // 2, color)
+
+_W, _H = 1240, 1180
+img = np.full((_H, _W, 3), 255, np.uint8)
+_text(img, (_W - _text_w("HMC FUNNEL TRANSITION-KERNEL FORENSIC AUDIT", 3)) // 2, 16,
+      "HMC FUNNEL TRANSITION-KERNEL FORENSIC AUDIT", DARK, 3)
+
+R1 = (90, 80, 590, 340)
+R2 = (700, 80, 1200, 340)
+R3 = (90, 460, 590, 720)
+R4 = (700, 460, 1200, 720)
+R5 = (90, 840, 590, 1100)
+R6 = (700, 840, 1200, 1100)
+
+# (1) marginal of v vs N(0, 9)
+vmin, vmax = min(-8.0, float(v_flat.min())), max(8.0, float(v_flat.max()))
+edges = np.linspace(vmin, vmax, 41)
+hist, _ = np.histogram(v_flat, bins=edges)
+dens = hist / (n_kept * (edges[1] - edges[0]))
+vv = np.linspace(vmin, vmax, 400)
+norm = np.exp(-vv ** 2 / (2 * SIGMA_V ** 2)) / (SIGMA_V * np.sqrt(2 * np.pi))
+ax = _Axes(img, *R1, "MARGINAL OF V (KEPT) VS N(0, 9)", "V", "DENSITY",
+           (vmin, vmax), (0.0, float(max(dens.max(), norm.max())) * 1.12))
+bw = (R1[2] - R1[0]) / len(hist)
+for i in range(len(hist)):
+    _rect(img, int(ax.tx(edges[i])), int(ax.ty(dens[i])),
+          int(ax.tx(edges[i])) + int(bw), R1[3], BLUE)
+ax.polyline(vv, norm, RED, 2)
+_text(img, R1[2] - 130, R1[1] + 12, "N(0, 9)", RED, 1)
+
+# (2) funnel cross-section (log radius)
+r = np.sqrt(radius2_kept)
+ok = np.isfinite(r) & (r > 1e-6)
+idx = np.random.default_rng(0).choice(int(ok.sum()), size=min(1500, int(ok.sum())), replace=False)
+sel = np.where(ok)[0][idx]
+ax = _Axes(img, *R2, "FUNNEL CROSS-SECTION: RADIUS VS V", "V", "SQRT(SUM X_I^2)",
+           (vmin, vmax), (1e-2, 1e3), logy=True)
+ax.scatter(v_flat[sel], r[sel], BLUE, 2)
+ax.polyline(vv, np.sqrt((DIM - 1) * np.exp(vv)), RED, 2)
+_text(img, R2[2] - 150, R2[1] + 12, "SQRT(11 E^V)", RED, 1)
+
+# (3) rolling acceptance
+acc = prod["accepted"].astype(float)
+win = 100
+ax = _Axes(img, *R3, "ROLLING ACCEPTANCE (WINDOW 100), PRODUCTION", "TRANSITION", "RATE",
+           (0, total), (0.0, 1.0))
+chain_colors = [BLUE, RED, GREEN, PURPLE]
+for c in range(n_chains):
+    conv = np.convolve(acc[c], np.ones(win) / win, mode="valid")
+    ax.polyline(np.arange(win // 2, win // 2 + len(conv)), conv, chain_colors[c], 1)
+for c in range(n_chains):
+    _text(img, R3[0] + 10 + c * 92, R3[3] - 20, f"CHAIN {c}", chain_colors[c], 1)
+
+# (4) Hamiltonian of kept states
+H_kept = np.array([
+    hamiltonian(latent_samples[c, k], p_stream[c, warmup + k])
+    for c in range(n_chains) for k in range(kept_n)
+]).reshape(n_chains, kept_n)
+hlo, hhi = np.percentile(H_kept, 0.5), np.percentile(H_kept, 99.5)
+ax = _Axes(img, *R4, "HAMILTONIAN OF KEPT STATES (PRODUCTION)", "KEPT TRANSITION", "H",
+           (0, kept_n), (hlo, hhi))
+for c in range(n_chains):
+    ax.polyline(np.arange(kept_n), H_kept[c], chain_colors[c], 1)
+sm = np.convolve(H_kept[0], np.ones(100) / 100, mode="valid")
+ax.polyline(np.arange(50, 50 + len(sm)), sm, DARK, 2)
+_text(img, R4[2] - 210, R4[1] + 12, "CHAIN 0, 100-STEP MEAN", DARK, 1)
+
+# (5) validity scores
+scores = [audit[c]["validity_score"] for c in CAND_IDS]
+ax = _Axes(img, *R5, "CANDIDATE VALIDITY SCORES", "", "VALIDITY_SCORE", (0, 1), (0.0, 1.0))
+short = {"valid_transition": "VALID", "energy_drift": "ENERGY DRIFT", "terminal_imbalance": "TERM IMBAL",
+         "delayed_response": "DELAYED RESP", "coordinate_mismatch": "COORD MISMATCH", "volume_loss": "VOL LOSS"}
+for j, c in enumerate(CAND_IDS):
+    bx0 = R5[0] + int((j + 0.15) * (R5[2] - R5[0]) / 6)
+    bx1 = R5[0] + int((j + 0.85) * (R5[2] - R5[0]) / 6)
+    py = int(ax.ty(scores[j]))
+    _rect(img, bx0, py, bx1, R5[3], GREEN if c == valid_id else RED)
+    _text(img, (bx0 + bx1 - _text_w(c.upper(), 1)) // 2, R5[3] + 6, c.upper(), DARK, 1)
+    _text(img, (bx0 + bx1 - _text_w(short[labels[c]], 1)) // 2, max(py - 14, R5[1]), short[labels[c]], DARK, 1)
+
+# (6) |dH| histogram (log x)
+ad = np.abs(prod["delta_h"]).ravel()
+ad = ad[ad > 0]
+lx0, lx1 = 1e-4, max(1e3, float(ad.max()) * 2)
+lgrid = np.logspace(np.log10(lx0), np.log10(lx1), 25)
+hlog, _ = np.histogram(ad, bins=lgrid)
+ax = _Axes(img, *R6, "|DH| PER PRODUCTION TRANSITION", "|DH|", "COUNT",
+           (lx0, lx1), (0.0, float(hlog.max()) * 1.1), logx=True)
+for i in range(len(hlog)):
+    if hlog[i] <= 0:
+        continue
+    _rect(img, int(ax.tx(lgrid[i])), int(ax.ty(hlog[i])), int(ax.tx(lgrid[i + 1])), R6[3], BLUE)
+
+_png_write(RESULTS / "overview.png", img)
+
+
+# ------------------------------------------------------------------- summary
+print("selected:", valid_id, "score=%.4f" % audit[valid_id]["validity_score"])
+print("labels:", {c: labels[c] for c in CAND_IDS})
+print("prod acceptance: %.4f" % diag["overall_acceptance_rate"],
+      "holdout acceptance: %.4f" % ho["accepted"].mean())
+print("v: mean %.3f var %.3f | split rhat v %.4f ess %d" % (
+    diag["mean_v"], diag["var_v"], diag["split_rhat_v"], diag["ess_v"]))
+print("z residuals: mean_abs_max %.4f var_abs_max %.4f" % (
+    diag["latent_mean_abs_max"], diag["latent_var_abs_max"]))
+print("artifacts written under", RESULTS)

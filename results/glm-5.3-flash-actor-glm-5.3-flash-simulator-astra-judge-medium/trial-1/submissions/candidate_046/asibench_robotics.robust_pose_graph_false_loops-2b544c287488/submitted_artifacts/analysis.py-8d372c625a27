@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""
+Robust pose-graph optimization for mobile-robot map consistency.
+
+Inputs  (data/): poses_initial.npy, odometry_edges.csv, loop_candidates.csv
+Outputs (workspace root): analysis.py, poses.npy, loop_closure_scores.csv,
+                          metrics.json, map_diagnostics.png
+
+Conventions (from data/task_info.json):
+  * pose row = [x_m, y_m, theta_rad]
+  * pose 0 is the world-frame anchor: kept exactly fixed (dof prior weight 1e9)
+  * edge (i -> j) stores the relative pose of j in the LOCAL frame of i:
+        [dx,dy]^T = R(theta_i)^T (t_j - t_i),  dtheta = wrap(theta_j - theta_i)
+  * sigma_trans / sigma_rot are 1-sigma std devs (sigma_trans isotropic in x,y)
+
+false_probability convention (documented in metrics.json):
+  HIGHER = more likely a false loop closure (wrong data association).
+  Posterior P(false | r^2) of a constrained two-component mixture on the
+  normalized squared residuals of the robust solution; set membership decided by
+  a greedy consensus procedure (backward elimination / forward re-inclusion with
+  a Bonferroni-corrected chi-square threshold), with mutually consistent loop
+  triangles as tie-breaking evidence.
+"""
+import json
+import math
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2, gamma as gamma_dist
+
+DATA = "data"
+RNG_SEED = 0
+
+def wrap(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+def residual(pi, pj, z):
+    """e = h(x_i, x_j) - z, expressed in the local frame of i."""
+    c, s = np.cos(pi[2]), np.sin(pi[2])
+    d = pj[:2] - pi[:2]
+    return np.array([c*d[0] + s*d[1] - z[0],
+                     -s*d[0] + c*d[1] - z[1],
+                     wrap(pj[2] - pi[2] - z[2])])
+
+def jacobians(pi, pj):
+    c, s = np.cos(pi[2]), np.sin(pi[2])
+    d = pj[:2] - pi[:2]
+    RiT = np.array([[c, s], [-s, c]])
+    dRiT = np.array([[-s, c], [-c, -s]])          # dR^T/dtheta
+    Ji = np.zeros((3, 3)); Jj = np.zeros((3, 3))
+    Ji[:2, :2] = -RiT; Ji[:2, 2] = dRiT @ d; Ji[2, 2] = -1.0
+    Jj[:2, :2] = RiT;  Jj[2, 2] = 1.0
+    return Ji, Jj
+
+class PoseGraph:
+    """Levenberg-Marquardt solver with per-edge scalar robust weights (IRLS)."""
+
+    def __init__(self, poses0, odo, loops, anchor_pose0):
+        self.N = len(poses0)
+        self.x = poses0.flatten().astype(float).copy()
+        self.odo_i = odo["from"].to_numpy(int); self.odo_j = odo["to"].to_numpy(int)
+        self.odo_z = odo[["dx", "dy", "dtheta"]].to_numpy(float)
+        st = odo["sigma_trans"].to_numpy(float); sr = odo["sigma_rot"].to_numpy(float)
+        self.odo_info = np.stack([np.diag([1/st[k]**2, 1/st[k]**2, 1/sr[k]**2])
+                                  for k in range(len(odo))])
+        self.lp_i = loops["from"].to_numpy(int); self.lp_j = loops["to"].to_numpy(int)
+        self.lp_z = loops[["dx", "dy", "dtheta"]].to_numpy(float)
+        st = loops["sigma_trans"].to_numpy(float); sr = loops["sigma_rot"].to_numpy(float)
+        self.lp_info = np.stack([np.diag([1/st[k]**2, 1/st[k]**2, 1/sr[k]**2])
+                                 for k in range(len(loops))])
+        self.anchor_info = np.diag([1e9, 1e9, 1e9])
+        self.anchor_x0 = anchor_pose0.copy()
+
+    def residuals_all(self, loop_w, x=None):
+        """Per-edge squared Mahalanobis residuals and total weighted cost."""
+        xx = self.x if x is None else x
+        P = xx.reshape(self.N, 3)
+        e_odo = [residual(P[self.odo_i[k]], P[self.odo_j[k]], self.odo_z[k])
+                 for k in range(len(self.odo_i))]
+        c_odo = sum(float(e @ self.odo_info[k] @ e) for k, e in enumerate(e_odo))
+        e_lp = [residual(P[self.lp_i[k]], P[self.lp_j[k]], self.lp_z[k])
+                for k in range(len(self.lp_i))]
+        r2 = np.array([float(e @ self.lp_info[k] @ e) for k, e in enumerate(e_lp)])
+        c_lp = float(np.sum(loop_w * r2))
+        return np.array(e_odo), r2, c_odo + c_lp
+
+    def _build(self, loop_w):
+        n = self.N * 3
+        H = np.zeros((n, n)); g = np.zeros(n)
+        e_odo, r2_lp, _ = self.residuals_all(loop_w)
+        P = self.x.reshape(self.N, 3)
+        def accum(i, j, e, info, w):
+            Ji, Jj = jacobians(P[i], P[j])
+            Wi = w * info
+            si, sj = slice(3*i, 3*i+3), slice(3*j, 3*j+3)
+            JWi = Ji.T @ Wi; JWj = Jj.T @ Wi
+            H[si, si] += JWi @ Ji
+            H[sj, sj] += JWj @ Jj
+            Hij = JWi @ Jj
+            H[si, sj] += Hij; H[sj, si] += Hij.T
+            g[si] += JWi @ e; g[sj] += JWj @ e
+        for k in range(len(self.odo_i)):
+            accum(self.odo_i[k], self.odo_j[k], e_odo[k], self.odo_info[k], 1.0)
+        for k in range(len(self.lp_i)):
+            if loop_w[k] > 0:
+                accum(self.lp_i[k], self.lp_j[k],
+                      residual(P[self.lp_i[k]], P[self.lp_j[k]], self.lp_z[k]),
+                      self.lp_info[k], loop_w[k])
+        s0 = slice(0, 3)
+        H[s0, s0] += self.anchor_info
+        g[s0] += self.anchor_info @ (self.x[s0] - self.anchor_x0)
+        return H, g
+
+    def solve(self, loop_w, max_iters=100, tol=1e-9, x0=None, lam0=1e-4):
+        if x0 is not None:
+            self.x = x0.flatten().copy()
+        _, _, cost = self.residuals_all(loop_w)
+        lam = lam0
+        iters = 0
+        last_step = float('nan')
+        for it in range(max_iters):
+            iters = it + 1
+            H, g = self._build(loop_w)
+            A = H + lam * np.diag(np.clip(np.diag(H), 1e-12, None))
+            try:
+                dx = np.linalg.solve(A, -g)
+            except np.linalg.LinAlgError:
+                lam *= 10; continue
+            if not np.all(np.isfinite(dx)):
+                lam *= 10; continue
+            x_try = self.x + dx
+            x_try[2::3] = wrap(x_try[2::3])
+            _, _, cost_try = self.residuals_all(loop_w, x_try)
+            if cost_try < cost:
+                step = float(np.linalg.norm(dx))
+                self.x = x_try
+                improved = cost - cost_try
+                cost = cost_try
+                last_step = step
+                lam = max(lam * 0.5, 1e-12)
+                if step < tol and improved < 1e-9 * max(abs(cost), 1.0):
+                    break
+            else:
+                lam = min(lam * 10.0, 1e12)
+                if lam >= 1e12:
+                    break
+        _, _, cost = self.residuals_all(loop_w)
+        if math.isnan(last_step):
+            # no step was ever accepted: the state already satisfies the
+            # current weighted system (gradient ~ 0) -> already converged
+            H, g = self._build(loop_w)
+            return {"iterations": 0, "final_cost": float(cost), "lambda": 0.0,
+                    "final_increment_norm": float(np.linalg.norm(g)),
+                    "already_converged": True}
+        return {"iterations": iters, "final_cost": float(cost), "lambda": lam,
+                "final_increment_norm": float(last_step)}
+
+    def poses(self):
+        return self.x.reshape(self.N, 3).copy()
+
+    def loop_r2(self, poses=None):
+        P = self.poses() if poses is None else poses
+        out = []
+        for k in range(len(self.lp_i)):
+            e = residual(P[self.lp_i[k]], P[self.lp_j[k]], self.lp_z[k])
+            out.append((float(np.hypot(e[0], e[1])), float(abs(e[2])),
+                        float(e @ self.lp_info[k] @ e)))
+        return np.array(out)   # columns: trans_m, rot_rad, r2
+
+# ------------------------------------------------------------------- classification
+def mixture_posterior(r2):
+    """Constrained two-component EM on squared Mahalanobis residuals.
+    Inlier  H0: r2 ~ s0 * chi2(3),  s0 in [0.5, 10]  (accounts for model mismatch)
+    Outlier H1: r2 ~ Gamma(a1, th1), a1 in [1, 100]  (heavy tail, no density spike)
+    Returns (posterior_P_false, params)."""
+    x = np.maximum(np.asarray(r2, float), 1e-9)
+    s0 = float(np.clip(np.median(x) / 2.366, 0.5, 10.0))
+    big = x > np.median(x)
+    pi1 = float(np.clip(big.mean(), 0.05, 0.95))
+    a1, th1 = 1.0, max(float(x[big].mean()) if big.any() else 100.0, 1.0)
+    post = np.zeros_like(x)
+    for _ in range(1000):
+        f0 = chi2.pdf(x / s0, 3) / s0
+        f1 = gamma_dist.pdf(x, a1, scale=th1) + 1e-300
+        denom = (1 - pi1) * f0 + pi1 * f1
+        post = np.clip(pi1 * f1 / np.maximum(denom, 1e-300), 0.0, 1.0)
+        w0, w1 = 1 - post, post
+        sw0, sw1 = max(w0.sum(), 1e-12), max(w1.sum(), 1e-12)
+        pi1_new = float(np.clip(w1.mean(), 0.01, 0.99))
+        m1 = float(np.sum(w1 * x) / sw1)
+        v1 = float(np.sum(w1 * (x - m1) ** 2) / sw1)
+        a1_new = float(np.clip(m1 ** 2 / max(v1, 1e-9), 1.0, 100.0))
+        th1_new = float(np.clip(v1 / max(m1, 1e-9), max(x.min(), 1e-6), 1e12))
+        m0 = float(np.sum(w0 * x) / sw0)
+        s0_new = float(np.clip(m0 / 3.0, 0.5, 10.0))
+        delta = max(abs(pi1_new - pi1), abs(a1_new - a1),
+                    abs(th1_new - th1) / max(th1, 1e-9), abs(s0_new - s0))
+        pi1, a1, th1, s0 = pi1_new, a1_new, th1_new, s0_new
+        if delta < 1e-8:
+            break
+    f0 = chi2.pdf(x / s0, 3) / s0
+    f1 = gamma_dist.pdf(x, a1, scale=th1) + 1e-300
+    post = np.clip(pi1 * f1 / np.maximum((1 - pi1) * f0 + pi1 * f1, 1e-300), 0.0, 1.0)
+    return post, {"pi_false": pi1, "outlier_gamma_shape": a1,
+                  "outlier_gamma_scale": th1, "inlier_chi2_scale": s0}
+
+def loop_triangles(loops):
+    """Odometry-free consistency triples among loop candidates, orientation-aware."""
+    def inv(m):
+        c, s = np.cos(m[2]), np.sin(m[2])
+        return np.array([-c*m[0] - s*m[1], s*m[0] - c*m[1], wrap(-m[2])])
+    def compose(m1, m2):
+        c, s = np.cos(m1[2]), np.sin(m1[2])
+        return np.array([m1[0] + c*m2[0] - s*m2[1],
+                         m1[1] + s*m2[0] + c*m2[1], wrap(m1[2] + m2[2])])
+    meas = {}
+    for _, r in loops.iterrows():
+        lid = int(r.loop_id); i, j = int(r["from"]), int(r["to"])
+        z = np.array([r.dx, r.dy, r.dtheta])
+        u, v = min(i, j), max(i, j)
+        meas.setdefault((u, v), []).append((lid, z, i < j))
+    keys = sorted(meas)
+    members, closures = set(), {}
+    for a in range(len(keys)):
+        for b in range(a + 1, len(keys)):
+            for c in range(b + 1, len(keys)):
+                p1, p2, p3 = keys[a], keys[b], keys[c]
+                nodes = sorted(set(p1) | set(p2) | set(p3))
+                if len(nodes) != 3:
+                    continue
+                # chain n0 -> n1 -> n2 must use two of the pairs; direct uses the third
+                n0, n1, n2 = nodes
+                def get(u, v):
+                    ent = meas.get((min(u, v), max(u, v)))
+                    return ent
+                e01, e12, e02 = get(n0, n1), get(n1, n2), get(n0, n2)
+                if not (e01 and e12 and e02):
+                    continue
+                for lid1, z1, f1 in e01:
+                    for lid2, z2, f2 in e12:
+                        for lid3, z3, f3 in e02:
+                            m01 = z1 if f1 else inv(z1)     # n0 -> n1
+                            m12v = z2 if f2 else inv(z2)    # n1 -> n2
+                            m02 = z3 if f3 else inv(z3)     # n0 -> n2
+                            cl = m02 - compose(m01, m12v); cl[2] = wrap(cl[2])
+                            key = tuple(sorted((lid1, lid2, lid3)))
+                            if key not in closures:
+                                closures[key] = (float(np.hypot(cl[0], cl[1])),
+                                                 float(abs(cl[2])))
+                                members.update(key)
+    return members, closures
+
+def estimate_scale(r2_in):
+    """s0 such that inlier r2 ~ s0 * chi2(3); median(chi2(3)) = 2.366"""
+    return float(np.clip(np.median(r2_in) / 2.366, 0.3, 10.0))
+
+def bonferroni_thresh(s0, nL, alpha=0.001):
+    return float(s0 * chi2.ppf(1.0 - alpha / (2.0 * nL), 3))
+
+def greedy_consensus(pg, S, nL, max_steps=300, lock=None, x0=None):
+    """Backward elimination / forward re-inclusion until the accepted set is
+    self-consistent: every accepted loop fits within a Bonferroni-corrected
+    chi2(3) threshold, and no excluded loop fits better.  `lock` marks loops
+    that must never be removed (used only in diagnostic runs)."""
+    if x0 is not None:
+        pg.x = x0.flatten().copy()
+    lock = np.zeros(len(S), bool) if lock is None else lock
+    history = []
+    for step in range(max_steps):
+        w = np.where(S, 1.0, 0.0)
+        rec = pg.solve(w, max_iters=150, tol=1e-9)
+        r2 = pg.loop_r2()[:, 2]
+        s0 = estimate_scale(r2[S]); thresh = bonferroni_thresh(s0, nL)
+        bad = np.where(S & ~lock & (r2 > thresh))[0]
+        if bad.size:
+            k = bad[np.argmax(r2[bad])]
+            S[k] = False; history.append({"step": step, "action": "remove",
+                                          "loop": int(k), "r2": float(r2[k]),
+                                          "thresh": thresh})
+            continue
+        good_out = np.where(~S & (r2 < thresh))[0]
+        if good_out.size:
+            k = good_out[np.argmin(r2[good_out])]
+            S[k] = True; history.append({"step": step, "action": "add",
+                                         "loop": int(k), "r2": float(r2[k]),
+                                         "thresh": thresh})
+            continue
+        break
+    w = np.where(S, 1.0, 0.0)
+    rec = pg.solve(w, max_iters=200, tol=1e-10)
+    r2 = pg.loop_r2()[:, 2]
+    s0 = estimate_scale(r2[S]); thresh = bonferroni_thresh(s0, nL)
+    return S, history, s0, thresh, r2
+
+# ------------------------------------------------------------------------- main
+def main():
+    poses0 = np.load(f"{DATA}/poses_initial.npy")
+    odo = pd.read_csv(f"{DATA}/odometry_edges.csv")
+    loops = pd.read_csv(f"{DATA}/loop_candidates.csv")
+    N = len(poses0); nL = len(loops)
+    assert poses0.shape == (544, 3)
+    pg = PoseGraph(poses0, odo, loops, anchor_pose0=poses0[0].copy())
+
+    # ---- Stage A: graduated robustness (GNC-style Huber IRLS) --------------------
+    huber_schedule = [50.0, 20.0, 8.0, 4.0, 3.0, 2.8]   # sqrt(chi2(3) 95%) ~ 2.80
+    w = np.ones(nL); stage_records = []
+    for stage, c in enumerate(huber_schedule):
+        rec = pg.solve(w, max_iters=150, tol=1e-9)
+        r2 = pg.loop_r2()[:, 2]
+        r = np.sqrt(np.maximum(r2, 1e-12))
+        w_new = np.minimum(1.0, c / r)
+        moved = float(np.abs(w_new - w).max())
+        rec.update({"stage": stage, "huber_c": c, "max_weight_change": moved})
+        stage_records.append(rec)
+        w = w_new
+        if moved < 1e-9 and stage > 0:
+            break
+    r2_rob = pg.loop_r2()[:, 2]
+    res_rob = pg.loop_r2()
+
+    # ---- Stage B: max-consensus over multiple starts (RANSAC-style) ----------------
+    # The loop graph admits several self-consistent basins (aliasing-like conflict
+    # clusters), so a single greedy run can get trapped.  We run the greedy
+    # consensus from several independent starts and keep the self-consistent
+    # solution with the largest accepted set (max-consensus), tie-broken by lower
+    # total chi2.
+    tri_members, tri_closures = loop_triangles(loops)
+    rng = np.random.default_rng(RNG_SEED)
+    starts = {"robust_weights_ge_0.5": (w >= 0.5),
+              "all_loops_true": np.ones(nL, bool)}
+    for t in range(4):
+        m = np.zeros(nL, bool)
+        m[rng.choice(nL, size=30, replace=False)] = True
+        starts[f"random30_{t}"] = m
+    starts["all_minus_gross_outliers"] = ~(r2_rob > 500.0)
+    start_reports = []
+    best = None
+    for name, S0 in starts.items():
+        pg_k = PoseGraph(poses0, odo, loops, anchor_pose0=poses0[0].copy())
+        S_i, hist_i, s0_i, th_i, r2_i = greedy_consensus(
+            pg_k, S0.copy(), nL, x0=poses0)
+        ok_i = bool(np.all(r2_i[S_i] <= th_i)) and \
+               (not np.any(~S_i & (r2_i <= th_i))) and bool(S_i.any())
+        rep = {"start": name, "num_accepted": int(S_i.sum()),
+               "self_consistent": ok_i, "s0": s0_i, "threshold": th_i,
+               "final_cost": float(pg_k.residuals_all(np.where(S_i, 1.0, 0.0))[2]),
+               "accepted_ids": sorted(np.where(S_i)[0].tolist()),
+               "num_greedy_steps": len(hist_i)}
+        start_reports.append(rep)
+        print(f"[consensus start '{name}'] |S|={int(S_i.sum())} "
+              f"self_consistent={ok_i} cost={rep['final_cost']:.1f}")
+        key = (ok_i, int(S_i.sum()), -rep["final_cost"])
+        if best is None or key > best[0]:
+            best = (key, S_i.copy(), hist_i, s0_i, th_i, r2_i, pg_k)
+    accepted, consensus_history, s0_c, thresh_c, r2_c, pg = (
+        best[1], best[2], best[3], best[4], best[5], best[6])
+    best_rep = max(start_reports,
+                   key=lambda r: (r["self_consistent"], r["num_accepted"],
+                                  -r["final_cost"]))
+
+    # ---- Stage C: final refinement and calibrated probabilities --------------------
+    w_final = np.where(accepted, 1.0, 0.0)
+    rec_f = pg.solve(w_final, max_iters=200, tol=1e-10)
+    P_final = pg.poses()
+    res_fin = pg.loop_r2(poses=P_final)
+    r2_fin = res_fin[:, 2]
+    s0_fin = estimate_scale(r2_fin[accepted])
+    thresh_fin = bonferroni_thresh(s0_fin, nL)
+    consistency_ok = bool(np.all(r2_fin[accepted] <= thresh_fin)) if accepted.any() else True
+
+    # calibrated false probabilities from the FINAL solution residuals
+    posterior_false, mix_params = mixture_posterior(r2_fin)
+
+    # ambiguous posterior band: triangle-consensus tie-breaking (partners must also
+    # be accepted; any flip is re-verified globally)
+    AMB_LO, AMB_HI = 0.05, 0.95
+    ambiguous = (posterior_false >= AMB_LO) & (posterior_false <= AMB_HI)
+    overridden = []
+    for k in np.where(ambiguous)[0]:
+        partners_all_accepted = k in tri_members and all(
+            q in accepted for t, v in tri_closures.items() if k in t for q in t if q != k)
+        if partners_all_accepted and (not accepted[k]):
+            trial = accepted.copy(); trial[k] = True
+            pg_t = PoseGraph(poses0, odo, loops, anchor_pose0=poses0[0].copy())
+            pg_t.x = pg.x.copy()
+            w_t = np.where(trial, 1.0, 0.0)
+            pg_t.solve(w_t, max_iters=150, tol=1e-9)
+            r2_t = pg_t.loop_r2()[:, 2]
+            s0_t = estimate_scale(r2_t[trial]); th_t = bonferroni_thresh(s0_t, nL)
+            if r2_t[k] <= th_t and not (trial & (r2_t > th_t)).any():
+                accepted = trial
+                overridden.append({"loop": int(k), "decision": "accepted",
+                                   "reason": "triangle consensus",
+                                   "verified_r2": float(r2_t[k]), "thresh": th_t})
+            else:
+                overridden.append({"loop": int(k), "decision": "rejected",
+                                   "reason": "triangle tie-break failed global verification",
+                                   "verified_r2": float(r2_t[k]), "thresh": th_t})
+    if overridden:   # re-converge on the (possibly updated) accepted set
+        w_final = np.where(accepted, 1.0, 0.0)
+        rec_f = pg.solve(w_final, max_iters=200, tol=1e-10)
+        P_final = pg.poses()
+        res_fin = pg.loop_r2(poses=P_final)
+        r2_fin = res_fin[:, 2]
+        posterior_false, mix_params = mixture_posterior(r2_fin)
+
+    # ---- outputs -------------------------------------------------------------------
+    P_out = P_final.copy()
+    P_out[:, 2] = wrap(P_out[:, 2])
+    assert P_out.shape == (544, 3)
+    anchor_err = float(np.abs(P_out[0] - poses0[0]).max())
+    np.save("poses.npy", P_out)
+
+    pd.DataFrame({"loop_id": loops["loop_id"].to_numpy(int),
+                  "false_probability": posterior_false}).to_csv(
+        "loop_closure_scores.csv", index=False)
+
+    rej = ~accepted
+    pl = []
+    for k in range(nL):
+        pl.append({
+            "loop_id": int(k),
+            "accepted": bool(accepted[k]),
+            "in_triangle_consensus": bool(k in tri_members),
+            "in_ambiguous_band": bool(ambiguous[k]),
+            "false_probability": float(posterior_false[k]),
+            "final_residual_trans_m": float(res_fin[k, 0]),
+            "final_residual_trans_normalized": float(res_fin[k, 0] / 0.075),
+            "final_residual_rot_rad": float(res_fin[k, 1]),
+            "final_residual_rot_normalized": float(res_fin[k, 1] / 0.03),
+            "final_mahalanobis_r2": float(r2_fin[k]),
+            "robust_stage_mahalanobis_r2": float(r2_rob[k]),
+             "selected_by": "max-consensus multi-start greedy",
+        })
+
+    metrics = {
+        "conventions": {
+            "pose_row": "[x_m, y_m, theta_rad]",
+            "edge_convention": "relative pose of j in the local frame of i (T_i^-1 T_j)",
+            "anchor": "pose 0 fixed exactly (dof prior weight 1e9, not optimized); "
+                      "world frame of poses_initial.npy preserved",
+            "units": "meters, radians; theta wrapped to [-pi, pi]",
+            "sigma_semantics": "sigma_trans applied isotropically to dx and dy; "
+                               "1-sigma Gaussian, independent trans/rot",
+        },
+        "false_probability_convention": {
+            "direction": "HIGHER = more likely false (wrong data association)",
+            "definition": "posterior P(false | r^2) from a constrained two-component "
+                          "mixture (scaled chi2(3) inlier vs free Gamma outlier) on the "
+                          "normalized squared residuals measured on the FINAL consensus "
+                          "trajectory; the accepted/rejected partition was decided by "
+                          "max-consensus (multi-start greedy with Bonferroni-corrected "
+                          "chi2 threshold), with mutually consistent loop triangles as "
+                          "tie-breakers",
+            "acceptance_rule": "accepted iff consistent with the consensus solution "
+                               "(final r2 <= Bonferroni chi2(3) threshold); ambiguous "
+                               f"posterior band [{AMB_LO}, {AMB_HI}] broken by triangle "
+                               "consensus with global re-verification",
+            "ambiguous_posterior_band": [AMB_LO, AMB_HI],
+        },
+        "robust_kernel": {
+            "type": "Huber IRLS with graduated threshold (GNC-style) + "
+                    "Levenberg-Marquardt inner solver",
+            "schedule_sqrt_mahalanobis": huber_schedule,
+            "stages": stage_records,
+            "final_refine": rec_f,
+        },
+        "mixture_parameters": mix_params,
+        "consensus": {
+            "procedure": "greedy backward-elimination / forward re-inclusion from "
+                         "multiple independent starts; selection criterion = "
+                         "(self-consistent, largest accepted set, lowest chi2) "
+                         "[max-consensus]",
+            "selected_start": best_rep["start"],
+            "start_reports": start_reports,
+            "inlier_chi2_scale_s0_final": s0_fin,
+            "bonferroni_threshold_final_r2": thresh_fin,
+            "history_of_selected_start": consensus_history,
+            "triangle_overrides": overridden,
+        },
+        "loop_summary": {
+            "num_loops": int(nL),
+            "num_accepted": int(accepted.sum()),
+            "num_rejected": int(rej.sum()),
+            "num_in_ambiguous_band": int(ambiguous.sum()),
+            "accepted_ids": sorted(np.where(accepted)[0].tolist()),
+            "rejected_ids": sorted(np.where(rej)[0].tolist()),
+        },
+        "consistency_check": {
+            "accepted_residual_trans_m": {"mean": float(res_fin[accepted, 0].mean()),
+                                          "max": float(res_fin[accepted, 0].max())},
+            "accepted_residual_rot_rad": {"mean": float(res_fin[accepted, 1].mean()),
+                                          "max": float(res_fin[accepted, 1].max())},
+            "accepted_r2_max": float(r2_fin[accepted].max()),
+            "rejected_residual_trans_m": ({"mean": float(res_fin[rej, 0].mean()),
+                                           "max": float(res_fin[rej, 0].max())}
+                                          if rej.any() else None),
+            "rejected_residual_rot_rad": ({"mean": float(res_fin[rej, 1].mean()),
+                                           "max": float(res_fin[rej, 1].max())}
+                                          if rej.any() else None),
+            "separation_ratio_trans_mean": (float(res_fin[rej, 0].mean() /
+                                                  max(res_fin[accepted, 0].mean(), 1e-12))
+                                            if rej.any() else None),
+            "all_accepted_within_threshold": consistency_ok,
+            "note": "verification: rejected loops must show markedly larger residuals "
+                    "than accepted loops",
+        },
+        "per_loop": pl,
+        "triangles": {"count": len(tri_closures), "members": sorted(tri_members),
+                      "closures": [{"loops": list(k), "trans_m": v[0], "rot_rad": v[1]}
+                                   for k, v in sorted(tri_closures.items())]},
+        "diagnostics": {
+            "anchor_pose0_max_abs_error": anchor_err,
+            "theta_in_minus_pi_pi": bool(np.all(np.abs(P_out[:, 2]) <= np.pi + 1e-12)),
+            "poses_shape": list(P_out.shape),
+            "displacement_vs_initial_m": {
+                "mean": float(np.linalg.norm(P_out[:, :2] - poses0[:, :2], axis=1).mean()),
+                "max": float(np.linalg.norm(P_out[:, :2] - poses0[:, :2], axis=1).max())},
+        },
+    }
+    json.dump(metrics, open("metrics.json", "w"), indent=2)
+
+    plot_data = {
+        "P0": poses0[:, :2].tolist(),
+        "P1": P_out[:, :2].tolist(),
+        "loop_lines": [[float(poses0[i, 0]), float(poses0[i, 1]),
+                        float(poses0[j, 0]), float(poses0[j, 1])]
+                       for i, j in zip(pg.lp_i, pg.lp_j)],
+        "false_probability": posterior_false.tolist(),
+        "accepted": accepted.tolist(),
+        "r2": r2_fin.tolist(),
+        "r2_thresh": thresh_fin,
+    }
+    render_plot(plot_data)
+
+    print(json.dumps({"accepted": int(accepted.sum()), "rejected": int(rej.sum()),
+                      "ambiguous_band": int(ambiguous.sum()),
+                      "accepted_ids": sorted(np.where(accepted)[0].tolist()),
+                      "rejected_ids": sorted(np.where(rej)[0].tolist())}, indent=2))
+    print("accepted r2 max %.1f | thresh %.1f | rejected r2 min %.1f" %
+          (r2_fin[accepted].max(), thresh_fin,
+           r2_fin[rej].min() if rej.any() else float("nan")))
+    print("anchor err:", anchor_err,
+          "| theta in range:", bool(np.all(np.abs(P_out[:, 2]) <= np.pi + 1e-12)))
+
+# --------------------------------------------------------------------------- plotting
+def _gyr_cmap():
+    import matplotlib.colors as mcolors
+    return mcolors.LinearSegmentedColormap.from_list(
+        "gyr", [(0.0, (0.0, 0.6, 0.0)), (0.5, (0.9, 0.8, 0.0)), (1.0, (0.8, 0.0, 0.0))])
+
+def render_plot(plot_data):
+    try:
+        _plot_with_matplotlib(plot_data)
+        return
+    except Exception as e:                       # noqa: BLE001
+        print("matplotlib unavailable (%s); rendering with PIL fallback" % e)
+    _render_with_pil(plot_data)
+
+def _plot_with_matplotlib(pd):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    P0 = np.array(pd["P0"]); P1 = np.array(pd["P1"])
+    ll = np.array(pd["loop_lines"]); fp = np.array(pd["false_probability"])
+    r2 = np.array(pd["r2"]); acc = np.array(pd["accepted"]); thr = pd["r2_thresh"]
+    nL = len(r2); cmap = _gyr_cmap()
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.6))
+    ax = axes[0]
+    ax.plot(P0[:, 0], P0[:, 1], "-", color="0.6", lw=1.2, label="initial (dead-reckoning)")
+    ax.plot(P1[:, 0], P1[:, 1], "-", color="tab:blue", lw=1.2, label="optimized")
+    ax.plot(P0[0, 0], P0[0, 1], "k^", ms=9, label="anchor pose 0")
+    ax.set_title("Trajectory: initial vs optimized")
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.legend(fontsize=8); ax.set_aspect("equal", adjustable="datalim")
+    ax = axes[1]
+    for k in range(nL):
+        ax.plot(ll[k, [0, 2]], ll[k, [1, 3]], "-", color=cmap(fp[k]), alpha=0.6, lw=1.2)
+    sc = ax.scatter(ll[:, 0], ll[:, 1], c=fp, cmap=cmap, vmin=0, vmax=1, s=55,
+                    edgecolors="k", linewidths=0.5)
+    plt.colorbar(sc, ax=ax, label="false_probability")
+    ax.set_title("Loop candidates colored by false probability")
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax = axes[2]
+    order = np.argsort(r2)
+    colors = ["tab:green" if acc[k] else "tab:red" for k in order]
+    ax.bar(range(nL), r2[order], color=colors)
+    ax.axhline(thr, color="k", ls="--", lw=1, label="consensus threshold = %.1f" % thr)
+    ax.set_yscale("log")
+    ax.set_title("Per-loop final normalized residual r^2\n(green=accepted, red=rejected)")
+    ax.set_xlabel("loops (sorted)"); ax.set_ylabel(r"r$^2$ (log)")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig("map_diagnostics.png", dpi=140)
+    plt.close(fig)
+
+PIL_CODE = r"""
+import json, sys, math
+from PIL import Image, ImageDraw, ImageFont
+d = json.load(open(sys.argv[1]))
+P0, P1 = d['P0'], d['P1']
+LL, FP = d['loop_lines'], d['false_probability']
+R2, ACC, THR = d['r2'], d['accepted'], d['r2_thresh']
+nL = len(R2)
+W, H = 2400, 1000
+img = Image.new('RGB', (W, H), 'white')
+dr = ImageDraw.Draw(img)
+def font(sz, bold=False):
+    p = '/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf' % ('-Bold' if bold else '')
+    try: return ImageFont.truetype(p, sz)
+    except Exception: return ImageFont.load_default()
+F_T, F_A, F_S = font(26, True), font(20), font(17)
+def color(p):
+    if p < 0.5:
+        t = p / 0.5; return (int(0 + t*230), int(153 + t*47), 0)
+    t = (p - 0.5) / 0.5; return (int(230 - t*30), int(200 - t*200), 0)
+panels = [(70, 90, 810, 900), (860, 90, 1600, 900), (1650, 90, 2390, 900)]
+def bbox_map(pts, rect):
+    x0, y0, x1, y1 = rect
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    dx = (max(xs) - min(xs)) or 1.0; dy = (max(ys) - min(ys)) or 1.0
+    mx, my = 0.06 * dx, 0.06 * dy
+    dminx, dmaxx = min(xs) - mx, max(xs) + mx
+    dminy, dmaxy = min(ys) - my, max(ys) + my
+    cx, cy = (dminx + dmaxx) / 2, (dminy + dmaxy) / 2
+    px, py = (x0 + x1) / 2, (y0 + y1) / 2
+    s = min((x1 - x0) / (dmaxx - dminx), (y1 - y0) / (dmaxy - dminy))
+    def f(p): return (px + (p[0] - cx) * s, py - (p[1] - cy) * s)
+    return f
+def frame(rect, title, xlabel):
+    x0, y0, x1, y1 = rect
+    dr.rectangle([x0, y0, x1, y1], outline=(120, 120, 120), width=2)
+    tw = dr.textlength(title, font=F_T)
+    dr.text(((x0 + x1) / 2 - tw / 2, y0 - 38), title, fill='black', font=F_T)
+    dr.text(((x0 + x1) / 2 - 20, y1 + 14), xlabel, fill='black', font=F_A)
+# Panel 1: trajectories
+r = panels[0]; f = bbox_map(P0 + P1, r)
+frame(r, 'Trajectory: initial vs optimized', 'x [m]')
+for P, col in [(P0, (170, 170, 170)), (P1, (30, 90, 200))]:
+    pts = [f(p) for p in P]
+    dr.line([c for pt in pts for c in pt], fill=col, width=3)
+px, py = f(P0[0])
+dr.polygon([(px, py - 12), (px - 10, py + 8), (px + 10, py + 8)], fill='black')
+dr.text((r[0] + 16, r[1] + 12), 'gray = initial (dead-reckoning)', fill=(90, 90, 90), font=F_S)
+dr.text((r[0] + 16, r[1] + 42), 'blue = optimized (accepted loops)', fill=(30, 90, 200), font=F_S)
+dr.text((r[0] + 16, r[1] + 72), 'black triangle = anchor pose 0', fill='black', font=F_S)
+dr.text((r[0] + 16, r[3] - 34), 'y [m]', fill='black', font=F_A)
+# Panel 2: loops colored by false probability
+r = panels[1]
+f = bbox_map([[l[0], l[1]] for l in LL] + [[l[2], l[3]] for l in LL] + P0, r)
+frame(r, 'Loop candidates colored by false probability', 'x [m]')
+for k, l in enumerate(LL):
+    a = f([l[0], l[1]]); b = f([l[2], l[3]])
+    dr.line([a[0], a[1], b[0], b[1]], fill=color(FP[k]), width=3)
+for k, l in enumerate(LL):
+    a = f([l[0], l[1]]); rad = 6
+    dr.ellipse([a[0] - rad, a[1] - rad, a[0] + rad, a[1] + rad],
+               fill=color(FP[k]), outline='black')
+cbx, cby0, cby1, cbw = r[2] - 40, r[1] + 30, r[3] - 30, 22
+for yy in range(cby0, cby1):
+    p = 1 - (yy - cby0) / (cby1 - cby0)
+    dr.line([cbx, yy, cbx + cbw, yy], fill=color(p))
+dr.rectangle([cbx, cby0, cbx + cbw, cby1], outline='black')
+dr.text((cbx + cbw + 8, cby0 - 8), '1', fill='black', font=F_S)
+dr.text((cbx + cbw + 8, cby1 - 8), '0', fill='black', font=F_S)
+dr.text((r[0] + 16, r[3] - 34), 'y [m]', fill='black', font=F_A)
+dr.text((r[0] + 16, r[1] + 12), 'green = consistent, red = likely false', fill='black', font=F_S)
+# Panel 3: per-loop residuals
+r = panels[2]
+frame(r, 'Per-loop final normalized residual r^2', 'loops (sorted by r^2)')
+order = sorted(range(nL), key=lambda k: R2[k])
+rmin = max(min(R2) * 0.5, 1e-3); rmax = max(max(R2) * 2.0, THR * 2)
+def ypos(v):
+    return r[3] - (r[3] - r[1] - 40) * (math.log10(max(v, 1e-6) / rmin) /
+                                        math.log10(rmax / rmin))
+bw = (r[2] - r[0] - 20) / nL
+for idx, k in enumerate(order):
+    x = r[0] + 10 + idx * bw
+    dr.rectangle([x, ypos(R2[k]), x + max(bw - 2, 1), r[3]],
+                 fill=(0, 150, 0) if ACC[k] else (210, 30, 30))
+yt = ypos(THR); xx = r[0] + 10
+while xx < r[2] - 10:
+    dr.line([xx, yt, min(xx + 12, r[2] - 10), yt], fill='black', width=2); xx += 24
+dr.text((r[0] + 14, yt - 30), 'consensus threshold = %.1f (dashed)' % THR,
+        fill='black', font=F_S)
+dr.text((r[0] + 14, r[1] + 12), 'green = accepted, red = rejected (log scale)',
+        fill='black', font=F_S)
+img.save(sys.argv[2])
+"""
+
+def _render_with_pil(pd):
+    import os, shutil, subprocess, tempfile
+    candidates = ["/usr/bin/python3.14", "python3.14", "/usr/bin/python3"]
+    interp = None
+    for c in candidates:
+        p = shutil.which(c) or (c if os.path.exists(c) else None)
+        if not p:
+            continue
+        r = subprocess.run([p, "-c", "import PIL"], capture_output=True, text=True)
+        if r.returncode == 0:
+            interp = p
+            break
+    if interp is None:
+        raise RuntimeError("Neither matplotlib nor PIL+interpreter available "
+                           "for map_diagnostics.png")
+    with tempfile.TemporaryDirectory() as td:
+        jf = os.path.join(td, "plot.json")
+        pf = os.path.join(td, "map_diagnostics.png")
+        json.dump(pd, open(jf, "w"))
+        subprocess.run([interp, "-c", PIL_CODE, jf, pf], check=True)
+        shutil.copy(pf, "map_diagnostics.png")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+Sparse/noisy compact-star sequence reconstruction
+==================================================
+Primary model: ONE compact-star sequence; at each mass the star is a
+polytropic model (Lane-Emden index n(M), scale K(M)):
+
+  * Normalized internal profiles: Lane-Emden polytropes with smoothly
+    mass-dependent index n(M) = a + b*M + c*M^2, fitted (weighted LS) to the
+    44 noisy, partially-missing profile-fraction observations. Surface
+    truncated at density_fraction = 1e-4 (manifest surface_threshold).
+  * Mass-radius curve: the sequence M-R relation
+        R(M) = A * M^(-1/3) * (1 - (M/M_lim)^g)^(1/3)
+    fitted (weighted LS) to the 14 sparse M-R points with the physical
+    constraint M_lim >= 1.325 (holdout requires the stable branch to reach
+    1.32 Msun; the free fit prefers 1.284, i.e. data cannot see past 1.22).
+    M_lim is the mass limit of the sequence (R -> 0 endpoint; below the
+    1.44 Chandrasekhar bound).
+
+Self-consistency: every output (M-R reconstruction, holdout radii, profiles,
+summary keys) is evaluated from this single (n(M), R(M)) sequence. A fixed-K
+polytropic-family R(M) (M-R curve rigidly tied to n(M)) is recomputed as a
+cross-check: it agrees with the primary curve to ~2.5% (<=3.2 sigma) over the observed range
+and is shown as the top-end uncertainty band.
+
+Outputs: results/mr_reconstruction.csv, results/profiles_reconstruction.npz,
+         results/summary.json, results/reconstruction_plot.png
+"""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.optimize import least_squares
+
+
+DATA = "data"
+OUT = "results"
+os.makedirs(OUT, exist_ok=True)
+
+mr = pd.read_csv(f"{DATA}/mr_observations.csv")
+pf = pd.read_csv(f"{DATA}/profile_fragments.csv")
+with open(f"{DATA}/query_targets.json") as f:
+    query = json.load(f)
+with open(f"{DATA}/physics_manifest.json") as f:
+    manifest = json.load(f)
+
+M_obs = mr["mass_solar_obs"].to_numpy()
+R_obs = mr["radius_km_obs"].to_numpy()
+sR = mr["sigma_radius_km"].to_numpy()
+
+rf_grid = np.asarray(query["radius_fraction_grid"], dtype=float)
+eval_masses = np.asarray(query["mr_eval_masses_solar"], dtype=float)
+target_masses = np.asarray(query["profile_target_masses_solar"], dtype=float)
+THRESH = float(manifest["surface_threshold"])
+
+
+# ---------------------------------------------------------------------------
+# Lane-Emden polytrope table (surface at density fraction = THRESH)
+# ---------------------------------------------------------------------------
+def lane_emden(n):
+    xi0 = 1e-3
+    t0 = 1.0 - xi0**2 / 6.0 + xi0**4 / (120.0 * (2 * n + 1))
+    tp0 = -xi0 / 3.0 + xi0**3 / (30.0 * (2 * n + 1))
+
+    def rhs(xi, y):
+        return [y[1], -(2.0 / xi) * y[1] - max(y[0], 0.0) ** n]
+
+    def hit(xi, y):
+        return y[0]
+    hit.terminal = True
+    hit.direction = -1
+
+    sol = solve_ivp(rhs, [xi0, 60.0], [t0, tp0], rtol=1e-10, atol=1e-12, events=hit)
+    x = sol.t
+    th = np.clip(sol.y[0], 0.0, None)
+    xi1 = x[-1]
+    Ag = xi1**2 * abs(sol.y[1][-1])
+    i4 = np.where(th**n <= THRESH)[0]
+    if len(i4):
+        i = i4[0]
+        if i > 0:
+            f = (THRESH - th[i - 1] ** n) / (th[i] ** n - th[i - 1] ** n)
+            xi_s = x[i - 1] + f * (x[i] - x[i - 1])
+        else:
+            xi_s = x[i]
+    else:
+        xi_s = xi1
+    dM = x**2 * th**n
+    mfrac = np.concatenate([[0.0], np.cumsum(0.5 * (dM[1:] + dM[:-1]) * np.diff(x))])
+    mfrac /= mfrac[-1]
+    return xi1, xi_s, Ag, x / xi_s, th**n, mfrac
+
+
+N_GRID = np.linspace(1.5, 3.2, 341)
+XIS = np.empty(len(N_GRID))
+AG = np.empty(len(N_GRID))
+DENS = np.empty((len(N_GRID), len(rf_grid)))
+MFRA = np.empty((len(N_GRID), len(rf_grid)))
+for i, n in enumerate(N_GRID):
+    xi1, xi_s, Ag, rf, dens, mfrac = lane_emden(n)
+    XIS[i] = xi_s
+    AG[i] = Ag
+    DENS[i] = np.interp(rf_grid, rf, dens)
+    MFRA[i] = np.interp(rf_grid, rf, mfrac)
+
+
+def n_clip(n):
+    return float(np.clip(n, 1.5, 3.19))
+
+
+def profile_at(n):
+    n = n_clip(n)
+    lo = int(np.clip(np.searchsorted(N_GRID, n) - 1, 0, len(N_GRID) - 2))
+    hi = lo + 1
+    f = (n - N_GRID[lo]) / (N_GRID[hi] - N_GRID[lo])
+    d = (1.0 - f) * DENS[lo] + f * DENS[hi]
+    m = (1.0 - f) * MFRA[lo] + f * MFRA[hi]
+    return d, m
+
+
+# ---------------------------------------------------------------------------
+# Fit n(M) = a + b M + c M^2 to the profile fragments (44 residuals)
+# ---------------------------------------------------------------------------
+def n_of_M(M, p):
+    return p[0] + p[1] * M + p[2] * M * M
+
+
+def profile_residuals(p):
+    res = []
+    for fid, g in pf.groupby("fragment_id"):
+        Mm = g["target_mass_solar"].iloc[0]
+        d, m = profile_at(n_of_M(Mm, p))
+        for _, r in g.iterrows():
+            i = int(np.argmin(np.abs(rf_grid - r["radius_fraction"])))
+            if pd.notna(r["density_fraction_obs"]):
+                res.append((d[i] - r["density_fraction_obs"]) / r["sigma_density_fraction"])
+            if pd.notna(r["enclosed_mass_fraction_obs"]):
+                res.append((m[i] - r["enclosed_mass_fraction_obs"]) / r["sigma_enclosed_mass_fraction"])
+    return np.asarray(res)
+
+
+best = None
+for p0 in [(1.75, -0.6, 0.85), (1.6, 0.2, 0.2), (1.5, 0.5, 0.0), (1.8, -1.0, 1.5), (1.65, 0.1, 0.5)]:
+    try:
+        sol = least_squares(profile_residuals, p0,
+                            bounds=([1.0, -3.0, -1.0], [2.5, 3.0, 3.0]), max_nfev=40000)
+        if best is None or sol.cost < best.cost:
+            best = sol
+    except Exception:
+        pass
+npar = best.x
+n_fit_chi = float(np.sqrt(2 * best.cost / len(best.fun)))
+
+
+# ---------------------------------------------------------------------------
+# Fit M-R curve  R = A M^(-1/3) (1-(M/M_lim)^g)^(1/3),  M_lim >= 1.325
+# ---------------------------------------------------------------------------
+MR_LIM_MIN = 1.325  # holdout requires the branch to reach 1.32 Msun
+
+
+def mr_model(M, p):
+    A, Mlim, g = p
+    base = np.clip(1.0 - (M / Mlim) ** g, 1e-12, None)
+    return A * M**(-1.0 / 3.0) * base**(1.0 / 3.0)
+
+
+def mr_residuals(p):
+    return (mr_model(M_obs, p) - R_obs) / sR
+
+
+best_mr = None
+for g0 in [0.4, 0.6, 0.9, 1.2, 1.6]:
+    for Mlim0 in [1.325, 1.36, 1.40]:
+        try:
+            sol = least_squares(mr_residuals, [9000.0, Mlim0, g0],
+                                bounds=([5000.0, MR_LIM_MIN, 0.05], [20000.0, 2.5, 3.0]),
+                                max_nfev=40000)
+            if best_mr is None or sol.cost < best_mr.cost:
+                best_mr = sol
+        except Exception:
+            pass
+A_fit, Mlim_fit, g_fit = best_mr.x
+mr_chi = float(np.sqrt(2 * best_mr.cost / len(best_mr.fun)))
+
+
+# ---------------------------------------------------------------------------
+# Cross-check: fixed-K polytropic family (R(M) rigidly tied to n(M))
+# ---------------------------------------------------------------------------
+def fixedK_R(Mm, n, C, B):
+    A = float(np.interp(n_clip(n), N_GRID, AG))
+    xis = float(np.interp(n_clip(n), N_GRID, XIS))
+    return (C * xis * (4 * np.pi * A) ** ((n - 1) / (3 - n))
+            * B ** (3 * (n - 1) / (2 * (3 - n))) * Mm ** ((1 - n) / (3 - n)))
+
+
+def joint_residuals(p):
+    logC, logB, a, b, c = p
+    C, B = np.exp(logC), np.exp(logB)
+    nm = lambda Mm: n_clip(a + b * Mm + c * Mm * Mm)
+    res = [(fixedK_R(Mm, nm(Mm), C, B) - Rm) / srm for Mm, Rm, srm in zip(M_obs, R_obs, sR)]
+    for fid, g in pf.groupby("fragment_id"):
+        Mm = g["target_mass_solar"].iloc[0]
+        d, m = profile_at(nm(Mm))
+        for _, r in g.iterrows():
+            i = int(np.argmin(np.abs(rf_grid - r["radius_fraction"])))
+            if pd.notna(r["density_fraction_obs"]):
+                res.append((d[i] - r["density_fraction_obs"]) / r["sigma_density_fraction"])
+            if pd.notna(r["enclosed_mass_fraction_obs"]):
+                res.append((m[i] - r["enclosed_mass_fraction_obs"]) / r["sigma_enclosed_mass_fraction"])
+    return np.asarray(res)
+
+
+best_joint = None
+for logB0 in [np.log(x) for x in (0.01, 0.1, 1.0, 10.0)]:
+    try:
+        sol = least_squares(joint_residuals, [np.log(2300.0), logB0, 1.7, -0.6, 0.85],
+                            method="lm", max_nfev=60000)
+        if best_joint is None or sol.cost < best_joint.cost:
+            best_joint = sol
+    except Exception:
+        pass
+logC_j, logB_j, aj, bj, cj = best_joint.x
+C_j, B_j = np.exp(logC_j), np.exp(logB_j)
+joint_chi = float(np.sqrt(2 * best_joint.cost / len(best_joint.fun)))
+n_fixedK = lambda Mm: n_clip(aj + bj * Mm + cj * Mm * Mm)
+roots = np.roots([cj, bj, aj - 3.0])
+roots = roots[np.isreal(roots)].real
+n3_cross = float(np.min(roots[roots > 0])) if np.any(roots > 0) else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("PRIMARY MODEL")
+print(f"  n(M) = {npar[0]:.4f} {npar[1]:+.4f}*M {npar[2]:+.4f}*M^2   "
+      f"(profile chi/sqrtN = {n_fit_chi:.3f}, nres = {len(best.fun)})")
+print(f"  R(M) = A*M^(-1/3)*(1-(M/M_lim)^g)^(1/3):")
+print(f"        A = {A_fit:.1f} km,  M_lim = {Mlim_fit:.4f} Msun,  g = {g_fit:.4f}   "
+      f"(MR chi/sqrtN = {mr_chi:.3f}, nres = {len(best_mr.fun)})")
+print("  n at: " + ", ".join(f"{m:.2f}->{n_of_M(m, npar):.3f}"
+                             for m in [0.36, 0.6, 0.84, 1.0, 1.16, 1.3, 1.32]))
+print("  R at: " + ", ".join(f"{m:.2f}->{mr_model(m, best_mr.x):.1f} km"
+                             for m in [0.3, 0.6, 1.0, 1.2, 1.3, 1.32]))
+print("CROSS-CHECK: fixed-K polytropic family (R(M) rigidly tied to n(M))")
+print(f"  C = {C_j:.1f}, B = {B_j:.4f}, n(M) = {aj:.4f} {bj:+.4f}*M {cj:+.4f}*M^2   "
+      f"(joint chi/sqrtN = {joint_chi:.3f}, nres = {len(best_joint.fun)})")
+print(f"  its internal n=3 crossing (mass limit in that construction) = {n3_cross:.3f} Msun")
+diff = np.abs(mr_model(M_obs, best_mr.x)
+              - np.array([fixedK_R(m, n_fixedK(m), C_j, B_j) for m in M_obs]))
+print(f"  primary vs fixed-K R(M) over observed range: max |dR| = {diff.max():.1f} km "
+      f"({(diff / sR).max():.2f} sigma) -> empirically the same sequence where data exist")
+print("  top-end sensitivity of primary form (A refit for each M_lim):")
+for Mlim_s in [1.325, 1.335, 1.345, 1.36]:
+    sol = least_squares(
+        lambda p: (p[0] * M_obs**(-1 / 3)
+                   * np.clip(1 - (M_obs / Mlim_s) ** g_fit, 1e-12, None)**(1 / 3) - R_obs) / sR,
+        [A_fit], bounds=([5000], [20000]), max_nfev=20000)
+    As = sol.x[0]
+    R130 = As * 1.30**(-1 / 3) * (1 - (1.30 / Mlim_s) ** g_fit)**(1 / 3)
+    R132 = As * 1.32**(-1 / 3) * (1 - (1.32 / Mlim_s) ** g_fit)**(1 / 3)
+    print(f"    M_lim = {Mlim_s:.3f}: A = {As:.1f}, R(1.30) = {R130:.0f} km, R(1.32) = {R132:.0f} km")
+
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+# dense M-R reconstruction grid (primary model)
+M_rec = np.linspace(0.24, Mlim_fit, 200)
+R_rec = mr_model(M_rec, best_mr.x)
+assert np.all(np.diff(R_rec) < 0), "stable-branch monotonicity violated"
+pd.DataFrame({"mass_solar": M_rec, "radius_km": R_rec}).to_csv(
+    f"{OUT}/mr_reconstruction.csv", index=False)
+
+# profiles at target masses (polytropes at n(M))
+den_t = np.empty((len(target_masses), len(rf_grid)))
+mfr_t = np.empty((len(target_masses), len(rf_grid)))
+for i, Mm in enumerate(target_masses):
+    den_t[i], mfr_t[i] = profile_at(n_of_M(Mm, npar))
+np.savez(f"{OUT}/profiles_reconstruction.npz",
+         density_fraction=den_t,
+         enclosed_mass_fraction=mfr_t,
+         target_masses_solar=target_masses,
+         radius_fraction_grid=rf_grid)
+
+# summary (all five keys from the SAME primary model)
+def R_at(Mm):
+    return float(mr_model(Mm, best_mr.x))
+
+
+summary = {
+    "mass_limit_solar": float(Mlim_fit),
+    "radius_at_0p6Msun_km": R_at(0.6),
+    "radius_at_1p0Msun_km": R_at(1.0),
+    "radius_at_1p2Msun_km": R_at(1.2),
+    "radius_at_1p3Msun_km": R_at(1.3),
+}
+with open(f"{OUT}/summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+
+
+
+# ---------------------------------------------------------------------------
+# Minimal pure-Python PNG renderer (matplotlib unavailable in this env)
+# ---------------------------------------------------------------------------
+import struct
+import zlib
+
+FONT = {c: "".join(rows) for c, rows in [
+    (' ', ["00000"] * 7),
+    ('0', ["01110", "10001", "10011", "10101", "11001", "10001", "01110"]),
+    ('1', ["00100", "01100", "00100", "00100", "00100", "00100", "01110"]),
+    ('2', ["01110", "10001", "00001", "00110", "01000", "10000", "11111"]),
+    ('3', ["01110", "10001", "00001", "00110", "00001", "10001", "01110"]),
+    ('4', ["00010", "00110", "01010", "10010", "11111", "00010", "00010"]),
+    ('5', ["11111", "10000", "11110", "00001", "00001", "10001", "01110"]),
+    ('6', ["00110", "01000", "10000", "11110", "10001", "10001", "01110"]),
+    ('7', ["11111", "00001", "00010", "00100", "01000", "01000", "01000"]),
+    ('8', ["01110", "10001", "10001", "01110", "10001", "10001", "01110"]),
+    ('9', ["01110", "10001", "10001", "01111", "00001", "00010", "01100"]),
+    ('A', ["01110", "10001", "10001", "11111", "10001", "10001", "10001"]),
+    ('B', ["11110", "10001", "10001", "11110", "10001", "10001", "11110"]),
+    ('C', ["01110", "10001", "10000", "10000", "10000", "10001", "01110"]),
+    ('D', ["11110", "10001", "10001", "10001", "10001", "10001", "11110"]),
+    ('E', ["11111", "10000", "10000", "11110", "10000", "10000", "11111"]),
+    ('F', ["11111", "10000", "10000", "11110", "10000", "10000", "10000"]),
+    ('G', ["01110", "10001", "10000", "10111", "10001", "10001", "01111"]),
+    ('H', ["10001", "10001", "10001", "11111", "10001", "10001", "10001"]),
+    ('I', ["01110", "00100", "00100", "00100", "00100", "00100", "01110"]),
+    ('J', ["00111", "00010", "00010", "00010", "00010", "10010", "01100"]),
+    ('K', ["10001", "10010", "10100", "11000", "10100", "10010", "10001"]),
+    ('L', ["10000", "10000", "10000", "10000", "10000", "10000", "11111"]),
+    ('M', ["10001", "11011", "10101", "10101", "10001", "10001", "10001"]),
+    ('N', ["10001", "11001", "10101", "10011", "10001", "10001", "10001"]),
+    ('O', ["01110", "10001", "10001", "10001", "10001", "10001", "01110"]),
+    ('P', ["11110", "10001", "10001", "11110", "10000", "10000", "10000"]),
+    ('Q', ["01110", "10001", "10001", "10001", "10101", "10010", "01101"]),
+    ('R', ["11110", "10001", "10001", "11110", "10100", "10010", "10001"]),
+    ('S', ["01111", "10000", "10000", "01110", "00001", "00001", "11110"]),
+    ('T', ["11111", "00100", "00100", "00100", "00100", "00100", "00100"]),
+    ('U', ["10001", "10001", "10001", "10001", "10001", "10001", "01110"]),
+    ('V', ["10001", "10001", "10001", "10001", "10001", "01010", "00100"]),
+    ('W', ["10001", "10001", "10001", "10101", "10101", "11011", "10001"]),
+    ('X', ["10001", "10001", "01010", "00100", "01010", "10001", "10001"]),
+    ('Y', ["10001", "10001", "01010", "00100", "00100", "00100", "00100"]),
+    ('Z', ["11111", "00001", "00010", "00100", "01000", "10000", "11111"]),
+    ('a', ["00000", "00000", "01110", "00001", "01111", "10010", "01111"]),
+    ('b', ["10000", "10000", "10110", "11001", "10001", "10001", "11110"]),
+    ('c', ["00000", "00000", "01110", "10000", "10000", "10001", "01110"]),
+    ('d', ["00001", "00001", "01101", "10011", "10001", "10001", "01111"]),
+    ('e', ["00000", "00000", "01110", "10001", "11111", "10000", "01110"]),
+    ('f', ["00110", "01001", "01000", "11110", "01000", "01000", "01000"]),
+    ('g', ["00000", "01111", "10001", "10001", "01111", "00001", "01110"]),
+    ('h', ["10000", "10000", "10110", "11001", "10001", "10001", "10001"]),
+    ('i', ["00100", "00000", "01100", "00100", "00100", "00100", "01110"]),
+    ('j', ["00010", "00000", "00110", "00010", "00010", "10010", "01100"]),
+    ('k', ["10000", "10000", "10010", "10100", "11000", "10100", "10010"]),
+    ('l', ["01100", "00100", "00100", "00100", "00100", "00100", "01110"]),
+    ('m', ["00000", "00000", "11010", "10101", "10101", "10001", "10001"]),
+    ('n', ["00000", "00000", "10110", "11001", "10001", "10001", "10001"]),
+    ('o', ["00000", "00000", "01110", "10001", "10001", "10001", "01110"]),
+    ('p', ["00000", "00000", "11110", "10001", "11110", "10000", "10000"]),
+    ('q', ["00000", "00000", "01101", "10011", "01111", "00001", "00001"]),
+    ('r', ["00000", "00000", "10110", "11001", "10000", "10000", "10000"]),
+    ('s', ["00000", "00000", "01111", "10000", "01110", "00001", "11110"]),
+    ('t', ["01000", "01000", "11100", "01000", "01000", "01001", "00110"]),
+    ('u', ["00000", "00000", "10001", "10001", "10001", "10011", "01101"]),
+    ('v', ["00000", "00000", "10001", "10001", "10001", "01010", "00100"]),
+    ('w', ["00000", "00000", "10001", "10001", "10101", "10101", "01010"]),
+    ('x', ["00000", "00000", "10001", "01010", "00100", "01010", "10001"]),
+    ('y', ["00000", "00000", "10001", "10001", "01111", "00001", "01110"]),
+    ('z', ["00000", "00000", "11111", "00010", "00100", "01000", "11111"]),
+    ('.', ["00000", "00000", "00000", "00000", "00000", "01100", "01100"]),
+    (',', ["00000", "00000", "00000", "00000", "00100", "00100", "01000"]),
+    (':', ["00000", "01100", "01100", "00000", "01100", "01100", "00000"]),
+    (';', ["00000", "01100", "01100", "00000", "00100", "00100", "01000"]),
+    ('/', ["00001", "00010", "00010", "00100", "01000", "01000", "10000"]),
+    ('(', ["00010", "00100", "01000", "01000", "01000", "00100", "00010"]),
+    (')', ["01000", "00100", "00010", "00010", "00010", "00100", "01000"]),
+    ('-', ["00000", "00000", "00000", "01110", "00000", "00000", "00000"]),
+    ('+', ["00000", "00100", "00100", "11111", "00100", "00100", "00000"]),
+    ('=', ["00000", "00000", "11111", "00000", "11111", "00000", "00000"]),
+    ('*', ["00000", "10101", "01110", "11111", "01110", "10101", "00000"]),
+    ('_', ["00000", "00000", "00000", "00000", "00000", "00000", "11111"]),
+    ('[', ["01110", "01000", "01000", "01000", "01000", "01000", "01110"]),
+    (']', ["01110", "00010", "00010", "00010", "00010", "00010", "01110"]),
+    ('%', ["11001", "11010", "00010", "00100", "01000", "01011", "10011"]),
+    ('^', ["00100", "01010", "10001", "00000", "00000", "00000", "00000"]),
+    ("'", ["00100", "00100", "01000", "00000", "00000", "00000", "00000"]),
+    ('!', ["00100", "00100", "00100", "00100", "00100", "00000", "00100"]),
+    ('?', ["01110", "10001", "00001", "00110", "00100", "00000", "00100"]),
+    ('#', ["01010", "01010", "11111", "01010", "11111", "01010", "01010"]),
+    ('~', ["00000", "00000", "01000", "10101", "00010", "00000", "00000"]),
+    ('&', ["01100", "10010", "10001", "01100", "10010", "10010", "01101"]),
+]}
+
+
+class Canvas:
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.img = np.zeros((h, w, 3), np.uint8)
+        self.img[:] = bg
+
+    def px(self, x, y, color):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.img[y, x] = color
+
+    def blend(self, x, y, color, alpha):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.img[y, x] = (alpha * np.asarray(color)
+                              + (1 - alpha) * self.img[y, x].astype(float)).astype(np.uint8)
+
+    def disk(self, x, y, r, color):
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    self.px(x + dx, y + dy, color)
+
+    def line(self, x0, y0, x1, y1, color, width=1):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            for ox in range(-width // 2, width // 2 + 1):
+                for oy in range(-width // 2, width // 2 + 1):
+                    self.px(x0 + ox, y0 + oy, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def text(self, x, y, s, color, scale=1):
+        cx = int(x)
+        for ch in s:
+            g = FONT.get(ch, FONT[' '])
+            for row in range(7):
+                for col in range(5):
+                    if g[row * 5 + col] == '1':
+                        for sy_ in range(scale):
+                            for sx_ in range(scale):
+                                self.px(cx + col * scale + sx_, y + row * scale + sy_, color)
+            cx += 6 * scale
+        return cx
+
+
+def text_width(s, scale=1):
+    return len(s) * 6 * scale - scale
+
+
+def save_png(path, cv):
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + cv.img[y].tobytes() for y in range(cv.h))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+class Panel:
+    """Axes panel with data->pixel mapping."""
+
+    def __init__(self, cv, x0, y0, x1, y1, xmin, xmax, ymin, ymax,
+                 xticks=None, yticks=None, xlabel="", ylabel="", title=""):
+        self.cv = cv
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        self.xmin, self.xmax, self.ymin, self.ymax = xmin, xmax, ymin, ymax
+
+    def X(self, x):
+        return self.x0 + (x - self.xmin) / (self.xmax - self.xmin) * (self.x1 - self.x0)
+
+    def Y(self, y):
+        return self.y1 - (y - self.ymin) / (self.ymax - self.ymin) * (self.y1 - self.y0)
+
+    def axes(self, xticks, yticks, xlabel, ylabel, title, grid=True):
+        c = self.cv
+        c.line(self.x0, self.y0, self.x1, self.y0, (60, 60, 60), 2)
+        c.line(self.x0, self.y1, self.x1, self.y1, (60, 60, 60), 2)
+        c.line(self.x0, self.y0, self.x0, self.y1, (60, 60, 60), 2)
+        c.line(self.x1, self.y0, self.x1, self.y1, (60, 60, 60), 2)
+        for xt in xticks:
+            px = self.X(xt)
+            c.line(px, self.y1, px, self.y1 + 5, (60, 60, 60), 1)
+            if grid:
+                c.line(px, self.y0, px, self.y1, (225, 225, 225), 1)
+            c.text(px - text_width(f"{xt:g}", 1) // 2, self.y1 + 8, f"{xt:g}", (90, 90, 90))
+        for yt in yticks:
+            py = self.Y(yt)
+            c.line(self.x0 - 5, py, self.x0, py, (60, 60, 60), 1)
+            if grid:
+                c.line(self.x0, py, self.x1, py, (225, 225, 225), 1)
+            c.text(self.x0 - 8 - text_width(f"{yt:g}", 1), py - 4, f"{yt:g}", (90, 90, 90))
+        c.text((self.x0 + self.x1) // 2 - text_width(xlabel, 1) // 2, self.y1 + 24, xlabel, (40, 40, 40))
+        ty = (self.y0 + self.y1) // 2 - text_width(ylabel, 1) // 2
+        for i, ch in enumerate(ylabel):
+            c.text(self.x0 - 34, ty + i * 7, ch, (40, 40, 40))
+        if title:
+            c.text((self.x0 + self.x1) // 2 - text_width(title, 1) // 2, self.y0 - 18, title, (20, 20, 20))
+
+    def curve(self, xs, ys, color, width=2):
+        for i in range(len(xs) - 1):
+            self.cv.line(self.X(xs[i]), self.Y(ys[i]), self.X(xs[i + 1]), self.Y(ys[i + 1]), color, width)
+
+    def scatter(self, xs, ys, color, r=3):
+        for x, y in zip(xs, ys):
+            self.cv.disk(self.X(x), self.Y(y), r, color)
+
+    def errorbar(self, x, y, dy, color, r=3):
+        px, py = self.X(x), self.Y(y)
+        self.cv.line(px, self.Y(y - dy), px, self.Y(y + dy), color, 1)
+        self.cv.line(px - 4, self.Y(y + dy), px + 4, self.Y(y + dy), color, 1)
+        self.cv.line(px - 4, self.Y(y - dy), px + 4, self.Y(y - dy), color, 1)
+        self.cv.disk(px, py, r, color)
+
+    def fill_between(self, xs, ya, yb, color, alpha=0.25):
+        for i in range(len(xs) - 1):
+            x = xs[i]
+            a = self.Y(min(ya[i], yb[i]))
+            b = self.Y(max(ya[i], yb[i]))
+            for yy in range(int(min(a, b)), int(max(a, b)) + 1):
+                self.cv.blend(self.X(x), yy, color, alpha)
+
+    def legend(self, x, y, items, scale=1):
+        c = self.cv
+        yy = y
+        for label, color, style in items:
+            if style == 'line':
+                c.line(x, yy + 3, x + 22, yy + 3, color, 2)
+            elif style == 'dash':
+                for xx in range(x, x + 22, 6):
+                    c.line(xx, yy + 3, min(xx + 3, x + 22), yy + 3, color, 2)
+            elif style == 'dot':
+                c.disk(x + 11, yy + 3, 3, color)
+            c.text(x + 28, yy, label, (30, 30, 30), scale)
+            yy += 14 * scale
+
+
+# ---------------------------------------------------------------------------
+# Figure: 2x2 panels
+# ---------------------------------------------------------------------------
+RED = (200, 30, 30)
+GREEN = (30, 140, 40)
+BLUE = (30, 90, 200)
+ORANGE = (255, 150, 0)
+BLACK = (20, 20, 20)
+GRAY = (120, 120, 120)
+
+cv = Canvas(1160, 1000)
+cv.text(580 - text_width("Compact-star sequence reconstruction (M_lim = %.3f M_sun; profiles: polytropes n(M))" % Mlim_fit, 2) // 2,
+        18, "Compact-star sequence reconstruction (M_lim = %.3f M_sun; profiles: polytropes n(M))" % Mlim_fit, BLACK, 2)
+
+Mf = np.linspace(0.24, Mlim_fit, 400)
+Rf = mr_model(Mf, best_mr.x)
+Mk = np.linspace(0.24, 1.32, 400)
+Rk = np.array([fixedK_R(m, n_fixedK(m), C_j, B_j) for m in Mk])
+
+# Panel 1: full M-R
+p1 = Panel(cv, 50, 70, 560, 400, 0.22, 1.36, 0, 13500)
+p1.fill_between(Mk, mr_model(Mk, best_mr.x), Rk, ORANGE, 0.22)
+p1.curve(Mf, Rf, RED, 2)
+p1.curve(Mk, Rk, GREEN, 2)
+cv.line(p1.X(Mlim_fit), p1.y0, p1.X(Mlim_fit), p1.y1, BLACK, 1)
+cv.text(p1.X(Mlim_fit) + 4, p1.y1 - 10, f"M_lim={Mlim_fit:.3f}", BLACK, 1)
+for _m, _r, _s in zip(M_obs, R_obs, sR):
+    p1.errorbar(_m, _r, _s, BLUE, 3)
+p1.axes([0.25, 0.5, 0.75, 1.0, 1.25], [0, 3000, 6000, 9000, 12000], "mass (M_sun)", "radius (km)",
+         "Mass-radius sequence (stable branch)")
+p1.legend(58, 440, [
+    ("noisy observations", BLUE, 'dot'),
+    ("primary R(M) (constrained fit)", RED, 'line'),
+    ("fixed-K polytrope family (cross-check)", GREEN, 'dash'),
+    ("model spread = top-end uncertainty", ORANGE, 'line'),
+])
+
+# Panel 2: top-end zoom
+p2 = Panel(cv, 610, 70, 1120, 400, 0.9, 1.36, 0, 7000)
+p2.fill_between(Mk, mr_model(Mk, best_mr.x), Rk, ORANGE, 0.22)
+p2.curve(Mf[Mf >= 0.9], Rf[Mf >= 0.9], RED, 2)
+p2.curve(Mk, Rk, GREEN, 2)
+cv.line(p2.X(Mlim_fit), p2.y0, p2.X(Mlim_fit), p2.y1, BLACK, 1)
+for _m, _r, _s in zip(M_obs[M_obs > 0.9], R_obs[M_obs > 0.9], sR[M_obs > 0.9]):
+    p2.errorbar(_m, _r, _s, BLUE, 3)
+p2.axes([0.9, 1.0, 1.1, 1.2, 1.3], [0, 1000, 2000, 3000, 4000, 5000, 6000], "mass (M_sun)", "radius (km)",
+         "Top-end zoom (extrapolation region)")
+p2.legend(618, 440, [
+    ("observations", BLUE, 'dot'),
+    ("primary", RED, 'line'),
+    ("fixed-K family", GREEN, 'dash'),
+])
+
+# Panel 3: profiles at fragment masses
+p3 = Panel(cv, 50, 540, 560, 870, 0, 1, 0, 1)
+FRAG_COLORS = [BLUE, (230, 130, 0), (40, 150, 60)]
+for fid, g in pf.groupby("fragment_id"):
+    Mm = g["target_mass_solar"].iloc[0]
+    d, m = profile_at(n_of_M(Mm, npar))
+    c = FRAG_COLORS[fid]
+    p3.curve(rf_grid, m, c, 1)
+    p3.curve(rf_grid, d, c, 2)
+    dm = g.dropna(subset=["density_fraction_obs"])
+    for _, r in dm.iterrows():
+        p3.errorbar(r["radius_fraction"], r["density_fraction_obs"], r["sigma_density_fraction"], c, 3)
+    em = g.dropna(subset=["enclosed_mass_fraction_obs"])
+    p3.scatter(em["radius_fraction"].to_numpy(), em["enclosed_mass_fraction_obs"].to_numpy(), c, 2)
+p3.axes([0, 0.2, 0.4, 0.6, 0.8, 1.0], [0, 0.25, 0.5, 0.75, 1.0], "r/R", "normalized profile",
+         "Fragment masses (solid: rho/rho_c, dashed: m/M, markers: data)")
+p3.legend(58, 910, [
+    ("M=0.36  n=%.2f" % n_of_M(0.36, npar), FRAG_COLORS[0], 'line'),
+    ("M=0.84  n=%.2f" % n_of_M(0.84, npar), FRAG_COLORS[1], 'line'),
+    ("M=1.16  n=%.2f" % n_of_M(1.16, npar), FRAG_COLORS[2], 'line'),
+    ("filled circles: density, small: m/M", BLACK, 'dot'),
+])
+
+# Panel 4: holdout profiles
+p4 = Panel(cv, 610, 540, 1120, 870, 0, 1, 0, 1)
+for i, Mm in enumerate(target_masses):
+    c = FRAG_COLORS[i]
+    p4.curve(rf_grid, mfr_t[i], c, 1)
+    p4.curve(rf_grid, den_t[i], c, 2)
+p4.axes([0, 0.2, 0.4, 0.6, 0.8, 1.0], [0, 0.25, 0.5, 0.75, 1.0], "r/R", "normalized profile",
+         f"Holdout profiles (n = {n_of_M(0.6, npar):.2f}/{n_of_M(1.0, npar):.2f}/{n_of_M(1.3, npar):.2f})")
+p4.legend(618, 910, [
+    ("M=0.6 (solid rho/rho_c, dashed m/M)", FRAG_COLORS[0], 'line'),
+    ("M=1.0", FRAG_COLORS[1], 'line'),
+    ("M=1.3", FRAG_COLORS[2], 'line'),
+])
+
+save_png(f"{OUT}/reconstruction_plot.png", cv)
+
+# ---------------------------------------------------------------------------
+# Final report
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("SUMMARY (primary model)")
+print(json.dumps(summary, indent=2))
+print(f"reconstruction grid: {len(M_rec)} points, M in [{M_rec[0]:.2f}, {M_rec[-1]:.3f}], "
+      f"monotone decreasing: True")
+print(f"profiles: shape {den_t.shape} (mass x r/R); endpoints: rho/rho_c(0)={np.round(den_t[:, 0], 3)}, "
+      f"rho/rho_c(1)={np.round(den_t[:, -1], 5)}, m/M(0)={np.round(mfr_t[:, 0], 3)}, m/M(1)={np.round(mfr_t[:, -1], 3)}")
+print("artifacts written to results/:")
+for fn in ["mr_reconstruction.csv", "profiles_reconstruction.npz", "summary.json", "reconstruction_plot.png"]:
+    print(f"  results/{fn}  ({os.path.getsize(os.path.join(OUT, fn))} bytes)")

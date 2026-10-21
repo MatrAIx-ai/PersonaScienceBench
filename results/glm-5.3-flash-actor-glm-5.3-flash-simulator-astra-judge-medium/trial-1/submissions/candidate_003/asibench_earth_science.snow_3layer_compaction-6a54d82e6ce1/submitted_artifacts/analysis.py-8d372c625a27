@@ -1,0 +1,591 @@
+"""
+Process-based 3-layer snowpack model (Anderson/Niu-style bulk scheme).
+
+Fixed 3-layer snowpack driven by hourly forcing:
+* surface energy balance: (1-alpha)*SW_in + eps*(LW_in - sigma*Ts^4) plus
+  bulk-aerodynamic sensible/latent heat (assumed u=2 m/s, RH=80%, neutral);
+* interlayer heat conduction with k(rho) (Sturm et al. 1997), fixed ground
+  temperature (273.15 K) at the bottom boundary;
+* melt/refreeze with latent heat, porosity-based liquid water retention
+  (irreducible saturation 0.057), cascade drainage, bottom runoff;
+* density: destructive metamorphism toward 250 kg/m3 + overburden
+  compaction via a temperature-dependent viscosity;
+* snowfall merged into the top layer (layer count fixed at 3).
+
+Mass conservation: snowfall + rain + deposition = dSWE + runoff + sublimation;
+the closure residual is printed and annotated on the figure.
+"""
+import json
+import numpy as np
+import pandas as pd
+
+RHO_I, RHO_W = 917.0, 1000.0
+CI, CW = 2100.0, 4186.0
+LF, LS = 334000.0, 2.84e6
+SIGMA, KAPPA = 5.670374e-8, 0.98
+CP_AIR, R_AIR, G, T0 = 1005.0, 287.05, 9.81, 273.15
+
+WIND, RH, CH = 2.0, 0.80, 1.5e-3          # assumed (absent from forcing)
+ALB_MAX, ALB_MIN = 0.85, 0.55
+TAU_COLD, TAU_WARM = 10.0, 3.0            # albedo decay days (cold/warm)
+T_GROUND = 273.15
+RHO_MAX, RHO_DM_MAX, RHO_DM_LIMIT = 550.0, 250.0, 260.0
+C_DM, ETA0, A_ETA = 1.0e-6, 5.0e10, 0.08
+S_IRR = 0.057                              # irreducible liquid saturation
+DT_HOUR = 3600.0
+
+
+def snow_thermal_conductivity(rho):
+    r = np.clip(rho / 1000.0, 0.01, 0.6)
+    return np.clip(0.138 - 1.01 * r + 3.233 * r ** 2, 0.02, 2.5)
+
+
+def q_sat(T, p, over_ice=True):
+    tc = T - T0
+    e = 6.1115 * np.exp(22.452 * tc / (272.55 + tc)) if over_ice else \
+        6.1121 * np.exp(17.502 * tc / (240.97 + tc))
+    return 0.622 * max(e, 1e-6) / (p - 0.378 * max(e, 1e-6))
+
+
+def lwc_max_of(rho, dz):
+    return S_IRR * max(1.0 - rho / RHO_I, 0.0) * dz * 1000.0  # mm w.e.
+
+
+class Snowpack:
+    def __init__(self, init):
+        L = init["layers"]
+        self.n = init["n_layers"]
+        self.ice = np.array([l["ice_mm"] for l in L], float)
+        self.liq = np.array([l["liq_mm"] for l in L], float)
+        self.temp = np.array([l["temp_K"] for l in L], float)
+        rho_in = np.array([l["density_kg_m3"] for l in L], float)
+        # thickness from mass and density: mass (kg/m2) = mm w.e. numerically,
+        # dz = mass / rho  (reproduces the init file exactly; liq = 0 there)
+        self.dz = np.array([self.ice[i] / rho_in[i] + self.liq[i] / 1000.0
+                            for i in range(self.n)])
+        self.rho = (self.ice + self.liq) / self.dz
+        self.albedo, self.snow_age = ALB_MAX, 0.0
+
+    def heat_capacity(self):
+        return CI * self.ice + CW * self.liq          # J/m2/K
+
+    def swe(self):
+        return float(self.ice.sum() + self.liq.sum())
+
+    def sync_thickness(self):
+        self.dz = np.maximum((self.ice + self.liq) / self.rho, 1e-4)
+        self.rho = (self.ice + self.liq) / self.dz
+
+    def add_precip(self, snow_mm, rain_mm, t_air):
+        if snow_mm > 0:
+            rho_new = float(np.clip(100.0 + 5.0 * (T0 - t_air), 60.0, 200.0))
+            e_old = self.heat_capacity()[0] * (self.temp[0] - T0)
+            self.ice[0] += snow_mm
+            e_new = e_old + CI * snow_mm * (min(t_air, T0) - T0)
+            self.dz[0] += snow_mm / rho_new
+            self.rho[0] = (self.ice[0] + self.liq[0]) / self.dz[0]
+            self.temp[0] = T0 + e_new / self.heat_capacity()[0]
+            self.snow_age, self.albedo = 0.0, ALB_MAX
+        if rain_mm > 0:
+            e_old = self.heat_capacity()[0] * (self.temp[0] - T0)
+            self.liq[0] += rain_mm
+            e_new = e_old + CW * rain_mm * (min(t_air, T0 + 1.0) - T0)
+            self.temp[0] = T0 + e_new / self.heat_capacity()[0]
+            self.sync_thickness()
+
+    def surface_fluxes(self, t_air, p_atm, sw_in, lw_in):
+        ts = self.temp[0]
+        swnet = (1.0 - self.albedo) * sw_in
+        lwnet = KAPPA * (lw_in - SIGMA * ts ** 4)
+        rho_a = p_atm / (R_AIR * t_air)
+        h = rho_a * CP_AIR * CH * WIND * (t_air - ts)
+        qa = RH * q_sat(t_air, p_atm, over_ice=(t_air < T0))
+        qs = q_sat(ts, p_atm, over_ice=(ts < T0))
+        le = rho_a * LS * CH * WIND * (qa - qs)       # + = deposition
+        return swnet + lwnet + h + le, (swnet, lwnet, h, le)
+
+    def apply_surface(self, net, subl, depo, dt):
+        """Vapour exchange then net energy on the top layer."""
+        if subl > 0:
+            m = min(subl, self.liq[0])
+            self.liq[0] -= m
+            rem = subl - m
+            if rem > 0 and self.ice[0] > 0:
+                take = min(rem, self.ice[0])
+                e = self.heat_capacity()[0] * (self.temp[0] - T0) - CI * take * (self.temp[0] - T0)
+                self.ice[0] -= take
+                self.temp[0] = T0 + e / self.heat_capacity()[0]
+        if depo > 0:
+            e_old = self.heat_capacity()[0] * (self.temp[0] - T0)
+            self.ice[0] += depo
+            self.temp[0] = T0 + e_old / self.heat_capacity()[0]
+        self.sync_thickness()
+        e = self.heat_capacity()[0] * (self.temp[0] - T0) + net * dt
+        self.temp[0] = T0 + e / self.heat_capacity()[0]
+
+    def conduction(self, dt):
+        k = snow_thermal_conductivity(self.rho)
+        e_gain = np.zeros(self.n)
+        for i in range(self.n - 1):
+            kh = 2.0 * k[i] * k[i + 1] / (k[i] + k[i + 1])
+            f = kh * (self.temp[i + 1] - self.temp[i]) / (0.5 * (self.dz[i] + self.dz[i + 1]))
+            e_gain[i] += f * dt
+            e_gain[i + 1] -= f * dt
+        e_gain[-1] += k[-1] * (T_GROUND - self.temp[-1]) / (0.5 * self.dz[-1]) * dt
+        return e_gain
+
+    def phase_change(self, i):
+        melt = refz = 0.0
+        cap = self.heat_capacity()[i]
+        if self.temp[i] > T0:
+            excess = cap * (self.temp[i] - T0)
+            melt = min(self.ice[i], excess / LF)
+            self.ice[i] -= melt
+            self.liq[i] += melt
+            self.temp[i] = T0
+        if self.temp[i] < T0 and self.liq[i] > 0:
+            deficit = cap * (T0 - self.temp[i])
+            refz = min(self.liq[i], deficit / LF)
+            self.liq[i] -= refz
+            self.ice[i] += refz
+            residual = max(deficit - refz * LF, 0.0)
+            self.temp[i] = T0 - residual / self.heat_capacity()[i]
+        return melt, refz
+
+    def drainage(self):
+        runoff = 0.0
+        for i in range(self.n):
+            ex = max(self.liq[i] - lwc_max_of(self.rho[i], self.dz[i]), 0.0)
+            if ex > 0:
+                self.liq[i] -= ex
+                if i < self.n - 1:
+                    self.liq[i + 1] += ex
+                else:
+                    runoff = ex
+        self.sync_thickness()
+        return runoff
+
+    def compact(self, dt):
+        new_rho = self.rho.copy()
+        overburden = 0.0
+        for i in range(self.n):
+            p = G * overburden
+            overburden += self.ice[i] + self.liq[i]
+            r, t = self.rho[i], self.temp[i]
+            if r < RHO_DM_LIMIT:
+                new_rho[i] += max(C_DM * (RHO_DM_MAX - r) * np.exp(-A_ETA * (T0 - t)) * dt, 0.0)
+            new_rho[i] += r * p / (ETA0 * np.exp(A_ETA * (T0 - t))) * dt
+        self.rho = np.clip(new_rho, 30.0, RHO_MAX)
+        self.sync_thickness()
+
+    def age_albedo(self, t_air):
+        tau = TAU_COLD if t_air < T0 else TAU_WARM
+        self.snow_age += 1.0 / 24.0
+        self.albedo = ALB_MIN + (ALB_MAX - ALB_MIN) * np.exp(-self.snow_age / tau)
+
+
+# ----------------------------------------------------------------------
+# Figure: use matplotlib if available, otherwise a self-contained
+# numpy/zlib PNG renderer (same diagnostic panels either way).
+# ----------------------------------------------------------------------
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+FONT = {
+ '0':'.###.|#...#|#..##|#.#.#|##..#|#...#|.###.',
+ '1':'..#..|.##..|..#..|..#..|..#..|..#..|.###.',
+ '2':'.###.|#...#|....#|...#.|..#..|.#...|#####',
+ '3':'#####|...#.|..#..|...#.|....#|#...#|.###.',
+ '4':'...#.|..##.|.#.#.|#..#.|#####|...#.|...#.',
+ '5':'#####|#....|####.|....#|....#|#...#|.###.',
+ '6':'..##.|.#...|#....|####.|#...#|#...#|.###.',
+ '7':'#####|....#|...#.|..#..|.#...|.#...|.#...',
+ '8':'.###.|#...#|#...#|.###.|#...#|#...#|.###.',
+ '9':'.###.|#...#|#...#|.####|....#|...#.|.##..',
+ 'A':'.###.|#...#|#...#|#####|#...#|#...#|#...#',
+ 'B':'####.|#...#|#...#|####.|#...#|#...#|####.',
+ 'C':'.###.|#...#|#....|#....|#....|#...#|.###.',
+ 'D':'####.|#...#|#...#|#...#|#...#|#...#|####.',
+ 'E':'#####|#....|#....|####.|#....|#....|#####',
+ 'F':'#####|#....|#....|####.|#....|#....|#....',
+ 'G':'.###.|#...#|#....|#..##|#...#|#...#|.###.',
+ 'H':'#...#|#...#|#...#|#####|#...#|#...#|#...#',
+ 'I':'.###.|..#..|..#..|..#..|..#..|..#..|.###.',
+ 'J':'..###|...#.|...#.|...#.|...#.|#..#.|.##..',
+ 'K':'#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#',
+ 'L':'#....|#....|#....|#....|#....|#....|#####',
+ 'M':'#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#',
+ 'N':'#...#|##..#|#.#.#|#..##|#...#|#...#|#...#',
+ 'O':'.###.|#...#|#...#|#...#|#...#|#...#|.###.',
+ 'P':'####.|#...#|#...#|####.|#....|#....|#....',
+ 'Q':'.###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#',
+ 'R':'####.|#...#|#...#|####.|#.#..|#..#.|#...#',
+ 'S':'.####|#....|#....|.###.|....#|....#|####.',
+ 'T':'#####|..#..|..#..|..#..|..#..|..#..|..#..',
+ 'U':'#...#|#...#|#...#|#...#|#...#|#...#|.###.',
+ 'V':'#...#|#...#|#...#|#...#|#...#|.#.#.|..#..',
+ 'W':'#...#|#...#|#...#|#.#.#|#.#.#|##.##|#...#',
+ 'X':'#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#',
+ 'Y':'#...#|#...#|.#.#.|..#..|..#..|..#..|..#..',
+ 'Z':'#####|....#|...#.|..#..|.#...|#....|#####',
+ ' ':'.....|.....|.....|.....|.....|.....|.....',
+ '.':'.....|.....|.....|.....|.....|.##..|.##..',
+ '-':'.....|.....|.....|#####|.....|.....|.....',
+ '+':'.....|..#..|..#..|#####|..#..|..#..|.....',
+ '/':'....#|....#|...#.|..#..|.#...|#....|#....',
+ '(':'..##.|.#..#|.#...|.#...|.#...|.#..#|..##.',
+ ')':'.##..|...#.|...#.|...#.|...#.|#..#.|.##..',
+ ':':'.....|.##..|.##..|.....|.##..|.##..|.....',
+ '%':'#...#|...#.|..#..|.#...|#....|#...#|.###.',
+ '=':'.....|.....|#####|.....|#####|.....|.....',
+ ',':'.....|.....|.....|.....|.##..|.##..|#....',
+}
+FONT = {k: v.split('|') for k, v in FONT.items()}
+
+
+def write_png(path, arr):
+    import zlib, struct
+    h, w, _ = arr.shape
+    raw = b''.join(b'\x00' + arr[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c))
+    png = (b'\x89PNG\r\n\x1a\n'
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+    open(path, 'wb').write(png)
+
+
+def _line(arr, pts, color):
+    for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+        n = int(max(abs(x1 - x0), abs(y1 - y0), 1))
+        t = np.linspace(0.0, 1.0, n + 1)
+        xs = np.round(x0 + (x1 - x0) * t).astype(int)
+        ys = np.round(y0 + (y1 - y0) * t).astype(int)
+        m = (xs >= 0) & (xs < arr.shape[1]) & (ys >= 0) & (ys < arr.shape[0])
+        arr[ys[m], xs[m]] = color
+
+
+def _text(arr, x, y, s, color, scale=2):
+    for ch in s:
+        g = FONT.get(ch.upper(), FONT[' '])
+        for r in range(7):
+            for c in range(5):
+                if g[r][c] == '#':
+                    arr[y + r * scale:y + (r + 1) * scale,
+                        x + c * scale:x + (c + 1) * scale] = color
+        x += 6 * scale
+
+
+def _fmt(v):
+    s = '%g' % v
+    return s.replace('e+', 'e').replace('e-0', 'e-')
+
+
+class _Panel:
+    def __init__(self, arr, box, title='', xlabel='', ylabel='', y2label=''):
+        self.arr, self.box = arr, box
+        self.x0, self.y0, self.x1, self.y1 = box   # pixel box (x0,y0)-(x1,y1)
+        self.title, self.xlabel = title, xlabel
+        self.ylabel, self.y2label = ylabel, y2label
+        self.series, self.series2 = [], []
+        self.xlim = self.ylim = self.ylim2 = None
+
+    def plot(self, x, y, color, label='', right=False):
+        (self.series2 if right else self.series).append((np.asarray(x, float),
+            np.asarray(y, float), color, label))
+
+    def _axis(self, lo, hi):
+        if hi - lo < 1e-9:
+            hi = lo + 1.0
+        pad = 0.04 * (hi - lo)
+        return lo - pad, hi + pad
+
+    def _scale(self, xlim, ylim):
+        x0, y0, x1, y1 = self.x0, self.y0, self.x1, self.y1
+        fx = lambda xv: x0 + (xv - xlim[0]) / (xlim[1] - xlim[0]) * (x1 - x0)
+        fy = lambda yv: y1 - (yv - ylim[0]) / (ylim[1] - ylim[0]) * (y1 - y0)
+        return fx, fy
+
+    def _ticks(self, lo, hi, n):
+        raw = np.linspace(lo, hi, n)
+        step = (hi - lo) / (n - 1)
+        if step > 1:
+            step = max(round(step), 1)
+            start = np.ceil(lo / step) * step
+            return np.arange(start, hi + step * 0.5, step)
+        return raw
+
+    def draw(self):
+        arr = self.arr
+        for side in (((self.x0, self.y0), (self.x1, self.y0)),
+                     ((self.x1, self.y0), (self.x1, self.y1)),
+                     ((self.x1, self.y1), (self.x0, self.y1)),
+                     ((self.x0, self.y1), (self.x0, self.y0))):
+            _line(arr, [side[0], side[1]], (60, 60, 60))
+        allx = [x for s in self.series for x in s[0]] + \
+               [x for s in self.series2 for x in s[0]]
+        ally = [y for s in self.series for y in s[1]]
+        ally2 = [y for s in self.series2 for y in s[1]]
+        if not allx:
+            return
+        xlim = self._axis(min(allx), max(allx))
+        ylim = self._axis(min(ally), max(ally)) if ally else (0, 1)
+        ylim2 = self._axis(min(ally2), max(ally2)) if ally2 else None
+        fx, fy = self._scale(xlim, ylim)
+        # grid + ticks
+        for tv in self._ticks(*ylim, 6):
+            yy = int(round(fy(tv)))
+            _line(arr, [(self.x0, yy), (self.x1, yy)], (225, 225, 225))
+            _line(arr, [(self.x0 - 5, yy), (self.x0, yy)], (60, 60, 60))
+            _text(arr, self.x0 - 12 - 6 * len(_fmt(tv)), yy - 7, _fmt(tv), (40, 40, 40), 2)
+        for tv in self._ticks(*xlim, 6):
+            xx = int(round(fx(tv)))
+            _line(arr, [(xx, self.y0), (xx, self.y1)], (225, 225, 225))
+            _line(arr, [(xx, self.y1), (xx, self.y1 + 5)], (60, 60, 60))
+            _text(arr, xx - 3 * len(_fmt(tv)), self.y1 + 9, _fmt(tv), (40, 40, 40), 2)
+        if ylim2 is not None:
+            _, fy2 = self._scale(xlim, ylim2)
+            for tv in self._ticks(*ylim2, 6):
+                yy = int(round(fy2(tv)))
+                _line(arr, [(self.x1, yy), (self.x1 + 5, yy)], (60, 60, 60))
+                _text(arr, self.x1 + 9, yy - 7, _fmt(tv), (40, 40, 40), 2)
+        # series
+        for x, y, c, lab in self.series:
+            pts = [(fx(xi), fy(yi)) for xi, yi in zip(x, y)]
+            _line(arr, [(px, min(max(py, self.y0), self.y1))
+                        for px, py in pts], c)
+        for x, y, c, lab in self.series2:
+            _, fy2 = self._scale(xlim, ylim2)
+            pts = [(fx(xi), min(max(fy2(yi), self.y0), self.y1)) for xi, yi in zip(x, y)]
+            _line(arr, pts, c)
+        # labels
+        tw = 6 * len(self.title) * 2
+        _text(arr, (self.x0 + self.x1) // 2 - tw // 2, self.y0 - 22,
+              self.title, (20, 20, 20), 2)
+        _text(arr, (self.x0 + self.x1) // 2 - 6 * len(self.xlabel),
+              self.y1 + 26, self.xlabel, (20, 20, 20), 2)
+        _text(arr, self.x0 - 12 - 6 * len(self.ylabel) * 2 - 20,
+              (self.y0 + self.y1) // 2 - 7 * len(self.ylabel), self.ylabel, (20, 20, 20), 2)
+        # legend (top-right inside)
+        entries = [(l, c) for _, _, c, l in self.series if l]
+        if entries:
+            wmax = max(6 * len(l) + 16 for l, _ in entries)
+            ly = self.y0 + 6
+            for lab, col in entries:
+                _line(arr, [(self.x1 - wmax - 8, ly + 7), (self.x1 - wmax + 2, ly + 7)], col)
+                _text(arr, self.x1 - wmax + 6, ly, lab, (30, 30, 30), 2)
+                ly += 18
+
+
+def _fallback_figure(n_days, summ, state, fc, cum, residual, path):
+    """Diagnostic figure rendered without matplotlib (numpy/zlib PNG)."""
+    W, H = 1400, 1320
+    arr = np.full((H, W, 3), 255, np.uint8)
+    t = np.arange(1, n_days + 1)
+    snow_d = fc.snowfall_mm_hr.values[:24 * n_days].reshape(-1, 24).sum(axis=1)
+    tair_d = fc.t_air_K.values[:24 * n_days].reshape(-1, 24).mean(axis=1) - T0
+    specs = [
+        dict(title='SWE AND SNOW DEPTH', ylabel='SWE (MM W.E.)', y2label='DEPTH (M)',
+             series=[(t, summ.swe_mm.values, (31, 119, 180), 'SWE'),
+                     (t, summ.snow_depth_m.values * 100.0, (255, 127, 14), 'depth x100')]),
+        dict(title='LAYER DENSITY', ylabel='DENSITY (KG/M3)',
+             series=[(t, state[:, i, 1], c, 'LAYER %d' % (i + 1))
+                     for i, c in enumerate([(31, 119, 180), (255, 127, 14), (44, 160, 44)])]
+             + [(t, summ.mean_density_kg_m3.values, (0, 0, 0), 'BULK')]),
+        dict(title='LAYER TEMPERATURE', ylabel='T (C)',
+             series=[(t, state[:, i, 4] - T0, c, 'LAYER %d' % (i + 1))
+                     for i, c in enumerate([(31, 119, 180), (255, 127, 14), (44, 160, 44)])]),
+        dict(title='LIQUID WATER CONTENT', ylabel='LIQ (MM)',
+             series=[(t, state[:, i, 3], c, 'LAYER %d' % (i + 1))
+                     for i, c in enumerate([(31, 119, 180), (255, 127, 14), (44, 160, 44)])]),
+        dict(title='CUMULATIVE MELT/REFREEZE/RUNOFF', ylabel='MM W.E.',
+             series=[(t, np.cumsum(summ.melt_mm), (214, 39, 40), 'MELT'),
+                     (t, np.cumsum(summ.refreeze_mm), (148, 103, 189), 'REFREEZE'),
+                     (t, np.cumsum(summ.runoff_mm), (140, 86, 75), 'RUNOFF'),
+                     (t, np.full(n_days, cum['subl']), (23, 190, 207), 'SUBLIMATION (TOT)')]),
+        dict(title='FORCING: SNOWFALL AND T AIR', ylabel='SNOWFALL (MM/D)',
+             y2label='T AIR (C)',
+             series=[(t, snow_d, (31, 119, 180), 'SNOWFALL'),
+                     (t, tair_d, (214, 39, 40), 'T AIR MEAN')]),
+    ]
+    m_l, m_r, m_t, m_b = 30, 30, 96, 40
+    gap_x, gap_y = 70, 70
+    pw = (W - m_l - m_r - gap_x) // 2
+    ph = (H - m_t - m_b - 2 * gap_y) // 3
+    for k, spec in enumerate(specs):
+        r, c = divmod(k, 2)
+        x0 = m_l + c * (pw + gap_x)
+        y0 = m_t + r * (ph + gap_y)
+        p = _Panel(arr, (x0, y0, x0 + pw, y0 + ph),
+                   title=spec['title'], xlabel='DAY',
+                   ylabel=spec['ylabel'], y2label=spec.get('y2label', ''))
+        for x, y, col, lab in spec['series']:
+            p.plot(x, y, col, lab)
+        p.draw()
+        if p.y2label:
+            _text(arr, x0 + pw + 9, y0 + ph // 2 - 7 * len(p.y2label),
+                  p.y2label, (20, 20, 20), 2)
+    head = 'SNOWPACK EVOLUTION - 3-LAYER PROCESS MODEL (CLOSURE RESIDUAL %s MM)' % _fmt(residual)
+    _text(arr, (W - 6 * len(head) * 2) // 2, 28, head, (20, 20, 20), 2)
+    _text(arr, W - 330, H - 26, 'RENDERED BY BUILT-IN PNG WRITER', (120, 120, 120), 1)
+    write_png(path, arr)
+
+
+def make_figure(n_days, summ, state, fc, cum, residual, path):
+    t = np.arange(1, n_days + 1)
+    snow_d = fc.snowfall_mm_hr.values[:24 * n_days].reshape(-1, 24).sum(axis=1)
+    tair_d = fc.t_air_K.values[:24 * n_days].reshape(-1, 24).mean(axis=1) - T0
+    if not HAVE_MPL:
+        _fallback_figure(n_days, summ, state, fc, cum, residual, path)
+        return
+    fig, axes = plt.subplots(3, 2, figsize=(13, 12))
+    ax = axes[0, 0]
+    ax.plot(t, summ.swe_mm, label="SWE (mm w.e.)")
+    ax2 = ax.twinx(); ax2.plot(t, summ.snow_depth_m, color="tab:red", label="depth (m)")
+    ax2.set_ylabel("snow depth (m)")
+    ax.set_ylabel("SWE (mm w.e.)"); ax.set_xlabel("day")
+    ax.set_title("SWE and snow depth"); ax.legend(loc="best"); ax2.legend(loc="lower left")
+    ax = axes[0, 1]
+    for i in range(3):
+        ax.plot(t, state[:, i, 1], label=f"layer {i+1}")
+    ax.plot(t, summ.mean_density_kg_m3, "k--", label="bulk")
+    ax.set_ylabel("density (kg/m3)"); ax.set_xlabel("day")
+    ax.set_title("Layer density"); ax.legend()
+    ax = axes[1, 0]
+    for i in range(3):
+        ax.plot(t, state[:, i, 4] - T0, label=f"layer {i+1}")
+    ax.axhline(0, color="k", lw=0.5)
+    ax.set_ylabel("layer temperature (C)"); ax.set_xlabel("day")
+    ax.set_title("Layer temperature"); ax.legend()
+    ax = axes[1, 1]
+    for i in range(3):
+        ax.plot(t, state[:, i, 3], label=f"layer {i+1}")
+    ax.set_ylabel("liquid water (mm)"); ax.set_xlabel("day")
+    ax.set_title("Liquid water content"); ax.legend()
+    ax = axes[2, 0]
+    ax.plot(t, np.cumsum(summ.melt_mm), label="melt")
+    ax.plot(t, np.cumsum(summ.refreeze_mm), label="refreeze")
+    ax.plot(t, np.cumsum(summ.runoff_mm), label="runoff")
+    ax.plot(t, np.full(n_days, cum["subl"]), label="sublimation (total)")
+    ax.set_ylabel("cumulative (mm w.e.)"); ax.set_xlabel("day")
+    ax.set_title("Cumulative melt / refreeze / runoff / sublimation"); ax.legend()
+    ax = axes[2, 1]
+    ax.plot(t, snow_d, label="snowfall (mm/d)")
+    ax2 = ax.twinx(); ax2.plot(t, tair_d, color="tab:red", label="T_air mean (C)")
+    ax2.set_ylabel("T_air (C)")
+    ax.set_ylabel("daily snowfall (mm)"); ax.set_xlabel("day")
+    ax.set_title("Forcing: snowfall and air temperature")
+    ax.legend(loc="best"); ax2.legend(loc="lower right")
+    fig.suptitle("Snowpack evolution — 3-layer process model "
+                 f"(closure residual {residual:+.2e} mm)", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(path, dpi=150)
+
+
+def main():
+    with open("data/snowpack_init.json") as f:
+        init = json.load(f)
+    fc = pd.read_csv("data/forcing.csv")
+    n_hours, n_days = len(fc), len(fc) // 24
+    assert n_hours == 24 * n_days
+
+    sp = Snowpack(init)
+    swe_init = sp.swe()
+
+    state = np.zeros((n_days, sp.n, 5))
+    cum = dict(snow=0.0, rain=0.0, melt=0.0, refz=0.0, runoff=0.0, subl=0.0, depo=0.0)
+    day_acc = dict(melt=0.0, refz=0.0, runoff=0.0)
+    daily = []
+
+    for h in range(n_hours):
+        row = fc.iloc[h]
+        t_air = float(row.t_air_K); p_atm = float(row.p_atm_Pa)
+        snow = float(row.snowfall_mm_hr); rain = float(row.rainfall_mm_hr)
+        sw_in = float(row.sw_in_wm2); lw_in = float(row.lw_in_wm2)
+
+        sp.add_precip(snow, rain, t_air)
+        cum["snow"] += snow; cum["rain"] += rain
+        sp.age_albedo(t_air)
+
+        # adaptive substepping (explicit scheme stability)
+        k_eff = snow_thermal_conductivity(sp.rho)
+        cap = sp.heat_capacity()
+        alpha = float((k_eff * sp.dz / cap).max())
+        dt_max = 0.4 * min(sp.dz) ** 2 / max(alpha, 1e-7)
+        n_sub = int(np.clip(np.ceil(DT_HOUR / min(dt_max, 600.0)), 1, 3600))
+        dt = DT_HOUR / n_sub
+        for _ in range(n_sub):
+            net, fx = sp.surface_fluxes(t_air, p_atm, sw_in, lw_in)
+            rho_a = p_atm / (R_AIR * t_air)
+            m_vap = rho_a * CH * WIND * dt * (
+                RH * q_sat(t_air, p_atm, t_air < T0)
+                - q_sat(sp.temp[0], p_atm, sp.temp[0] < T0))
+            subl, depo = max(-m_vap, 0.0), max(m_vap, 0.0)
+            sp.apply_surface(net, subl, depo, dt)
+            sp.temp += sp.conduction(dt) / sp.heat_capacity()
+            for i in range(sp.n):
+                m, r = sp.phase_change(i)
+                day_acc["melt"] += m; day_acc["refz"] += r
+                cum["melt"] += m; cum["refz"] += r
+            ro = sp.drainage()
+            day_acc["runoff"] += ro; cum["runoff"] += ro
+            sp.compact(dt)
+            cum["subl"] += subl; cum["depo"] += depo
+
+        if (h + 1) % 24 == 0:
+            d = (h + 1) // 24 - 1
+            state[d, :, 0] = sp.dz
+            state[d, :, 1] = sp.rho
+            state[d, :, 2] = sp.ice
+            state[d, :, 3] = sp.liq
+            state[d, :, 4] = sp.temp
+            swe_d = sp.swe()
+            depth = float(sp.dz.sum())
+            daily.append(dict(day=d + 1, swe_mm=swe_d, snow_depth_m=depth,
+                              melt_mm=day_acc["melt"], refreeze_mm=day_acc["refz"],
+                              runoff_mm=day_acc["runoff"],
+                              mean_density_kg_m3=swe_d / depth if depth > 0 else 0.0))
+            day_acc = dict(melt=0.0, refz=0.0, runoff=0.0)
+
+    summ = pd.DataFrame(daily)
+    summ.to_csv("results/snow_summary.csv", index=False)
+    np.save("results/snow_state.npy", state)
+    make_figure(n_days, summ, state, fc, cum, 0.0, "results/snow_evolution.png")
+
+    # ---- mass-balance closure ------------------------------------------
+    mass_in = cum["snow"] + cum["rain"] + cum["depo"]
+    mass_out = cum["runoff"] + cum["subl"]
+    residual = mass_in + swe_init - mass_out - sp.swe()
+    rel = abs(residual) / max(mass_in + swe_init, 1.0)
+    make_figure(n_days, summ, state, fc, cum, residual, "results/snow_evolution.png")
+
+    print("=" * 68)
+    print("SNOWPACK MODEL - mass balance over %d days" % n_days)
+    print(f"  initial SWE        : {swe_init:10.4f} mm w.e.")
+    print(f"  snowfall           : {cum['snow']:10.4f} mm")
+    print(f"  rainfall           : {cum['rain']:10.4f} mm")
+    print(f"  deposition (vapour): {cum['depo']:10.4f} mm")
+    print(f"  sublimation        : {cum['subl']:10.4f} mm")
+    print(f"  melt (total)       : {cum['melt']:10.4f} mm")
+    print(f"  refreeze (total)   : {cum['refz']:10.4f} mm")
+    print(f"  runoff (bottom)    : {cum['runoff']:10.4f} mm")
+    print(f"  final SWE          : {sp.swe():10.4f} mm  "
+          f"(dSWE = {sp.swe() - swe_init:+.4f})")
+    print(f"  final depth        : {sp.dz.sum():10.4f} m")
+    print(f"  final layer rho    : {np.round(sp.rho, 2)}")
+    print(f"  final layer temp K : {np.round(sp.temp, 3)}")
+    print(f"  CLOSURE: snow+rain+depo+init - runoff - subl - finalSWE "
+          f"= {residual:+.6e} mm (relative {rel:.2e})")
+    print("=" * 68)
+    print("saved: results/snow_state.npy, results/snow_summary.csv, "
+          "results/snow_evolution.png")
+
+
+if __name__ == "__main__":
+    main()

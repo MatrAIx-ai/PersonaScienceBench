@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+analysis.py -- implicit-solvent binding-response analysis (task implicit_solvent_pb_gb_v6_8_001)
+
+Primary route (high fidelity, per scored contract):
+  * assembly entity solved on the supplied SES tensor (volume_a); part_a / part_b entities
+    reconstructed from their own sites.csv rows (VDW voxel masks -> SAS(r+probe),
+    SES = probe-dilation then erosion of VDW union VDW; signed distance = EDT(out)-EDT(in)).
+  * zero-Dirichlet 7-point finite-volume solve on the 33^3 interior nodes,
+    harmonic face-averaged dielectrics, screening term kappa^2 * solvent_fraction,
+    RHS = 4*pi*332.06371 * rho (kcal/mol/e units), trilinear CIC charge deposition / spacing^3.
+  * solvent_fraction: mol -> outside-of-SES indicator (sd > 0 -> 1);
+                      smol -> 0.5*(1 + tanh(sd_SES / smoothing_window)).
+    eps = inner_dielectric + (outer_dielectric - inner_dielectric) * solvent_fraction.
+  * vacuum subtraction: matching zero-boundary solve with uniform eps_in, sf=0, kappa=0.
+  * response_regime: linearized_screening -> kappa^2*sf*phi; nonlinear_screening -> kappa^2*sf*sinh(phi) (Newton).
+  * reaction field = medium - vacuum; entity energy = 0.5 * sum(q_i * phi_react(r_i));
+    binding metric from manifest binding_expression = assembly - part_a - part_b.
+
+Secondary route (fast surrogate): cross-term-only Born-style GB with component Born radii
+  a_i = max(atom radius, nearest distance to that component's reconstructed SES boundary),
+  f_ij = sqrt(r_ij^2 + a_i a_j exp(-r_ij^2/(4 a_i a_j))),
+  secondary = -332.06371 * sum_i in part_a, sum_j in part_b q_i q_j ((1/eps_in) - exp(-kappa f_ij)/eps_out)/f_ij,
+  skipping part_a sites whose nearest part_b site is farther than 6.5 Angstrom.
+
+Documented convention choices (assumptions, see report):
+  * mol indicator uses strictly sd > 0 as "outside"; sd == 0 nodes take eps_in.
+  * smol tanh normalization: sf = 0.5*(1 + tanh(sd/window)) (tanh -> +1 in solvent).
+  * CIC fractional coordinates are clipped to the node range [0, n-1].
+"""
+import json, csv, math, time, sys
+import numpy as np
+from scipy import sparse, ndimage
+from scipy.sparse.linalg import cg
+
+RHS_CONST = 4.0 * math.pi * 332.06371
+GB_CONST = 332.06371
+CUTOFF_A = 6.5
+
+LOG_LINES = []
+def log(msg):
+    print(msg, flush=True)
+    LOG_LINES.append(msg)
+
+# ----------------------------------------------------------------------------- io
+def load_inputs():
+    manifest = json.load(open('data/manifest.json'))
+    plane_spec = json.load(open('data/plane_spec.json'))
+    vol_a = np.load('data/volume_a.npy')
+    vol_b = np.load('data/volume_b.npy')
+    queries = np.load('data/queries.npy')
+    sites = {}
+    with open('data/sites.csv') as fh:
+        for row in csv.DictReader(fh):
+            sites.setdefault(row['case_id'], {}).setdefault(row['entity_id'], []).append(row)
+    return manifest, plane_spec, vol_a, vol_b, queries, sites
+
+def node_axes(case):
+    g = case['grid']; n = g['shape'][0]; h = g['spacing_angstrom']; c = g['box_center_angstrom']
+    return [c[k] + (np.arange(n) - (n - 1) / 2.0) * h for k in range(3)], h
+
+def sites_array(rows):
+    xyz = np.array([[float(r['x_angstrom']), float(r['y_angstrom']), float(r['z_angstrom'])] for r in rows])
+    q = np.array([float(r['charge_e']) for r in rows])
+    rad = np.array([float(r['radius_angstrom']) for r in rows])
+    return xyz, q, rad
+
+# ------------------------------------------------------------------- geometry
+def vdw_mask(axes, h, xyz, rad):
+    n = len(axes[0]); mask = np.zeros((n, n, n), dtype=bool)
+    ax0, ax1, ax2 = axes
+    for (px, py, pz), r in zip(xyz, rad):
+        if r <= 0.0:
+            continue
+        lo = [max(int(np.floor((p - r - a[0]) / h)), 0) for p, a in zip((px, py, pz), axes)]
+        hi = [min(int(np.ceil((p + r - a[0]) / h)), n - 1) for p, a in zip((px, py, pz), axes)]
+        if any(lo[k] > hi[k] for k in range(3)):
+            continue
+        xs = ax0[lo[0]:hi[0]+1, None, None]; ys = ax1[None, lo[1]:hi[1]+1, None]; zs = ax2[None, None, lo[2]:hi[2]+1]
+        d2 = (xs - px) ** 2 + (ys - py) ** 2 + (zs - pz) ** 2
+        mask[lo[0]:hi[0]+1, lo[1]:hi[1]+1, lo[2]:hi[2]+1] |= (d2 <= r * r + 1e-9)
+    return mask
+
+def ses_mask_from_vdw(vdw, probe, h):
+    """probe-radius dilation of VDW, then erosion of the dilated mask, union VDW."""
+    if probe <= 0.0:
+        return vdw.copy()
+    dist_to_vdw = ndimage.distance_transform_edt(~vdw, sampling=h)
+    dil = dist_to_vdw <= probe + 1e-9
+    dist_in_dil = ndimage.distance_transform_edt(dil, sampling=h)
+    ero = dist_in_dil >= probe - 1e-9
+    return ero | vdw
+
+def sas_mask(axes, h, xyz, rad, probe):
+    return vdw_mask(axes, h, xyz, rad + probe)
+
+def sdf_from_mask(mask, h):
+    out = ndimage.distance_transform_edt(~mask, sampling=h)
+    inn = ndimage.distance_transform_edt(mask, sampling=h)
+    return (out - inn).astype(np.float64)
+
+def component_surfaces(axes, h, xyz, rad, probe):
+    """Reconstruct component SES/SAS signed distances from its own site rows."""
+    vdw = vdw_mask(axes, h, xyz, rad)
+    ses = ses_mask_from_vdw(vdw, probe, h)
+    sas = sas_mask(axes, h, xyz, rad, probe)
+    if not ses.any():   # degenerate (sub-voxel component, e.g. single small ion): analytic fallback
+        n = len(axes[0])
+        X, Y, Z = np.meshgrid(axes[0], axes[1], axes[2], indexing='ij')
+        sdf_ses = np.full((n, n, n), np.inf)
+        for (px, py, pz), r in zip(xyz, rad):
+            d = np.sqrt((X - px) ** 2 + (Y - py) ** 2 + (Z - pz) ** 2) - r
+            sdf_ses = np.minimum(sdf_ses, d)
+        sdf_sas = sdf_ses - probe
+        log(f"    [geometry] component SES mask empty on grid (sub-voxel); analytic sphere fallback used")
+    else:
+        sdf_ses = sdf_from_mask(ses, h)
+        sdf_sas = sdf_from_mask(sas, h)
+    return sdf_ses, sdf_sas
+
+# ----------------------------------------------------------------- deposition
+def cic_deposit(points, charges, axes, h):
+    """trilinear cloud-in-cell weights, divided by spacing**3."""
+    n = len(axes[0]); rho = np.zeros((n, n, n))
+    f = np.empty_like(points)
+    for k in range(3):
+        f[:, k] = (points[:, k] - axes[k][0]) / h
+    np.clip(f, 0.0, n - 1.0, out=f)
+    i0 = np.floor(f).astype(int); i0 = np.minimum(i0, n - 2)
+    w = f - i0
+    for dx in (0, 1):
+        wx = w[:, 0] if dx else 1.0 - w[:, 0]
+        for dy in (0, 1):
+            wy = w[:, 1] if dy else 1.0 - w[:, 1]
+            for dz in (0, 1):
+                wz = w[:, 2] if dz else 1.0 - w[:, 1]
+                np.add.at(rho, (i0[:, 0] + dx, i0[:, 1] + dy, i0[:, 2] + dz), charges * wx * wy * wz)
+    return rho / h ** 3
+
+def trilinear(field, points, axes, h):
+    n = field.shape[0]
+    f = np.empty_like(points)
+    for k in range(3):
+        f[:, k] = (points[:, k] - axes[k][0]) / h
+    np.clip(f, 0.0, n - 1.0, out=f)
+    i0 = np.floor(f).astype(int); i0 = np.minimum(i0, n - 2)
+    w = f - i0
+    acc = np.zeros(len(points))
+    for dx in (0, 1):
+        wx = w[:, 0] if dx else 1.0 - w[:, 0]
+        for dy in (0, 1):
+            wy = w[:, 1] if dy else 1.0 - w[:, 1]
+            for dz in (0, 1):
+                wz = w[:, 2] if dz else 1.0 - w[:, 1]
+                acc += wx * wy * wz * field[i0[:, 0] + dx, i0[:, 1] + dy, i0[:, 2] + dz]
+    return acc
+
+# --------------------------------------------------------------- PB solver
+def interior_index(i, j, k, m):
+    return (i - 1) * m * m + (j - 1) * m + (k - 1)
+
+def build_operator(eps, h, sf=None, kappa=0.0):
+    """7-point FV operator with harmonic face-averaged dielectrics; zero Dirichlet on boundary."""
+    n = eps.shape[0]; m = n - 2; inv_h2 = 1.0 / h ** 2
+    idx = np.arange(1, n - 1)
+    II, JJ, KK = np.meshgrid(idx, idx, idx, indexing='ij')
+    rows, cols, vals = [], [], []
+    diag = np.zeros(m ** 3)
+    self_lin = interior_index(II, JJ, KK, m)
+
+    def harm(a, b):
+        return 2.0 * a * b / (a + b)
+
+    for axis in range(3):
+        for sgn in (1, -1):
+            nb = [II, JJ, KK]; nb[axis] = nb[axis] + sgn
+            nb = tuple(nb)
+            e_face = harm(eps[II, JJ, KK], eps[nb]) * inv_h2
+            inside = (nb[0] >= 1) & (nb[0] <= n - 2) & (nb[1] >= 1) & (nb[1] <= n - 2) & (nb[2] >= 1) & (nb[2] <= n - 2)
+            r = self_lin.ravel(); f = e_face.ravel(); ins = inside.ravel()
+            # neighbour linear index (only for interior neighbours)
+            ni, nj, nk = nb
+            c = interior_index(np.clip(ni, 1, n - 2), np.clip(nj, 1, n - 2), np.clip(nk, 1, n - 2), m).ravel()
+            rows.append(r[ins]); cols.append(c[ins]); vals.append(-f[ins])
+            diag += f  # boundary neighbours contribute only to the diagonal (phi_b = 0)
+    if sf is not None and kappa != 0.0:
+        diag += (kappa ** 2) * sf[1:n-1, 1:n-1, 1:n-1].ravel()
+    A = sparse.coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(m ** 3, m ** 3)).tocsr()
+    A = A + sparse.diags(diag)
+    A.sum_duplicates()
+    return A
+
+def cg_solve(A, b, tag):
+    m = sparse.diags(1.0 / A.diagonal())
+    t0 = time.time()
+    phi, info = cg(A, b, rtol=1e-10, atol=0.0, maxiter=50000, M=m)
+    res = np.linalg.norm(A @ phi - b) / max(np.linalg.norm(b), 1e-300)
+    status = {0: 'converged'}.get(info, f'info={info}')
+    log(f"    [solve] {tag}: CG {status}, rel_resid={res:.3e}, {time.time()-t0:.1f}s")
+    return phi, res
+
+def solve_medium(eps, sf, h, rho, regime, kappa):
+    """medium solve; nonlinear handled by Newton on the sinh-screening equation.
+
+    The sinh nonlinearity is stiff when the linearized start has large |phi| in the
+    solvent region: Newton then marches ~1 log-unit per step. The nonlinear operator
+    L*phi + kappa^2*sf*sinh(phi) is monotone, so its solution is unique and any
+    convergent Newton path reaches the same solution; we allow enough iterations
+    and log the residual descent.
+    """
+    b = (RHS_CONST * rho[1:-1, 1:-1, 1:-1]).ravel()
+    if regime == 'linearized_screening':
+        A = build_operator(eps, h, sf=sf, kappa=kappa)
+        phi, res = cg_solve(A, b, 'medium linearized')
+        return phi.reshape(33, 33, 33)
+    A0 = build_operator(eps, h, sf=None, kappa=0.0)
+    A_lin = build_operator(eps, h, sf=sf, kappa=kappa)
+    phi, _ = cg_solve(A_lin, b, 'medium linearized (Newton start)')
+    phi = np.clip(phi, -600.0, 600.0)
+    kap2sf = (kappa ** 2) * sf[1:-1, 1:-1, 1:-1].ravel()
+    for it in range(1, 1200):
+        phi_safe = np.clip(phi, -600.0, 600.0)
+        resid = A0 @ phi_safe + kap2sf * np.sinh(phi_safe) - b
+        rnorm = np.linalg.norm(resid) / max(np.linalg.norm(b), 1e-300)
+        if rnorm < 1e-10:
+            log(f"    [solve] medium nonlinear Newton: converged at step {it-1}, rel_resid={rnorm:.3e}")
+            break
+        J = A0 + sparse.diags(kap2sf * np.cosh(phi_safe))
+        delta, info = cg(J, -resid, rtol=1e-11, atol=0.0, maxiter=50000,
+                         M=sparse.diags(1.0 / np.abs(J.diagonal())))
+        step = np.clip(delta, -50.0, 50.0)
+        phi = phi_safe + step
+        if not np.all(np.isfinite(phi)):
+            raise RuntimeError('Newton produced non-finite phi')
+        if it <= 5 or it % 25 == 0:
+            log(f"    [solve] medium nonlinear Newton step {it}: rel_resid={rnorm:.3e}, CG info={info}, |phi|max={np.abs(phi).max():.2f}")
+    else:
+        raise RuntimeError('Newton did not converge in 1200 steps')
+    return phi.reshape(33, 33, 33)
+
+def solve_vacuum(h, rho, eps_in):
+    n = 35
+    eps = np.full((n, n, n), eps_in)
+    A = build_operator(eps, h, sf=None, kappa=0.0)
+    b = (RHS_CONST * rho[1:-1, 1:-1, 1:-1]).ravel()
+    phi, res = cg_solve(A, b, 'vacuum')
+    return phi.reshape(33, 33, 33)
+
+def full_field(interior, n=35):
+    full = np.zeros((n, n, n))
+    full[1:-1, 1:-1, 1:-1] = interior
+    return full
+
+# ------------------------------------------------------------------ secondary
+def secondary_metric(xyz_a, q_a, rad_a, sdf_ses_a, axes_a, h_a,
+                     xyz_b, q_b, rad_b, sdf_ses_b, axes_b, h_b,
+                     eps_in, eps_out, kappa):
+    """Cross-term-only Born-style surrogate (contract formula)."""
+    sd_a = np.abs(trilinear(sdf_ses_a, xyz_a, axes_a, h_a))
+    sd_b = np.abs(trilinear(sdf_ses_b, xyz_b, axes_b, h_b))
+    a_a = np.maximum(rad_a, sd_a)
+    a_b = np.maximum(rad_b, sd_b)
+    # nearest part_b distance per part_a site
+    if len(xyz_b) == 0:
+        return 0.0, 0
+    d2 = ((xyz_a[:, None, :] - xyz_b[None, :, :]) ** 2).sum(-1)
+    dmin = np.sqrt(d2.min(axis=1))
+    keep = dmin <= CUTOFF_A
+    n_kept = int(keep.sum())
+    if n_kept == 0:
+        return 0.0, 0
+    ia = np.where(keep)[0]
+    r2 = d2[np.ix_(ia, np.arange(len(xyz_b)))]          # (na_kept, nb)
+    ai = a_a[ia][:, None]; aj = a_b[None, :]
+    r2s = np.maximum(r2, 1e-12)
+    fij = np.sqrt(r2s + ai * aj * np.exp(-r2s / (4.0 * ai * aj)))
+    qij = q_a[ia][:, None] * q_b[None, :]
+    term = qij * ((1.0 / eps_in) - np.exp(-kappa * fij) / eps_out) / fij
+    return -GB_CONST * term.sum(), n_kept
+
+# --------------------------------------------------- pure-numpy overview renderer
+def _render_overview_fallback(case_order, manifest, planes, vol_a, queries, primary, secondary,
+                              field_slice, e_report, diag):
+    import figlib_fallback as F
+    ROW, HEADER, W = 270, 36, 1010
+    H = HEADER + ROW * len(case_order)
+    canvas = np.full((H, W, 3), 255, dtype=np.uint8)
+    F.draw_text(canvas, 12, 8, 'IMPLICIT SOLVENT PB/GB BINDING RESPONSE OVERVIEW - 8 CASES', 2, (20, 20, 20))
+    BLUE, ORANGE, GRAY = (40, 70, 160), (235, 145, 30), (120, 120, 120)
+    for ci, cid in enumerate(case_order):
+        case = next(c for c in manifest['cases'] if c['case_id'] == cid)
+        p = planes[cid]; ax_i = {'x': 0, 'y': 1, 'z': 2}[p['axis']]
+        axes_, h = node_axes(case)
+        casep = case['response_parameters']; casesf = case['surface_parameters']
+        r0 = HEADER + ci * ROW
+        F.draw_text(canvas, 10, r0 + 4,
+                    f"{cid}  {casesf['surface_model']} K={casep['screening_kappa_per_angstrom']:.4f} "
+                    f"EPS {casep['inner_dielectric']:.0f}/{casep['outer_dielectric']:.0f} "
+                    f"{casep['response_regime']}", 2, (20, 20, 20))
+        sd = vol_a[ci].astype(np.float64)
+        if casesf['surface_model'] == 'mol':
+            sfmap = (sd > 0.0).astype(float)
+        else:
+            sfmap = 0.5 * (1 + np.tanh(sd / casesf['smoothing_window_angstrom']))
+        epsmap = casep['inner_dielectric'] + (casep['outer_dielectric'] - casep['inner_dielectric']) * sfmap
+        sl_eps = epsmap[:, :, p['plane_index']] if ax_i == 2 else (epsmap[:, p['plane_index'], :] if ax_i == 1 else epsmap[p['plane_index'], :, :])
+        sl_phi = field_slice[ci]
+
+        def panel(img35, x0, y0, scale, vmin, vmax, cmap, label):
+            img = F.upscale(F.colormap(img35, cmap, vmin, vmax), scale)
+            canvas[y0:y0 + 210, x0:x0 + 210] = (img * 255).astype(np.uint8)
+            # colorbar
+            bar = F.colormap(np.linspace(0, 1, 210), cmap, 0, 1)[::-1]
+            canvas[y0:y0 + 210, x0 + 214:x0 + 220] = (bar[:, None, :] * 255).astype(np.uint8)
+            F.draw_text(canvas, x0, y0 - 14, label, 2, (20, 20, 20))
+            F.draw_text(canvas, x0, y0 + 214, f"{vmin:.3G}", 2, (60, 60, 60))
+            F.draw_text(canvas, x0 + 150, y0 + 214, f"{vmax:.3G}", 2, (60, 60, 60))
+
+        panel(sl_eps.T, 10, r0 + 40, 6, casep['inner_dielectric'], casep['outer_dielectric'],
+              F.VIRIDIS, f"EPS (PLANE {p['axis'].upper()}={p['plane_index']})")
+        vmax = max(abs(sl_phi.min()), abs(sl_phi.max()), 1e-12)
+        panel(sl_phi.T, 310, r0 + 40, 6, -vmax, vmax, F.RDBU, "PHI_REACT (KCAL/MOL/E)")
+        qi = [k for k in range(3) if k != ax_i]
+        qq = queries[ci].astype(np.float64)
+        for q in qq:
+            px = 310 + (q[qi[0]] - axes_[qi[0]][0]) / h * 6
+            py = r0 + 40 + 210 - (q[qi[1]] - axes_[qi[1]][0]) / h * 6  # origin lower
+            F.draw_cross(canvas, px, py, 4, (0, 0, 0))
+        # bar panel
+        bx0, by0, bw, bh = 600, r0 + 60, 380, 170
+        base = by0 + bh // 2
+        canvas[base, bx0:bx0 + bw] = GRAY
+        vals = [primary[ci], secondary[ci]]
+        scale = max(abs(vals[0]), abs(vals[1]), 1e-12)
+        for k, (v, col, lab) in enumerate(zip(vals, [BLUE, ORANGE], ['PRIMARY', 'SECONDARY'])):
+            cx = bx0 + 70 + k * 180
+            hpx = int(round(v / scale * (bh // 2 - 30)))
+            y_top = base - hpx if v >= 0 else base
+            canvas[y_top:base, cx:cx + 70] = col
+            ty = y_top - 14 if v >= 0 else base + hpx + 4
+            F.draw_text(canvas, cx, ty, f"{v:+.2F}", 2, (20, 20, 20))
+            F.draw_text(canvas, cx, by0 + bh + 8, lab, 2, (60, 60, 60))
+        F.draw_text(canvas, bx0, r0 + 40, f"GAP={primary[ci]-secondary[ci]:+.2F}", 2, (20, 20, 20))
+        F.draw_text(canvas, bx0 + 180, r0 + 40, f"E:A{e_report[cid]['assembly']:+.0F} A{e_report[cid]['part_a']:+.0F} B{e_report[cid]['part_b']:+.0F}", 2, (90, 90, 90))
+    F.write_png('results/overview.png', canvas)
+    log('    [figure] overview.png written with pure-numpy PNG renderer (matplotlib unavailable)')
+
+# --------------------------------------------------------------------- main
+def main():
+    t_start = time.time()
+    manifest, plane_spec, vol_a, vol_b, queries, sites = load_inputs()
+    case_order = manifest['case_order']
+    planes = {p['case_id']: p for p in plane_spec['planes']}
+
+    primary = []; secondary = []
+    e_report = {}; diag = {}
+    field_samples = np.zeros((8, 24), dtype=np.float64)
+    field_slice = np.zeros((8, 35, 35), dtype=np.float64)
+
+    for ci, cid in enumerate(case_order):
+        case = next(c for c in manifest['cases'] if c['case_id'] == cid)
+        axes, h = node_axes(case)
+        rp = case['response_parameters']; sp = case['surface_parameters']
+        eps_in, eps_out = rp['inner_dielectric'], rp['outer_dielectric']
+        kappa = rp['screening_kappa_per_angstrom']; regime = rp['response_regime']
+        probe, window, model = sp['probe_radius_angstrom'], sp['smoothing_window_angstrom'], sp['surface_model']
+        log(f"== {cid}: {model} probe={probe} window={window} | {regime} eps {eps_in}/{eps_out} kappa={kappa} h={h:.6f}")
+
+        sd_ses_asm = vol_a[ci].astype(np.float64)     # supplied SES tensor = authoritative assembly geometry
+
+        def solvent_fraction(sd):
+            if model == 'mol':
+                return (sd > 0.0).astype(np.float64)          # outside-of-SES indicator (sd==0 -> solute side)
+            return 0.5 * (1.0 + np.tanh(sd / window))         # tanh transition, +1 in solvent
+
+        energies = {}
+        query_phi = None
+        for ent in ['assembly', 'part_a', 'part_b']:
+            rows = sites[cid][ent]
+            xyz, q, rad = sites_array(rows)
+            if ent == 'assembly':
+                sdf_ses, sdf_sas = sd_ses_asm, vol_b[ci].astype(np.float64)
+            else:
+                sdf_ses, sdf_sas = component_surfaces(axes, h, xyz, rad, probe)
+            sf = solvent_fraction(sdf_ses)
+            eps = eps_in + (eps_out - eps_in) * sf
+            rho = cic_deposit(xyz, q, axes, h)
+            phi_m = solve_medium(eps, sf, h, rho, regime, kappa)
+            phi_v = solve_vacuum(h, rho, eps_in)
+            phi_r = full_field(phi_m) - full_field(phi_v)
+            e = 0.5 * float(np.sum(q * trilinear(phi_r, xyz, axes, h)))
+            energies[ent] = e
+            if ent == 'assembly':
+                query_phi = trilinear(phi_r, queries[ci].astype(np.float64), axes, h)
+                p = planes[cid]; ax_i = {'x': 0, 'y': 1, 'z': 2}[p['axis']]
+                if ax_i == 2:   sl = phi_r[:, :, p['plane_index']]       # storage [x, y]
+                elif ax_i == 1: sl = phi_r[:, p['plane_index'], :]       # storage [x, z]
+                else:           sl = phi_r[p['plane_index'], :, :]
+                field_slice[ci] = sl
+                field_samples[ci] = query_phi
+            log(f"    entity {ent}: n_sites={len(q)} sum_q={q.sum():+.3f} E_react={e:+.4f} kcal/mol")
+
+        binding = energies['assembly'] - energies['part_a'] - energies['part_b']
+        primary.append(binding)
+        e_report[cid] = energies
+
+        # ---- secondary route
+        xyz_a, q_a, rad_a = sites_array(sites[cid]['part_a'])
+        xyz_b, q_b, rad_b = sites_array(sites[cid]['part_b'])
+        sdf_a, _ = component_surfaces(axes, h, xyz_a, rad_a, probe)
+        sdf_b, _ = component_surfaces(axes, h, xyz_b, rad_b, probe)
+        sec, n_kept = secondary_metric(xyz_a, q_a, rad_a, sdf_a, axes, h,
+                                       xyz_b, q_b, rad_b, sdf_b, axes, h,
+                                       eps_in, eps_out, kappa)
+        secondary.append(sec)
+        log(f"    secondary cross-term: pairs_kept={n_kept}/{len(q_a)} value={sec:+.4f} kcal/mol; binding_primary={binding:+.4f} gap={binding-sec:+.4f}")
+
+        # ---- diagnostics: reconstructed union vs supplied assembly SES tensor
+        vdw_a = vdw_mask(axes, h, xyz_a, rad_a); vdw_b = vdw_mask(axes, h, xyz_b, rad_b)
+        ses_u = ses_mask_from_vdw(vdw_a | vdw_b, probe, h)
+        sup = sd_ses_asm < 0.0
+        iou = (ses_u & sup).sum() / max((ses_u | sup).sum(), 1)
+        q_asm = sum(float(r['charge_e']) for r in sites[cid]['assembly'])
+        q_parts = sum(float(r['charge_e']) for r in sites[cid]['part_a'] + sites[cid]['part_b'])
+        diag[cid] = dict(union_vs_supplied_IoU=float(iou), q_assembly=q_asm, q_parts=q_parts,
+                         q_diff=abs(q_asm - q_parts))
+        log(f"    diag: union(component SES) vs supplied assembly SES IoU={iou:.4f}; |sum_q(assembly)-sum_q(parts)|={abs(q_asm-q_parts):.2e} e")
+
+    # ------------------------------------------------------------------ outputs
+    primary = np.array(primary); secondary = np.array(secondary)
+    import os
+    os.makedirs('results', exist_ok=True)
+    with open('results/summary_metrics.csv', 'w', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(['case_id', 'metric_primary_kcal_mol', 'metric_secondary_kcal_mol', 'metric_gap_kcal_mol'])
+        for cid, p, s in zip(case_order, primary, secondary):
+            p_r, s_r = round(float(p), 6), round(float(s), 6)
+            w.writerow([cid, f"{p_r:.6f}", f"{s_r:.6f}", f"{round(p_r - s_r, 6):.6f}"])
+    np.save('results/field_samples.npy', field_samples.astype(np.float32))
+    np.save('results/field_slice.npy', field_slice.astype(np.float32))
+
+    # ---------------- overview figure (matplotlib if available, else pure-numpy PNG renderer)
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        fig, axes_grid = plt.subplots(8, 3, figsize=(13, 26))
+        for ci, cid in enumerate(case_order):
+            case = next(c for c in manifest['cases'] if c['case_id'] == cid)
+            p = planes[cid]; ax_i = {'x': 0, 'y': 1, 'z': 2}[p['axis']]
+            axes_, h = node_axes(case)
+            sd = vol_a[ci].astype(np.float64)
+            casep = case['response_parameters']; casesf = case['surface_parameters']
+            if casesf['surface_model'] == 'mol':
+                sfmap = (sd > 0.0).astype(float)
+            else:
+                sfmap = 0.5 * (1 + np.tanh(sd / casesf['smoothing_window_angstrom']))
+            epsmap = casep['inner_dielectric'] + (casep['outer_dielectric'] - casep['inner_dielectric']) * sfmap
+            sl_eps = epsmap[:, :, p['plane_index']] if ax_i == 2 else (epsmap[:, p['plane_index'], :] if ax_i == 1 else epsmap[p['plane_index'], :, :])
+            im0 = axes_grid[ci, 0].imshow(sl_eps.T, origin='lower', cmap='viridis')
+            axes_grid[ci, 0].set_title(f"{cid} eps (plane {p['axis']}={p['plane_index']})", fontsize=8)
+            plt.colorbar(im0, ax=axes_grid[ci, 0], fraction=0.046)
+            im1 = axes_grid[ci, 1].imshow(field_slice[ci].T, origin='lower', cmap='RdBu_r')
+            axes_grid[ci, 1].set_title(f"{cid} phi_react slice", fontsize=8)
+            plt.colorbar(im1, ax=axes_grid[ci, 1], fraction=0.046)
+            qi = [k for k in range(3) if k != ax_i]
+            qq = queries[ci].astype(np.float64)
+            ix = (qq[:, qi[0]] - axes_[qi[0]][0]) / h
+            iy = (qq[:, qi[1]] - axes_[qi[1]][0]) / h
+            axes_grid[ci, 1].scatter(ix, iy, s=8, c='k', marker='x')
+            ax2 = axes_grid[ci, 2]
+            ax2.bar([0, 1], [primary[ci], secondary[ci]], color=['tab:blue', 'tab:orange'])
+            ax2.set_title(f"{cid} primary {primary[ci]:.3f} vs secondary {secondary[ci]:.3f}", fontsize=8)
+            ax2.set_xticks([0, 1]); ax2.set_xticklabels(['primary', 'secondary'], fontsize=7)
+            ax2.axhline(0, color='k', lw=0.5)
+        plt.tight_layout()
+        plt.savefig('results/overview.png', dpi=110)
+        plt.close(fig)
+    except ImportError:
+        _render_overview_fallback(case_order, manifest, planes, vol_a, queries, primary, secondary,
+                                  field_slice, e_report, diag)
+
+    with open('results/solver_log.txt', 'w') as fh:
+        fh.write('\n'.join(LOG_LINES) + '\n')
+
+    log("\n=== summary ===")
+    for cid, p, s in zip(case_order, primary, secondary):
+        log(f"{cid}: primary={p:+.4f}  secondary={s:+.4f}  gap={p-s:+.4f}")
+    log(f"total runtime {time.time()-t_start:.1f}s")
+
+if __name__ == '__main__':
+    main()

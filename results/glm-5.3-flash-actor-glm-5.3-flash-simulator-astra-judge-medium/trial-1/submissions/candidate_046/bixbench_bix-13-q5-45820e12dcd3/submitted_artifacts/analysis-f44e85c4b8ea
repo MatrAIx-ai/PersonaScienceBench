@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+DESeq2-equivalent differential expression pipeline (Plan B).
+Genuine DESeq2 (R) is unavailable in this runtime: no R/Rscript anywhere on the
+filesystem, docker daemon not running, no apt sources and no network (DNS fails),
+pip cannot reach PyPI. This script re-implements the DESeq2 core pipeline:
+  - median-of-ratios size factors
+  - NB GLM (log link) with log(size factor) offset, IRLS fitting
+  - gene-wise dispersion MLE (alternating IRLS / Newton on 1/alpha)
+  - parametric dispersion trend fit  alpha(mu) = a1/mu + a0
+  - posterior (MAP) dispersion shrinkage toward the trend
+    (log-normal prior, sigma^2 = 1/n_params, as in DESeq2::nbinomWaldTest)
+  - Wald test, Benjamini-Hochberg FDR over all genes
+Design: ~ Strain + Media  (reference: Strain=1 = JBX1, Media=MMGluFeMinus)
+Contrasts (Wald, coefficient-based): 97 vs 1, 98 vs 1, 99 vs 1.
+Question: # genes with padj<0.05 in (97 vs 1) OR (98 vs 1) AND padj>=0.05 in (99 vs 1).
+"""
+import json
+import numpy as np
+import pandas as pd
+from scipy.special import gammaln, digamma, polygamma
+trigamma = lambda x: polygamma(1, x)
+from scipy.stats import norm, chi2
+
+md = pd.read_csv('data/experiment_metadata.csv')
+rc = pd.read_csv('data/raw_counts.csv', index_col=0)
+gene_ids = rc.index.to_numpy()
+rc = rc[md.AzentaName]                      # reorder columns by SampleNumber order
+Y = rc.to_numpy(np.float64)                 # genes x samples
+n, p_samp = Y.shape
+strain = md.Strain.to_numpy()
+media = md.Media.to_numpy()
+
+# design ~ Strain + Media; reference: strain 1, media MMGluFeMinus
+S97 = (strain == 97).astype(float); S98 = (strain == 98).astype(float)
+S99 = (strain == 99).astype(float)
+MPlus = (media == 'MMGluFePlus').astype(float)
+MSucc = (media == 'Succinate').astype(float)
+X = np.column_stack([np.ones(p_samp), S97, S98, S99, MPlus, MSucc])
+p = X.shape[1]
+CONTRAST_IDX = [1, 2, 3]
+CONTRAST_NAMES = ['padj_97vs1', 'padj_98vs1', 'padj_99vs1']
+
+# median-of-ratios size factors
+logY = np.where(Y > 0, np.log(np.maximum(Y, 1e-12)), np.nan)
+gm = np.exp(np.nanmean(logY, axis=1))
+ok = np.isfinite(gm) & (gm > 0)
+size_factors = np.median(Y[ok] / gm[ok, None], axis=0)
+size_factors = size_factors / np.exp(np.mean(np.log(size_factors)))
+off = np.log(size_factors)
+
+def fit_beta(Y, alphas, X, off, max_iter=200, tol=1e-7):
+    G = Y.shape[0]
+    Beta = np.zeros((G, X.shape[1]))
+    Beta[:, 0] = np.log(Y.mean(axis=1) / np.exp(np.mean(off)) + 0.5)
+    for _ in range(max_iter):
+        eta = off[None, :] + Beta @ X.T
+        mu = np.exp(np.clip(eta, -20, 30))
+        w = mu / (1.0 + alphas[:, None] * mu)
+        z = eta + (Y - mu) / mu
+        A = np.einsum('ik,gi,il->gkl', X, w, X)
+        b = np.einsum('ik,gi,gi->gk', X, w, z)
+        Beta_new = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+        if np.max(np.abs(Beta_new - Beta)) < tol:
+            Beta = Beta_new; break
+        Beta = Beta_new
+    return Beta
+
+def nb_loglik(Y, mu, alpha):
+    if alpha.ndim == 1:
+        n_ = (1.0 / alpha)[:, None]
+        return (gammaln(Y + n_) - gammaln(n_) - gammaln(Y + 1.0)
+                + n_ * np.log(n_ / (n_ + mu)) + Y * np.log(mu / (n_ + mu))).sum(axis=1)
+    n_ = (1.0 / alpha)[:, :, None]
+    return (gammaln(Y[:, None, :] + n_) - gammaln(n_) - gammaln(Y[:, None, :] + 1.0)
+            + n_ * np.log(n_ / (n_ + mu[:, None, :]))
+            + Y[:, None, :] * np.log(mu[:, None, :] / (n_ + mu[:, None, :]))).sum(axis=2)
+
+norm_ = Y / size_factors
+mnorm = norm_.mean(axis=1)
+vnorm = norm_.var(axis=1, ddof=1)
+alpha = np.clip(np.maximum((vnorm - mnorm) / mnorm**2, 1e-6), 1e-6, 10.0)
+
+for it in range(12):                      # gene-wise dispersion MLE
+    Beta = fit_beta(Y, alpha, X, off)
+    mu = np.exp(np.clip(off[None, :] + Beta @ X.T, -20, 30))
+    n_ = (1.0 / alpha)[:, None]
+    for _ in range(8):                    # Newton on n=1/alpha, beta fixed
+        dl = (digamma(Y + n_) - digamma(n_) + np.log(n_ / (n_ + mu))
+              + 1.0 - (n_ + Y) / (n_ + mu)).sum(axis=1)
+        d2 = (trigamma(Y + n_) - trigamma(n_) + 1.0 / n_ - 1.0 / (n_ + mu)
+              - (mu - Y) / (n_ + mu)**2).sum(axis=1)
+        step = dl / np.where(np.abs(d2) < 1e-12, np.nan, d2)
+        step = np.nan_to_num(step, nan=0.0)[:, None]
+        n_new = n_ - np.clip(step, -0.5 * n_, 0.5 * n_)
+        n_ = np.clip(n_new, 1e-6, 1e6)
+    alpha_new = (1.0 / n_).ravel()
+    if np.max(np.abs(np.log(alpha_new / alpha))) < 1e-4:
+        alpha = alpha_new; break
+    alpha = alpha_new
+alpha_mle = np.clip(alpha, 1e-6, 10.0)
+base_mean = mnorm.copy()
+
+# parametric dispersion trend alpha = a1/mu + a0
+mu_g = np.exp(np.clip(off[None, :] + fit_beta(Y, alpha_mle, X, off) @ X.T, -20, 30)).mean(axis=1)
+best = None
+for a0 in np.concatenate([[1e-6], np.logspace(-5, 0, 120)]):
+    t = alpha_mle - a0
+    a1 = np.sum(t / mu_g) / np.sum(1.0 / mu_g**2)
+    if a1 <= 0: continue
+    sse = np.sum((alpha_mle - a0 - a1 / mu_g)**2)
+    if best is None or sse < best[0]: best = (sse, a0, a1)
+_, a0_hat, a1_hat = best
+trend = np.clip(a1_hat / mu_g + a0_hat, 1e-6, None)
+print(f"[trend] a0={a0_hat:.4g} a1={a1_hat:.4g}; median MLE alpha={np.median(alpha_mle):.4g}, "
+      f"median trend={np.median(trend):.4g}")
+
+# MAP shrinkage toward trend (prior variance 1/p, as DESeq2)
+sigma2 = 1.0 / p
+u_grid = np.linspace(-3, 3, 21) * np.sqrt(sigma2)
+A_grid = trend[:, None] * np.exp(u_grid[None, :])
+ll_all = np.concatenate([nb_loglik(Y, mu, A_grid),
+                         nb_loglik(Y, mu, alpha_mle)[:, None]], axis=1)
+u_rel = np.concatenate([np.broadcast_to(u_grid, (n, 21)),
+                        np.log(alpha_mle)[:, None] - np.log(trend)[:, None]], axis=1)
+obj = -ll_all + u_rel**2 / (2 * sigma2)
+alpha_final = np.clip(A_all := np.concatenate([A_grid, alpha_mle[:, None]], axis=1)[
+                      np.arange(n), np.argmin(obj, axis=1)], 1e-8, None)
+print(f"[MAP] median final alpha={np.median(alpha_final):.4g}; frac raised >2x MLE="
+      f"{np.mean(alpha_final > 2*alpha_mle):.3f}")
+
+# final GLM fit and Wald tests
+Beta = fit_beta(Y, alpha_final, X, off)
+eta = off[None, :] + Beta @ X.T
+mu = np.exp(np.clip(eta, -20, 30))
+w = mu / (1.0 + alpha_final[:, None] * mu)
+cov = np.linalg.inv(np.einsum('ik,gi,il->gkl', X, w, X))
+se = np.sqrt(np.einsum('gii->gi', cov))
+log2fc = Beta / np.log(2.0)
+
+def bh(pv):
+    pv = np.asarray(pv); N = len(pv)
+    o = np.argsort(pv); ranked = pv[o] * N / np.arange(1, N + 1)
+    adj = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty(N); out[o] = np.clip(adj, 0, 1)
+    return out
+
+results = pd.DataFrame({'gene': gene_ids, 'baseMean': base_mean})
+padj = {}
+for ci, cname in zip(CONTRAST_IDX, CONTRAST_NAMES):
+    z = Beta[:, ci] / se[:, ci]
+    pv = 2.0 * norm.sf(np.abs(z))
+    padj[cname] = bh(pv)
+    tag = cname[5:]
+    results[f'log2FC_{tag}'] = log2fc[:, ci]
+    results[f'pvalue_{tag}'] = pv
+    results[cname] = padj[cname]
+
+DE97 = padj['padj_97vs1'] < 0.05
+DE98 = padj['padj_98vs1'] < 0.05
+DE99 = padj['padj_99vs1'] < 0.05
+singles = DE97 | DE98
+answer_mask = singles & (~DE99)
+summary = {
+    'n_genes_tested': int(n),
+    'DE_97_vs_1': int(DE97.sum()),
+    'DE_98_vs_1': int(DE98.sum()),
+    'DE_99_vs_1': int(DE99.sum()),
+    'DE_either_single': int(singles.sum()),
+    'DE_both_singles': int((DE97 & DE98).sum()),
+    'answer_singles_not_double': int(answer_mask.sum()),
+    'up_in_97_among_answer': int((answer_mask & (results.log2FC_97vs1 > 0)).sum()),
+}
+
+# ---------------- strain-mapping verification (unsupervised, no annotation needed)
+L = np.log2(norm_ + 1.0)
+print("\n=== STRAIN-MAPPING VERIFICATION ===")
+for med in ['MMGluFeMinus', 'MMGluFePlus', 'Succinate']:
+    idx = media == med
+    c1 = L[:, idx & (strain == 1)].mean(axis=1)
+    d = {s: float(np.sqrt(np.mean((L[:, idx & (strain == s)].mean(axis=1) - c1)**2)))
+         for s in [97, 98, 99]}
+    print(f"  {med:13s} RMS log2 dist to strain1: 97:{d[97]:.3f} 98:{d[98]:.3f} 99:{d[99]:.3f}")
+c1 = L[:, strain == 1].mean(axis=1)
+dpool = {s: float(np.sqrt(np.mean((L[:, strain == s].mean(axis=1) - c1)**2)))
+         for s in [97, 98, 99]}
+print("  pooled RMS dist to strain1: " + ", ".join(f"{s}:{dpool[s]:.3f}" for s in dpool))
+fc97 = log2fc[:, 1]; fc98 = log2fc[:, 2]; fc99 = log2fc[:, 3]
+r_add = np.corrcoef(fc99, fc97 + fc98)[0, 1]
+print(f"  corr(FC99, FC97+FC98)={r_add:.3f}  corr(FC99,FC97)={np.corrcoef(fc99,fc97)[0,1]:.3f}  "
+      f"corr(FC99,FC98)={np.corrcoef(fc99,fc98)[0,1]:.3f}")
+print(f"  median |FC|: 97={np.median(np.abs(fc97)):.3f} 98={np.median(np.abs(fc98)):.3f} "
+      f"99={np.median(np.abs(fc99)):.3f}")
+ss = (np.sign(fc97) == np.sign(fc99)) & (np.sign(fc98) == np.sign(fc99))
+print(f"  fraction sign(FC97)=sign(FC98)=sign(FC99): {ss.mean():.3f}")
+top99 = np.argsort(-np.abs(fc99))[:20]
+print("  top |log2FC| genes, strain 99 vs 1:")
+for i in top99:
+    print(f"    {gene_ids[i]:>12s} 99vs1={fc99[i]:+7.2f} 97vs1={fc97[i]:+7.2f} 98vs1={fc98[i]:+7.2f}")
+
+# ----------------------------------- interaction diagnostic (Strain x Media LRT)
+Xint_cols = [((strain == s) & (media == m)).astype(float)
+             for s in [97, 98, 99] for m in ['MMGluFePlus', 'Succinate']]
+Xint = np.column_stack([X] + Xint_cols)
+Beta_i = fit_beta(Y, alpha_final, Xint, off)
+mu_i = np.exp(np.clip(off[None, :] + Beta_i @ Xint.T, -20, 30))
+lrt = np.clip(2 * (nb_loglik(Y, mu_i, alpha_final) - nb_loglik(Y, mu, alpha_final)), 0, None)
+p_lrt = chi2.sf(lrt, df=Xint.shape[1] - p)
+summary['frac_genes_interaction_LRT_p<0.05'] = float((p_lrt < 0.05).mean())
+print(f"\n[interaction diagnostic] genes with Strain:Media LRT p<0.05: {(p_lrt<0.05).sum()}/{n} "
+      f"({100*(p_lrt<0.05).mean():.1f}%)")
+
+# per-media log2FC spread (sensitivity of contrasts to medium)
+spreads = []
+for med in ['MMGluFeMinus', 'MMGluFePlus', 'Succinate']:
+    idx = media == med
+    Xm = np.column_stack([np.ones(idx.sum()), (strain[idx] == 97).astype(float),
+                          (strain[idx] == 98).astype(float), (strain[idx] == 99).astype(float)])
+    spreads.append(fit_beta(Y[:, idx], alpha_final, Xm, off[idx])[:, 1:4] / np.log(2.0))
+sp = np.stack(spreads)
+rng = sp.max(axis=0) - sp.min(axis=0)
+for j, nm in enumerate(['97vs1', '98vs1', '99vs1']):
+    print(f"[per-media spread] {nm}: median cross-media log2FC spread="
+          f"{np.median(rng[:, j]):.2f}, 90th pct={np.percentile(rng[:, j], 90):.2f}")
+
+results.to_csv('analysis/deseq2_results.csv', index=False)
+with open('analysis/summary.json', 'w') as f:
+    json.dump({**summary, 'mapping_distances_pooled': dpool,
+               'corr_fc99_vs_sum_singles': float(r_add),
+               'trend': {'a0': float(a0_hat), 'a1': float(a1_hat)},
+               'size_factors': size_factors.tolist()}, f, indent=2)
+print("\n=== SUMMARY ===")
+for k, v in summary.items():
+    print(f"  {k}: {v}")

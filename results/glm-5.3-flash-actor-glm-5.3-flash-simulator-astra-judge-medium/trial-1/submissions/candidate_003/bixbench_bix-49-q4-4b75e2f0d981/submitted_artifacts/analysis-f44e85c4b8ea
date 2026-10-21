@@ -1,0 +1,259 @@
+"""
+DESeq2-equivalent differential expression analysis in pure Python/numpy
+for bixbench:bix-49-q4 (ASXL1 mutation vs Control, blood RNA-seq).
+
+DEVIATION (flagged): R/DESeq2 and PyDESeq2 are both unavailable in this offline
+runner (no network). This script re-implements the DESeq2 methodology:
+  - median-of-ratios size factors
+  - gene-wise dispersion via method of moments on NB residuals
+  - parametric dispersion trend alpha(mu) = a1/mu + a0
+  - lognormal-prior MAP dispersion shrinkage toward the trend
+  - vectorized NB GLM (log link) IRLS, Wald test, BH padj
+  - DESeq2-style Cook's-distance outlier replacement (F(p,n-p) 99% quantile),
+    then full refit
+  - independent filtering (maximize rejections at alpha=0.1) -> NA padj
+apeglm lfcShrinkage is NOT performed (Bioconductor-only); per the approved plan
+significance uses the unshrunken Wald padj, which apeglm does not change
+(it replaces only log2FC/lfcSE).
+"""
+import numpy as np, pandas as pd
+from scipy.special import gammaln
+from scipy.optimize import minimize
+from scipy.stats import f as fdist
+
+EPS = 1e-8
+
+# ---------------- input ----------------
+cts = pd.read_csv("data/Issy_ASXL1_blood_featureCounts_GeneTable_final.txt", sep=r"\s+").set_index("Geneid")
+col = pd.read_excel("data/Issy_ASXL1_blood_coldata_gender.xlsx").set_index("sample")
+samples = [s for s in cts.columns if s in col.index]
+Y0 = cts[samples].to_numpy(np.float64)
+cd = col.loc[samples]
+cond = (cd["condition"] == "ASXL1").to_numpy(np.float64)
+sexM = (cd["sex"] == "M").to_numpy(np.float64)
+n = len(samples)
+print(f"samples used ({n}): {samples}")
+
+keep = (Y0 >= 10).sum(axis=1) >= 2
+Y = Y0[keep].T
+print(f"pre-filter rowSums(counts>=10)>=2: kept {Y.shape[1]} / {Y0.shape[0]} genes")
+
+# ---------------- size factors ----------------
+def size_factors(Y):
+    gm = np.exp(np.log(np.maximum(Y, 1e-9)).mean(axis=1))
+    ok = gm > 0
+    sf = np.median(Y[ok] / gm[ok, None], axis=0)
+    sf = np.maximum(sf, EPS)
+    return sf * np.exp(-np.mean(np.log(sf)))
+
+# ---------------- NB log-lik ----------------
+def nb_loglik(Y, mu, alpha):
+    a = np.maximum(alpha, EPS)[None, :]
+    r = 1.0 / a
+    ll = gammaln(Y + r) - gammaln(r) - gammaln(Y + 1)
+    ll += r * np.log(r) - r * np.log(r + mu)
+    ll += Y * np.log(mu) - Y * np.log(r + mu)
+    return ll.sum(axis=0)
+
+# ---------------- vectorized IRLS ----------------
+def irls(Y, X, off, alpha, maxiter=60, tol=1e-7):
+    n, g = Y.shape; p = X.shape[1]
+    beta = np.zeros((p, g))
+    beta[0] = np.log(np.maximum(Y, 0.5) / np.exp(off)[:, None]).mean(axis=0)
+    ridge = np.eye(X.shape[1]) * 1e-6
+    for _ in range(maxiter):
+        mu = np.clip(np.exp(np.clip(off[:, None] + X @ beta, -30, 30)), EPS, 1e15)
+        W = mu / (1.0 + np.maximum(alpha, EPS)[None, :] * mu)
+        z = X @ beta + (Y - mu) / mu
+        XtW = X[:, :, None] * W[:, None, :]                       # n x p x g
+        XtWX = np.einsum("npg,nq->gpq", XtW, X)                   # g x p x p
+        XtWz = np.einsum("npg,ng->pg", XtW, z)                     # p x g
+        bnew = np.linalg.solve(XtWX + ridge, XtWz.T[..., None])[..., 0].T            # p x g
+        bnew += 0.0
+        if not np.all(np.isfinite(bnew)):
+            bad = ~np.all(np.isfinite(bnew), axis=0)
+            bnew[:, bad] = beta[:, bad]
+        if np.max(np.abs(bnew - beta)) < tol:
+            beta = bnew
+            break
+        beta = bnew
+    mu = np.clip(np.exp(off[:, None] + X @ beta), EPS, 1e15)
+    return beta, mu
+
+# ---------------- dispersion pipeline ----------------
+def dispersion_pipeline(Y, X, off):
+    n, g = Y.shape
+    b0, mu0 = irls(Y, X, off, np.zeros(g))                        # Poisson pilot
+    # gene-wise method-of-moments dispersion: E[(y-mu)^2 - mu] = alpha*mu^2
+    num = ((Y - mu0) ** 2 - mu0).sum(axis=0)
+    den = (mu0 ** 2).sum(axis=0)
+    alpha_gw = np.clip(num / np.maximum(den, EPS), 1e-8, 10.0)
+    mubar = np.exp(off) @ (mu0 / np.exp(off)[:, None]) / n        # mean normalized count per gene
+    mubar = (mu0 / np.exp(off)[:, None]).mean(axis=0)
+    # parametric trend: alpha = a1/mu + a0, fit on log scale
+    def trend_ab(a1, a0):
+        return np.maximum(a1 / np.maximum(mubar, 1e-3) + a0, 1e-8)
+    def nll(theta):
+        a1, a0 = np.exp(theta)
+        t = trend_ab(a1, a0)
+        return np.sum(np.log(t) + alpha_gw / t) / g               # gamma-like deviance proxy
+    res = minimize(nll, x0=np.log([1e-2, 1e-3]), method="Nelder-Mead",
+                   options=dict(maxiter=2000, xatol=1e-10, fatol=1e-12))
+    a1, a0 = np.exp(res.x)
+    alpha_tr = trend_ab(a1, a0)
+    # prior variance of log dispersions around trend (moment estimator)
+    lr = np.log(alpha_gw) - np.log(alpha_tr)
+    lr_trim = lr[np.abs(lr - np.median(lr)) < 5 * 1.4826 * np.median(np.abs(lr - np.median(lr)) + 1e-12)]
+    sigma2 = max(np.mean(lr_trim ** 2) / 2.0, 0.1)                # DESeq2-style halved moment estimate
+    # MAP: min over grid of  -loglik + (log d - log trend)^2 / (2 sigma2)
+    mult = np.exp(np.linspace(np.log(1 / 50), np.log(50), 61))    # 61 x g grid
+    D = alpha_tr[None, :] * mult[:, None]
+    ll = np.empty_like(D)
+    for k in range(mult.size):
+        ll[k] = nb_loglik(Y, mu0, D[k])
+    pen = (np.log(D) - np.log(alpha_tr)[None, :]) ** 2 / (2 * sigma2)
+    alpha_map = D[np.argmin(-ll + pen, axis=0), np.arange(D.shape[1])]
+    return alpha_map, mu0, b0, alpha_gw, alpha_tr, sigma2
+
+# ---------------- Cook's distance ----------------
+def cooks_distance(Y, X, beta, mu, alpha):
+    n, g = Y.shape; p = X.shape[1]
+    W = mu / (1.0 + np.maximum(alpha, EPS)[None, :] * mu)
+    XtWX = np.einsum("npg,nq->gpq", X[:, :, None] * W[:, None, :], X)
+    A = np.linalg.inv(XtWX + np.eye(X.shape[1]) * 1e-6)            # g x p x p
+    XM = np.einsum("np,gpq->gnq", X, A)                           # g x n x q
+    h = W.T * (XM * X[None, :, :]).sum(axis=2)                    # g x n
+    r = (Y - mu) / np.sqrt(mu + np.maximum(alpha, EPS)[None, :] * mu ** 2)
+    D = (r.T ** 2 / p) * h / (1.0 - h) ** 2                       # g x n
+    return D.T, A                                                 # back to n x g
+
+# ---------------- Wald test ----------------
+def wald(Y, X, off, alpha):
+    beta, mu = irls(Y, X, off, alpha)
+    n, g = Y.shape; p = X.shape[1]
+    W = mu / (1.0 + np.maximum(alpha, EPS)[None, :] * mu)
+    XtWX = np.einsum("npg,nq->gpq", X[:, :, None] * W[:, None, :], X)
+    ridge = np.eye(X.shape[1]) * 1e-6
+    A = np.linalg.inv(XtWX + ridge)                               # g x p x p
+    se = np.sqrt(np.maximum(A[:, -1, -1], EPS))
+    lfc = beta[-1]
+    z = lfc / se
+    from scipy.stats import norm
+    pval = 2.0 * norm.sf(np.abs(z))
+    return lfc, se, pval, beta, mu
+
+# ---------------- BH ----------------
+def bh(p):
+    g = len(p); order = np.argsort(p); ranked = p[order]
+    padj = np.minimum.accumulate((ranked * g / np.arange(1, g + 1))[::-1])[::-1]
+    out = np.empty(g); out[order] = np.clip(padj, 0, 1)
+    return out
+
+# ---------------- independent filtering (DESeq2 style) ----------------
+def results_with_filtering(pval, filt_stat, alpha_rej=0.1):
+    g = len(pval); padj = np.full(g, np.nan)
+    qs = np.unique(np.quantile(filt_stat, np.linspace(0, 0.95, 30)))
+    best = (-1, 0.0, None)
+    for t in qs:
+        sel = filt_stat >= t
+        if sel.sum() < 2: continue
+        pa = bh(pval[sel])
+        rej = int((pa <= alpha_rej).sum())
+        if rej > best[0]:
+            best = (rej, t, pa, sel)
+    rej, t, pa, sel = best
+    padj[sel] = pa
+    print(f"[indep filt] threshold on mean norm count = {t:.3f}; genes tested = {sel.sum()}; "
+          f"rejections@0.1 = {rej}; NA padj = {g - sel.sum()}")
+    return padj
+
+# ---------------- full DESeq2-equivalent run ----------------
+def run_design(Y, sf, X, label):
+    off = np.log(sf)
+    # pass 1
+    alpha1, mu0, b0, agw, atr, s2 = dispersion_pipeline(Y, X, off)
+    beta1, mu1 = irls(Y, X, off, alpha1)
+    Dc, _ = cooks_distance(Y, X, beta1, mu1, alpha1)
+    thr = fdist.ppf(0.99, X.shape[1], n - X.shape[1])
+    out_mask = Dc > thr                                            # g x n
+    # group-wise trimmed-mean replacement (DESeq2 replaceOutliers style)
+    Yrep = Y.copy()
+    groups = [np.where(cond == v)[0] for v in np.unique(cond)]
+    flag_counts = 0
+    for gi in range(out_mask.shape[0]):
+        idx = np.where(out_mask[gi])[0]
+        if len(idx) == 0: continue
+        norm = Y[gi] / sf
+        for j in idx:
+            grp = next(G for G in groups if j in G)
+            others = [k for k in grp if k != j]
+            if len(others) == 0: continue
+            tn = np.trim_mean(norm[others], 0.2)
+            Yrep[gi, j] = max(tn * sf[j], 0.0)
+            flag_counts += 1
+    n_genes_flagged = int((out_mask.any(axis=1)).sum())
+    print(f"[{label}] Cook's outliers: genes flagged={n_genes_flagged}, counts replaced={flag_counts} "
+          f"(threshold F0.99 df=({X.shape[1]},{n - X.shape[1]})={thr:.3f})")
+    # pass 2: full refit on replaced counts (skipped when nothing replaced)
+    sf2 = size_factors(Yrep.T) if flag_counts > 0 else sf
+    off2 = np.log(sf2)
+    alpha2, mu0b, b0b, agw2, atr2, s2b = dispersion_pipeline(Yrep, X, off2)
+    lfc, se, pval, beta, mu = wald(Yrep, X, off2, alpha2)
+    mnc = (Yrep / sf2[:, None]).mean(axis=0)
+    padj = results_with_filtering(pval, mnc)
+    return dict(lfc=lfc, se=se, pval=pval, padj=padj, alpha=alpha2, nflag=n_genes_flagged,
+                nreplaced=flag_counts, Yrep=Yrep, sf=sf2)
+
+sf_all = size_factors(Y.T)
+print("size factors:", np.round(sf_all, 3))
+
+# ---------------- run both designs ----------------
+X1 = np.column_stack([np.ones(n), cond])                           # ~ condition
+X2 = np.column_stack([np.ones(n), sexM, cond])                     # ~ sex + condition
+
+res1 = run_design(Y, sf_all, X1, "~ condition")
+res2 = run_design(Y, sf_all, X2, "~ sex + condition")
+
+for label, r in [("~ condition", res1), ("~ sex + condition", res2)]:
+    padj, lfc = r["padj"], r["lfc"]
+    sig = padj < 0.05
+    up = int((sig & (lfc > 0)).sum()); down = int((sig & (lfc < 0)).sum())
+    na = int(np.isnan(padj).sum())
+    print(f"[{label}] NA padj = {na}; up = {up}; down = {down}; TOTAL = {up + down} (padj<0.05)")
+
+import scipy, statsmodels, sys
+print("\nversions: python", sys.version.split()[0], "| numpy", np.__version__, "| pandas", pd.__version__,
+      "| scipy", scipy.__version__, "| statsmodels", statsmodels.__version__)
+print("NOTE: apeglm shrinkage NOT performed (see header); padj from unshrunken Wald test.")
+np.save("/tmp/res1.npy", res1, allow_pickle=True)
+np.save("/tmp/res2.npy", res2, allow_pickle=True)
+
+# ---------------- results export & sanity checks ----------------
+genes_kept = Y0[keep]
+idx = np.where(keep)[0]
+gene_ids = cts.index.to_numpy()[idx]
+genc = pd.read_csv("data/gencode.v31.primary_assembly.genes.csv")[["gene_id", "gene_name", "gene_type"]]
+gmap = dict(zip(genc.gene_id, genc.gene_name))
+def tab(r, label):
+    return pd.DataFrame({
+        "gene_id": gene_ids, "gene_name": [gmap.get(g, "") for g in gene_ids],
+        "log2FC": r["lfc"], "SE": r["se"], "pvalue": r["pval"], "padj": r["padj"]})
+t1, t2 = tab(res1, "~condition"), tab(res2, "~sex+condition")
+t1.to_csv("results_design_condition.csv", index=False)
+t2.to_csv("results_design_sex_condition.csv", index=False)
+for name, t in [("primary ~condition", t1), ("sensitivity ~sex+condition", t2)]:
+    s = t[t.padj < 0.05]
+    print(f"\n[{name}] top 8 by padj (of {len(s)} significant):")
+    print(s.sort_values("padj").head(8).to_string(index=False,
+          float_format=lambda v: f"{v:.4g}"))
+# sanity: overlap with Welch t-test on log2 counts
+from scipy import stats
+L = np.log2(Y.T + 1)   # genes x samples
+tt = stats.ttest_ind(L.T[cond == 1], L.T[cond == 0], axis=0)
+sig1 = t1.padj.to_numpy() < 0.05
+tsig = tt.pvalue < 0.05
+inter = int((sig1 & tsig).sum())
+print(f"\n[sanity] padj<0.05 genes also t-test p<0.05: {inter}/{sig1.sum()} "
+      f"({inter/sig1.sum():.1%}); t-test total {int(tsig.sum())}")
+print(f"[sanity] final dispersion median={np.median(res1['alpha']):.4f} "
+      f"(IQR {np.percentile(res1['alpha'],25):.4f}-{np.percentile(res1['alpha'],75):.4f})")

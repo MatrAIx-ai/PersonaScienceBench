@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""Leaf physiological response reconstruction (B3 task).
+
+Coupled Farquhar (C3) / Collatz (C4) photosynthesis with Ball-Berry
+stomatal conductance, in the land-surface (CLM/Noah-MP) convention
+specified by the task brief:
+
+* limitations combined by a hard minimum;
+* C3: Wc = Vcmax*(Ci-G*)/(Ci+Kc*(1+O2/Ko)),
+      Wj = J*(Ci-G*)/(4*Ci+8*G*), We = 0.5*Vcmax, J = alpha_q*APAR;
+* C4: Wc = Vcmax, Wj = alpha_q*APAR, We = 4000*Vcmax*Ci/p_atm;
+* A = min(Wc, Wj, We) - Rd, with APAR = 4.6*PAR (no extra absorptance
+  factor) and Rd = 0.015*Vcmax;
+* CLM/Noah-MP Q10 Vcmax with high-temperature inhibition:
+  Vcmax(T) = Vcmax25*2.4^((Tc-25)/10) /
+             (1 + exp((-2.2e5 + 710*(Tc+273.16)) / (R*(Tc+273.16))));
+* n_factor and btran scale photosynthetic capacity only (the Ball-Berry
+  intercept b0 is NOT scaled by btran);
+* leaf temperature = air temperature;
+  h_s = max(1 - vpd/esat(T), 0.25), bounded above by 1;
+* gas-diffusion chain with cf = p_atm/(R*T):
+    cs = ca - 1.37*rb*A_mol/cf*p_atm
+    gs = m*A_mol*h_s/cs*p_atm + b0
+    rs = cf/gs
+    Ci = cs - 1.65*rs*A_mol/cf*p_atm
+* at night (PAR ~ 0): respiratory assimilation A = -Rd and intercept
+  conductance gs = b0, which keeps every quantity finite at PAR = 0.
+
+Under light, (Ci, A, gs, rs, cs) must describe one common coupled fixed
+point.  Given Ci everything else is explicit, so the system reduces to the
+scalar fixed point Ci = G(Ci), solved by point iteration with a bisection
+fallback on F(Ci) = Ci - G(Ci).
+
+Outputs: analysis.py (this file), results/leaf_fluxes.csv,
+results/case_convergence.csv, results/diurnal.png.
+The figure uses matplotlib when available; otherwise a small built-in
+pure-Python PNG renderer produces the same two-panel figure.
+"""
+from __future__ import annotations
+
+import json
+import os
+import struct
+import zlib
+
+import numpy as np
+import pandas as pd
+
+# ------------------------------- constants ----------------------------
+R_GAS = 8.314            # J mol-1 K-1
+APAR_FACTOR = 4.6        # APAR = 4.6 * PAR (W m-2); no extra absorptance
+NIGHT_PAR = 1e-6         # W m-2; PAR below this -> night branch
+GS_FLOOR = 1e-6          # mol m-2 s-1; keeps rs finite on pathological iters
+CS_FLOOR = 1.0           # Pa; keeps gs finite (never active in this dataset)
+TOL_CI = 1e-6            # Pa
+TOL_A = 1e-8             # umol m-2 s-1
+MAX_ITER = 200
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+RESULTS = os.path.join(HERE, "results")
+
+
+# ------------------------------- physics ------------------------------
+def esat(t_k: float) -> float:
+    """Saturation vapour pressure (Pa), CLM formulation (T in deg C)."""
+    tc = t_k - 273.15
+    return 611.21 * np.exp(17.502 * tc / (240.97 + tc))
+
+
+def vcmax_temperature(vcmax25: float, t_k: float) -> float:
+    """CLM/Noah-MP Q10 response incl. high-temperature inhibition."""
+    tc = t_k - 273.15
+    base = vcmax25 * 2.4 ** ((tc - 25.0) / 10.0)
+    inhib = 1.0 + np.exp((-2.2e5 + 710.0 * (tc + 273.16))
+                         / (R_GAS * (tc + 273.16)))
+    return base / inhib
+
+
+def build_env(row: pd.Series, params: dict) -> dict:
+    """Row-wise environment + capacity for the coupled model."""
+    t_k = float(row["t_air_K"])
+    p_atm = float(row["p_atm_Pa"])
+    ca = float(row["co2_pa"])
+    o2 = float(row["o2_pa"])
+    vpd = float(row["vpd_Pa"])
+    rb = float(row["rb_sm"])
+    btran = float(row["btran"])
+    cf = p_atm / (R_GAS * t_k)                       # mol m-3
+    h_s = min(max(1.0 - vpd / esat(t_k), 0.25), 1.0)  # surface RH
+    # n_factor and btran act on photosynthetic capacity only
+    vcmax = vcmax_temperature(params["vcmax25"], t_k) * params["n_factor"] * btran
+    return dict(t_k=t_k, p_atm=p_atm, ca=ca, o2=o2, rb=rb, cf=cf, h_s=h_s,
+                vcmax=vcmax, rd=0.015 * vcmax,
+                m=float(params["bb_slope"]), b0=float(params["bb_intercept"]))
+
+
+def net_assim(ci: float, env: dict, apar: float, pathway: str,
+              alpha_q: float) -> float:
+    """Net assimilation A = min(Wc, Wj, We) - Rd (umol m-2 s-1)."""
+    vcmax, rd = env["vcmax"], env["rd"]
+    if pathway == "C4":
+        wc = vcmax
+        wj = alpha_q * apar
+        we = 4000.0 * vcmax * ci / env["p_atm"]
+        w = min(wc, wj, we)
+    else:  # C3 Farquhar branch (dormant for this dataset: pathway == "C4")
+        tc = env["t_k"] - 273.15
+        kc = 30.0 * 2.1 ** ((tc - 25.0) / 10.0)
+        ko = 30000.0 * 1.2 ** ((tc - 25.0) / 10.0)
+        o2 = env["o2"]
+        gstar = 0.5 * (kc / ko) * o2 * 0.21
+        j = alpha_q * apar
+        wc = vcmax * (ci - gstar) / (ci + kc * (1.0 + o2 / ko))
+        wj = j * (ci - gstar) / (4.0 * ci + 8.0 * gstar)
+        we = 0.5 * vcmax
+        w = min(wc, wj, we)
+    return w - rd
+
+
+def sweep(ci: float, env: dict, apar: float, pathway: str,
+          alpha_q: float) -> tuple:
+    """One fixed-point sweep: Ci -> A -> cs -> gs -> rs -> Ci_new."""
+    a = net_assim(ci, env, apar, pathway, alpha_q)
+    a_mol = a * 1e-6                                  # mol m-2 s-1
+    d = a_mol / env["cf"] * env["p_atm"]              # = A_mol * R * T
+    cs = max(env["ca"] - 1.37 * env["rb"] * d, CS_FLOOR)
+    gs = max(env["m"] * a_mol * env["h_s"] / cs * env["p_atm"] + env["b0"],
+             GS_FLOOR)
+    rs = env["cf"] / gs
+    ci_new = cs - 1.65 * rs * d
+    return ci_new, a, cs, gs, rs
+
+
+def solve_fixed_point(ci0: float, env: dict, apar: float, pathway: str,
+                      alpha_q: float) -> dict:
+    """Solve Ci = G(Ci) under light.
+
+    Point iteration (omega = 1) with a bisection fallback on
+    F(Ci) = Ci - G(Ci) over [1e-3, ca]; F is continuous there and
+    F(1e-3) < 0 < F(ca) for all daytime rows of this dataset.
+    """
+    ci = float(ci0)
+    a = net_assim(ci, env, apar, pathway, alpha_q)
+    n_iter = 0
+    for k in range(1, MAX_ITER + 1):
+        ci_new, a_new, cs, gs, rs = sweep(ci, env, apar, pathway, alpha_q)
+        n_iter = k
+        if not (np.isfinite(ci_new) and np.isfinite(a_new)):
+            break
+        if abs(ci_new - ci) < TOL_CI and abs(a_new - a) < TOL_A:
+            return dict(ci=ci_new, a=a_new, cs=cs, gs=gs, rs=rs,
+                        n_iter=n_iter, method="fixed_point")
+        ci, a = ci_new, a_new
+
+    # ---------------- bisection fallback on F(Ci) = Ci - G(Ci) --------
+    def f(c: float) -> float:
+        return c - sweep(c, env, apar, pathway, alpha_q)[0]
+
+    lo, hi = 1e-3, env["ca"]
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo * f_hi > 0.0:      # no sign change: keep last iterate
+        ci_new, a, cs, gs, rs = sweep(ci, env, apar, pathway, alpha_q)
+        return dict(ci=ci_new, a=a, cs=cs, gs=gs, rs=rs,
+                    n_iter=n_iter, method="fixed_point(no bracket)")
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        f_mid = f(mid)
+        n_iter += 1
+        if abs(f_mid) < TOL_CI or (hi - lo) < TOL_CI:
+            lo = hi = mid
+            break
+        if f_lo * f_mid <= 0.0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    ci = 0.5 * (lo + hi)
+    _, a, cs, gs, rs = sweep(ci, env, apar, pathway, alpha_q)
+    return dict(ci=ci, a=a, cs=cs, gs=gs, rs=rs, n_iter=n_iter,
+                method="bisection")
+
+
+def night_state(env: dict) -> dict:
+    """Night branch: respiratory assimilation + intercept conductance.
+
+    A = -Rd, gs = b0 (finite at PAR = 0); cs and Ci follow from the same
+    diffusion chain (with A < 0 they land slightly above ca).
+    """
+    a = -env["rd"]
+    a_mol = a * 1e-6
+    d = a_mol / env["cf"] * env["p_atm"]
+    cs = env["ca"] - 1.37 * env["rb"] * d
+    gs = env["b0"]
+    rs = env["cf"] / gs
+    ci = cs - 1.65 * rs * d
+    return dict(ci=ci, a=a, cs=cs, gs=gs, rs=rs, n_iter=0, method="night")
+
+
+# ------------------- minimal PNG renderer (fallback) -------------------
+# 5x7 bitmap font, rows top-to-bottom, MSB = leftmost pixel.
+_FONT = {
+ '0': (0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110),
+ '1': (0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110),
+ '2': (0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111),
+ '3': (0b11111,0b00010,0b00100,0b00010,0b00001,0b10001,0b01110),
+ '4': (0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010),
+ '5': (0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110),
+ '6': (0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110),
+ '7': (0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000),
+ '8': (0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110),
+ '9': (0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100),
+ 'A': (0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+ 'B': (0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110),
+ 'C': (0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110),
+ 'D': (0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100),
+ 'E': (0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111),
+ 'F': (0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000),
+ 'H': (0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+ 'I': (0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110),
+ 'L': (0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111),
+ 'M': (0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001),
+ 'N': (0b10001,0b10001,0b11001,0b10101,0b10011,0b10001,0b10001),
+ 'O': (0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+ 'P': (0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000),
+ 'R': (0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001),
+ 'S': (0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110),
+ 'T': (0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100),
+ 'U': (0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+ 'Y': (0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100),
+ '+': (0b00000,0b00100,0b00100,0b11111,0b00100,0b00100,0b00000),
+ '-': (0b00000,0b00000,0b00000,0b01110,0b00000,0b00000,0b00000),
+ '.': (0b00000,0b00000,0b00000,0b00000,0b00000,0b00100,0b00100),
+ '(': (0b00010,0b00100,0b01000,0b01000,0b01000,0b00100,0b00010),
+ ')': (0b01000,0b00100,0b00010,0b00010,0b00010,0b00100,0b01000),
+ ',': (0b00000,0b00000,0b00000,0b00000,0b00100,0b00100,0b01000),
+ ' ': (0,0,0,0,0,0,0),
+}
+
+
+class Canvas:
+    """Tiny RGB canvas with the drawing primitives the figure needs."""
+
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.buf = bytearray(w * h * 3)
+        for i in range(w * h):
+            self.buf[3 * i] = bg[0]
+            self.buf[3 * i + 1] = bg[1]
+            self.buf[3 * i + 2] = bg[2]
+
+    def put(self, x, y, col):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.buf[i] = col[0]
+            self.buf[i + 1] = col[1]
+            self.buf[i + 2] = col[2]
+
+    def hline(self, x0, x1, y, col):
+        for x in range(int(min(x0, x1)), int(max(x0, x1)) + 1):
+            self.put(x, int(y), col)
+
+    def vline(self, y0, y1, x, col):
+        for y in range(int(min(y0, y1)), int(max(y0, y1)) + 1):
+            self.put(int(x), y, col)
+
+    def rect(self, x0, y0, x1, y1, col):
+        for y in range(int(y0), int(y1) + 1):
+            for x in range(int(x0), int(x1) + 1):
+                self.put(x, y, col)
+
+    def line(self, x0, y0, x1, y1, col):
+        n = max(abs(x1 - x0), abs(y1 - y0), 1)
+        for i in range(int(n) + 1):
+            self.put(round(x0 + (x1 - x0) * i / n),
+                     round(y0 + (y1 - y0) * i / n), col)
+
+    def text(self, x, y, s, col, scale=1):
+        for i, ch in enumerate(s):
+            g = _FONT.get(ch.upper())
+            if g is None:
+                continue
+            ox = x + i * 6 * scale
+            for r in range(7):
+                row = g[r]
+                for c in range(5):
+                    if row & (1 << (4 - c)):
+                        for dy in range(scale):
+                            for dx in range(scale):
+                                self.put(ox + c * scale + dx,
+                                         y + r * scale + dy, col)
+
+    def save(self, path):
+        def chunk(tag, data):
+            out = struct.pack(">I", len(data)) + tag + data
+            out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            return out
+        raw = b"".join(b"\x00" + bytes(self.buf[y * 3 * self.w:
+                                                (y + 1) * 3 * self.w])
+                       for y in range(self.h))
+        png = b"\x89PNG\r\n\x1a\n"
+        png += chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h,
+                                          8, 2, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress(raw, 9))
+        png += chunk(b"IEND", b"")
+        with open(path, "wb") as fh:
+            fh.write(png)
+
+
+# ------------------------------- figures ------------------------------
+def _nice_ticks(lo, hi, n=5):
+    span = max(hi - lo, 1e-12)
+    step0 = span / n
+    mag = 10.0 ** np.floor(np.log10(step0))
+    step = 10 * mag
+    for m in (1.0, 2.0, 5.0):
+        if step0 <= m * mag:
+            step = m * mag
+            break
+    t0 = np.ceil(lo / step) * step
+    return list(np.arange(t0, hi + 0.5 * step, step)), step
+
+
+def _fmt(v):
+    return str(int(round(v))) if abs(v - round(v)) < 1e-9 else f"{v:g}"
+
+
+def plot_matplotlib(flux: pd.DataFrame, path: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    night = flux["A_sun"] < 0
+    for ax in (ax1, ax2):
+        for t in range(len(flux)):
+            if night.iloc[t]:
+                ax.axvspan(t - 0.5, t + 0.5, color="0.90", zorder=0)
+    ax1.plot(flux.time_hr, flux.A_sun, "-", color="darkorange", lw=1.6,
+             label="sunlit A")
+    ax1.plot(flux.time_hr, flux.A_shade, "--", color="gold", lw=1.6,
+             label="shaded A")
+    ax1.set_ylabel(r"A  ($\mu$mol CO$_2$ m$^{-2}$ s$^{-1}$)")
+    ax1.legend(loc="upper left")
+    ax1.grid(alpha=0.3)
+    ax1.set_title("Diurnal leaf response (5 days, coupled C4 + Ball-Berry)")
+    ax2.plot(flux.time_hr, flux.rs_sun, "-", color="seagreen", lw=1.6,
+             label="sunlit rs")
+    ax2.plot(flux.time_hr, flux.rs_shade, "--", color="mediumseagreen",
+             lw=1.6, label="shaded rs")
+    ax2.set_xlabel("time (h)")
+    ax2.set_ylabel(r"r$_s$  (s m$^{-1}$)")
+    ax2.legend(loc="upper right")
+    ax2.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_pure_python(flux: pd.DataFrame, path: str) -> None:
+    """Two-panel line figure (A top, rs bottom) with a stdlib PNG writer."""
+    W, H = 1100, 700
+    cv = Canvas(W, H)
+    axis_col, txt_col = (70, 70, 70), (30, 30, 30)
+    sun_a, shade_a = (217, 119, 6), (176, 141, 0)
+    sun_rs, shade_rs = (46, 139, 87), (60, 179, 113)
+    night = flux["A_sun"] < 0
+    xs = flux["time_hr"].to_numpy(float)
+
+    cv.text(W // 2 - 240, 12,
+            "DIURNAL LEAF RESPONSE (5 DAYS, COUPLED C4 + BALL-BERRY)",
+            txt_col, scale=2)
+
+    panels = [
+        dict(y0=55, y1=320, col_s=sun_a, col_d=shade_a,
+             ys=(flux["A_sun"], flux["A_shade"]),
+             lab="A (UMOL CO2 M-2 S-1)", leg=("SUNLIT A", "SHADED A")),
+        dict(y0=400, y1=655, col_s=sun_rs, col_d=shade_rs,
+             ys=(flux["rs_sun"], flux["rs_shade"]),
+             lab="RS (S M-1)", leg=("SUNLIT RS", "SHADED RS")),
+    ]
+    x0, x1 = 95, 1075
+    for pi, p in enumerate(panels):
+        ylo, yhi = float(np.min(p["ys"][0])), float(np.max(p["ys"][1]))
+        pad = 0.08 * (yhi - ylo)
+        ylo, yhi = ylo - pad, yhi + pad
+        ticks, _ = _nice_ticks(ylo, yhi)
+        X = lambda v: x0 + (v - xs.min()) / (xs.max() - xs.min()) * (x1 - x0)
+        Y = lambda v: p["y1"] - (v - ylo) / (yhi - ylo) * (p["y1"] - p["y0"])
+        # night shading
+        for t in range(len(flux)):
+            if night.iloc[t]:
+                cv.rect(X(t - 0.5), p["y0"], X(t + 0.5), p["y1"], (238, 238, 238))
+        # grid + y ticks
+        for tv in ticks:
+            cv.hline(x0, x1, Y(tv), (225, 225, 225))
+            cv.vline(Y(tv) - 3, Y(tv) + 3, x0, axis_col)
+            s = _fmt(tv)
+            cv.text(x0 - 8 - len(s) * 6, int(Y(tv)) - 3, s, txt_col)
+        # axes
+        cv.vline(p["y0"], p["y1"], x0, axis_col)
+        cv.hline(x0, x1, p["y1"], axis_col)
+        # x ticks
+        for tv in range(0, 121, 20):
+            cv.vline(p["y1"], p["y1"] + 3, X(tv), axis_col)
+            if pi == 1:
+                s = _fmt(tv)
+                cv.text(int(X(tv)) - len(s) * 3, p["y1"] + 8, s, txt_col)
+        # curves (solid sun, dashed shade)
+        for j, (ys, col) in enumerate(((p["ys"][0], p["col_s"]),
+                                       (p["ys"][1], p["col_d"]))):
+            dist = 0.0
+            for i in range(len(xs) - 1):
+                xa, ya = X(xs[i]), Y(ys[i])
+                xb, yb = X(xs[i + 1]), Y(ys[i + 1])
+                seg = ((xb - xa) ** 2 + (yb - ya) ** 2) ** 0.5
+                if j == 1 and int(dist // 18) % 2 == 1:
+                    dist += seg
+                    continue
+                steps = max(2, int(seg))
+                for s in range(steps + 1):
+                    px = int(round(xa + (xb - xa) * s / steps))
+                    py = int(round(ya + (yb - ya) * s / steps))
+                    cv.put(px, py, col)
+                    cv.put(px, py + 1, col)
+                dist += seg
+        # labels + legend
+        cv.text(12, p["y0"] - 4, p["lab"], txt_col)
+        lx = x1 - 150
+        for k, (lab, col, dash) in enumerate((
+                (p["leg"][0], p["col_s"], False),
+                (p["leg"][1], p["col_d"], True))):
+            ly = p["y0"] + 12 + k * 16
+            if dash:
+                for seg_i in (0, 8, 16):
+                    cv.hline(lx + seg_i, lx + seg_i + 5, ly + 3, col)
+            else:
+                cv.hline(lx, lx + 21, ly + 3, col)
+            cv.text(lx + 28, ly, lab, txt_col)
+    cv.text(W // 2 - 30, H - 20, "TIME (H)", txt_col)
+    cv.save(path)
+
+
+# ------------------------------- main ---------------------------------
+def main() -> None:
+    with open(os.path.join(DATA, "leaf_params.json")) as fh:
+        params = json.load(fh)
+    forcing = pd.read_csv(os.path.join(DATA, "forcing.csv"))
+    with open(os.path.join(DATA, "test_cases.json")) as fh:
+        cases = json.load(fh)
+
+    pathway = params["pathway"]
+    alpha_q = float(params["alpha_q"])
+    os.makedirs(RESULTS, exist_ok=True)
+
+    # ------------------------- diurnal time series --------------------
+    records = []
+    ci_prev = {"sun": None, "shade": None}
+    for _, row in forcing.iterrows():
+        env = build_env(row, params)
+        rec = {"time_hr": row["time_hr"]}
+        for tag, col in (("sun", "par_sun_wm2"), ("shade", "par_shade_wm2")):
+            par = float(row[col])
+            if par < NIGHT_PAR:
+                st = night_state(env)
+            else:
+                ci0 = ci_prev[tag] if ci_prev[tag] is not None else 0.5 * env["ca"]
+                st = solve_fixed_point(ci0, env, APAR_FACTOR * par, pathway,
+                                       alpha_q)
+            ci_prev[tag] = st["ci"]
+            rec[f"A_{tag}"] = st["a"]
+            rec[f"rs_{tag}"] = st["rs"]
+            rec[f"ci_{tag}"] = st["ci"]
+            rec[f"gs_{tag}"] = st["gs"]
+        records.append(rec)
+
+    flux = pd.DataFrame(records, columns=[
+        "time_hr", "A_sun", "A_shade", "rs_sun", "rs_shade",
+        "ci_sun", "ci_shade", "gs_sun", "gs_shade"])
+    flux.to_csv(os.path.join(RESULTS, "leaf_fluxes.csv"), index=False)
+
+    # ------------------------- single-point cases ---------------------
+    case_rows = []
+    for case in cases:
+        row = forcing.iloc[int(case["forcing_index"])]
+        env = build_env(row, params)
+        # case leaves evaluated on the sunlit forcing (par_sun_wm2); at
+        # forcing_index 12 both strata are Vcmax-limited, so the result
+        # is identical with par_shade_wm2 (verified in diagnostics).
+        par = float(row["par_sun_wm2"])
+        st = solve_fixed_point(float(case["ci_init_pa"]), env,
+                               APAR_FACTOR * par, pathway, alpha_q)
+        case_rows.append(dict(case_id=case["case_id"],
+                              ci_init_pa=case["ci_init_pa"],
+                              ci_final_pa=st["ci"],
+                              A_final=st["a"],
+                              rs_final=st["rs"],
+                              n_iterations=st["n_iter"]))
+    case_df = pd.DataFrame(case_rows, columns=[
+        "case_id", "ci_init_pa", "ci_final_pa", "A_final", "rs_final",
+        "n_iterations"])
+    case_df.to_csv(os.path.join(RESULTS, "case_convergence.csv"), index=False)
+
+    # ------------------------------- figure ---------------------------
+    png_path = os.path.join(RESULTS, "diurnal.png")
+    try:
+        plot_matplotlib(flux, png_path)
+        fig_backend = "matplotlib"
+    except ImportError:
+        plot_pure_python(flux, png_path)
+        fig_backend = "pure-python fallback (matplotlib no disponible)"
+    print(f"figura: {png_path}  [backend: {fig_backend}]")
+
+    # ----------------------------- diagnostics ------------------------
+    print("=" * 72)
+    night = flux["A_sun"] < 0
+    print(f"pathway={pathway}  rows={len(flux)}  "
+          f"night rows={int(night.sum())}  day rows={int((~night).sum())}")
+    r12 = flux.iloc[12]
+    print("\nFila 12 (sanity check vs estimacion a mano Ci~31, A~39, "
+          "gs~0.25, rs~167):")
+    for tag in ("sun", "shade"):
+        print(f"  {tag:5s}: Ci={r12[f'ci_{tag}']:.3f} Pa  "
+              f"A={r12[f'A_{tag}']:.3f} umol m-2 s-1  "
+              f"gs={r12[f'gs_{tag}']:.4f} mol m-2 s-1  "
+              f"rs={r12[f'rs_{tag}']:.2f} s m-1")
+    nf = flux[night]
+    ca0 = float(forcing.co2_pa.iloc[0])
+    print(f"\nNoche: A min={nf.A_sun.min():.4f} (=-Rd), "
+          f"gs max={nf.gs_sun.max():.4f} (=b0), "
+          f"rs min={nf.rs_sun.min():.1f} (cf/b0), "
+          f"ci max={nf.ci_sun.max():.3f}; ca={ca0:.4f}")
+    assert np.isfinite(flux.to_numpy()).all(), "NaN/inf en leaf_fluxes"
+    assert (nf.ci_sun > ca0).all() and (nf.ci_shade > ca0).all(), \
+        "noche: Ci debe ser > ca"
+    env12 = build_env(forcing.iloc[12], params)
+    st_sh = solve_fixed_point(0.5 * env12["ca"], env12,
+                              APAR_FACTOR * float(forcing.par_shade_wm2.iloc[12]),
+                              pathway, alpha_q)
+    print(f"\nFila 12 shade-only: Ci={st_sh['ci']:.3f} A={st_sh['a']:.3f} "
+          f"rs={st_sh['rs']:.2f} (debe coincidir con sun: ambos Vcmax-limited)")
+    print("\nCasos:")
+    print(case_df.to_string(index=False))
+    print("\nOK: results/leaf_fluxes.csv, results/case_convergence.csv, "
+          "results/diurnal.png escritos.")
+
+
+if __name__ == "__main__":
+    main()

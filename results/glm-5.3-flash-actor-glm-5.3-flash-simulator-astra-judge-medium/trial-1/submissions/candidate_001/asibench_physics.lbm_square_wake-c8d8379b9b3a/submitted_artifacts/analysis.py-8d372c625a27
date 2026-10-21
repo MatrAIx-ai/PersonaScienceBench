@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+LBM (D2Q9, BGK) simulation of flow past a square solid region in a rectangular
+lattice domain, driven solely by ./data/task_input.json.
+
+Outputs (exactly as required by the task contract):
+  ./results/fluid_summary.csv            case_id,nx,ny,re,uin,nu,tau,n_steps,cd_mean,cl_rms,converged
+  ./results/fluid_force_series.csv       case_id,step,cd,cl
+  ./results/fluid_centerline.csv         case_id,x,u          (nx rows per case, y = square_center_y, u = ux)
+  ./results/fluid_transverse_profile.csv case_id,x_probe,y,u,v (ny rows per case, x_probe = min(nx-1, cx+2*size), u = |u|, v = uy)
+  ./results/fluid_report.json            task_id, units, cd_mean_avg, method_summary (+ per-case details)
+
+Method (documented in fluid_report.json):
+  - D2Q9 lattice, weights w = [4/9, 1/9 x4, 1/36 x4], lattice units dx=dt=1.
+  - BGK collision with tau = 0.5 + 3*nu, nu = uin * square_size / re (contract formula).
+  - Initial field (deterministic and exactly symmetric): rho = 1 everywhere,
+    u = (uin, 0) at every fluid node, u = (0,0) inside the solid; f initialized at the
+    equilibrium of that field. No random noise, no pre-settling.
+  - Inlet (x=0): fixed-velocity equilibrium BC, rho = 1, u = (uin, 0).
+  - Outlet (x=nx-1): fixed-density equilibrium (rho = 1) with velocity extrapolated
+    from the penultimate column (standard pressure outlet; bounds density drift).
+  - Top/bottom (y=0, y=ny-1): specular-reflection (free-slip) walls, chosen to emulate
+    an unbounded lateral domain (modeling assumption, documented).
+  - Obstacle: link-wise half-way bounce-back on every fluid->solid link of the exact
+    solid mask x in [cx-half, cx-half+size), y in [cy-half, cy-half+size), half = size//2,
+    clipped to the domain.
+  - Force: momentum exchange on the solid, accumulated from post-collision populations
+    on each boundary link: contribution = 2 * f_i*(x) * c_i (fluid loses this momentum,
+    the solid gains it). Fx, Fy are per-step lattice-unit forces.
+  - Time window: exactly n_steps updates starting from the deterministic initial field;
+    steps are numbered 1..n_steps; the first warmup_steps steps are excluded from
+    statistics; (cd, cl) are recorded only at steps with (step - warmup_steps) % sample_every == 0.
+  - converged: over the sampled window, compare the mean cd of the first 80% of samples
+    with the mean cd of the last 20%; converged = (relative drift < 5%) or (absolute
+    change < 1e-3).
+  - cd_mean_avg = unweighted mean of the per-case cd_mean values.
+  - float64 everywhere (required by tau as low as 0.510125).
+"""
+
+import json
+import os
+import time
+
+import numpy as np
+import pandas as pd
+
+DATA_PATH = "./data/task_input.json"
+RESULTS_DIR = "./results"
+
+# direction index: 0:(0,0) 1:(1,0) 2:(0,1) 3:(-1,0) 4:(0,-1) 5:(1,1) 6:(-1,1) 7:(-1,-1) 8:(1,-1)
+CX = np.array([0, 1, 0, -1, 0, 1, -1, -1, 1], dtype=np.int64)
+CY = np.array([0, 0, 1, 0, -1, 1, 1, -1, -1], dtype=np.int64)
+W = np.array([4.0 / 9.0] + [1.0 / 9.0] * 4 + [1.0 / 36.0] * 4, dtype=np.float64)
+OPP = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6], dtype=np.int64)  # opposite direction index
+
+
+def equilibrium(rho, ux, uy, w=W, cx=CX, cy=CY):
+    """D2Q9 equilibrium distributions, shape (9, ny, nx) or (9, n) for a column."""
+    uu = 1.5 * (ux * ux + uy * uy)
+    feq = np.empty((9,) + rho.shape, dtype=np.float64)
+    for i in range(9):
+        cu = 3.0 * (cx[i] * ux + cy[i] * uy)
+        feq[i] = w[i] * rho * (1.0 + cu + 0.5 * cu * cu - uu)
+    return feq
+
+
+def make_solid_mask(nx, ny, square_center, square_size):
+    """Exact solid mask per contract: [cx-half, cx-half+size) x [cy-half, cy-half+size), clipped."""
+    cx, cy = int(square_center[0]), int(square_center[1])
+    size = int(square_size)
+    half = size // 2
+    x0, x1 = max(0, cx - half), min(nx, cx - half + size)
+    y0, y1 = max(0, cy - half), min(ny, cy - half + size)
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[y0:y1, x0:x1] = True
+    return mask, (x0, x1, y0, y1)
+
+
+def simulate_case(case):
+    nx, ny = int(case["nx"]), int(case["ny"])
+    uin = float(case["uin"])
+    re = float(case["re"])
+    size = int(case["square_size"])
+    n_steps = int(case["n_steps"])
+    warmup = int(case["warmup_steps"])
+    sample_every = int(case["sample_every"])
+
+    nu = uin * size / re
+    tau = 0.5 + 3.0 * nu
+    omega = 1.0 / tau
+
+    solid, box = make_solid_mask(nx, ny, case["square_center"], size)
+    fluid = ~solid
+
+    # Precomputed boundary-link index sets (fluid node whose neighbour in direction s is solid)
+    link_idx = []
+    for s in range(1, 9):
+        neighbour = np.roll(solid, shift=(-CY[s], -CX[s]), axis=(0, 1))
+        link_idx.append(np.where(fluid & neighbour))
+
+    cx_c, cy_c = int(case["square_center"][0]), int(case["square_center"][1])
+    x_probe = min(nx - 1, cx_c + 2 * size)
+
+    # ---- deterministic, exactly symmetric initial field ----
+    ux0 = np.full((ny, nx), uin, dtype=np.float64)
+    ux0[solid] = 0.0
+    f = equilibrium(np.ones((ny, nx)), ux0, np.zeros((ny, nx)))
+
+    # inlet equilibrium column (constant every step)
+    feq_in = equilibrium(np.ones(ny), np.full(ny, uin), np.zeros(ny))  # (9, ny)
+
+    feq_out = equilibrium(np.ones(ny), np.full(ny, uin), np.zeros(ny))
+    sample_set = set(range(warmup + sample_every, n_steps + 1, sample_every))
+    sample_set.add(n_steps)  # (n_steps - warmup) % sample_every == 0 here
+
+    force_rows = []
+    t0 = time.time()
+    denom = 0.5 * uin * uin * size
+
+    for step in range(1, n_steps + 1):
+        # ---- macroscopic fields (solid nodes pinned to rho=1, u=0) ----
+        rho = f.sum(axis=0)
+        ux = (f[1] - f[3] + f[5] + f[8] - f[6] - f[7]) / rho
+        uy = (f[2] - f[4] + f[5] + f[6] - f[7] - f[8]) / rho
+        rho[solid] = 1.0
+        ux[solid] = 0.0
+        uy[solid] = 0.0
+        feq_out = equilibrium(np.ones(ny), ux[:, -2], uy[:, -2])
+
+        # ---- BGK collision ----
+        feq = equilibrium(rho, ux, uy)
+        f += (feq - f) * omega
+        f_star = f.copy()
+
+        # ---- momentum exchange on solid (post-collision populations on boundary links) ----
+        fx = fy = 0.0
+        for s in range(1, 9):
+            yi, xi = link_idx[s - 1]
+            fs = f_star[s][yi, xi].sum()
+            fx += 2.0 * fs * CX[s]
+            fy += 2.0 * fs * CY[s]
+        cd = fx / denom
+        cl = fy / denom
+
+        if step in sample_set:
+            force_rows.append((step, cd, cl))
+
+        # ---- streaming (pull via roll; node receives from x - c) ----
+        for i in range(1, 9):
+            f[i] = np.roll(f[i], (CY[i], CX[i]), axis=(0, 1))
+
+        # ---- half-way bounce-back on fluid->solid links: f_opp[s](x') = f_s*(x') ----
+        for s in range(1, 9):
+            yi, xi = link_idx[s - 1]
+            f[OPP[s]][yi, xi] = f_star[s][yi, xi]
+
+        # ---- free-slip (specular) top/bottom walls ----
+        # y=0 (bottom): populations arriving from outside (cy=+1: 2,5,6) reflect
+        # the outgoing toward-wall populations (cy=-1: 4,7,8)
+        f[2][0, :] = f_star[4][0, :]
+        f[5][0, :] = f_star[8][0, :]
+        f[6][0, :] = f_star[7][0, :]
+        # y=ny-1 (top): populations arriving from outside (cy=-1: 4,7,8) reflect
+        # the outgoing toward-wall populations (cy=+1: 2,5,6)
+        f[4][-1, :] = f_star[2][-1, :]
+        f[7][-1, :] = f_star[5][-1, :]
+        f[8][-1, :] = f_star[6][-1, :]
+
+        # ---- inlet: fixed-velocity equilibrium; outlet: fixed-density (rho=1)
+      # equilibrium with velocity extrapolated from the penultimate column ----
+        f[:, :, 0] = feq_in
+        f[:, :, -1] = feq_out
+
+    elapsed = time.time() - t0
+
+    # ---- final-state diagnostics ----
+    rho = f.sum(axis=0)
+    ux = (f[1] - f[3] + f[5] + f[8] - f[6] - f[7]) / rho
+    uy = (f[2] - f[4] + f[5] + f[6] - f[7] - f[8]) / rho
+    rho[solid] = 1.0
+    ux[solid] = 0.0
+    uy[solid] = 0.0
+
+    # ---- statistics over the sampled window ----
+    steps = np.array([r[0] for r in force_rows], dtype=np.int64)
+    cds = np.array([r[1] for r in force_rows], dtype=np.float64)
+    cls = np.array([r[2] for r in force_rows], dtype=np.float64)
+    cd_mean = float(cds.mean())
+    cl_rms = float(np.sqrt(np.mean(cls ** 2)))
+
+    n = len(cds)
+    n_tail = max(1, int(np.ceil(0.2 * n)))
+    m_head = cds[: n - n_tail].mean()
+    m_tail = cds[-n_tail:].mean()
+    diff = abs(m_tail - m_head)
+    rel = diff / max(abs(m_head), 1e-12)
+    converged = bool(rel < 0.05 or diff < 1e-3)
+
+    trans = {
+        "x_probe": x_probe,
+        "u": np.sqrt(ux[:, x_probe] ** 2 + uy[:, x_probe] ** 2),
+        "v": uy[:, x_probe].copy(),
+    }
+    info = {
+        "case_id": case["case_id"], "nx": nx, "ny": ny, "re": re, "uin": uin,
+        "nu": nu, "tau": tau, "n_steps": n_steps, "warmup_steps": warmup,
+        "sample_every": sample_every,
+        "cd_mean": cd_mean, "cl_rms": cl_rms, "converged": converged,
+        "solid_box": box, "x_probe": x_probe, "centerline_y": cy_c,
+        "n_samples": n, "first_sample_step": int(steps[0]),
+        "last_sample_step": int(steps[-1]), "runtime_s": elapsed,
+    }
+    series = [(case["case_id"], int(r[0]), float(r[1]), float(r[2])) for r in force_rows]
+    return info, series, ux[cy_c, :].copy(), trans
+
+
+def main():
+    with open(DATA_PATH, "rb") as fh:
+        raw = fh.read()
+    data = json.loads(raw.decode("utf-8-sig"))
+
+    cases = data["cases"]
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    summary_rows, all_series, center_rows, profile_rows, per_case = [], [], [], [], {}
+    total_t0 = time.time()
+
+    for case in cases:
+        cid = case["case_id"]
+        print(f"[run] case {cid}: nx={case['nx']} ny={case['ny']} re={case['re']} "
+              f"steps={case['n_steps']}", flush=True)
+        info, series, cl_u, trans = simulate_case(case)
+
+        for x in range(info["nx"]):
+            center_rows.append((cid, x, float(cl_u[x])))
+        for y in range(info["ny"]):
+            profile_rows.append((cid, trans["x_probe"], y,
+                                 float(trans["u"][y]), float(trans["v"][y])))
+        summary_rows.append((cid, info["nx"], info["ny"], info["re"], info["uin"],
+                             info["nu"], info["tau"], info["n_steps"],
+                             info["cd_mean"], info["cl_rms"], info["converged"]))
+        all_series.extend(series)
+        per_case[cid] = {k: (bool(v) if isinstance(v, (np.bool_, bool)) else v)
+                         for k, v in info.items()}
+        print(f"[done] {cid}: cd_mean={info['cd_mean']:.5f} cl_rms={info['cl_rms']:.5f} "
+              f"converged={info['converged']} ({info['runtime_s']:.1f}s, "
+              f"{info['n_samples']} samples)", flush=True)
+
+    # ---- finite-value guard on every numeric value written ----
+    def check_finite(df, name):
+        vals = df.select_dtypes(include=[np.floating]).to_numpy()
+        if not np.all(np.isfinite(vals)):
+            raise ValueError(f"non-finite values in {name}")
+
+    df_summary = pd.DataFrame(summary_rows, columns=[
+        "case_id", "nx", "ny", "re", "uin", "nu", "tau", "n_steps",
+        "cd_mean", "cl_rms", "converged"])
+    df_series = pd.DataFrame(all_series, columns=["case_id", "step", "cd", "cl"])
+    df_center = pd.DataFrame(center_rows, columns=["case_id", "x", "u"])
+    df_profile = pd.DataFrame(profile_rows, columns=["case_id", "x_probe", "y", "u", "v"])
+    for df, nm in ((df_summary, "summary"), (df_series, "force_series"),
+                   (df_center, "centerline"), (df_profile, "transverse")):
+        check_finite(df, nm)
+
+    df_summary.to_csv(os.path.join(RESULTS_DIR, "fluid_summary.csv"), index=False)
+    df_series.to_csv(os.path.join(RESULTS_DIR, "fluid_force_series.csv"), index=False)
+    df_center.to_csv(os.path.join(RESULTS_DIR, "fluid_centerline.csv"), index=False)
+    df_profile.to_csv(os.path.join(RESULTS_DIR, "fluid_transverse_profile.csv"), index=False)
+
+    cd_mean_avg = float(df_summary["cd_mean"].mean())
+    method_summary = (
+        "D2Q9 lattice-Boltzmann with BGK collision, tau = 0.5 + 3*nu with "
+        "nu = uin*square_size/re (contract formula; float64 throughout). Deterministic, "
+        "exactly symmetric initial field: rho=1, u=(uin,0) on fluid nodes, u=0 inside the "
+        "solid; f initialized at equilibrium (no random perturbation, no pre-settling). "
+        "BCs: inlet x=0 fixed-velocity equilibrium (rho=1, u=(uin,0)); outlet x=nx-1 "
+        "fixed-density equilibrium (rho=1) with velocity extrapolated from the penultimate "
+        "column (standard pressure outlet, chosen after a zero-gradient outlet caused "
+        "unbounded mass accumulation; with this outlet the global mean density stays "
+        "within ~2e-3 of 1 over the full window); "
+        "top/bottom specular-reflection free-slip walls (modeling assumption emulating an "
+        "unbounded lateral domain). Obstacle: exact solid mask [cx-half, cx-half+size) x "
+        "[cy-half, cy-half+size), half=size//2, treated with link-wise half-way bounce-back "
+        "on all fluid->solid links. Force: momentum exchange per step from post-collision "
+        "populations, contribution 2*f_i*(x)*c_i per boundary link; cd = Fx/(0.5*uin^2*size), "
+        "cl = Fy/(0.5*uin^2*size). Time window: exactly n_steps updates, steps 1..n_steps, "
+        "first warmup_steps steps excluded, (cd,cl) recorded only at steps with "
+        "(step-warmup_steps)%sample_every==0. cd_mean = arithmetic mean of sampled cd; "
+        "cl_rms = sqrt(mean(cl^2)) over the same samples. converged: mean cd of last 20% of "
+        "sampled window vs first 80%: relative drift < 5% or absolute change < 1e-3. "
+        "centerline 'u' = ux at y = square_center_y (final state, step n_steps); transverse "
+        "'u' = |u| magnitude and 'v' = uy at x_probe = min(nx-1, cx+2*size) (final state). "
+        "cd_mean_avg = unweighted mean of per-case cd_mean. Initial field is exactly "
+        "symmetric; no artificial asymmetry was injected, so near-zero cl indicates a "
+        "symmetry-locked or symmetric-stable wake in this deterministic configuration."
+    )
+    report = {
+        "task_id": data.get("task_id", "unknown"),
+        "units": data.get("units", "dimensionless"),
+        "cd_mean_avg": cd_mean_avg,
+        "method_summary": method_summary,
+        "per_case": per_case,
+    }
+    json_text = json.dumps(report, indent=2)
+    if "NaN" in json_text or "Infinity" in json_text:
+        raise ValueError("non-finite values in fluid_report.json")
+    with open(os.path.join(RESULTS_DIR, "fluid_report.json"), "w") as fh:
+        fh.write(json_text)
+
+    print(f"[all] total runtime {time.time() - total_t0:.1f}s; cd_mean_avg={cd_mean_avg:.5f}",
+          flush=True)
+
+
+if __name__ == "__main__":
+    main()

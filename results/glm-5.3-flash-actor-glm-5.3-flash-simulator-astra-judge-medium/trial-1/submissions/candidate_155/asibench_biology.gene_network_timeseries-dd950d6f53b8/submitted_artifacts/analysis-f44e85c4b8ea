@@ -1,0 +1,364 @@
+"""
+Gene regulatory network inference from time-series + steady-state perturbation data.
+
+Methods:
+  A) Time-series vector-field regression: Savitzky-Golay derivatives of the 5 replicate
+     series pooled; per-target elastic net (alpha/l1_ratio by 5-fold CV) with
+     block-bootstrap stability selection.
+  B) Steady-state perturbation sparse regression: per-gene Lasso (LOO-CV alpha, row
+     bootstrap) of each gene's perturbation response on the other genes' responses.
+  C) Lagged-correlation baseline (unsigned, comparison only).
+Combination: weighted geometric mean of per-method max-normalized confidence scores,
+thresholded to ~20% off-diagonal density (asserted within [5%, 40%]).
+
+NOTE: scikit-learn is unavailable in this offline environment, so the elastic-net /
+Lasso coordinate-descent solver (standard covariance-update formulation, Friedman et
+al. 2010), CV loops and bootstrap loops are implemented with numpy.
+"""
+import json, time
+import numpy as np
+from scipy.signal import savgol_filter
+
+RNG = np.random.default_rng(0)
+DT = 0.612245
+N_GENES = 25
+EPS = 1e-6  # degeneracy guard: exact-0.0 knockdown values cannot blow up scaling
+t0 = time.time()
+
+def _soft(x, t):
+    return np.sign(x) * np.maximum(np.abs(x) - t, 0.0)
+
+def enet_cd(G, Xty, n, alpha, l1_ratio, w0=None, max_iter=400, tol=1e-6):
+    """Coordinate descent for (1/(2n))||y-Xw||^2 + alpha*(l1r*|w|_1 + (1-l1r)/2*|w|^2)."""
+    p = G.shape[0]
+    w = np.zeros(p) if w0 is None else w0.copy()
+    lam = alpha * l1_ratio
+    Gd = np.diag(G).copy()
+    Gd_n = Gd / n
+    for it in range(max_iter):
+        q = Xty - G @ w                  # exact refresh each sweep: no incremental drift
+        change = 0.0
+        for j in range(p):
+            gjj = Gd_n[j]                # per-feature variance in this training subset
+            if gjj <= 0.0:
+                w[j] = 0.0
+                continue
+            rho = (q[j] + Gd[j] * w[j]) / n
+            # correct per-coordinate curvature: gjj + alpha*(1-l1r) (+ tiny ridge floor)
+            wj = _soft(rho, lam) / (gjj + alpha * (1.0 - l1_ratio) + 1e-3)
+            d = wj - w[j]
+            if d != 0.0:
+                q -= G[:, j] * d
+                w[j] = wj
+                if abs(d) > change:
+                    change = abs(d)
+        if change < tol:
+            break
+    if not np.isfinite(w).all():
+        w = np.where(np.isfinite(w), w, 0.0)
+    return w
+
+def alpha_grid(Xty, n, l1_ratio, n_alpha=25, eps=1e-2):
+    lam_max = np.max(np.abs(Xty)) / n / max(l1_ratio, 1e-3)
+    return np.geomspace(lam_max, lam_max * eps, n_alpha)
+
+def kfold_folds(n, k, seed):
+    idx = np.random.default_rng(seed).permutation(n)
+    return np.array_split(idx, k)
+
+# ============================================================ load & checks
+ts = np.load('data/expression_timeseries.npy')          # (5, 50, 25)
+ps = np.load('data/perturbation_steady_states.npy')     # (16, 25)
+assert ts.shape == (5, 50, 25) and ps.shape == (16, 25)
+assert np.isfinite(ts).all() and np.isfinite(ps).all()
+base = ps[0]
+delta = ps[1:] - base                                   # (15, 25)
+NEAR_BASELINE_DELTA_ROW = 1   # ps array index 2 -> delta row index 1 (near-baseline row)
+
+# ============================================================ Method A
+dx_all, x_all = [], []
+for s in range(ts.shape[0]):
+    x = ts[s]
+    dx = savgol_filter(x, window_length=7, polyorder=2, deriv=1, delta=DT, axis=0)
+    x_all.append(x); dx_all.append(dx)
+X = np.vstack(x_all)                                    # (250, 25)
+dX = np.vstack(dx_all)
+mu, sd = X.mean(0), X.std(0) + EPS
+Xz = (X - mu) / sd
+nA = X.shape[0]
+L1R_A = (0.5, 1.0)
+# time-block folds: fold k = contiguous block k of every series (no temporal leakage)
+foldsA = [np.concatenate([np.arange(s*50 + k*10, s*50 + (k+1)*10)
+                          for s in range(5)]) for k in range(5)]
+# precompute per-fold gram matrices once (features gram does not depend on target)
+fold_grams = []
+for f in foldsA:
+    te = np.zeros(nA, bool); te[f] = True; tr = ~te
+    fold_grams.append((Xz[tr].T @ Xz[tr], tr, te))
+
+coefA = np.zeros((N_GENES, N_GENES))
+meanAbsA = np.zeros((N_GENES, N_GENES))
+meanSA = np.zeros((N_GENES, N_GENES))
+stabA = np.zeros((N_GENES, N_GENES))
+r2A = np.zeros(N_GENES)
+n_boot_A = 60
+blocks = [np.arange(k, min(k + 10, Xz.shape[0])) for k in range(0, Xz.shape[0], 10)]
+for i in range(N_GENES):
+    y = dX[:, i]
+    yz = (y - y.mean()) / (y.std() + EPS)
+    # CV over (alpha, l1_ratio); per (fold, l1r) run a warm-started alpha path
+    cv_mse = {}
+    for l1r in L1R_A:
+        grid = alpha_grid(Xz.T @ yz, nA, l1r)
+        for gi, (G_tr, tr, te) in enumerate(fold_grams):
+            Xty_tr = Xz[tr].T @ yz[tr]
+            wpath = None
+            for a in grid:
+                w = enet_cd(G_tr, Xty_tr, tr.sum(), a, l1r, w0=wpath)
+                wpath = w
+                err = ((yz[te] - Xz[te] @ w) ** 2).sum()
+                cv_mse[(a, l1r)] = cv_mse.get((a, l1r), 0.0) + err
+    cv_mse = {k2: v / nA for k2, v in cv_mse.items()}
+    (a_best, l1r_best) = min(cv_mse, key=cv_mse.get)
+    # CV R2 for the chosen hyperparameters
+    pred = np.zeros(nA)
+    for (G_tr, tr, te) in fold_grams:
+        w = enet_cd(G_tr, Xz[tr].T @ yz[tr], tr.sum(), a_best, l1r_best)
+        pred[te] = Xz[te] @ w
+    r2A[i] = 1.0 - ((yz - pred) ** 2).sum() / ((yz - yz.mean()) ** 2).sum()
+    w_full = enet_cd(Xz.T @ Xz, Xz.T @ yz, nA, a_best, l1r_best)
+    coefA[i] = w_full
+    sel = np.zeros(N_GENES)
+    sum_abs = np.zeros(N_GENES)
+    sum_signed = np.zeros(N_GENES)
+    for b in range(n_boot_A):
+        pick = RNG.integers(0, len(blocks), len(blocks))
+        idx = np.concatenate([blocks[k] for k in pick])
+        Xt, yt = Xz[idx], yz[idx]
+        wb = enet_cd(Xt.T @ Xt, Xt.T @ yt, len(idx), a_best, l1r_best)
+        sel += (np.abs(wb) > 1e-10).astype(float)
+        sum_abs += np.abs(wb)
+        sum_signed += wb
+    stabA[i] = sel / n_boot_A
+    meanAbsA[i] = sum_abs / n_boot_A          # bootstrap-aggregated magnitude (dense)
+    meanSA[i] = sum_signed / n_boot_A         # bootstrap-majority signed effect
+scoreA = meanAbsA
+np.fill_diagonal(scoreA, 0.0)
+print(f"[A] mean CV R2 = {r2A.mean():.3f}  ({time.time()-t0:.1f}s)", flush=True)
+
+# ============================================================ Method B
+L1R_B = 0.9
+
+def methodB_rows(rows, n_boot=200):
+    D = delta[rows]
+    sdD = D.std(0) + EPS            # eps guards exact-0.0 knockdown columns in scaling
+    Dz = D / sdD
+    assert np.isfinite(Dz).all() and sdD.min() > 0, "degenerate predictor scaling"
+    print(f"    [B] predictor sd min={sdD.min():.4f} (epsilon-guarded), finite OK")
+    n = len(rows)
+    coef = np.zeros((N_GENES, N_GENES)); stab = np.zeros((N_GENES, N_GENES))
+    meanAbs = np.zeros((N_GENES, N_GENES)); meanS = np.zeros((N_GENES, N_GENES))
+    r2 = np.zeros(N_GENES)
+    for i in range(N_GENES):
+        y = Dz[:, i].copy()
+        Xd = np.delete(Dz, i, axis=1)
+        cols = [j for j in range(N_GENES) if j != i]
+        G = Xd.T @ Xd; Xty = Xd.T @ y
+        grid = alpha_grid(Xty, n, L1R_B, n_alpha=25, eps=1e-2)
+        # LOO-CV alpha selection with warm-started path per fold (downdated gram)
+        cv_err = np.zeros(len(grid))
+        loo_ws = {}
+        for k in range(n):
+            Gk = G - np.outer(Xd[k], Xd[k])
+            Xtyk = Xty - Xd[k] * y[k]
+            wpath = None
+            for gi, a in enumerate(grid):
+                w = enet_cd(Gk, Xtyk, n - 1, a, L1R_B, w0=wpath)
+                wpath = w
+                loo_ws[(k, gi)] = w
+                cv_err[gi] += (y[k] - Xd[k] @ w) ** 2
+        gi_best = int(np.argmin(cv_err))
+        a_best = grid[gi_best]
+        # LOO R2 with chosen alpha
+        pred = np.array([Xd[k] @ loo_ws[(k, gi_best)] for k in range(n)])
+        r2[i] = 1.0 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum()
+        w = enet_cd(G, Xty, n, a_best, L1R_B)
+        coef[i, cols] = w
+        sel = np.zeros(N_GENES); sum_abs = np.zeros(N_GENES); sum_signed = np.zeros(N_GENES)
+        for b in range(n_boot):
+            idx = RNG.integers(0, n, n)
+            Xb, yb = Xd[idx], y[idx]
+            wb = enet_cd(Xb.T @ Xb, Xb.T @ yb, n, a_best, L1R_B)
+            sel[cols] += (np.abs(wb) > 1e-10).astype(float)
+            sum_abs[cols] += np.abs(wb)
+            sum_signed[cols] += wb
+        stab[i, cols] = sel[cols] / n_boot
+        meanAbs[i, cols] = sum_abs[cols] / n_boot
+        meanS[i, cols] = sum_signed[cols] / n_boot
+    return meanAbs, stab, coef, r2, meanS
+
+all_rows = np.arange(15)
+scoreB, stabB, coefB, r2B, meanSB = methodB_rows(all_rows)
+# sensitivity: stability with the near-baseline perturbed row (array index 2) removed
+rows_no2 = np.array([r for r in all_rows if r != NEAR_BASELINE_DELTA_ROW])
+scoreB_no2, stabB_no2, _, _, _ = methodB_rows(rows_no2)
+iu = np.triu_indices(N_GENES, 1)
+mean_stabB_with2 = float(stabB[iu].mean())
+mean_stabB_no2 = float(stabB_no2[iu].mean())
+print(f"[B] mean LOO R2 = {r2B.mean():.3f}; stab with/without row2: "
+      f"{mean_stabB_with2:.3f}/{mean_stabB_no2:.3f}  ({time.time()-t0:.1f}s)", flush=True)
+
+# ============================================================ Method C (baseline)
+xc = (X - mu) / sd
+dc = (dX - dX.mean(0)) / (dX.std(0) + EPS)
+scoreC = np.zeros((N_GENES, N_GENES))
+for i in range(N_GENES):
+    for j in range(N_GENES):
+        if i == j:
+            continue
+        c = np.corrcoef(xc[:, j], dc[:, i])[0, 1]
+        scoreC[i, j] = abs(c) if np.isfinite(c) else 0.0
+
+# ============================================================ Combination
+# Per-method max-normalized confidence with a support floor: an edge with explicit
+# support from only one method keeps a small floor (FLOOR) instead of collapsing to
+# zero so the geometric mean can still rank strong single-method edges; edges with
+# support from neither method stay exactly 0.
+FLOOR = 0.05
+sA = np.where(scoreA > 0, np.maximum(scoreA / (scoreA.max() + EPS), FLOOR), 0.0)
+sB = np.where(scoreB > 0, np.maximum(scoreB / (scoreB.max() + EPS), FLOOR), 0.0)
+wA = float(np.clip(r2A.mean() / (r2A.mean() + r2B.mean() + EPS), 0.25, 0.75))
+combined = (sA ** wA) * (sB ** (1 - wA))   # weighted geometric mean
+np.fill_diagonal(combined, 0.0)
+flat = combined[~np.eye(N_GENES, dtype=bool)]
+
+TARGET_DENSITY = 0.20
+K = int(round(TARGET_DENSITY * flat.size))               # 120 of 600 off-diagonal pairs
+supported = flat > 0
+if supported.sum() >= K:
+    thresh = float(np.sort(flat[supported])[-K])
+else:
+    thresh = float(flat[supported].min()) if supported.any() else 0.0
+network = np.where(combined >= thresh, combined, 0.0)
+np.fill_diagonal(network, 0.0)
+
+off = ~np.eye(N_GENES, dtype=bool)
+density = network[off].astype(bool).sum() / off.sum()
+assert 0.05 <= density <= 0.40, f"density {density:.3f} outside [0.05,0.40]"
+assert 0.15 <= density <= 0.25, f"density {density:.3f} outside target band [0.15,0.25]"
+print(f"[check] off-diagonal nonzero density = {density:.3f} "
+      f"({int(network[off].astype(bool).sum())} edges of {off.sum()}) - within 15-25% target")
+
+# ============================================================ Signs
+signs = np.zeros((N_GENES, N_GENES))
+for i in range(N_GENES):
+    for j in range(N_GENES):
+        if network[i, j] == 0.0:
+            continue
+        sa, sb = np.sign(meanSA[i, j]), np.sign(meanSB[i, j])
+        if sa != 0 and sa == sb:
+            signs[i, j] = sa                       # methods agree
+        elif sa != 0 and sb != 0:                  # disagreement: more stable method wins
+            s_pick, stab_pick = (sa, stabA[i, j]) if stabA[i, j] >= stabB[i, j] else (sb, stabB[i, j])
+            signs[i, j] = s_pick if stab_pick >= 0.3 else 0.0
+        elif sa != 0:
+            signs[i, j] = sa if stabA[i, j] >= 0.3 else 0.0
+        elif sb != 0:
+            signs[i, j] = sb if stabB[i, j] >= 0.3 else 0.0
+        # both ~0 (cancelled bootstrap mean) -> leave 0 = uncertain
+assert np.all(signs[network == 0] == 0)
+assert set(np.unique(signs)).issubset({-1.0, 0.0, 1.0})
+n_agree = int(((np.sign(meanSA) == np.sign(meanSB)) & (np.sign(meanSA) != 0) & (network != 0)).sum())
+n_disagree = int(((np.sign(meanSA) != np.sign(meanSB)) & (np.sign(meanSA) != 0) & (np.sign(meanSB) != 0) & (network != 0)).sum())
+print(f"[check] signs: +{int((signs==1).sum())} / -{int((signs==-1).sum())} / "
+      f"uncertain-on-nonzero {int(((signs==0)&(network!=0)).sum())}; "
+      f"methods agree on {n_agree}, disagree-resolved {n_disagree}")
+
+# ============================================================ Hubs & metrics
+out_strength = np.abs(network).sum(axis=0)               # column sums = outgoing influence
+hub_order = np.argsort(-out_strength)
+hub_genes = [int(k) for k in hub_order[:2]]
+
+adj = network != 0
+in_deg = adj.sum(axis=1)                                 # row sums = in-degree
+out_deg = adj.sum(axis=0)                                # column sums = out-degree
+metrics = {
+    "convention": "inferred_network[i,j] = influence of gene j (source) on gene i (target)",
+    "n_edges": int(adj.sum()),
+    "density_offdiagonal": float(density),
+    "n_nodes": N_GENES,
+    "in_degree": {"mean": float(in_deg.mean()), "min": int(in_deg.min()), "max": int(in_deg.max())},
+    "out_degree": {"mean": float(out_deg.mean()), "min": int(out_deg.min()), "max": int(out_deg.max())},
+    "mean_in_strength": float(np.abs(network).sum(axis=1).mean()),
+    "mean_out_strength": float(np.abs(network).sum(axis=0).mean()),
+    "n_positive_edges": int((signs == 1).sum()),
+    "n_negative_edges": int((signs == -1).sum()),
+    "n_nonzero_sign_uncertain": int(((signs == 0) & adj).sum()),
+    "n_reciprocal_edge_pairs": int((adj & adj.T).sum() // 2),
+    "edge_support": {
+        "both_methods": int((adj & (scoreA > 0) & (scoreB > 0)).sum()),
+        "only_method_A": int((adj & (scoreA > 0) & (scoreB == 0)).sum()),
+        "only_method_B": int((adj & (scoreA == 0) & (scoreB > 0)).sum()),
+    },
+    "hub_genes_by_out_strength": hub_genes,
+    "hub_out_strength_values": [float(out_strength[hub_genes[0]]), float(out_strength[hub_genes[1]])],
+}
+assert np.all(np.diag(network) == 0), "diagonal must be zero"
+assert np.isfinite(network).all() and np.isfinite(signs).all()
+
+method_comparison = {
+    "methods": [
+        {"name": "A_vector_field_regression",
+         "description": ("Savitzky-Golay derivatives (window 7, order 2, dt=0.612245) of the 5 "
+                         "replicate series pooled to 250 samples; per-target elastic net "
+                         "(alpha and l1_ratio by 5-fold CV) with 60-replicate block-bootstrap "
+                         "stability selection (10-step blocks). Confidence = bootstrap-aggregated mean |coefficient|; signs from bootstrap-majority signed means."),
+         "score": float(r2A.mean()), "mean_r2": float(r2A.mean()),
+         "stability": float(stabA[stabA > 0].mean()) if (stabA > 0).any() else 0.0,
+         "strengths": ("Estimates direct, signed influences from dynamical data; high SNR "
+                       "(noise sigma ~0.08-0.12 vs signal up to 17.5); replicate pooling "
+                       "denoises derivatives."),
+         "limitations": ("Single initial-condition family limits identifiability; linear "
+                         "approximation; dt=0.612 induces mild derivative bias."),
+         "rationale": "Vector-field regression directly recovers terms of the underlying ODE."},
+        {"name": "B_steady_state_perturbation",
+         "description": ("Per-gene lasso-dominant elastic net (l1_ratio=0.9; alpha by leave-one-out CV, 200 row-bootstrap "
+                         "replicates) of each gene's perturbation response on the other "
+                         "genes' responses across 15 conditions; exact-0 knockdown columns "
+                         "guarded by epsilon in the standardization. Confidence = bootstrap-aggregated mean |coefficient|."),
+         "score": float(r2B.mean()), "mean_r2": float(r2B.mean()),
+         "stability": mean_stabB_with2,
+         "stability_without_near_baseline_row2": mean_stabB_no2,
+         "strengths": ("Independent interventional data type; captures propagated network "
+                       "effects; sign-informative for activation vs repression."),
+         "limitations": ("Only 15 samples (small n); cannot separate direct from indirect "
+                         "edges; perturbation targets/mechanisms unknown."),
+         "rationale": "Perturbation responses constrain edge sign and strength at steady state."},
+        {"name": "C_lagged_correlation_baseline",
+         "description": "Unsigned pooled correlation between x_j(t) and dx_i(t) across all series and timepoints.",
+         "score": float(np.percentile(scoreC[off], 90)),
+         "metric": "90th percentile |lagged correlation| over off-diagonal pairs",
+         "strengths": "Simple, parameter-free reference.",
+         "limitations": "Unsigned; confounded by coregulation and indirect paths; not used in the final network.",
+         "rationale": "Baseline showing regularized methods add directional/sign information."},
+    ],
+    "combination": {
+        "rule": "weighted geometric mean of per-method max-normalized confidence scores",
+        "weight_method_A": wA, "weight_method_B": 1.0 - wA,
+        "threshold": thresh, "target_density": TARGET_DENSITY,
+    },
+}
+
+# ============================================================ save
+np.save('inferred_network.npy', network.astype(np.float64))
+np.save('edge_sign_predictions.npy', signs.astype(np.float64))
+json.dump({"hub_genes": hub_genes}, open('hub_genes.json', 'w'), indent=2)
+json.dump(method_comparison, open('method_comparison.json', 'w'), indent=2)
+json.dump(metrics, open('network_metrics.json', 'w'), indent=2)
+
+print(f"[check] hub genes {hub_genes}: outgoing influence "
+      f"{out_strength[hub_genes[0]]:.4f}, {out_strength[hub_genes[1]]:.4f}; "
+      f"next best {out_strength[hub_order[2]]:.4f}")
+print(f"[check] diagonal all zero: {bool(np.all(np.diag(network)==0))}; "
+      f"no NaN/Inf: {bool(np.isfinite(network).all() and np.isfinite(signs).all())}")
+print(f"[done] all artifacts written ({time.time()-t0:.1f}s)")

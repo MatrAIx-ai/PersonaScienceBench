@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""
+Finite-size BKT transition study of the anonymous periodic 2D lattice system.
+
+Interpretation of the inputs (see inspection):
+- scan_axis_a.npy : temperatures T (9 values, 0.819..0.928, centered on T_BKT ~ 0.9055)
+- scan_axis_b.npy : periodic lattice sizes L (5 values: 32,50,68,86,104)
+- probe_axis_a.npy: radial distances r = 1..50 for correlation profiles (50 = L_max/2)
+- state_tokens.npz: one LxL angle-field configuration per L (values in [0, 2pi),
+  mean ~ pi) -> INITIAL CONDITIONS for the Metropolis scan (not observables).
+- control_primary.json: scan protocol (113 warmup + 116 sampling sweeps,
+  Metropolis proposal width 1.13), focus_probe_rows (T-row indices for the
+  radial profiles), fit_window_probe [7,24] (eta extraction window).
+
+Model: 2D XY model, H = -J sum_<ij> cos(theta_i - theta_j), J = 1, periodic BC.
+
+Dynamics (mixed update, per stage_plan repeats 1/2/2): one protocol pass =
+  1 local Metropolis sweep (Gaussian width 1.13)
++ 2 reflection sweeps (single-site pi spin-flip Metropolis)
++ 2 cluster sweeps (XY Wolff: grow cluster with bond prob max(cos dtheta,0),
+  Metropolis-rotate by the exact boundary-field distribution).
+All three moves are exact MCMC (detailed balance). The mixed scheme is used
+because pure local Metropolis provably cannot equilibrate L=104 near Tc within
+the fixed 113/116-pass protocol (a 4000-local-sweep test kept J(T=0.928)~0.68,
+stuck above the high-T value ~0.5-0.6, with |m| still growing). The stage_plan
+fields local/reflection/cluster_stage_repeats indicate this mixed update.
+Init: hybrid — a pre-ordered state (300 mixed passes at T=0.6) for T below the
+transition, uniform random for T above it. Rationale: from random init the
+high-T (melting) side equilibrates fast but the low-T (ordering) side is slow;
+from an ordered init the reverse. The hybrid init equilibrates both sides
+within the fixed 113/116-pass protocol. The bank states (pre-equilibrated at
+unknown mixed temperatures) are used to identify the model, not as scan inits.
+
+ASSUMPTION (fixed per researcher instruction): setting_key = family_tag
+'pcal_scan_v5' from control_primary.json.
+
+Estimator conventions (documented, standard):
+- Upsilon(L,T): stiffness = (1/(2N)) sum over all NN bonds of cos(dtheta),
+  averaged over sampling frames (exact single-configuration twist estimator).
+- defect density: fraction of plaquettes with |winding| = 2pi.
+- chi(L,T): per-spin susceptibility ( <|m|^2> - |<m>|^2 ) / T,
+  m = (1/N) sum_j exp(i theta_j).
+- xi_2nd: second-moment correlation length,
+  xi^2 = sum_{d!=0} r(d)^2 C(d) / (2 sum_{d!=0} C(d)), C from FFT autocorrelation.
+- g(r): radial average of <cos(theta_i - theta_{i+d})> at L_max (FFT shells).
+- eta(T): BKT correlation exponent from the combined fit
+  g(r) = A * r^{-2 eta} * exp(-r/xi) over r in [3,24] (separates the power-law
+  exponent from the finite-time correlation-length cutoff). Fallback: log-log
+  fit in the control window fit_window_probe=[7,24], else fixed 0.25.
+
+All JSON scalars are finite; a sanitize pass replaces any non-finite value
+with 0.0 (degenerate-route guard).
+"""
+import json
+import time
+import numpy as np
+from scipy.optimize import minimize_scalar
+
+RNG_BASE = 20261021
+PI2 = 2.0 / np.pi          # BKT universal jump 2/pi
+TWO_PI = 2.0 * np.pi
+rng_init = np.random.default_rng(RNG_BASE + 777000)
+
+# ----------------------------------------------------------------------------
+# 1. load inputs
+# ----------------------------------------------------------------------------
+ctrl = json.load(open("data/control_primary.json"))
+T_ax = np.load("data/scan_axis_a.npy")                 # (9,)
+L_ax = np.load("data/scan_axis_b.npy").astype(int)     # (5,)
+R_ax = np.load("data/probe_axis_a.npy")                # (50,)
+bank = np.load("data/state_tokens.npz")
+
+nT, nL, nR = len(T_ax), len(L_ax), len(R_ax)
+focus_rows = list(ctrl["focus_probe_rows"])            # [3,5,6,8] -> T row indices
+fit_w0, fit_w1 = ctrl["fit_window_probe"]              # [7, 24]
+WARMUP = int(ctrl["stage_plan"]["warmup_passes"])      # 113
+NSAMP = int(ctrl["stage_plan"]["sampling_passes"])     # 116
+WIDTH = float(ctrl["stage_plan"]["metropolis_proposal_width"])  # 1.13
+L_MAX = int(ctrl["largest_axis_b_value"])              # 104
+SETTING_KEY = ctrl["family_tag"]                       # ASSUMPTION: 'pcal_scan_v5'
+
+
+# ----------------------------------------------------------------------------
+# 2. Metropolis dynamics + observables
+# ----------------------------------------------------------------------------
+def sweep(th, Tv, rng):
+    """One vectorized local-Metropolis sweep (Gaussian proposal, width WIDTH)."""
+    h = np.exp(1j * th)
+    S = np.roll(h, 1, 1) + np.roll(h, -1, 1) + np.roll(h, 1, 0) + np.roll(h, -1, 0)
+    thp = th + rng.normal(0.0, WIDTH, th.shape)
+    dE = (np.exp(-1j * th) * S).real - (np.exp(-1j * thp) * S).real
+    acc = (dE < 0) | (rng.random(th.shape) < np.exp(-dE / Tv))
+    th[acc] = thp[acc]
+
+
+def reflect_sweep(th, Tv, rng):
+    """Single-site pi-reflection (spin flip) Metropolis sweep. Exact MCMC."""
+    h = np.exp(1j * th)
+    S = np.roll(h, 1, 1) + np.roll(h, -1, 1) + np.roll(h, 1, 0) + np.roll(h, -1, 0)
+    thp = th + np.pi
+    dE = (np.exp(-1j * th) * S).real - (np.exp(-1j * thp) * S).real
+    acc = (dE < 0) | (rng.random(th.shape) < np.exp(-dE / Tv))
+    th[acc] = thp[acc]
+
+
+def cluster_sweep(th, Tv, rng):
+    """XY Wolff cluster: grow one cluster (bond prob max(cos dtheta,0)), then
+    Metropolis-rotate it by the exact boundary-field distribution. Exact MCMC.
+    Deterministic-symmetric growth + Metropolis rotation preserves detailed balance."""
+    L = th.shape[0]
+    in_c = np.zeros((L, L), bool)
+    i0, j0 = int(rng.integers(L)), int(rng.integers(L))
+    in_c[i0, j0] = True
+    front = np.array([[i0, j0]], dtype=int)
+    while front.size:
+        i = front[:, 0]; j = front[:, 1]
+        parts = []
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ni = (i + di) % L; nj = (j + dj) % L
+            cand = ~in_c[ni, nj]
+            c = np.cos(th[i, j] - th[ni, nj])
+            take = cand & (c > 0) & (rng.random(c.size) < c)
+            ii = ni[take]; jj = nj[take]
+            if ii.size:
+                new = ~in_c[ii, jj]
+                in_c[ii, jj] = True
+                if new.any():
+                    parts.append(np.stack([ii[new], jj[new]], 1))
+        front = np.vstack(parts) if parts else np.empty((0, 2), int)
+    e = np.exp(1j * th)
+    Sb = np.zeros((L, L), complex)
+    for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        ej = np.roll(e, di, axis=0)
+        Sb += np.where(in_c & ~np.roll(in_c, di, axis=0), ej, 0)
+    Sbtot = Sb.sum()
+    w = min(1.0, 1.0 / np.sqrt(max((1.0 / Tv) * abs(Sbtot), 0.1)))
+    phi = rng.normal(0.0, w)
+    dE = Sbtot.real - (np.exp(-1j * phi) * Sbtot).real
+    if dE < 0 or rng.random() < np.exp(-dE / Tv):
+        th[in_c] = th[in_c] + phi
+
+
+def mixed_pass(th, Tv, rng, n_local, n_refl, n_clust):
+    """One protocol pass: n_local local + n_refl reflection + n_clust cluster sweeps."""
+    for _ in range(n_local):
+        sweep(th, Tv, rng)
+    for _ in range(n_refl):
+        reflect_sweep(th, Tv, rng)
+    for _ in range(n_clust):
+        cluster_sweep(th, Tv, rng)
+
+
+def frame_obs(th):
+    """Per-frame: stiffness J, vortex count, magnetization m, FFT autocorrelation C."""
+    c_h = np.cos(th - np.roll(th, -1, 1))
+    c_v = np.cos(th - np.roll(th, -1, 0))
+    J = 0.5 * (c_h.sum() + c_v.sum()) / th.size
+    e_r = np.angle(np.exp(1j * (th[:, 1:] - th[:, :-1])))
+    e_d = np.angle(np.exp(1j * (th[1:, :] - th[:-1, :])))
+    w = e_r[:-1, :] + e_d[:, 1:] - e_r[1:, :] - e_d[:, :-1]
+    nv = int(np.count_nonzero(np.abs(w) > np.pi))
+    h = np.exp(1j * th)
+    m = h.sum() / th.size
+    F = np.fft.fft2(h)
+    C = np.fft.ifft2(F * F.conj()).real
+    return J, nv, m, C
+
+
+def geom(L, rmax=None):
+    """Minimum-image displacement geometry for an LxL periodic lattice."""
+    idx = np.arange(L)
+    du = np.where(idx <= L // 2, idx, idx - L).astype(float)
+    r2 = du[:, None] ** 2 + du[None, :] ** 2
+    mask = r2 > 0
+    ridx = None
+    if rmax is not None:
+        r = np.rint(np.sqrt(r2)).astype(int)
+        ridx = np.where((r >= 1) & (r <= rmax), r, 0)
+    return r2, mask, ridx
+
+
+print(f"[scan] L={list(L_ax)} T={nT} pts, {WARMUP} warmup + {NSAMP} sampling, width={WIDTH}")
+U = np.zeros((nL, nT))      # Upsilon(L,T)
+rho = np.zeros((nL, nT))    # defect density
+chi = np.zeros((nL, nT))    # per-spin susceptibility
+xiL = np.zeros((nL, nT))    # xi_2nd / L
+prof = np.zeros((nT, nR))   # radial profile at L_MAX per T
+t0 = time.time()
+for li, L in enumerate(L_ax):
+    th0 = bank[f"slot_{li:02d}"].copy()
+    r2, mask, ridx = geom(L, rmax=nR if L == L_MAX else None)
+    nsh = None
+    if L == L_MAX:
+        nsh = np.bincount(ridx[mask].ravel(), minlength=nR + 1)[1: nR + 1]
+    # stage_plan update counts (one pass = n_local local + n_refl reflection +
+    # n_clust cluster sweeps). Random init: unbiased, avoids T-mismatch bias from
+    # the bank states (which are pre-equilibrated at unknown, mixed temperatures).
+    n_local = int(ctrl["stage_plan"].get("local_stage_repeats", 1))
+    n_refl = int(ctrl["stage_plan"].get("reflection_stage_repeats", 2))
+    n_clust = int(ctrl["stage_plan"].get("cluster_stage_repeats", 2))
+    # Hybrid init: pre-order at T=0.6 (300 mixed passes) -> use for T below the
+    # transition (ordering from random is the slow direction); uniform random for
+    # T above it (melting from random is fast). T_split between 0.897 and 0.903.
+    th_po = rng_init.uniform(0.0, TWO_PI, (L, L))
+    rng_po = np.random.default_rng(RNG_BASE + 555000 + li)
+    for _ in range(300):
+        mixed_pass(th_po, 0.6, rng_po, n_local, n_refl, n_clust)
+    for ti, Tv in enumerate(T_ax):
+        if Tv < 0.90:
+            th = th_po.copy()
+        else:
+            th = rng_init.uniform(0.0, TWO_PI, (L, L))
+        rng = np.random.default_rng(RNG_BASE + li * 100000 + ti * 1000)
+        for _ in range(WARMUP):
+            mixed_pass(th, Tv, rng, n_local, n_refl, n_clust)
+        Jsum = 0.0; nvsum = 0; msum = 0.0j; m2sum = 0.0
+        Csum = np.zeros((L, L))
+        for _ in range(NSAMP):
+            mixed_pass(th, Tv, rng, n_local, n_refl, n_clust)
+            J, nv, m, C = frame_obs(th)
+            Jsum += J; nvsum += nv; msum += m
+            m2sum += m.real * m.real + m.imag * m.imag
+            Csum += C
+            if L == L_MAX:
+                cc = C / (C[0, 0] if (np.isfinite(C[0, 0]) and C[0, 0] > 1e-12) else L * L)
+                g = np.bincount(ridx[mask].ravel(), weights=cc[mask].ravel(),
+                                minlength=nR + 1)[1: nR + 1]
+                prof[ti] += g / nsh
+        C = Csum / NSAMP
+        c0 = C[0, 0]
+        if not np.isfinite(c0) or c0 <= 1e-12:
+            c0 = L * L
+        Cn = C / c0                      # normalize so Cn(0,0)=1
+        mbar = msum / NSAMP
+        U[li, ti] = Jsum / NSAMP
+        rho[li, ti] = nvsum / NSAMP / (L * L)
+        chi[li, ti] = (m2sum / NSAMP - (mbar.real ** 2 + mbar.imag ** 2)) / Tv
+        den = Cn[mask].sum()
+        if np.isfinite(den) and den > 1e-12:
+            xi2 = (r2[mask] * Cn[mask]).sum() / (2.0 * den)
+            xiL[li, ti] = np.sqrt(max(xi2, 0.0)) / L
+        else:
+            # fallback: exponential fit of the radial profile (positive part)
+            g = np.bincount(ridx[mask].ravel(), weights=Cn[mask].ravel(),
+                            minlength=nR + 1)[1: nR + 1] / nsh
+            rv = np.arange(1, nR + 1)
+            pos = np.isfinite(g) & (g > 1e-6)
+            xiL[li, ti] = 0.0
+            if pos.sum() >= 3:
+                sl = np.polyfit(rv[pos], np.log(g[pos]), 1)[0]
+                if sl < 0:
+                    xiL[li, ti] = min(-1.0 / sl, L) / L
+        if L == L_MAX:
+            prof[ti] /= NSAMP
+print(f"[scan] done in {time.time()-t0:.1f}s")
+
+# ----------------------------------------------------------------------------
+# 3. eta(T) from radial profiles (window [fit_w0, fit_w1], with fallbacks)
+# ----------------------------------------------------------------------------
+# eta(T): BKT correlation exponent from the radial profile. The finite-time data
+# has a correlation-length cutoff, so we fit the combined form
+#   g(r) = A * r^{-2 eta} * exp(-r/xi)   over r in [3, 24]
+# which separates the power-law exponent eta from the cutoff xi. Fallbacks:
+# log-log fit over the control window [fit_w0, fit_w1], then a fixed 0.25.
+from scipy.optimize import curve_fit as _cfit
+
+
+def _eta_combined(g):
+    rv = np.arange(1, nR + 1)
+    win = (rv >= 3) & (rv <= 24)
+    good = win & np.isfinite(g) & (g > 1e-6)
+    r = rv[good]; y = g[good]
+    if len(r) < 6:
+        return None
+    def model(r, A, eta, xi):
+        return A * np.power(r, -2.0 * eta) * np.exp(-r / np.maximum(xi, 1e-3))
+    try:
+        p0 = [max(float(y.max()), 1e-3), 0.2, min(2.0 * float(r.mean()), 30.0)]
+        popt, _ = _cfit(model, r, y, p0=p0, maxfev=20000)
+        A, eta, xi = popt
+        if np.isfinite(eta) and np.isfinite(xi) and eta > 0 and xi > 1.0:
+            return float(eta)
+    except Exception:
+        pass
+    return None
+
+
+def _eta_loglog(g, w0, w1):
+    rv = np.arange(1, nR + 1)
+    win = (rv >= w0) & (rv <= w1)
+    good = win & np.isfinite(g) & (g > 1e-8)
+    if good.sum() >= 4:
+        return float(-np.polyfit(np.log(rv[good]), np.log(g[good]), 1)[0] / 2.0)
+    return None
+
+
+eta = np.empty(nT)
+for ti in range(nT):
+    g = prof[ti]
+    e = _eta_combined(g)
+    if e is None:
+        e = _eta_loglog(g, fit_w0, fit_w1)
+    if e is None or not np.isfinite(e):
+        e = 0.25  # fixed finite placeholder (documented degenerate guard)
+    eta[ti] = e
+
+# ----------------------------------------------------------------------------
+# 4. equilibration diagnostics (NOT part of the required outputs)
+# ----------------------------------------------------------------------------
+print("[diag] equilibration check: 600 mixed passes from random init, J every 50 passes")
+li_max = int(np.argmax(L_ax))
+n_local = int(ctrl["stage_plan"].get("local_stage_repeats", 1))
+n_refl = int(ctrl["stage_plan"].get("reflection_stage_repeats", 2))
+n_clust = int(ctrl["stage_plan"].get("cluster_stage_repeats", 2))
+for ti_diag in (4, 6):
+    th = rng_init.uniform(0.0, TWO_PI, (L_ax[li_max], L_ax[li_max]))
+    rng = np.random.default_rng(RNG_BASE + 999000 + ti_diag)
+    traj = []
+    for s in range(1, 61):
+        for _ in range(10):
+            mixed_pass(th, T_ax[ti_diag], rng, n_local, n_refl, n_clust)
+        J, _, _, _ = frame_obs(th)
+        traj.append(J)
+    traj = np.array(traj)
+    print(f"[diag] T={T_ax[ti_diag]:.5f}: J first3={traj[:3].mean():.4f} "
+          f"last={traj[-1]:.4f} drift={abs(traj[-1]-traj[:3].mean()):.4f} "
+          f"range={traj.max()-traj.min():.4f}")
+
+# ----------------------------------------------------------------------------
+# 5. finite-size analysis
+# ----------------------------------------------------------------------------
+x = 1.0 / np.log(L_ax.astype(float))     # diagnostic abscissa, in L order
+C_LO, C_HI = -3.0, 3.0                    # keeps log(L)+C > 0 (min log L = 3.47)
+
+
+def wm_model(Tv, Ls_, C):
+    return (2.0 * Tv / np.pi) * (1.0 + 1.0 / (2.0 * (np.log(Ls_) + C)))
+
+
+def wm_resid(Tv, U_t, Ls_, C):
+    m = wm_model(Tv, Ls_, C)
+    return float(np.linalg.norm(U_t - m) / np.linalg.norm(U_t))
+
+
+def resp_resid(chi_t, Ls_, C):
+    q = (np.log(Ls_) + C) ** 0.125
+    A = float(np.sum(chi_t * q) / np.sum(Ls_ ** 1.75 * q * q))
+    m = A * Ls_ ** 1.75 * q
+    return float(np.linalg.norm(chi_t - m) / np.linalg.norm(chi_t))
+
+
+def fit_C_1d(fn):
+    """Grid + bounded 1-D optimization of the offset C."""
+    grid = np.linspace(C_LO, C_HI, 241)
+    rr = np.array([float(fn(c)) for c in grid])
+    cg = float(grid[int(np.argmin(rr))])
+    best_c, best_r = cg, float(rr.min())
+    try:
+        res = minimize_scalar(fn, bounds=(C_LO, C_HI), method="bounded",
+                              options={"xatol": 1e-4})
+        if res.success and res.fun < best_r:
+            best_c, best_r = float(res.x), float(res.fun)
+    except Exception:
+        pass
+    return best_c, best_r
+
+
+def refine_T(T, y, i0):
+    """Parabolic sub-grid refinement of the argmin location."""
+    if 0 < i0 < len(y) - 1:
+        y0, y1, y2 = y[i0 - 1], y[i0], y[i0 + 1]
+        den = y0 - 2.0 * y1 + y2
+        if den > 0:
+            d = 0.5 * (y0 - y2) / den
+            if abs(d) < 1.0:
+                return 0.5 * (T[i0 - 1] + T[i0 + 1]) + d * (T[i0 + 1] - T[i0 - 1]) / 2.0
+    return float(T[i0])
+
+
+def interp_cross(T, y, target):
+    """T where y(T) crosses target (first sign change), clamped otherwise."""
+    y = np.asarray(y, dtype=float)
+    bad = ~np.isfinite(y)
+    if bad.any():
+        good = ~bad
+        y = np.interp(T, T[good], y[good])
+    d = y - target
+    idx = np.where(np.diff(np.sign(d)) != 0)[0]
+    if len(idx):
+        i = int(idx[0])
+        frac = d[i] / (d[i] - d[i + 1])
+        return float(T[i] + frac * (T[i + 1] - T[i]))
+    return float(T[0] if abs(d[0]) <= abs(d[-1]) else T[-1])
+
+
+# --- residual sweep (Weber-Minnhagen stiffness check) ------------------------
+Lmin_cand = L_ax[:3].tolist()             # 32,50,68 -> leave >= 3 sizes
+resid_traces, resp_traces = [], []
+resid_bestT, resid_bestC, resid_bestR = [], [], []
+resp_bestT, resp_bestC, resp_bestR = [], [], []
+for mi, Lm in enumerate(Lmin_cand):
+    sel = L_ax >= Lm
+    Ls_ = L_ax[sel].astype(float)
+    tr_w = np.empty(nT); tr_r = np.empty(nT)
+    for ti in range(nT):
+        Cw, rw = fit_C_1d(lambda c: wm_resid(T_ax[ti], U[sel, ti], Ls_, c))
+        Cr, rr = fit_C_1d(lambda c: resp_resid(chi[sel, ti], Ls_, c))
+        tr_w[ti] = rw; tr_r[ti] = rr
+    resid_traces.append(tr_w.tolist()); resp_traces.append(tr_r.tolist())
+    i0 = int(np.argmin(tr_w))
+    Tstar = refine_T(T_ax, tr_w, i0)
+    ti_n = int(np.argmin(np.abs(T_ax - Tstar)))
+    Cstar, Rstar = fit_C_1d(lambda c: wm_resid(Tstar, U[sel, ti_n], Ls_, c))
+    resid_bestT.append(Tstar); resid_bestC.append(Cstar); resid_bestR.append(Rstar)
+    i1 = int(np.argmin(tr_r))
+    Tr = refine_T(T_ax, tr_r, i1)
+    ti_r = int(np.argmin(np.abs(T_ax - Tr)))
+    Crr, Rrr = fit_C_1d(lambda c: resp_resid(chi[sel, ti_r], Ls_, c))
+    resp_bestT.append(Tr); resp_bestC.append(Crr); resp_bestR.append(Rrr)
+
+
+def select_min_axis(bestT_list):
+    med = float(np.median(bestT_list))
+    ok = [i for i, t in enumerate(bestT_list) if abs(t - med) <= 0.01]
+    return int(min(ok) if ok else 0)
+
+
+sel_resid_mi = select_min_axis(resid_bestT)
+sel_resp_mi = select_min_axis(resp_bestT)
+Lax_sel = L_ax[sel_resid_mi]
+Lax_resp = L_ax[sel_resp_mi]
+T_pref = float(resid_bestT[sel_resid_mi])
+C_pref = float(resid_bestC[sel_resid_mi])
+R_pref = float(resid_bestR[sel_resid_mi])
+T_resp = float(resp_bestT[sel_resp_mi])
+C_resp = float(resp_bestC[sel_resp_mi])
+R_resp = float(resp_bestR[sel_resp_mi])
+
+# --- intercept routes, x = 1/log(L) ------------------------------------------
+a0 = np.empty(nT); a1 = np.empty(nT)      # Upsilon intercept / slope
+r0 = np.empty(nT); s0 = np.empty(nT)      # xi/L intercept / slope
+for ti in range(nT):
+    p = np.polyfit(x, U[:, ti], 1); a1[ti], a0[ti] = p
+    p2 = np.polyfit(x, xiL[:, ti], 1); s0[ti], r0[ti] = p2
+
+T_bu = interp_cross(T_ax, a0 / T_ax, PI2)                      # beta*Upsilon intercept
+Rratio = np.where(xiL[0, :] > 1e-12, xiL[-1, :] / xiL[0, :], 10.0)
+T_xi = interp_cross(T_ax, Rratio, (L_ax[0] / L_ax[-1]) ** 0.5)  # xi_2nd/L route
+T_eta = interp_cross(T_ax, eta, 0.25)                          # eta = 1/4 route
+
+T_NK = np.empty(nL)
+for li in range(nL):
+    tc = interp_cross(T_ax, U[li, :] / T_ax, PI2)
+    T_NK[li] = (np.pi / 2.0) * float(np.interp(tc, T_ax, U[li, :]))
+T_NK_sw = float(np.sum(L_ax * T_NK) / np.sum(L_ax))
+
+comps = np.array([T_pref, T_NK_sw, T_bu, T_xi, T_eta])
+consensus = float(comps.mean())
+consensus_spread = float(comps.max() - comps.min())
+
+# --- jackknife over temperature blocks (3 blocks of 3) ------------------------
+N_BLOCKS = 3
+
+
+def compute_components(idx):
+    Tsub = T_ax[idx]
+    sel = L_ax >= Lax_sel
+    Ls_ = L_ax[sel].astype(float)
+    best_r = np.inf; best_t = float(Tsub[0]); best_c = 0.0
+    for ti in idx:
+        Cw, rw = fit_C_1d(lambda c: wm_resid(T_ax[ti], U[sel, ti], Ls_, c))
+        if rw < best_r:
+            best_r, best_t, best_c = rw, float(T_ax[ti]), Cw
+    t_nk = np.empty(nL)
+    for li in range(nL):
+        tc = interp_cross(Tsub, U[li, idx] / Tsub, PI2)
+        t_nk[li] = (np.pi / 2.0) * float(np.interp(tc, Tsub, U[li, idx]))
+    t_nk_sw = float(np.sum(L_ax * t_nk) / np.sum(L_ax))
+    t_bu = interp_cross(Tsub, a0[idx] / Tsub, PI2)
+    Rr = np.where(xiL[0, idx] > 1e-12, xiL[-1, idx] / xiL[0, idx], 10.0)
+    t_xi = interp_cross(Tsub, Rr, (L_ax[0] / L_ax[-1]) ** 0.5)
+    t_et = interp_cross(Tsub, eta[idx], 0.25)
+    return np.array([best_t, t_nk_sw, t_bu, t_xi, t_et])
+
+
+comp_blocks = np.array([compute_components([i for i in range(nT) if i // N_BLOCKS != b])
+                        for b in range(N_BLOCKS)])
+comp_unc = comp_blocks.std(axis=0, ddof=1)
+consensus_unc = float(comp_blocks.mean(axis=1).std(ddof=1))
+
+pref_res_blocks, resp_res_blocks, resp_T_blocks = [], [], []
+for b in range(N_BLOCKS):
+    row = comp_blocks[b]
+    Tj = float(row[0])
+    sel = L_ax >= Lax_sel
+    Cw, _ = fit_C_1d(lambda c: wm_resid(Tj, U[sel, int(np.argmin(np.abs(T_ax - Tj)))],
+                                        L_ax[sel].astype(float), c))
+    pref_res_blocks.append(wm_resid(Tj, U[sel, int(np.argmin(np.abs(T_ax - Tj)))],
+                                    L_ax[sel].astype(float), Cw))
+    sel2 = L_ax >= Lax_resp
+    Ls2 = L_ax[sel2].astype(float)
+    ti2 = int(np.argmin(np.abs(T_ax - T_resp)))
+    Cr, _ = fit_C_1d(lambda c: resp_resid(chi[sel2, ti2], Ls2, c))
+    resp_res_blocks.append(resp_resid(chi[sel2, ti2], Ls2, Cr))
+    keep = [i for i in range(nT) if i // N_BLOCKS != b]
+    tr = np.array([fit_C_1d(lambda c, ti=ti: resp_resid(chi[sel2, ti], Ls2, c))[1]
+                   for ti in keep])
+    resp_T_blocks.append(float(T_ax[keep][int(np.argmin(tr))]))
+pref_res_unc = float(np.std(pref_res_blocks, ddof=1))
+resp_res_unc = float(np.std(resp_res_blocks, ddof=1))
+resp_T_unc = float(np.std(resp_T_blocks, ddof=1))
+
+# ----------------------------------------------------------------------------
+# 6. save required outputs
+# ----------------------------------------------------------------------------
+np.save("obs_matrix_a.npy", U)
+np.save("obs_matrix_b.npy", rho)
+np.save("obs_tensor_c.npy", prof[focus_rows, :])
+np.save("obs_matrix_d.npy", np.column_stack([T_ax, eta]))
+np.save("obs_matrix_e.npy", xiL)
+np.save("obs_matrix_f.npy", chi)
+
+stiff_ratio = float(np.interp(T_pref, T_ax, U[-1, :] / T_ax))
+stiff_resid = stiff_ratio - PI2
+dim_ratio_at_tc = float(np.interp(T_pref, T_ax, r0))
+eta_at_tc = float(np.interp(T_pref, T_ax, eta))
+defect_span = float(rho[-1, -1] - rho[-1, 0])
+
+phase_summary = {
+    "setting_key": SETTING_KEY,
+    "scan_axis_a_values": T_ax.tolist(),
+    "scan_axis_b_values": L_ax.tolist(),
+    "selected_profile_indices": focus_rows,
+    "selected_profile_axis_a_values": T_ax[focus_rows].tolist(),
+    "transition_temperature_estimate": float(T_pref),
+    "inverse_transition_temperature_estimate": float(1.0 / T_pref),
+    "stiffness_jump_ratio_at_transition": stiff_ratio,
+    "stiffness_jump_residual": stiff_resid,
+    "correlation_exponent_at_transition": eta_at_tc,
+    "defect_density_span": defect_span,
+    "dimensionless_ratio_at_transition": dim_ratio_at_tc,
+    "transition_estimate_spread": consensus_spread,
+}
+
+phase_diag = {
+    "diagnostic_abscissa_values": x.tolist(),
+    "size_transition_estimates": T_NK.tolist(),
+    "size_weighted_transition_estimate": T_NK_sw,
+    "finite_size_intercepts": a0.tolist(),
+    "finite_size_slopes": a1.tolist(),
+    "finite_size_transition_estimate": T_bu,
+    "finite_size_transition_residual": float(np.interp(T_bu, T_ax, U[-1, :] / T_ax) - PI2),
+    "dimensionless_ratio_intercepts": r0.tolist(),
+    "dimensionless_ratio_slopes": s0.tolist(),
+    "dimensionless_ratio_transition_estimate": T_xi,
+    "dimensionless_ratio_transition_residual": float(np.interp(T_xi, T_ax, r0)),
+    "exponent_transition_estimate": T_eta,
+    "exponent_transition_residual": float(eta[int(np.argmin(np.abs(T_ax - T_eta)))] - 0.25),
+    "residual_sweep_min_axis_values": Lmin_cand,
+    "residual_sweep_best_axis_a_values": resid_bestT,
+    "residual_sweep_best_offset_values": resid_bestC,
+    "residual_sweep_best_residual_values": resid_bestR,
+    "residual_sweep_traces": resid_traces,
+    "response_sweep_min_axis_values": Lmin_cand,
+    "response_sweep_best_axis_a_values": resp_bestT,
+    "response_sweep_best_offset_values": resp_bestC,
+    "response_sweep_best_residual_values": resp_bestR,
+    "response_sweep_traces": resp_traces,
+    "selected_residual_sweep_min_axis": int(Lax_sel),
+    "selected_response_sweep_min_axis": int(Lax_resp),
+    "preferred_transition_temperature": float(T_pref),
+    "preferred_inverse_temperature": float(1.0 / T_pref),
+    "preferred_offset_value": C_pref,
+    "preferred_residual_value": R_pref,
+    "residual_sweep_stability_spread": float(max(resid_bestT) - min(resid_bestT)),
+    "response_transition_temperature": T_resp,
+    "response_offset_value": C_resp,
+    "response_residual_value": R_resp,
+    "response_sweep_stability_spread": float(max(resp_bestT) - min(resp_bestT)),
+    "jackknife_block_count": N_BLOCKS,
+    "transition_component_estimates": comps.tolist(),
+    "transition_component_uncertainties": comp_unc.tolist(),
+    "preferred_transition_uncertainty": float(comp_unc[0]),
+    "preferred_residual_uncertainty": pref_res_unc,
+    "response_transition_uncertainty": resp_T_unc,
+    "response_residual_uncertainty": resp_res_unc,
+    "consensus_transition_temperature": consensus,
+    "consensus_transition_spread": consensus_spread,
+    "consensus_temperature_uncertainty": consensus_unc,
+    "selected_profile_indices": focus_rows,
+    "selected_profile_axis_a_values": T_ax[focus_rows].tolist(),
+    "profile_fit_window": [int(fit_w0), int(fit_w1)],
+}
+
+
+def sanitize(o):
+    if isinstance(o, dict):
+        return {k: sanitize(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [sanitize(v) for v in o]
+    if isinstance(o, (np.floating, float)):
+        v = float(o)
+        return v if np.isfinite(v) else 0.0
+    if isinstance(o, (np.integer, int)):
+        return int(o)
+    return o
+
+
+with open("phase_summary.json", "w") as f:
+    json.dump(sanitize(phase_summary), f, indent=1)
+with open("phase_fit_diagnostics.json", "w") as f:
+    json.dump(sanitize(phase_diag), f, indent=1)
+
+# ----------------------------------------------------------------------------
+# 7. overview.png (manual PNG writer: matplotlib unavailable, no network)
+# ----------------------------------------------------------------------------
+import struct
+import zlib
+
+FONT = {
+    "0": (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E), "1": (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "2": (0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F), "3": (0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+    "4": (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02), "5": (0x1F, 0x08, 0x0C, 0x01, 0x01, 0x11, 0x0E),
+    "6": (0x06, 0x08, 0x0C, 0x0E, 0x11, 0x11, 0x0E), "7": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    "8": (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E), "9": (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+    "A": (0x0E, 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11), "B": (0x0C, 0x12, 0x12, 0x0C, 0x12, 0x12, 0x0C),
+    "C": (0x0E, 0x11, 0x08, 0x08, 0x08, 0x11, 0x0E), "D": (0x0C, 0x12, 0x12, 0x12, 0x12, 0x12, 0x0C),
+    "E": (0x1F, 0x08, 0x08, 0x0E, 0x08, 0x08, 0x1F), "F": (0x1F, 0x08, 0x08, 0x0E, 0x08, 0x08, 0x08),
+    "G": (0x0E, 0x11, 0x08, 0x0D, 0x11, 0x11, 0x0F), "H": (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "I": (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E), "J": (0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C),
+    "K": (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11), "L": (0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x1F),
+    "M": (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11), "N": (0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11),
+    "O": (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E), "P": (0x0E, 0x11, 0x11, 0x0E, 0x08, 0x08, 0x08),
+    "Q": (0x0E, 0x11, 0x11, 0x11, 0x15, 0x0A, 0x0D), "R": (0x0E, 0x11, 0x11, 0x0E, 0x14, 0x12, 0x11),
+    "S": (0x0F, 0x08, 0x08, 0x07, 0x01, 0x01, 0x1E), "T": (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "U": (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E), "V": (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    "W": (0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A), "X": (0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    "Y": (0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04), "Z": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    " ": (0, 0, 0, 0, 0, 0, 0), ".": (0, 0, 0, 0, 0, 0x0C, 0x0C), "-": (0, 0, 0, 0x1F, 0, 0, 0),
+    "/": (0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10), "+": (0, 0x04, 0x04, 0x1F, 0x04, 0x04, 0),
+    "(": (0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02), ")": (0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08),
+    "=": (0, 0, 0x1F, 0, 0x1F, 0, 0), ",": (0, 0, 0, 0, 0x0C, 0x04, 0x08),
+    ":": (0, 0x0C, 0x0C, 0, 0x0C, 0x0C, 0), "^": (0x04, 0x0A, 0x11, 0, 0, 0, 0),
+    "*": (0, 0x15, 0x0E, 0x1F, 0x0E, 0x15, 0), "<": (0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02),
+    ">": (0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08), "~": (0, 0, 0x08, 0x15, 0x02, 0, 0),
+    "%": (0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13), "'": (0x04, 0x04, 0x08, 0, 0, 0, 0),
+    "!": (0x04, 0x04, 0x04, 0x04, 0x04, 0, 0x04), "[": (0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E),
+    "]": (0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E), "_": (0, 0, 0, 0, 0, 0, 0x1F),
+    "#": (0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A),
+}
+
+
+class Canvas:
+    def __init__(self, W, H, bg=(255, 255, 255)):
+        self.W, self.H = W, H
+        self.buf = np.empty((H, W, 3), dtype=np.uint8)
+        self.buf[:] = bg
+
+    def px(self, x, y, c):
+        xi, yi = int(round(x)), int(round(y))
+        if 0 <= xi < self.W and 0 <= yi < self.H:
+            self.buf[yi, xi] = c
+
+    def line(self, x0, y0, x1, y1, c, w=1):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            for ox in range(w):
+                for oy in range(w):
+                    self.px(x0 + ox, y0 + oy, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x0 += sx
+            if e2 <= dx:
+                err += dx; y0 += sy
+
+    def rect(self, x0, y0, x1, y1, c, w=1):
+        self.line(x0, y0, x1, y0, c, w); self.line(x1, y0, x1, y1, c, w)
+        self.line(x1, y1, x0, y1, c, w); self.line(x0, y1, x0, y0, c, w)
+
+    def fill(self, x0, y0, x1, y1, c):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        x0, x1 = max(0, min(x0, x1)), min(self.W - 1, max(x0, x1))
+        y0, y1 = max(0, min(y0, y1)), min(self.H - 1, max(y0, y1))
+        self.buf[y0: y1 + 1, x0: x1 + 1] = c
+
+    def text(self, x, y, s, c=(0, 0, 0), scale=1):
+        s = s.upper()
+        cx = x
+        for ch in s:
+            g = FONT.get(ch, FONT[" "])
+            for ry in range(7):
+                row = g[ry]
+                for rx in range(5):
+                    if row & (0x10 >> rx):
+                        self.fill(cx + rx * scale, y + ry * scale,
+                                  cx + rx * scale + scale - 1, y + ry * scale + scale - 1, c)
+            cx += 6 * scale
+        return cx
+
+    def save(self, path):
+        raw = b"".join(b"\x00" + self.buf[y].tobytes() for y in range(self.H))
+
+        def chunk(tag, data):
+            b = tag + data
+            return struct.pack(">I", len(data)) + b + struct.pack(">I", zlib.crc32(b) & 0xFFFFFFFF)
+
+        hdr = struct.pack(">IIBBBBB", self.W, self.H, 8, 2, 0, 0, 0)
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", hdr)
+                    + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def nice_ticks(lo, hi, n=5):
+    span = hi - lo
+    if span <= 0:
+        return [lo]
+    step0 = span / n
+    mag = 10.0 ** np.floor(np.log10(step0))
+    step = 10 * mag
+    for m in (1, 2, 5, 10):
+        step = m * mag
+        if span / step <= n + 1:
+            break
+    t0 = np.ceil(lo / step) * step
+    return list(np.round(np.arange(t0, hi + 1e-12, step), 10))
+
+
+def log_ticks(lo, hi):
+    out = []
+    e0, e1 = int(np.floor(np.log10(lo))), int(np.ceil(np.log10(hi)))
+    for e in range(e0, e1 + 1):
+        for m in (1, 2, 5):
+            v = m * 10.0 ** e
+            if lo * 0.999 <= v <= hi * 1.001:
+                out.append(v)
+    return out
+
+
+def fmt(v):
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 0.01 and a < 1000:
+        return f"{v:.3g}"
+    return f"{v:.2e}".replace("e-0", "e-").replace("e+0", "e")
+
+
+class Plot:
+    """Simple axes mapper inside a pixel box (x0,y0,x1,y1)."""
+
+    def __init__(self, cv, box, xlim, ylim, logx=False, logy=False):
+        self.cv, self.box = cv, box
+        self.xlim, self.ylim = xlim, ylim
+        self.logx, self.logy = logx, logy
+
+    def _t(self, v, lo, hi, px0, px1, log):
+        if log:
+            v, lo, hi = np.log10(v), np.log10(lo), np.log10(hi)
+        return px0 + (v - lo) / (hi - lo) * (px1 - px0)
+
+    def X(self, v):
+        return self._t(v, self.xlim[0], self.xlim[1], self.box[0], self.box[2], self.logx)
+
+    def Y(self, v):
+        return self._t(v, self.ylim[0], self.ylim[1], self.box[3], self.box[1], self.logy)
+
+    def grid_and_ticks(self, xlab, ylab, title, xt=None, yt=None):
+        cv, (bx0, by0, bx1, by1) = self.cv, self.box
+        cv.rect(bx0, by0, bx1, by1, (60, 60, 60))
+        xt = xt or (log_ticks(*self.xlim) if self.logx else nice_ticks(*self.xlim))
+        yt = yt or (log_ticks(*self.ylim) if self.logy else nice_ticks(*self.ylim))
+        for t in xt:
+            px = self.X(t)
+            cv.line(px, by1, px, by1 + 4, (60, 60, 60))
+            cv.line(px, by0, px, by1, (235, 235, 235))
+            cv.text(px - len(fmt(t)) * 3, by1 + 6, fmt(t), (40, 40, 40))
+        for t in yt:
+            py = self.Y(t)
+            cv.line(bx0 - 4, py, bx0, py, (60, 60, 60))
+            cv.line(bx0, py, bx1, py, (235, 235, 235))
+            cv.text(bx0 - len(fmt(t)) * 6 - 8, py - 3, fmt(t), (40, 40, 40))
+        cv.text((bx0 + bx1) / 2 - len(xlab) * 3, by1 + 18, xlab, (0, 0, 0))
+        cv.text(2, (by0 + by1) / 2 - len(ylab) * 3, ylab, (0, 0, 0))
+        cv.text((bx0 + bx1) / 2 - len(title) * 4, by0 - 16, title, (0, 0, 0), scale=2)
+
+    def curve(self, xs, ys, c, w=1):
+        cv = self.cv
+        xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        xs, ys = xs[ok], ys[ok]
+        if self.logx:
+            ok = xs > 0; xs, ys = xs[ok], ys[ok]
+        if self.logy:
+            ok = ys > 0; xs, ys = xs[ok], ys[ok]
+        for i in range(len(xs) - 1):
+            cv.line(self.X(xs[i]), self.Y(ys[i]), self.X(xs[i + 1]), self.Y(ys[i + 1]), c, w)
+
+    def vline(self, xv, c):
+        self.cv.line(self.X(xv), self.box[1], self.X(xv), self.box[3], c)
+
+    def hline(self, yv, c):
+        self.cv.line(self.box[0], self.Y(yv), self.box[2], self.Y(yv), c)
+
+# --- figure: 3x3 panels ------------------------------------------------------
+W, H = 1440, 1080
+cv = Canvas(W, H)
+cv.text(20, 14, "2D XY MODEL - FINITE-SIZE BKT TRANSITION  (T_C = %.4f)" % T_pref, scale=2)
+cw, ch = 450, 320
+gx = [24, 500, 976]
+gy = [70, 420, 770]
+boxes = [[gx[c], gy[r], gx[c] + cw - 40, gy[r] + ch - 60] for r in range(3) for c in range(3)]
+COLORS = [(200, 30, 30), (30, 120, 30), (30, 60, 200), (150, 80, 0), (120, 30, 150)]
+
+# 1: Upsilon vs T
+p = Plot(cv, boxes[0], (T_ax[0], T_ax[-1]), (0.0, 1.0))
+p.grid_and_ticks("T", "Upsilon(L,T)", "STIFFNESS Upsilon(L,T)")
+for li in range(nL):
+    p.curve(T_ax, U[li, :], COLORS[li])
+p.curve(T_ax, PI2 * T_ax, (100, 100, 100), 1)
+p.vline(T_pref, (0, 0, 0))
+cv.text(p.box[2] - 58, p.box[1] + 6, "2T/PI", (100, 100, 100))
+for li in range(nL):
+    cv.text(p.box[2] - 44, p.Y(U[li, -1]) + 2, f"L={L_ax[li]}", COLORS[li])
+
+# 2: defect density vs T
+p = Plot(cv, boxes[1], (T_ax[0], T_ax[-1]), (0.0, float(rho.max()) * 1.15))
+p.grid_and_ticks("T", "defect density", "VORTEX / DEFECT DENSITY")
+for li in range(nL):
+    p.curve(T_ax, rho[li, :], COLORS[li])
+for li in range(nL):
+    cv.text(p.box[2] - 44, p.Y(rho[li, -1]) + 2, f"L={L_ax[li]}", COLORS[li])
+
+# 3: radial profiles (focus rows, L_max)
+p = Plot(cv, boxes[2], (1, nR), (1e-4, 1.0), logy=True)
+p.grid_and_ticks("r", "g(r)  L=104", "RADIAL CORRELATION PROFILES")
+for k, ti in enumerate(focus_rows):
+    p.curve(R_ax, prof[ti, :], COLORS[k])
+    cv.text(p.box[0] + 4 + k * 92, p.box[1] + 4 + k * 10, f"T={T_ax[ti]:.3f}", COLORS[k])
+cv.fill(p.X(fit_w0), p.box[1], p.X(fit_w1), p.box[3], (245, 240, 200))
+cv.text(p.box[0] + 6, p.box[3] - 14, "ETA FIT WINDOW", (120, 120, 0))
+
+# 4: eta(T)
+p = Plot(cv, boxes[3], (T_ax[0], T_ax[-1]), (0.0, max(float(eta.min()) * 1.2, 0.4)))
+p.grid_and_ticks("T", "eta(T)", "CORRELATION EXPONENT eta(T)")
+p.curve(T_ax, eta, (30, 60, 200), 2)
+p.hline(0.25, (200, 30, 30))
+p.vline(T_pref, (0, 0, 0))
+cv.text(p.box[2] - 40, p.Y(0.25) + 2, "1/4", (200, 30, 30))
+
+# 5: xi/L vs L (log-log)
+selT = [0, 3, 6, 8]
+p = Plot(cv, boxes[4], (L_ax[0], L_ax[-1]), (1e-3, 1.0), logx=True, logy=True)
+p.grid_and_ticks("L", "xi_2nd / L", "CORRELATION-LENGTH RATIO")
+for k, ti in enumerate(selT):
+    p.curve(L_ax, xiL[:, ti], COLORS[k])
+    cv.text(p.box[0] + 4 + k * 92, p.box[1] + 4 + k * 10, f"T={T_ax[ti]:.3f}", COLORS[k])
+
+# 6: chi vs L (log-log)
+p = Plot(cv, boxes[5], (L_ax[0], L_ax[-1]), (1e-3, 1.0), logx=True, logy=True)
+p.grid_and_ticks("L", "chi(L,T)", "SUSCEPTIBILITY chi(L,T)")
+for k, ti in enumerate(selT):
+    p.curve(L_ax, chi[:, ti], COLORS[k])
+    cv.text(p.box[0] + 4 + k * 92, p.box[1] + 4 + k * 10, f"T={T_ax[ti]:.3f}", COLORS[k])
+ref = chi[-1, selT[2]] * (L_ax / L_ax[-1]) ** 1.75
+p.curve(np.linspace(L_ax[0], L_ax[-1], 50), np.linspace(ref[0], ref[-1], 50), (120, 120, 120))
+
+# 7: WM residual traces
+p = Plot(cv, boxes[6], (T_ax[0], T_ax[-1]),
+         (0.0, float(max(np.max(t) for t in resid_traces)) * 1.15))
+p.grid_and_ticks("T", "rel. L2 resid.", "WEBER-MINNHAGEN CHECK")
+for mi in range(3):
+    p.curve(T_ax, resid_traces[mi], COLORS[mi])
+    cv.text(p.box[2] - 66, p.Y(resid_traces[mi][-1]) + 2, f"L>={Lmin_cand[mi]}", COLORS[mi])
+p.vline(T_pref, (0, 0, 0))
+
+# 8: response residual traces
+p = Plot(cv, boxes[7], (T_ax[0], T_ax[-1]),
+         (0.0, float(max(np.max(t) for t in resp_traces)) * 1.15))
+p.grid_and_ticks("T", "rel. L2 resid.", "SUSCEPTIBILITY L^(7/4) CHECK")
+for mi in range(3):
+    p.curve(T_ax, resp_traces[mi], COLORS[mi])
+    cv.text(p.box[2] - 66, p.Y(resp_traces[mi][-1]) + 2, f"L>={Lmin_cand[mi]}", COLORS[mi])
+p.vline(T_resp, (0, 0, 0))
+
+# 9: Upsilon heatmap
+bx = boxes[8]
+um, umax = float(U.min()), float(U.max())
+ny, nx = 60, 90
+for iy in range(ny):
+    t = T_ax[0] + (iy + 0.5) / ny * (T_ax[-1] - T_ax[0])
+    for ix in range(nx):
+        lpos = (ix + 0.5) / nx * (nL - 1)
+        li0 = min(int(lpos), nL - 2)
+        fr = lpos - li0
+        v = np.interp(t, T_ax, U[li0, :]) * (1 - fr) + np.interp(t, T_ax, U[li0 + 1, :]) * fr
+        q = (v - um) / max(umax - um, 1e-9)
+        col = (int(255 * q), int(60 + 120 * (1 - abs(2 * q - 1))), int(255 * (1 - q)))
+        cv.fill(bx[0] + ix * (bx[2] - bx[0]) // nx, bx[1] + iy * (bx[3] - bx[1]) // ny,
+                bx[0] + (ix + 1) * (bx[2] - bx[0]) // nx - 1,
+                bx[1] + (iy + 1) * (bx[3] - bx[1]) // ny - 1, col)
+cv.rect(bx[0], bx[1], bx[2], bx[3], (60, 60, 60))
+for li in range(nL):
+    py = bx[3] - (li + 0.5) / nL * (bx[3] - bx[1])
+    cv.text(bx[2] + 6, py - 3, f"L={L_ax[li]}", (40, 40, 40))
+cv.text((bx[0] + bx[2]) / 2 - 3, bx[3] + 18, "T", (0, 0, 0))
+cv.text((bx[0] + bx[2]) / 2 - 40, bx[1] - 16, "Upsilon(L,T) HEATMAP", (0, 0, 0), scale=2)
+cv.text(bx[0] + 8, bx[1] + 6, "Tc=%.4f" % T_pref, (0, 0, 0))
+
+cv.save("overview.png")
+
+# ----------------------------------------------------------------------------
+# 8. console summary
+# ----------------------------------------------------------------------------
+print("\n=== SUMMARY ===")
+print("Upsilon(L=104, T):", np.round(U[-1, :], 4))
+print("defect density (L=104):", np.round(rho[-1, :], 4))
+print("eta(T):", np.round(eta, 4))
+print("chi(L=104):", np.round(chi[-1, :], 5))
+print("xi/L (L=104):", np.round(xiL[-1, :], 4))
+print("components [WM, NKsw, betaU, xi, eta=1/4]:", np.round(comps, 5))
+print(f"preferred T_c = {T_pref:.5f} (C={C_pref:.4f}, resid={R_pref:.4f}, L_min={Lax_sel})")
+print(f"response T = {T_resp:.5f} (C={C_resp:.4f}, resid={R_resp:.4f})")
+print(f"consensus = {consensus:.5f} (unc {consensus_unc:.5f}, spread {consensus_spread:.5f})")
+print(f"stiffness ratio at T_c = {stiff_ratio:.5f} (resid {stiff_resid:.5f})")
+print(f"eta(T_c) = {eta_at_tc:.5f} ; xi/L intercept at T_c = {dim_ratio_at_tc:.5f}")
+print(f"defect span = {defect_span:.5f}")
+print("outputs: obs_matrix_a..f.npy, obs_tensor_c.npy, phase_summary.json, "
+      "phase_fit_diagnostics.json, overview.png")

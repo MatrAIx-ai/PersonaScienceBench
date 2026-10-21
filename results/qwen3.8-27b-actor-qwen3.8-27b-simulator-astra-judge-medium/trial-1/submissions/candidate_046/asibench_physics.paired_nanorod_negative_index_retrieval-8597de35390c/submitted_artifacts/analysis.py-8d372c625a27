@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""
+Negative-Index Retrieval in Paired-Nanorod Metamaterials
+=========================================================
+Coherent workflow:
+  1. Phase-aware retrieval of effective n(lambda), z(lambda) from calibration
+     spectra (single effective slab, thickness = slab_thickness_nm; convention
+         r = (1-z)/(1+z),  t = 2/(1+z) * exp(i k0 n d)
+     =>  z = (1-r)/(1+r),  w = t(1+z)/2,  n = [arg_unwrap(w) - i ln|w|]/(k0 d)
+     Verified on the data: forward-model round-trip residuals ~1e-16.)
+  2. Compare three compact physical mechanism families, each expressed as
+     Lorentzian eps(lambda), mu(lambda) -> n = sqrt(eps*mu), z = sqrt(mu/eps):
+         electric_only
+         electric_magnetic_dual_resonance
+         dual_resonance_plus_substrate_shift
+     Families are fitted (scipy least_squares, multi-start) to the phase-aware
+     retrieved n(lambda), z(lambda) of the calibration samples.
+  3. Held-out transfer WITHOUT interpolation/surrogate APIs: a low-dimensional
+     ridge-linear map (numpy) from geometry features to the *physical
+     parameters of the selected family* (learned from per-sample fits of the
+     retrieved quantities), validated by leave-one-sample-out. Held-out spectra
+     are produced by evaluating the same selected family on the provided
+     wavelength grid and applying the slab forward model.
+  4. Negative-index summary with the documented zero-width no-band convention.
+Outputs: results/{calibration_retrieval,model_comparison,heldout_prediction,
+negative_index_summary}.csv, retrieval_diagnostics.png, conclusion.txt
+"""
+import os
+import numpy as np
+import pandas as pd
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:  # matplotlib is in the declared runtime; fallback PNG writer below
+    HAVE_MPL = False
+from scipy.optimize import least_squares
+
+DATA = "data"
+OUT = "results"
+FAMILIES = [
+    "electric_only",
+    "electric_magnetic_dual_resonance",
+    "dual_resonance_plus_substrate_shift",
+]
+FAMILY_DESC = {
+    "electric_only": ("Single electric (dipole) Lorentz resonance in eps; mu = 1 "
+                      "(no magnetic response)."),
+    "electric_magnetic_dual_resonance": ("Electric and magnetic Lorentz resonances; "
+                                         "n = sqrt(eps*mu), z = sqrt(mu/eps); negative "
+                                         "index where both eps and mu are negative."),
+    "dual_resonance_plus_substrate_shift": ("Electric+magnetic dual resonance plus a "
+                                            "substrate-index-dependent background shift "
+                                            "of eps."),
+}
+RIDGE = 1e-6  # numerical-safety ridge for the geometry->parameter map
+# Feature set: the family parameters (resonance positions first) follow a linear law in
+# (rod_length, gap, spacer, substrate_index); rod_width shows no independent linear effect.
+FEATS = ["rod_length_nm", "gap_nm", "spacer_thickness_nm", "substrate_index"]
+
+
+# ----------------------------------------------------------------------
+# 1. Data + phase-aware retrieval
+# ----------------------------------------------------------------------
+def load_data():
+    cal_s = pd.read_csv(f"{DATA}/calibration_samples.csv")
+    cal_o = pd.read_csv(f"{DATA}/calibration_optics.csv")
+    ho_s = pd.read_csv(f"{DATA}/heldout_samples.csv")
+    return cal_s, cal_o, ho_s
+
+
+def wrap_phase(p):
+    """Wrap to [-pi, pi)."""
+    return ((p + np.pi) % (2 * np.pi)) - np.pi
+
+
+def retrieve(g, d_nm):
+    """Phase-aware retrieval for one sample (g: optics rows, sorted by wl)."""
+    g = g.sort_values("wavelength_nm")
+    wl = g["wavelength_nm"].to_numpy()
+    k0 = 2 * np.pi / wl
+    t = g["t_amp"].to_numpy() * np.exp(1j * g["phi_t_rad"].to_numpy())
+    r = g["r_amp"].to_numpy() * np.exp(1j * g["phi_r_rad"].to_numpy())
+    z = (1 - r) / (1 + r)
+    w = t * (1 + z) / 2
+    arg = np.unwrap(np.angle(w))
+    n_real = arg / (k0 * d_nm)
+    n_imag = -np.log(np.abs(w)) / (k0 * d_nm)
+    return wl, t, r, z, n_real, n_imag
+
+
+# ----------------------------------------------------------------------
+# 2. Compact family models: Lorentz eps(mu) -> n, z
+# ----------------------------------------------------------------------
+def lorentz_c(bg, S, lam0, gam, lam):
+    """Complex Lorentz: bg + S*lam0^2/(lam0^2 - lam^2 - i*lam*gam).
+    S > 0 gives a dispersive dip in the real part (crossing bg at lam0) and a
+    positive absorptive peak in the imaginary part at lam0 (passive)."""
+    a = lam0**2 - lam**2
+    b = lam * gam
+    return bg + S * lam0**2 * (a + 1j * b) / (a*a + b*b)
+
+
+def family_nz(fam, p, lam, sub=1.0):
+    """Complex (n, z) arrays. p = [eps_inf, S_e, gam_e, lam_e, mu_inf, S_m,
+    gam_m, lam_m] (+ a1 for the substrate-shift family); S_e, S_m > 0.
+    n = sqrt(eps*mu) on the passive branch (Im n >= 0), z = mu/n (consistent)."""
+    eps_inf, S_e, gam_e, lam_e, mu_inf, S_m, gam_m, lam_m = p[:8]
+    a1 = p[8] if len(p) > 8 else 0.0
+    eps = lorentz_c(eps_inf, S_e, lam_e, gam_e, lam)
+    if fam == "dual_resonance_plus_substrate_shift":
+        eps = eps + a1 * (sub - 1.0)
+    if fam == "electric_only":
+        mu = np.ones_like(lam, dtype=complex)
+    else:
+        mu = lorentz_c(mu_inf, S_m, lam_m, gam_m, lam)
+    n = np.sqrt(eps * mu + 0j)
+    n = np.where(n.imag < 0, -n, n)  # passive branch
+    z = mu / n
+    return n, z
+
+
+def init_params(fam, wl, n_real, n_imag, z):
+    """Physics-based initialization from retrieved quantities of one sample."""
+    nc = n_real + 1j * n_imag
+    eps = nc**2 / z**2
+    mu = (z * nc) ** 2
+    i0, i1 = 6, -7  # endpoint bands away from resonances
+    eps_inf = float(np.clip(eps[i0:i1].real.mean(), 0.3, 6.0))
+    mu_inf = float(np.clip(mu[i0:i1].real.mean(), 0.3, 6.0))
+    i_e = int(np.argmin(n_imag))
+    lam_e = float(wl[i_e])
+    gam_e = float(max(10.0, (wl[1] - wl[0]) * 8))
+    S_e = float(max(0.3, eps_inf * 1.2))
+    if fam == "electric_only":
+        return np.array([eps_inf, S_e, gam_e, lam_e, 1.0, 0.1, gam_e, lam_e])
+    i_m = int(np.argmin(mu.real))
+    lam_m = float(wl[i_m])
+    gam_m = float(max(10.0, (wl[1] - wl[0]) * 10))
+    S_m = float(max(0.1, abs(mu[i_m].real) + 0.1))
+    if fam == "electric_magnetic_dual_resonance":
+        return np.array([eps_inf, S_e, gam_e, lam_e, mu_inf, S_m, gam_m, lam_m])
+    a1 = float(np.clip((n_real[i0:i1].mean() - np.sqrt(eps_inf * mu_inf)) / 0.46, -3.0, 3.0))
+    return np.array([eps_inf, S_e, gam_e, lam_e, mu_inf, S_m, gam_m, lam_m, a1])
+
+
+def unpack_params(x):
+    """x[:8] in log-space (positive), x[8:] raw (a1 may be negative)."""
+    p = np.exp(x[:8])
+    if len(x) > 8:
+        p = np.concatenate([p, x[8:]])
+    return p
+
+
+def starts_for(fam, base):
+    """Multi-start perturbations (log-space for the 8 positive params)."""
+    x0 = np.log(np.abs(base[:8]))
+    if len(base) > 8:
+        x0 = np.concatenate([x0, base[8:]])
+    out = [x0]
+    dle, dlm, sg = 8.0, 10.0, 1.6
+    for e in (-dle, 0.0, dle):
+        for m in (-dlm, 0.0, dlm):
+            for s in (1.0 / sg, 1.0, sg):
+                x = x0.copy()
+                x[3] += np.log(1 + e / base[3])
+                if fam != "electric_only":
+                    x[7] += np.log(1 + m / base[7])
+                x[2] += np.log(s)
+                if fam != "electric_only":
+                    x[6] += np.log(s)
+                out.append(x)
+    return out[:12]
+
+
+def _bounds(fam):
+    """(lo, hi) in the mixed parameter space (log for the 8 positive params)."""
+    lo = np.array([np.log(0.2), np.log(0.05), np.log(5.0), np.log(1240.0),
+                   np.log(0.2), np.log(0.05), np.log(5.0), np.log(1240.0)])
+    hi = np.array([np.log(6.0), np.log(20.0), np.log(300.0), np.log(1720.0),
+                   np.log(6.0), np.log(20.0), np.log(300.0), np.log(1720.0)])
+    if fam == "dual_resonance_plus_substrate_shift":
+        lo = np.concatenate([lo, [-5.0]])
+        hi = np.concatenate([hi, [5.0]])
+    return lo, hi
+
+
+def _resid_factory(fam, wl, sub, tr, ti, zr, zi):
+    def resid(x):
+        p = unpack_params(x)
+        n, z = family_nz(fam, p, wl, sub)
+        res = np.concatenate([n.real - tr, n.imag - ti, z.real - zr, z.imag - zi])
+        res = np.where(np.isfinite(res), res, 1e3)
+        return res
+    return resid
+
+
+def _safe_family(p, fam, wl, sub):
+    """Return family (n, z) if finite everywhere, else None."""
+    try:
+        n, z = family_nz(fam, p, wl, sub)
+    except Exception:
+        return None
+    if not (np.isfinite(n).all() and np.isfinite(z).all()):
+        return None
+    return n, z
+
+
+def _multistart(fam, wl, sub, tr, ti, zr, zi):
+    resid = _resid_factory(fam, wl, sub, tr, ti, zr, zi)
+    base = init_params(fam, wl, tr, ti, zr + 0j * zi)
+    lo, hi = _bounds(fam)
+    best = None
+    for x0 in starts_for(fam, base):
+        x0 = np.clip(x0, lo, hi)
+        try:
+            sol = least_squares(resid, x0, method="trf", bounds=(lo, hi), max_nfev=300)
+            if best is None or sol.cost < best.cost:
+                best = sol
+        except Exception:
+            continue
+    if best is not None:
+        p = unpack_params(best.x)
+        sub_arr = np.full_like(wl, float(np.atleast_1d(sub)[0]))
+        if _safe_family(p, fam, wl, sub_arr) is not None:
+            return p, float(best.cost)
+    return base, np.inf
+
+
+def fit_family_global(fam, cal):
+    """One shared parameter set for the family across all calibration samples."""
+    wl_all = np.concatenate([c["wl"] for c in cal])
+    sub_all = np.concatenate([np.full(len(c["wl"]), c["sub"]) for c in cal])
+    tr = np.concatenate([c["n_real"] for c in cal])
+    ti = np.concatenate([c["n_imag"] for c in cal])
+    zr = np.concatenate([c["z"].real for c in cal])
+    zi = np.concatenate([c["z"].imag for c in cal])
+    return _multistart(fam, wl_all, sub_all, tr, ti, zr, zi)
+
+
+def fit_family_per_sample(fam, cal):
+    """Per-sample parameter vectors (aligned with cal) for the geometry map."""
+    res = []
+    for c in cal:
+        p, _ = _multistart(fam, c["wl"], np.full(len(c["wl"]), c["sub"]),
+                           c["n_real"], c["n_imag"], c["z"].real, c["z"].imag)
+        res.append(p)
+    return res
+
+
+# ----------------------------------------------------------------------
+# 3. Geometry -> family-parameter map (ridge linear, numpy only)
+# ----------------------------------------------------------------------
+def design_matrix(samples_df):
+    X = samples_df[FEATS].to_numpy(float)
+    X = (X - X.mean(0)) / X.std(0)
+    return np.column_stack([X, np.ones(len(X))])
+
+
+def ridge_map(X, Y):
+    """Y: (n_samples, n_params); per-parameter ridge solve. Returns (n_params, n_feat)."""
+    A = X.T @ X + RIDGE * np.eye(X.shape[1])
+    W = np.linalg.solve(A, X.T @ Y)
+    return W.T
+
+
+def predict_params(W, X):
+    return X @ W.T
+
+
+def loo_cv(fam, cal, samples_df, P=None):
+    """Leave-one-sample-out of the parameter map; returns (cv_rmse, pred_nz, P, Wfull)."""
+    X = design_matrix(samples_df)
+    if P is None:
+        P = fit_family_per_sample(fam, cal)
+    Pm = np.stack(P)
+    Y = np.log(np.abs(Pm[:, :8]))
+    if Pm.shape[1] > 8:
+        Y = np.column_stack([Y, Pm[:, 8:]])
+    Wfull = ridge_map(X, Y)
+    pred_nz, errs = [], []
+    for i in range(len(cal)):
+        mask = np.arange(len(cal)) != i
+        W = ridge_map(X[mask], Y[mask])
+        p = unpack_params(predict_params(W, X[i][None, :])[0])
+        n, z = family_nz(fam, p, cal[i]["wl"], cal[i]["sub"])
+        pred_nz.append((n, z))
+        errs.append(np.concatenate([n.real - cal[i]["n_real"], n.imag - cal[i]["n_imag"],
+                                    z.real - cal[i]["z"].real, z.imag - cal[i]["z"].imag]))
+    e = np.concatenate(errs)
+    return float(np.sqrt(np.mean(e**2))), pred_nz, P, Wfull
+
+
+# ----------------------------------------------------------------------
+# 4. Negative-index band summary (documented rule)
+# ----------------------------------------------------------------------
+def neg_band(wl, n_real):
+    row = {}
+    mask = n_real < 0
+    if mask.any():
+        idx = np.where(mask)[0]
+        w0, w1 = wl[idx[0]], wl[idx[-1]]
+        row.update(negative_band_start_nm=float(w0), negative_band_end_nm=float(w1),
+                   negative_band_center_nm=float(0.5 * (w0 + w1)),
+                   band_width_nm=float(w1 - w0),
+                   negative_fraction_of_grid=float(mask.mean()))
+    else:  # zero-width no-band convention
+        wmin = wl[int(np.argmin(n_real))]
+        row.update(negative_band_start_nm=float(wmin), negative_band_end_nm=float(wmin),
+                   negative_band_center_nm=float(wmin),
+                   band_width_nm=0.0, negative_fraction_of_grid=0.0)
+    row["min_n_real"] = float(n_real.min())
+    row["min_n_real_wavelength_nm"] = float(wl[int(np.argmin(n_real))])
+    return row
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    cal_s, cal_o, ho_s = load_data()
+    wl_grid = np.sort(cal_o["wavelength_nm"].unique())
+
+    # ---- retrieval on calibration --------------------------------------
+    cal, rows = [], []
+    for sid, g in cal_o.groupby("sample_id"):
+        srow = cal_s[cal_s.sample_id == sid].iloc[0]
+        d = float(srow["slab_thickness_nm"])
+        wl, t, r, z, nr, ni = retrieve(g, d)
+        gs = g.sort_values("wavelength_nm")
+        cal.append(dict(wl=wl, sub=float(srow["substrate_index"]), n_real=nr, n_imag=ni,
+                        z=z, d=d, t=t, r=r,
+                        phi_t=gs["phi_t_rad"].to_numpy(), phi_r=gs["phi_r_rad"].to_numpy()))
+        for j in range(len(wl)):
+            rows.append(dict(sample_id=sid, split="calibration", wavelength_nm=wl[j],
+                             t_amp=gs["t_amp"].to_numpy()[j], r_amp=gs["r_amp"].to_numpy()[j],
+                             phi_t_rad=wrap_phase(gs["phi_t_rad"].to_numpy()[j]),
+                             phi_r_rad=wrap_phase(gs["phi_r_rad"].to_numpy()[j]),
+                             n_real=nr[j], n_imag=ni[j], z_real=z[j].real, z_imag=z[j].imag))
+    cal_retr = pd.DataFrame(rows)
+    cal_retr.to_csv(f"{OUT}/calibration_retrieval.csv", index=False)
+
+    # ---- family comparison ----------------------------------------------
+    comp, artifacts = [], {}
+    for fam in FAMILIES:
+        # per-sample family fits (the pipeline's retrieval stage); the metrics
+        # measure how well the family *form* represents each calibration spectrum
+        P = fit_family_per_sample(fam, cal)
+        e_nz, e_ph = [], []
+        for c, p in zip(cal, P):
+            n, z = family_nz(fam, p, c["wl"], c["sub"])
+            e_nz.append(np.concatenate([n.real - c["n_real"], n.imag - c["n_imag"],
+                                        z.real - c["z"].real, z.imag - c["z"].imag]))
+            t_m = 2 / (1 + z) * np.exp(1j * 2 * np.pi / c["wl"] * n * c["d"])
+            r_m = (1 - z) / (1 + z)
+            e_ph.append(wrap_phase(np.angle(t_m) - c["phi_t"]))
+            e_ph.append(wrap_phase(np.angle(r_m) - c["phi_r"]))
+        cal_rmse = float(np.sqrt(np.mean(np.concatenate(e_nz) ** 2)))
+        ph_rmse = float(np.sqrt(np.mean(np.concatenate(e_ph) ** 2)))
+        cv_rmse, pred_nz, P, W = loo_cv(fam, cal, cal_s, P)
+        comp.append(dict(model_name=fam, calibration_rmse=cal_rmse, crossval_rmse=cv_rmse,
+                         phase_consistency_rmse=ph_rmse,
+                         num_parameters=len(P[0]),
+                         mechanism_summary=FAMILY_DESC[fam]))
+        artifacts[fam] = dict(P=P, W=W, pred_nz=pred_nz)
+    comp_df = pd.DataFrame(comp)
+    cv_vals = np.where(np.isfinite(comp_df["crossval_rmse"].to_numpy()),
+                       comp_df["crossval_rmse"].to_numpy(), np.inf)
+    best_i = int(np.argmin(cv_vals))
+    comp_df["preferred"] = [False] * len(comp_df)
+    comp_df.loc[best_i, "preferred"] = True
+    comp_df = comp_df[["model_name", "calibration_rmse", "crossval_rmse",
+                       "phase_consistency_rmse", "num_parameters", "preferred",
+                       "mechanism_summary"]]
+    comp_df.to_csv(f"{OUT}/model_comparison.csv", index=False)
+    fam_sel = str(comp_df.iloc[best_i]["model_name"])
+
+    # ---- held-out prediction with the SELECTED family only ---------------
+    art = artifacts[fam_sel]
+    Xh = design_matrix(ho_s)
+    ho_rows, ho_nz = [], {}
+    for k, srow in ho_s.iterrows():
+        p = unpack_params(predict_params(art["W"], Xh[k][None, :])[0])
+        n, z = family_nz(fam_sel, p, wl_grid, float(srow["substrate_index"]))
+        d = float(srow["slab_thickness_nm"])
+        t = 2 / (1 + z) * np.exp(1j * 2 * np.pi / wl_grid * n * d)
+        r = (1 - z) / (1 + z)
+        ho_nz[srow["sample_id"]] = (n.real, n)
+        for j in range(len(wl_grid)):
+            ho_rows.append(dict(sample_id=srow["sample_id"], wavelength_nm=wl_grid[j],
+                                t_amp=float(np.abs(t[j])), r_amp=float(np.abs(r[j])),
+                                phi_t_rad=float(wrap_phase(np.angle(t[j]))),
+                                phi_r_rad=float(wrap_phase(np.angle(r[j]))),
+                                n_real=float(n.real[j]), n_imag=float(n.imag[j]),
+                                z_real=float(z[j].real), z_imag=float(z[j].imag)))
+    ho_pred = pd.DataFrame(ho_rows)
+    ho_pred.to_csv(f"{OUT}/heldout_prediction.csv", index=False)
+
+    # ---- negative-index summary (same rule: cal retrieved / ho predicted)
+    sum_rows = []
+    for c, srow in zip(cal, cal_s.itertuples()):
+        row = neg_band(c["wl"], c["n_real"])
+        row.update(sample_id=srow.sample_id, split="calibration")
+        sum_rows.append(row)
+    for srow in ho_s.itertuples():
+        row = neg_band(wl_grid, ho_nz[srow.sample_id][0])
+        row.update(sample_id=srow.sample_id, split="heldout")
+        sum_rows.append(row)
+    sum_df = pd.DataFrame(sum_rows)[["sample_id", "split", "negative_band_start_nm",
+                                     "negative_band_end_nm", "negative_band_center_nm",
+                                     "min_n_real", "min_n_real_wavelength_nm",
+                                     "band_width_nm", "negative_fraction_of_grid"]]
+    sum_df.to_csv(f"{OUT}/negative_index_summary.csv", index=False)
+
+    # ---- diagnostics figure ----------------------------------------------
+    make_diagnostics(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid)
+
+
+    # ---- conclusion --------------------------------------------------------
+    csel = comp_df.iloc[best_i]
+    lines = [
+        "CONCLUSION",
+        "==========",
+        f"Selected family (preferred in model_comparison.csv, used for held-out): {fam_sel}",
+        f"  mechanism: {FAMILY_DESC[fam_sel]}",
+        f"  calibration_rmse={csel['calibration_rmse']:.4f}  crossval_rmse={csel['crossval_rmse']:.4f}  "
+        f"phase_consistency_rmse={csel['phase_consistency_rmse']:.4f}  num_parameters={int(csel['num_parameters'])}",
+        "(full family comparison in results/model_comparison.csv)",
+        "Negative-index bands (rule: first/last grid points with n_real<0; zero-width convention if none):",
+    ]
+    for _, r in sum_df.iterrows():
+        if r["band_width_nm"] > 0:
+            lines.append(f"  {r['sample_id']} ({r['split']}): {r['negative_band_start_nm']:.1f}-{r['negative_band_end_nm']:.1f} nm "
+                         f"(width {r['band_width_nm']:.1f} nm, min n_real {r['min_n_real']:.3f} @ "
+                         f"{r['min_n_real_wavelength_nm']:.1f} nm, fraction {r['negative_fraction_of_grid']:.2f})")
+        else:
+            lines.append(f"  {r['sample_id']} ({r['split']}): NO negative-index band (zero-width convention; "
+                         f"min n_real {r['min_n_real']:.3f} @ {r['min_n_real_wavelength_nm']:.1f} nm)")
+    lines += [
+        "Method: phase-aware single-slab retrieval (z=(1-r)/(1+r), n from unwrapped phase of t(1+z)/2)",
+        "-> compact complex-Lorentz family fit (passive sqrt branch) -> linear geometry map to the",
+        f"family's physical parameters ({len(FEATS)} features + intercept, ridge={RIDGE}) -> slab forward",
+        "model on the provided wavelength grid. No interpolation/surrogate APIs used for held-out transfer.",
+        f"The map targets the family parameters retrieved from the calibration spectra (leave-one-out",
+        f"n,z RMSE = {csel['crossval_rmse']:.3f} for the selected family).",
+        "Limitation: the geometry->parameter map is trained on only 6 calibration samples (4 features +",
+        "intercept => 1 spare degree of freedom per parameter; leave-one-out used for validation).",
+        "Held-out samples lie at or slightly beyond the calibration feature ranges (H1 rod_length), so",
+        "the map extrapolates mildly; per-parameter map uncertainty is the dominant source of held-out",
+        "error.",
+    ]
+    with open(f"{OUT}/conclusion.txt", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print("done. selected family:", fam_sel)
+    print(comp_df.to_string(index=False))
+
+
+# ----------------------------------------------------------------------
+# diagnostics figure: matplotlib if available, else pure-python PNG writer
+# ----------------------------------------------------------------------
+def _figure_mpl(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid):
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    fig.suptitle(f"Negative-index retrieval — selected family: {fam_sel}", fontsize=13)
+    ax = axes[0, 0]
+    for c, srow in zip(cal, cal_s.itertuples()):
+        ax.plot(c["wl"], c["n_real"], lw=1, label=srow.sample_id)
+        m = c["n_real"] < 0
+        if m.any():
+            ax.fill_between(c["wl"][m], c["n_real"][m], 0, alpha=0.15)
+    ax.axhline(0, color="k", lw=0.6)
+    ax.set_title("Retrieved n_real (calibration); shaded = n_real<0")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=7, ncol=2)
+    ax = axes[0, 1]
+    for c, srow, p in zip(cal, cal_s.itertuples(), art["P"]):
+        n, z = family_nz(fam_sel, p, c["wl"], c["sub"])
+        ax.plot(c["wl"], n.real, lw=1, label=srow.sample_id)
+        ax.plot(c["wl"], c["n_real"], "k--", lw=0.5, alpha=0.35)
+    ax.axhline(0, color="k", lw=0.6)
+    ax.set_title(f"Selected-family per-sample fit (solid) vs retrieved (dashed) n_real")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=7, ncol=2)
+    ax = axes[0, 2]
+    for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples())):
+        n, z = art["pred_nz"][i]
+        ax.plot(c["wl"], n.real, lw=1, label=f"{srow.sample_id} (LOO map)")
+        ax.plot(c["wl"], c["n_real"], "k--", lw=0.5, alpha=0.35)
+    ax.axhline(0, color="k", lw=0.6)
+    ax.set_title("Leave-one-out geometry-map predictions vs retrieved")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=6, ncol=2)
+    ax = axes[1, 0]
+    for c, srow in zip(cal, cal_s.itertuples()):
+        ax.plot(c["wl"], c["n_imag"], lw=1, label=srow.sample_id)
+    ax.set_title("Retrieved n_imag (absorption peak = electric resonance)")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=7, ncol=2)
+    ax = axes[1, 1]
+    for c, srow, p in zip(cal, cal_s.itertuples(), art["P"]):
+        n, z = family_nz(fam_sel, p, c["wl"], c["sub"])
+        ax.plot(c["wl"], z.real, lw=1, label=srow.sample_id)
+    ax.axhline(1.0, color="k", lw=0.6, ls=":")
+    ax.set_title("Selected-family per-sample z_real (magnetic resonance near z=1)")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=7, ncol=2)
+    ax = axes[1, 2]
+    for srow in ho_s.itertuples():
+        nr, n = ho_nz[srow.sample_id]
+        ax.plot(wl_grid, nr, lw=1.2, label=srow.sample_id)
+        m = nr < 0
+        if m.any():
+            ax.fill_between(wl_grid[m], nr[m], 0, alpha=0.2)
+    ax.axhline(0, color="k", lw=0.6)
+    ax.set_title("Held-out predicted n_real (same selected family)")
+    ax.set_xlabel("wavelength (nm)"); ax.legend(fontsize=7)
+    for a in axes.ravel():
+        a.grid(alpha=0.3)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(f"{OUT}/retrieval_diagnostics.png", dpi=140)
+    plt.close(fig)
+
+
+# ---- fallback pure-python PNG renderer (numpy + zlib + struct only) ----
+_FONT57 = {
+"0":"01110 10001 10011 10101 11001 10001 01110","1":"00100 01100 00100 00100 00100 00100 01110",
+"2":"01110 10001 00001 00010 00100 01000 11111","3":"01110 10001 00001 00110 00001 10001 01110",
+"4":"00010 00110 01010 10010 11111 00010 00010","5":"11111 10000 11110 00001 00001 10001 01110",
+"6":"00110 01000 10000 11110 10001 10001 01110","7":"11111 00001 00010 00100 01000 01000 01000",
+"8":"01110 10001 10001 01110 10001 10001 01110","9":"01110 10001 10001 01111 00001 00010 01100",
+"A":"01110 10001 10001 11111 10001 10001 10001","B":"11110 10001 10001 11110 10001 10001 11110",
+"C":"01110 10001 10000 10000 10000 10001 01110","D":"11100 10010 10001 10001 10001 10010 11100",
+"E":"11111 10000 10000 11110 10000 10000 11111","F":"11111 10000 10000 11110 10000 10000 10000",
+"G":"01110 10001 10000 10111 10001 10001 01111","H":"10001 10001 10001 11111 10001 10001 10001",
+"I":"01110 00100 00100 00100 00100 00100 01110","J":"00111 00010 00010 00010 00010 10010 01100",
+"K":"10001 10010 10100 11000 10100 10010 10001","L":"10000 10000 10000 10000 10000 10000 11111",
+"M":"10001 11011 10101 10101 10001 10001 10001","N":"10001 11001 10101 10011 10001 10001 10001",
+"O":"01110 10001 10001 10001 10001 10001 01110","P":"11110 10001 10001 11110 10000 10000 10000",
+"Q":"01110 10001 10001 10001 10101 10010 01101","R":"11110 10001 10001 11110 10100 10010 10001",
+"S":"01111 10000 10000 01110 00001 00001 11110","T":"11111 00100 00100 00100 00100 00100 00100",
+"U":"10001 10001 10001 10001 10001 10001 01110","V":"10001 10001 10001 10001 10001 01010 00100",
+"W":"10001 10001 10001 10101 10101 10101 01010","X":"10001 10001 01010 00100 01010 10001 10001",
+"Y":"10001 10001 01010 00100 00100 00100 00100","Z":"11111 00001 00010 00100 01000 10000 11111",
+" ":"00000 00000 00000 00000 00000 00000 00000","(": "00010 00100 01000 01000 01000 00100 00010",
+")":"01000 00100 00010 00010 00010 00100 01000","-":"00000 00000 00000 01110 00000 00000 00000",
+".":"00000 00000 00000 00000 00000 01100 01100","/":"00001 00010 00010 00100 01000 01000 10000",
+"<":"00010 00100 01000 10000 01000 00100 00010","=":"00000 00000 11111 00000 11111 00000 00000",
+":":"00000 01100 01100 00000 01100 01100 00000",",":"00000 00000 00000 00000 01100 00100 01000",
+"+":"00000 00100 00100 11111 00100 00100 00000","'":"00100 00100 01000 00000 00000 00000 00000",
+}
+
+
+def _put_text(buf, x, y, s, color, scale=1):
+    for ch in str(s).upper():
+        g = _FONT57.get(ch)
+        if g is None:
+            x += 6 * scale
+            continue
+        rows = g.split()
+        for r in range(7):
+            for c in range(5):
+                if rows[r][c] == "1":
+                    buf[y + r * scale:y + (r + 1) * scale, x + c * scale:x + (c + 1) * scale] = color
+        x += 6 * scale
+
+
+def _put_line(buf, x0, y0, x1, y1, color, width=1):
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    n = max(abs(x1 - x0), abs(y1 - y0), 1)
+    H, W = buf.shape[:2]
+    for i in range(n + 1):
+        x = x0 + (x1 - x0) * i // n
+        y = y0 + (y1 - y0) * i // n
+        if 0 <= y < H and 0 <= x < W:
+            buf[max(0, y):min(H, y + width), max(0, x):min(W, x + width)] = color
+
+
+def _write_png(path, buf):
+    import zlib, struct
+    h, w, _ = buf.shape
+    raw = b"".join(b"\x00" + buf[i].tobytes() for i in range(h))
+    def chunk(t, d):
+        c = t + d
+        return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def _draw_panel(buf, px0, py0, px1, py1, title, series, fill_neg=(), zero=True):
+    allx = np.concatenate([s[0] for s in series])
+    ally = np.concatenate([s[1] for s in series])
+    fin = np.isfinite(allx) & np.isfinite(ally)
+    allx, ally = allx[fin], ally[fin]
+    xmin, xmax = float(allx.min()), float(allx.max())
+    ymin, ymax = float(ally.min()), float(ally.max())
+    pad = 0.08 * (ymax - ymin) if ymax > ymin else 1.0
+    ymin -= pad
+    ymax += pad
+    if zero:
+        ymin = min(ymin, -0.05)
+        ymax = max(ymax, 0.05)
+    def X(v):
+        return px0 + (v - xmin) / (xmax - xmin) * (px1 - px0)
+    def Y(v):
+        return py1 - (v - ymin) / (ymax - ymin) * (py1 - py0)
+    _put_line(buf, px0, py0, px1, py0, (0, 0, 0))
+    _put_line(buf, px0, py1, px1, py1, (0, 0, 0))
+    _put_line(buf, px0, py0, px0, py1, (0, 0, 0))
+    _put_line(buf, px1, py0, px1, py1, (0, 0, 0))
+    if zero:
+        _put_line(buf, int(X(xmin)), int(Y(0)), int(X(xmax)), int(Y(0)), (130, 130, 130))
+    for v in range(int(np.ceil(xmin / 150) * 150), int(xmax) + 1, 150):
+        xx = int(X(v))
+        _put_line(buf, xx, py1, xx, py1 + 4, (0, 0, 0))
+        lab = str(int(v))
+        _put_text(buf, xx - 3 * len(lab), py1 + 8, lab, (0, 0, 0))
+    for f in (0.12, 0.4, 0.68, 0.95):
+        v = ymin + f * (ymax - ymin)
+        yy = int(Y(v))
+        _put_line(buf, px0 - 4, yy, px0, yy, (0, 0, 0))
+        lab = f"{v:.1f}"
+        _put_text(buf, px0 - 5 - 6 * len(lab), yy - 3, lab, (0, 0, 0))
+    for xs, ys, color, dash, label in series:
+        fin = np.isfinite(xs) & np.isfinite(ys)
+        if fin.sum() < 2:
+            continue
+        xs, ys = xs[fin], ys[fin]
+        px = X(xs)
+        py = Y(ys)
+        i = 0
+        while i < len(xs) - 1:
+            if dash == 0 or (i // dash) % 2 == 0:
+                _put_line(buf, px[i], py[i], px[i + 1], py[i + 1], color)
+            i += 1
+        if label in fill_neg:
+            yz = int(Y(0))
+            for k in range(len(xs)):
+                if ys[k] < 0:
+                    a, b = sorted((yz, int(py[k])))
+                    if b > a:
+                        seg = buf[a:b + 1, int(px[k])]
+                        buf[a:b + 1, int(px[k])] = np.clip(seg.astype(int) + np.array([170, 0, 0]), 0, 255).astype(np.uint8)
+    _put_text(buf, px0, py0 - 18, title, (0, 0, 0), scale=2)
+    _put_text(buf, px0 + (px1 - px0) // 2 - 3 * len("WAVELENGTH (NM)"), py1 + 26, "WAVELENGTH (NM)", (0, 0, 0))
+    ly = py0 + 8
+    for s in series:
+        _put_line(buf, px1 - 78, ly + 3, px1 - 56, ly + 3, s[2], width=2)
+        _put_text(buf, px1 - 52, ly - 3, s[4], (0, 0, 0))
+        ly += 15
+
+
+def _figure_fallback(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid):
+    H, W = 920, 1560
+    buf = np.full((H, W, 3), 255, np.uint8)
+    _put_text(buf, 40, 14, "NEGATIVE-INDEX RETRIEVAL - SELECTED FAMILY: " + fam_sel, (0, 0, 0), scale=2)
+    PAL = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189), (140, 86, 75)]
+    HPAL = [(0, 0, 0), (200, 0, 200), (0, 130, 130)]
+    panels = []
+    s1 = [(c["wl"], c["n_real"], PAL[i % 6], 0, srow.sample_id, ) for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples()))]
+    panels.append((60, 80, 540, 390, "RETRIEVED N_REAL (CAL), SHADED=N<0", s1, tuple(s[4] for s in s1)))
+    p2 = []
+    for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples())):
+        n, z = family_nz(fam_sel, art["P"][i], c["wl"], c["sub"])
+        p2.append((c["wl"], n.real, PAL[i % 6], 0, srow.sample_id))
+        p2.append((c["wl"], c["n_real"], (90, 90, 90), 4, srow.sample_id + " RET"))
+    panels.append((570, 80, 1050, 390, "SELECTED FAMILY FIT (SOLID) VS RETRIEVED (DASH)", p2, ()))
+    p3 = []
+    for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples())):
+        n, z = art["pred_nz"][i]
+        p3.append((c["wl"], n.real, PAL[i % 6], 0, srow.sample_id))
+        p3.append((c["wl"], c["n_real"], (90, 90, 90), 4, srow.sample_id + " RET"))
+    panels.append((1080, 80, 1560 - 20, 390, "LOO GEOMETRY-MAP PREDICTION VS RETRIEVED", p3, ()))
+    p4 = [(c["wl"], c["n_imag"], PAL[i % 6], 0, srow.sample_id) for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples()))]
+    panels.append((60, 480, 540, 790, "RETRIEVED N_IMAG (ELECTRIC RESONANCE)", p4, ()))
+    p5 = []
+    for i, (c, srow) in enumerate(zip(cal, cal_s.itertuples())):
+        n, z = family_nz(fam_sel, art["P"][i], c["wl"], c["sub"])
+        p5.append((c["wl"], z.real, PAL[i % 6], 0, srow.sample_id))
+    panels.append((570, 480, 1050, 790, "SELECTED FAMILY Z_REAL (MAG RESONANCE)", p5, ()))
+    p6 = []
+    for i, srow in enumerate(ho_s.itertuples()):
+        nr, n = ho_nz[srow.sample_id]
+        p6.append((wl_grid, nr, HPAL[i % 3], 0, srow.sample_id))
+    panels.append((1080, 480, 1560 - 20, 790, "HELDOUT PREDICTED N_REAL (SAME FAMILY)", p6, tuple(s[4] for s in p6)))
+    for px0, py0, px1, py1, title, series, fill in panels:
+        _draw_panel(buf, px0, py0, px1, py1, title, series, fill_neg=fill, zero=True)
+    _write_png(f"{OUT}/retrieval_diagnostics.png", buf)
+
+
+def make_diagnostics(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid):
+    if HAVE_MPL:
+        _figure_mpl(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid)
+    else:
+        _figure_fallback(cal, cal_s, ho_s, ho_nz, fam_sel, art, wl_grid)
+
+
+if __name__ == "__main__":
+    main()

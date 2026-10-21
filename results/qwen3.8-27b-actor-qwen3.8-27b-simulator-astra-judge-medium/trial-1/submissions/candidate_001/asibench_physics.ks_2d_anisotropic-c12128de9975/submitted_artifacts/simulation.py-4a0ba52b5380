@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""
+B3: 2D Nonlinear Field Prediction - complete analysis and simulation
+=====================================================================
+Deterministic, runnable with numpy/scipy/matplotlib only.
+
+Pipeline
+--------
+1. Load data/system_info.json, data/field_evolution.npy, data/initial_condition.npy.
+2. Characterize observed spatio-temporal structure (directional/radial spectra,
+   center-pixel autocorrelation, line autocorrelations).
+3. PDE-candidate route (strict validation):
+   - Least-squares fit of 9 candidate nonlinear PDE operators
+     {u*ux, u*uy, u*uxx, u*uyy, uxx, uyy, uxxxx, uyyyy, uxxxyy}
+     against the central-difference time derivative (spectral operators).
+   - Check whether the 7 given system coefficients can be assigned (up to sign)
+     to the fitted operators within 30% relative tolerance.
+   - Integrate the best-matching arrangement pseudospectrally (RK4, dt=0.02)
+     from the exact IC; require min corr > 0.999 at all 21 snapshot times.
+     If any check fails -> reject PDE route.
+4. Mode-space fallback (approved): track complex Fourier amplitudes of the
+   dominant modes; per-mode law selection from {quadratic, linear,
+   exponential, freeze} via holdout back-prediction (fit t=0..7.5 s,
+   predict t=8..10 s); K selected by holdout correlation; final fit on all
+   21 snapshots extrapolated to t = 30 s.
+5. Diagnostics per the public scored conventions:
+   - spectral_density.npy: mean of |fft2(field)|^2/field.size in 65
+     equal-width annuli from 0 to the full corner radius, k in PHYSICAL
+     wavenumber (cycles/unit) via fftfreq(N, d=dx/dy) -- the domain is
+     anisotropic (dx != dy), so physical coordinates are the natural choice
+     for a spatial power spectrum.
+   - decay_exponent: signed log-log slope of the time-averaged radial PSD
+     above its nonzero peak and below 0.65*k_max.
+   - temporal_decay_scale: first zero crossing of the mean-centered
+     center-pixel autocorrelation (fallback observation_time/4).
+   - coherence_length_{1,2}: first zero crossing of the averaged periodic
+     line autocorrelation after centering each line, times the grid spacing.
+   - divergence_measure: deterministic perturbation
+     rng(1729).standard_normal((Nx,Ny)), mean-centered, 2-norm 1e-8;
+     evolved min(target_time, 8) = 8 s in 2 s renormalization segments
+     under the chosen model's linearized (per-mode) dynamics.
+     DEFINITION (explicit): divergence_measure = product over the 4 segments
+     of (||xi_end||_2 / 1e-8), i.e. the total normalized growth of the
+     perturbation over 8 s; equivalently exp(8*lambda) where lambda is the
+     renormalized finite-time growth rate. Always finite and positive.
+6. Write all 7 required artifacts.
+"""
+import json
+import numpy as np
+
+# ----------------------------------------------------------------------
+# 1. Load
+# ----------------------------------------------------------------------
+with open("data/system_info.json") as fh:
+    info = json.load(fh)
+fe = np.load("data/field_evolution.npy")          # (21, 128, 128)
+ic = np.load("data/initial_condition.npy")        # (128, 128)
+
+Nx, Ny = int(info["grid_size_x"]), int(info["grid_size_y"])
+dx, dy = float(info["dx"]), float(info["dy"])
+Tobs, nT = float(info["observation_time"]), int(info["n_obs_snapshots"])
+Ttarget = float(info["target_time"])
+coef = np.array([float(info[f"system_coefficient_{j}"]) for j in range(1, 8)])
+dt = Tobs / (nT - 1)                              # 0.5 s
+ts = np.arange(nT) * dt                           # snapshot times, s
+
+assert fe.shape == (nT, Nx, Ny) and ic.shape == (Nx, Ny)
+assert np.isfinite(fe).all() and np.isfinite(ic).all()
+print(f"[load] dt = {dt} s, target t = {Ttarget} s, "
+      f"IC == snapshot[0]: max|diff| = {np.abs(ic - fe[0]).max():.3e}")
+
+kx = np.fft.fftfreq(Nx, d=dx)     # physical wavenumber, cycles/unit
+ky = np.fft.fftfreq(Ny, d=dy)
+KX, KY = np.meshgrid(kx, ky)
+ixn = (Nx - np.arange(Nx)) % Nx   # conjugate (negative) index maps
+iyn = (Ny - np.arange(Ny)) % Ny
+R = np.sqrt(KX**2 + KY**2)
+rmax = float(R.max())             # corner radius (physical)
+NB = 65
+edges = np.linspace(0.0, rmax, NB + 1)
+centers = 0.5 * (edges[:-1] + edges[1:])
+
+# ----------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------
+def radial_psd(field):
+    """65-bin radially averaged PSD, physical wavenumber annuli."""
+    F = np.fft.fft2(field)
+    P = (np.abs(F) ** 2) / field.size
+    idx = np.clip(np.digitize(R.ravel(), edges) - 1, 0, NB - 1)
+    out = np.zeros(NB)
+    for b in range(NB):
+        m = idx == b
+        out[b] = P.ravel()[m].mean() if m.any() else 0.0
+    return out
+
+def first_zero_lag(ac):
+    z = np.where(ac[1:] < 0.0)[0]
+    return int(z[0]) + 1 if len(z) else None
+
+def line_autocorr_zero(f, axis, h):
+    """first zero crossing of averaged periodic line autocorrelation (lines centered)"""
+    g = f - f.mean(axis=axis, keepdims=True)
+    n = f.shape[axis]
+    acs = np.array([(g * np.roll(g, lag, axis=axis)).mean() for lag in range(0, n)])
+    lag = first_zero_lag(acs)
+    if lag is None:                      # documented fallback
+        lag = n // 2
+    return lag * h
+
+def directional_peaks(field):
+    """dominant spatial frequency (magnitude, cycles/unit) per direction"""
+    P = np.abs(np.fft.fft2(field)) ** 2
+    Px = P.sum(axis=1); Px[0] = 0.0
+    Py = P.sum(axis=0); Py[0] = 0.0
+    return float(abs(kx[int(np.argmax(Px))])), float(abs(ky[int(np.argmax(Py))]))
+
+# ----------------------------------------------------------------------
+# 2. Observed-data characterization
+# ----------------------------------------------------------------------
+# time-averaged radial PSD (observed)
+rad_obs = np.mean([radial_psd(fe[t]) for t in range(nT)], axis=0)
+pk = int(np.argmax(rad_obs))
+kmax = rmax
+mask = (rad_obs > 0) & (centers >= centers[pk]) & (centers < 0.65 * kmax)
+decay_exponent = float(np.polyfit(np.log(centers[mask]), np.log(rad_obs[mask]), 1)[0])
+
+# center-pixel temporal decorrelation (scored convention)
+cp = fe[:, Nx // 2, Ny // 2]
+cp0 = cp - cp.mean()
+ac = np.correlate(cp0, cp0, "full")[len(cp0) - 1:]
+ac = ac / ac[0]
+lag_t = first_zero_lag(ac)
+temporal_decay_scale = float(lag_t * dt) if lag_t is not None else Tobs / 4.0
+
+# observed coherence lengths (last observed snapshot, t = 10 s)
+coh1_obs = line_autocorr_zero(fe[-1], 0, dx)   # x-direction
+coh2_obs = line_autocorr_zero(fe[-1], 1, dy)   # y-direction
+structural_ratio_obs = coh2_obs / coh1_obs
+
+# characteristic scales from time-averaged directional spectra (observed)
+Pavg = np.mean([np.abs(np.fft.fft2(fe[t])) ** 2 for t in range(nT)], axis=0)
+Px = Pavg.sum(axis=1); Px[0] = 0.0
+Py = Pavg.sum(axis=0); Py[0] = 0.0
+# NOTE (U3 decision): the single dominant mode of the observed field is
+# (kx = +/-0.09375, ky = 0) -- ky is degenerate (0). We therefore report the
+# dominant frequency of the SECOND direction from the directional (marginal)
+# power-spectrum peak, in physical cycles/unit.
+cs1_obs = float(abs(kx[int(np.argmax(Px))]))
+cs2_obs = float(abs(ky[int(np.argmax(Py))]))
+
+print(f"[obs] decay_exponent = {decay_exponent:.4f} (peak bin k = {centers[pk]:.4f})")
+print(f"[obs] temporal_decay_scale = {temporal_decay_scale:.3f} s (lag {lag_t})")
+print(f"[obs] coherence lengths (t=10): x = {coh1_obs:.3f}, y = {coh2_obs:.3f}, "
+      f"ratio = {structural_ratio_obs:.4f}")
+print(f"[obs] characteristic scales: kx = {cs1_obs:.6f}, ky = {cs2_obs:.6f} cycles/unit")
+
+# ----------------------------------------------------------------------
+# 3. PDE-candidate route with strict validation
+# ----------------------------------------------------------------------
+U = [np.fft.fft2(fe[t]) for t in range(nT)]
+
+def ops_at(t):
+    u, Uu = fe[t], U[t]
+    ux = np.fft.ifft2(1j * KX * Uu).real
+    uy = np.fft.ifft2(1j * KY * Uu).real
+    uxx = np.fft.ifft2(-(KX ** 2) * Uu).real
+    uyy = np.fft.ifft2(-(KY ** 2) * Uu).real
+    uxxxx = np.fft.ifft2((KX ** 4) * Uu).real
+    uyyyy = np.fft.ifft2((KY ** 4) * Uu).real
+    uxxxyy = np.fft.ifft2((KX ** 2 * KY ** 2) * Uu).real
+    return np.column_stack([(u * ux).ravel(), (u * uy).ravel(),
+                            (u * uxx).ravel(), (u * uyy).ravel(),
+                            uxx.ravel(), uyy.ravel(),
+                            uxxxx.ravel(), uyyyy.ravel(), uxxxyy.ravel()])
+
+names9 = ["u*ux", "u*uy", "u*uxx", "u*uyy", "uxx", "uyy", "uxxxx", "uyyyy", "uxxxyy"]
+Xrows, rhs = [], []
+for t in range(1, nT - 1):
+    Xrows.append(ops_at(t))
+    rhs.append(np.fft.ifft2((U[t + 1] - U[t - 1]) / (2 * dt)).real.ravel())
+Xall = np.vstack(Xrows); ball = np.concatenate(rhs)
+sol9, *_ = np.linalg.lstsq(Xall, ball, rcond=None)
+r2_pde = 1.0 - ((Xall @ sol9 - ball) ** 2).sum() / (ball ** 2).sum()
+print("[pde] LSQ operator fit (central-difference u_t):")
+for n, s in zip(names9, sol9):
+    print(f"      {n:8s} = {s:+.5f}")
+print(f"[pde] LSQ R^2 = {r2_pde:.4f}")
+
+# coefficient-assignment check: can the 7 given coefficients (up to sign)
+# match 7 of the 9 fitted operators within 30% relative tolerance?
+absfit = np.abs(sol9)
+order9 = np.argsort(absfit)[::-1]
+top7, rest2 = order9[:7], order9[7:]
+csort = np.sort(coef)[::-1]
+f7 = absfit[top7]
+rel_err = np.abs(f7 - csort) / csort
+assign_ok = bool(rel_err.max() <= 0.30 and absfit[rest2].max() <= 0.30 * coef.min())
+print(f"[pde] best-magnitude assignment rel errors = {np.round(rel_err, 3)}; "
+      f"zero-check = {np.round(absfit[rest2], 4)}; assignment consistent: {assign_ok}")
+
+def rhs_pde(u, c9):
+    Uu = np.fft.fft2(u)
+    ux = np.fft.ifft2(1j * KX * Uu).real
+    uy = np.fft.ifft2(1j * KY * Uu).real
+    uxx = np.fft.ifft2(-(KX ** 2) * Uu).real
+    uyy = np.fft.ifft2(-(KY ** 2) * Uu).real
+    uxxxx = np.fft.ifft2((KX ** 4) * Uu).real
+    uyyyy = np.fft.ifft2((KY ** 4) * Uu).real
+    uxxxyy = np.fft.ifft2((KX ** 2 * KY ** 2) * Uu).real
+    o = [u * ux, u * uy, u * uxx, u * uyy, uxx, uyy, uxxxx, uyyyy, uxxxyy]
+    return sum(ci * oi for ci, oi in zip(c9, o))
+
+def integrate_pde(c9, T=Tobs, h=0.02):
+    u = ic.copy()
+    nsteps = int(round(T / h))
+    save_every = int(round(dt / h))
+    snaps = [u.copy()]
+    for s in range(1, nsteps + 1):
+        k1 = rhs_pde(u, c9)
+        k2 = rhs_pde(u + 0.5 * h * k1, c9)
+        k3 = rhs_pde(u + 0.5 * h * k2, c9)
+        k4 = rhs_pde(u + h * k3, c9)
+        u = u + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        if s % save_every == 0:
+            snaps.append(u.copy())
+    return np.array(snaps)
+
+c9 = np.zeros(9)
+for j, op in enumerate(top7):
+    c9[op] = csort[j] * np.sign(sol9[op])
+sim = integrate_pde(c9)
+corrs = [float(np.corrcoef(sim[i].ravel(), fe[i].ravel())[0, 1]) for i in range(nT)]
+min_corr = min(corrs)
+ic_match = float(np.abs(sim[0] - ic).max())
+print(f"[pde] best-magnitude arrangement integrated from exact IC "
+      f"(max|u0-ic| = {ic_match:.2e}): min corr over 21 snapshots = {min_corr:.5f} "
+      f"(bar 0.999)")
+pde_accepted = bool(assign_ok and min_corr > 0.999)
+print(f"[pde] PDE route accepted: {pde_accepted}")
+
+# ----------------------------------------------------------------------
+# 4. Mode-space reduced-order model (primary predictor)
+# ----------------------------------------------------------------------
+E = np.mean([np.abs(u) ** 2 for u in U], axis=0)          # mean mode energy
+Etot = E.sum()
+order = np.argsort(E.ravel())[::-1]
+
+def mode_set(K):
+    ks = set()
+    for j in order[:K]:
+        ix, iy = divmod(int(j), Ny)
+        ks.add((ix, iy))
+        ks.add(((Nx - ix) % Nx, (Ny - iy) % Ny))          # include conjugate
+    return sorted(ks)
+
+NOISE_FRAC = 1e-5     # modes below this mean-energy fraction are frozen
+fit_ts = np.arange(16) * dt        # t = 0 .. 7.5 s
+test_ts = np.arange(16, 21) * dt   # t = 8 .. 10 s (holdout)
+
+def fit_quad(t, a):
+    cr = np.polyfit(t, a.real, 2); ci = np.polyfit(t, a.imag, 2)
+    return lambda tp: np.polyval(cr, tp) + 1j * np.polyval(ci, tp)
+
+def fit_lin(t, a):
+    cr = np.polyfit(t, a.real, 1); ci = np.polyfit(t, a.imag, 1)
+    return lambda tp: np.polyval(cr, tp) + 1j * np.polyval(ci, tp)
+
+def fit_exp(t, a):
+    amp = np.abs(a); m = amp > 1e-9
+    c1 = np.polyfit(t[m], np.log(amp[m]), 1)
+    c2 = np.polyfit(t[m], np.unwrap(np.angle(a[m])), 1)
+    return lambda tp: np.exp(c1[0] * tp + c1[1]) * np.exp(1j * (c2[0] * tp + c2[1]))
+
+def fit_logq(t, a):
+    """log-quadratic amplitude + linear phase (safer long extrapolation)"""
+    amp = np.abs(a); m = amp > 1e-9
+    if m.sum() < 8:
+        return fit_quad(t, a)
+    c1 = np.polyfit(t[m], np.log(amp[m]), 2)
+    c2 = np.polyfit(t[m], np.unwrap(np.angle(a[m])), 1)
+    return lambda tp: np.exp(np.polyval(c1, tp)) * np.exp(1j * (c2[0] * tp + c2[1]))
+
+def fit_freeze(t, a):
+    last = a[-1]
+    return lambda tp: last
+
+LAWS = {"quad": fit_quad, "lin": fit_lin, "exp": fit_exp, "logq": fit_logq,
+        "freeze": fit_freeze}
+
+def select_laws(ms):
+    sel = {}
+    for (ix, iy) in ms:
+        frac = E[ix, iy] / Etot
+        if frac < NOISE_FRAC:
+            sel[(ix, iy)] = "freeze"
+            continue
+        a = np.array([U[int(t / dt)][ix, iy] for t in fit_ts])
+        at = np.array([U[int(t / dt)][ix, iy] for t in test_ts])
+        best = None
+        for name, f in LAWS.items():
+            ev = f(fit_ts, a)
+            pred = np.array([ev(tp) for tp in test_ts])
+            err = np.linalg.norm(pred - at) / (np.linalg.norm(at) + 1e-30)
+            if best is None or err < best[1]:
+                best = (name, float(err))
+        sel[(ix, iy)] = best[0]
+    return sel
+
+def predict(ms, sel, t_eval):
+    F = np.zeros((Nx, Ny), complex)
+    for (ix, iy) in ms:
+        a = np.array([U[int(t / dt)][ix, iy] for t in fit_ts])
+        ev = LAWS[sel[(ix, iy)]](fit_ts, a)
+        F[ix, iy] = ev(t_eval)
+    F = 0.5 * (F + np.conj(F[ixn][:, iyn]))
+    return np.fft.ifft2(F).real
+
+# K selection via holdout back-prediction
+K_cands = [64, 128, 256]
+holdout_report = {}
+for K in K_cands:
+    ms = mode_set(K)
+    sel = select_laws(ms)
+    corrs = []
+    for tp in test_ts:
+        f = predict(ms, sel, tp)
+        corrs.append(float(np.corrcoef(f.ravel(), fe[int(tp / dt)].ravel())[0, 1]))
+    holdout_report[K] = (float(np.mean(corrs)), float(min(corrs)))
+    print(f"[model] K = {K:4d}: holdout mean corr = {np.mean(corrs):.5f}, "
+          f"min = {min(corrs):.5f}")
+Kbest = max(K_cands, key=lambda K: holdout_report[K][0])
+ms = mode_set(Kbest)
+sel = select_laws(ms)
+law_counts = {}
+for v in sel.values():
+    law_counts[v] = law_counts.get(v, 0) + 1
+print(f"[model] chosen K = {Kbest}; per-mode law counts: {law_counts}")
+print(f"[model] top-{Kbest // 2} modes carry "
+      f"{E.ravel()[order[:Kbest // 2]].sum() / Etot * 100:.2f}% of mean energy")
+
+# final fit on ALL 21 snapshots, extrapolate to target
+# plausibility cap: over the observed 10 s window the dominant modes grew at
+# most ~1.55x; we allow at most 2.5x growth (and at most 0.4x decay) over the
+# 20 s extrapolation horizon. This guards against polynomial-extrapolation
+# blowups of individual modes while preserving each mode's fitted phase.
+CAP_HI, CAP_LO = 2.5, 0.4
+a_final = {}
+n_guard = 0
+for (ix, iy) in ms:
+    a = np.array([U[t][ix, iy] for t in range(nT)])
+    ev = LAWS[sel[(ix, iy)]](ts, a)
+    val = ev(Ttarget)
+    ref = max(abs(a[-1]), 1e-12)
+    if abs(val) > CAP_HI * ref:
+        val = val / abs(val) * (CAP_HI * ref); n_guard += 1
+    elif abs(val) < CAP_LO * ref:
+        val = val / abs(val) * (CAP_LO * ref); n_guard += 1
+    a_final[(ix, iy)] = val
+print(f"[model] plausibility cap (|a30| in [{CAP_LO},{CAP_HI}]x|a10|) "
+      f"triggered on {n_guard} modes")
+
+F = np.zeros((Nx, Ny), complex)
+for (ix, iy), v in a_final.items():
+    F[ix, iy] = v
+F = 0.5 * (F + np.conj(F[ixn][:, iyn]))
+pred = np.fft.ifft2(F).real
+
+assert np.isfinite(pred).all(), "predicted field has non-finite values"
+print(f"[model] t=30 field checks: finite=True, |mean| = {abs(pred.mean()):.3e}, "
+      f"std = {pred.std():.4f} (observed t=10 std = {fe[-1].std():.4f}), "
+      f"min = {pred.min():.4f}, max = {pred.max():.4f}")
+
+# ----------------------------------------------------------------------
+# 5. Predicted-field diagnostics (scored conventions)
+# ----------------------------------------------------------------------
+spectral_density = radial_psd(pred)                    # 65 bins, physical k
+assert np.isfinite(spectral_density).all() and spectral_density.shape == (65,)
+
+coh1 = line_autocorr_zero(pred, 0, dx)            # x-direction
+coh2 = line_autocorr_zero(pred, 1, dy)            # y-direction
+structural_ratio = coh2 / coh1
+cs1, cs2 = directional_peaks(pred)
+
+# divergence_measure: deterministic perturbation protocol (see docstring)
+rng = np.random.default_rng(1729)
+xi = rng.standard_normal((Nx, Ny))
+xi -= xi.mean()
+xi *= 1e-8 / np.linalg.norm(xi)
+Tdiv = min(Ttarget, 8.0)                                # 8 s
+SEG = 2.0
+def mode_val(ix, iy, tsec):
+    a = np.array([U[t][ix, iy] for t in range(nT)])
+    ev = LAWS[sel[(ix, iy)]](ts, a)
+    return ev(tsec)
+G = 1.0
+seg_factors = []
+for i in range(int(Tdiv / SEG)):
+    t0, t1 = i * SEG, (i + 1) * SEG
+    ratio = np.ones((Nx, Ny), complex)
+    for (ix, iy) in ms:
+        v0 = mode_val(ix, iy, t0)
+        if abs(v0) > 1e-12:
+            ratio[ix, iy] = mode_val(ix, iy, t1) / v0
+    X = np.fft.fft2(xi) * ratio
+    xi = np.fft.ifft2(X).real
+    g = float(np.linalg.norm(xi) / 1e-8)
+    seg_factors.append(g)
+    xi -= xi.mean()
+    xi *= 1e-8 / np.linalg.norm(xi)
+    G *= g
+divergence_measure = float(G)
+assert np.isfinite(divergence_measure) and divergence_measure > 0
+print(f"[div] segment growth factors = {[round(g, 6) for g in seg_factors]}")
+print(f"[div] divergence_measure = {divergence_measure:.6f} "
+      f"(finite-time growth rate lambda = {np.log(divergence_measure) / Tdiv:.6f} /s)")
+
+# ----------------------------------------------------------------------
+# 6. JSON outputs
+# ----------------------------------------------------------------------
+data_exploration = {
+    "characteristic_scale_1": cs1_obs,
+    "characteristic_scale_2": cs2_obs,
+    "temporal_decay_scale": temporal_decay_scale,
+    "decay_exponent": decay_exponent,
+    "structural_ratio": float(structural_ratio_obs),
+}
+physical_quantities = {
+    "divergence_measure": divergence_measure,
+    "coherence_length_1": float(coh1),
+    "coherence_length_2": float(coh2),
+    "characteristic_scale_1": float(cs1),
+    "characteristic_scale_2": float(cs2),
+    "structural_ratio": float(structural_ratio),
+}
+for d in (data_exploration, physical_quantities):
+    assert all(np.isfinite(v) for v in d.values())
+with open("data_exploration.json", "w") as fh:
+    json.dump(data_exploration, fh, indent=2)
+with open("physical_quantities.json", "w") as fh:
+    json.dump(physical_quantities, fh, indent=2)
+
+np.save("predicted_field.npy", pred.astype(np.float64))
+np.save("spectral_density.npy", spectral_density.astype(np.float64))
+
+# ----------------------------------------------------------------------
+# 7. PNG outputs (matplotlib if available, else built-in pure-numpy renderer)
+# ----------------------------------------------------------------------
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+def _colormap(stops, t):
+    """vectorized piecewise-linear colormap; stops = [(pos, (r,g,b)), ...]"""
+    t = np.clip(t, 0.0, 1.0)
+    pos = np.array([s[0] for s in stops])
+    rgb = np.array([s[1] for s in stops], dtype=float)
+    i = np.clip(np.searchsorted(pos, t) - 1, 0, len(pos) - 2)
+    f = (t - pos[i]) / (pos[i + 1] - pos[i])
+    f = f[..., None]
+    return (rgb[i] * (1 - f) + rgb[i + 1] * f).astype(np.uint8)
+
+RDBU = [(0.0, (5, 10, 172)), (0.25, (103, 169, 207)), (0.5, (247, 247, 247)),
+        (0.75, (233, 128, 12)), (1.0, (178, 24, 43))]
+INF = [(0.0, (0, 0, 4)), (0.25, (67, 35, 107)), (0.5, (188, 55, 84)),
+       (0.75, (249, 142, 9)), (1.0, (252, 255, 164))]
+
+FONT = {
+ 'A': "01110 10001 10001 11111 10001 10001 10001", 'B': "11110 10001 11110 10001 10001 10001 11110",
+ 'C': "01110 10001 10000 10000 10000 10001 01110", 'D': "11110 10001 10001 10001 10001 10001 11110",
+ 'E': "11111 10000 11110 10000 10000 10000 11111", 'F': "11111 10000 11110 10000 10000 10000 10000",
+ 'G': "01110 10001 10000 10111 10001 10001 01111", 'H': "10001 10001 11111 10001 10001 10001 10001",
+ 'I': "01110 00100 00100 00100 00100 00100 01110", 'J': "00111 00010 00010 00010 00010 10010 01100",
+ 'K': "10001 10010 10100 11000 10100 10010 10001", 'L': "10000 10000 10000 10000 10000 10000 11111",
+ 'M': "10001 11011 10101 10101 10001 10001 10001", 'N': "10001 11001 10101 10011 10001 10001 10001",
+ 'O': "01110 10001 10001 10001 10001 10001 01110", 'P': "11110 10001 10001 11110 10000 10000 10000",
+ 'Q': "01110 10001 10001 10001 10101 10010 01101", 'R': "11110 10001 10001 11110 10100 10010 10001",
+ 'S': "01111 10000 10000 01110 00001 00001 11110", 'T': "11111 00100 00100 00100 00100 00100 00100",
+ 'U': "10001 10001 10001 10001 10001 10001 01110", 'V': "10001 10001 10001 10001 10001 01010 00100",
+ 'W': "10001 10001 10001 10101 10101 11011 10001", 'X': "10001 10001 01010 00100 01010 10001 10001",
+ 'Y': "10001 10001 01010 00100 00100 00100 00100", 'Z': "11111 00001 00010 00100 01000 10000 11111",
+ '0': "01110 10001 10011 10101 11001 10001 01110", '1': "00100 01100 00100 00100 00100 00100 01110",
+ '2': "01110 10001 00001 00010 00100 01000 11111", '3': "01110 10001 00001 00110 00001 10001 01110",
+ '4': "00010 00110 01010 10010 11111 00010 00010", '5': "11111 10000 11110 00001 00001 10001 01110",
+ '6': "00110 01000 10000 11110 10001 10001 01110", '7': "11111 00001 00010 00100 01000 01000 01000",
+ '8': "01110 10001 10001 01110 10001 10001 01110", '9': "01110 10001 10001 01111 00001 00010 01100",
+ ' ': "00000 00000 00000 00000 00000 00000 00000", '.': "00000 00000 00000 00000 00000 00000 00100",
+ '=': "00000 00000 11111 00000 11111 00000 00000", '-': "00000 00000 00000 11111 00000 00000 00000",
+ '/': "00001 00010 00010 00100 01000 01000 10000", '(': "00010 00100 01000 01000 01000 00100 00010",
+ ')': "01000 00100 00010 00010 00010 00100 01000", ':': "00000 00100 00100 00000 00100 00100 00000",
+ ',': "00000 00000 00000 00000 00100 00100 01000", '+': "00000 00100 00100 11111 00100 00100 00000",
+}
+
+def _text_w(s, scale):
+    return len(s) * 6 * scale - scale
+
+def _draw_text(cv, x, y, s, color, scale=2):
+    for ch in s.upper():
+        g = FONT.get(ch, FONT[' ']).split()
+        for r in range(7):
+            for c in range(5):
+                if g[r][c] == '1':
+                    cv[y + r * scale: y + (r + 1) * scale,
+                       x + c * scale: x + (c + 1) * scale] = color
+        x += 6 * scale
+
+def _center_text(cv, cx, y, s, color, scale=2):
+    _draw_text(cv, int(cx - _text_w(s, scale) / 2), y, s, color, scale)
+
+def _upscale(field, h, w):
+    idx_y = np.clip((np.arange(h) + 0.5) * field.shape[0] / h, 0, field.shape[0] - 1).astype(int)
+    idx_x = np.clip((np.arange(w) + 0.5) * field.shape[1] / w, 0, field.shape[1] - 1).astype(int)
+    return field[idx_y][:, idx_x]
+
+def _frame(cv, x, y, w, h, color=(0, 0, 0)):
+    cv[y:y+2, x:x+w] = color; cv[y+h-2:y+h, x:x+w] = color
+    cv[y:y+h, x:x+2] = color; cv[y:y+h, x+w-2:x+w] = color
+
+def _line(cv, x0, y0, x1, y1, color, th=2):
+    n = max(int(abs(x1 - x0) + abs(y1 - y0)), 1)
+    for i in range(n + 1):
+        xx = int(round(x0 + (x1 - x0) * i / n)); yy = int(round(y0 + (y1 - y0) * i / n))
+        cv[max(yy - th//2, 0):yy + th//2 + 1, max(xx - th//2, 0):xx + th//2 + 1] = color
+
+def _plot_data(cv, x, y, w, h, xs, ys, xlo, xhi, ylo, yhi, color, logx=False, logy=False):
+    xt = np.log10(xs) if logx else xs
+    yt = np.log10(np.maximum(ys, 1e-300)) if logy else ys
+    px = x + (xt - xlo) / (xhi - xlo) * w
+    py = y + h - (yt - ylo) / (yhi - ylo) * h
+    for i in range(len(px) - 1):
+        _line(cv, px[i], py[i], px[i + 1], py[i + 1], color)
+
+def _write_png(path, rgb):
+    import zlib, struct
+    h, w, _ = rgb.shape
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+def _spectrum_image(P):
+    t = np.clip((np.log10(P / P.max() + 1e-30) + 30.0) / 30.0, 0, 1)
+    return _upscale(t, 340, 340)
+
+def _ticks(lo, hi, n=5):
+    return np.linspace(lo, hi, n)
+
+def _fmt(v):
+    a = abs(v)
+    if a >= 100: return f"{v:.0f}"
+    if a >= 10: return f"{v:.1f}"
+    if a >= 1: return f"{v:.2f}"
+    if a == 0: return "0"
+    return f"{v:.3g}"
+
+def _axes(cv, x, y, w, h, xlo, xhi, ylo, yhi, xlab, ylab,
+          xticks=None, yticks=None, logy=False):
+    _frame(cv, x, y, w, h)
+    if xticks is None: xticks = _ticks(xlo, xhi, 5)
+    if yticks is None: yticks = _ticks(ylo, yhi, 4)
+    for tv in xticks:
+        px = x + (tv - xlo) / (xhi - xlo) * w
+        _line(cv, px, y + h, px, y + h + 8, (0, 0, 0))
+        s = _fmt(tv)
+        _draw_text(cv, int(px - _text_w(s, 1) / 2), y + h + 12, s, (0, 0, 0), 1)
+    for tv in yticks:
+        py = y + h - (tv - ylo) / (yhi - ylo) * h
+        _line(cv, x - 8, py, x, py, (0, 0, 0))
+        s = _fmt(tv)
+        _draw_text(cv, x - 12 - _text_w(s, 1), int(py - 4), s, (0, 0, 0), 1)
+    _center_text(cv, x + w / 2, y + h + 40, xlab, (0, 0, 0), 2)
+    _draw_text(cv, x - 12 - _text_w(ylab, 2), int(y + h / 2 - 7 * 2 / 2), ylab, (0, 0, 0), 2)
+
+if HAVE_MPL:
+    v = max(float(np.abs(fe).max()), float(np.abs(pred).max()))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
+    for ax, ti in zip(axes.ravel(), [0, 4, 8, 12, 16, 20]):
+        ax.imshow(fe[ti], cmap="RdBu_r", vmin=-v, vmax=v)
+        ax.set_title(f"t = {ts[ti]:.1f} s (observed)")
+        ax.axis("off")
+    ax = axes[1, 2]
+    ax.imshow(pred, cmap="RdBu_r", vmin=-v, vmax=v)
+    ax.set_title(f"t = {Ttarget:.1f} s (predicted)")
+    ax.axis("off")
+    fig.suptitle("B3: evolving 2D field (observed snapshots + prediction at target time)")
+    fig.tight_layout()
+    fig.savefig("field_visualization.png", dpi=130)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    P0 = np.abs(np.fft.fft2(ic)) ** 2
+    Pp = np.abs(np.fft.fft2(pred)) ** 2
+    ax = axes[0, 0]
+    ax.imshow(10 * np.log10(P0 / P0.max() + 1e-30), cmap="inferno",
+              extent=[-1, 1, -1 / dy, 1 / dy])
+    ax.set_title("2D power spectrum, initial condition (log)")
+    ax.set_xlabel("kx (cyc/unit)"); ax.set_ylabel("ky (cyc/unit)")
+    ax = axes[0, 1]
+    ax.imshow(10 * np.log10(Pp / Pp.max() + 1e-30), cmap="inferno",
+              extent=[-1, 1, -1 / dy, 1 / dy])
+    ax.set_title(f"2D power spectrum, predicted t = {Ttarget:.0f} s (log)")
+    ax.set_xlabel("kx (cyc/unit)"); ax.set_ylabel("ky (cyc/unit)")
+    ax = axes[1, 0]
+    ax.plot(centers, rad_obs, "o-", ms=3, label="observed (time-averaged)")
+    ax.plot(centers, spectral_density, "s-", ms=3, label="predicted t = 30 s")
+    ax.set_xlabel("k (cyc/unit)"); ax.set_ylabel("radial PSD"); ax.legend()
+    ax.set_title("Radially averaged spatial power spectrum")
+    ax = axes[1, 1]
+    ax.loglog(centers[mask], rad_obs[mask], "o-", ms=3, label="time-averaged observed")
+    fitline = np.polyfit(np.log(centers[mask]), np.log(rad_obs[mask]), 1)
+    ax.plot(centers[mask], np.exp(fitline[1]) * centers[mask] ** fitline[0],
+            "r--", label=f"slope = {decay_exponent:.2f}")
+    ax.set_xlabel("k (cyc/unit)"); ax.set_ylabel("radial PSD (log)"); ax.legend()
+    ax.set_title(f"Log-log PSD vs k (decay_exponent = {decay_exponent:.2f})")
+    fig.suptitle("B3: field spectrum")
+    fig.tight_layout()
+    fig.savefig("spectral_visualization.png", dpi=130)
+    plt.close(fig)
+    print("[plot] rendered with matplotlib")
+else:
+    # ---------------- fallback: pure-numpy renderer ----------------
+    cv = np.ones((940, 1400, 3), dtype=np.uint8) * 255
+    _center_text(cv, 700, 18, "B3: EVOLVING 2D FIELD (OBSERVED + PREDICTION AT T=30 S)", (0, 0, 0), 3)
+    v = max(float(np.abs(fe).max()), float(np.abs(pred).max()))
+    panels = [(0, 0), (4, 0), (8, 0), (12, 1), (16, 1), (20, 1)]
+    for (ti, row) in panels:
+        c = [p[0] for p in panels].index(ti) % 3
+        x = 70 + (c * 360) + (c * 80)
+        y = 110 + row * 440
+        f = pred if ti == 20 else fe[ti]
+        t = _upscale(f, 360, 360)
+        tt = np.clip((t + v) / (2 * v), 0, 1)
+        cv[y:y + 360, x:x + 360] = _colormap(RDBU, tt)
+        _frame(cv, x, y, 360, 360)
+        tag = "PREDICTED" if ti == 20 else "OBSERVED"
+        _center_text(cv, x + 180, y - 32, f"T = {ts[ti]:.1f} S ({tag})", (0, 0, 0), 2)
+    # colorbar
+    cbx, cby, cbh = 1330, 110, 780
+    for r in range(cbh):
+        cv[cby + r: cby + r + 1, cbx: cbx + 24] = _colormap(RDBU, np.array([1 - r / cbh]))[0]
+    _frame(cv, cbx, cby, 24, cbh)
+    _draw_text(cv, cbx + 30, cby + 4, _fmt(v), (0, 0, 0), 2)
+    _draw_text(cv, cbx + 30, cby + cbh // 2 - 7, "0", (0, 0, 0), 2)
+    _draw_text(cv, cbx + 30, cby + cbh - 18, _fmt(-v), (0, 0, 0), 2)
+    _write_png("field_visualization.png", cv)
+
+    cv = np.ones((1100, 1400, 3), dtype=np.uint8) * 255
+    _center_text(cv, 700, 18, "B3: FIELD SPECTRUM", (0, 0, 0), 3)
+    P0 = np.abs(np.fft.fft2(ic)) ** 2
+    Pp = np.abs(np.fft.fft2(pred)) ** 2
+    for j, (P, ttl) in enumerate([(P0, "2D POWER SPECTRUM, IC (LOG)"),
+                                  (Pp, f"2D POWER SPECTRUM, PREDICTED T=30 S (LOG)")]):
+        x = 150 + j * 660; y = 150
+        cv[y:y + 340, x:x + 340] = _colormap(INF, _spectrum_image(P))
+        _frame(cv, x, y, 340, 340)
+        _center_text(cv, x + 170, y - 32, ttl, (0, 0, 0), 2)
+        for tv, px in [(-1.0, x), (0.0, x + 170), (1.0, x + 340)]:
+            s = _fmt(tv)
+            _draw_text(cv, int(px - _text_w(s, 1) / 2), y + 348, s, (0, 0, 0), 1)
+        _center_text(cv, x + 170, y + 372, "KX (CYC/UNIT)", (0, 0, 0), 1)
+        for tv, py in [(-5.0, y + 340), (0.0, y + 170), (5.0, y)]:
+            s = _fmt(tv)
+            _draw_text(cv, x - 30 - _text_w(s, 1), int(py - 4), s, (0, 0, 0), 1)
+    # (c) linear radial PSD
+    x, y, w, h = 120, 640, 560, 340
+    yhi = max(float(rad_obs.max()), float(spectral_density.max())) * 1.1
+    _axes(cv, x, y, w, h, 0, rmax, 0, yhi, "K (CYC/UNIT)", "RADIAL PSD")
+    _plot_data(cv, x, y, w, h, centers, rad_obs, 0, rmax, 0, yhi, (31, 119, 180))
+    _plot_data(cv, x, y, w, h, centers, spectral_density, 0, rmax, 0, yhi, (214, 39, 40))
+    _line(cv, x + w - 250, y + 18, x + w - 200, y + 18, (31, 119, 180), 3)
+    _draw_text(cv, x + w - 192, y + 10, "OBSERVED (TIME-AVG)", (0, 0, 0), 1)
+    _line(cv, x + w - 250, y + 40, x + w - 200, y + 40, (214, 39, 40), 3)
+    _draw_text(cv, x + w - 192, y + 32, "PREDICTED T=30 S", (0, 0, 0), 1)
+    _center_text(cv, x + w / 2, y - 32, "RADIAL PSD VS K", (0, 0, 0), 2)
+    # (d) log-log
+    x2, y2 = 800, 640
+    xlo, xhi = float(np.log10(centers[mask][0])), float(np.log10(centers[mask][-1]))
+    ylo, yhi2 = float(np.log10(rad_obs[mask].min())), float(np.log10(rad_obs[mask].max()))
+    pad = (yhi2 - ylo) * 0.08
+    _axes(cv, x2, y2, w, h, xlo, xhi, ylo - pad, yhi2 + pad,
+          "K (CYC/UNIT, LOG)", "RADIAL PSD (LOG)",
+          xticks=[10 ** v for v in _ticks(xlo, xhi, 4)],
+          yticks=[10 ** v for v in _ticks(ylo - pad, yhi2 + pad, 4)])
+    _plot_data(cv, x2, y2, w, h, centers[mask], rad_obs[mask], xlo, xhi,
+               ylo - pad, yhi2 + pad, (31, 119, 180), logx=True, logy=True)
+    fitline = np.polyfit(np.log(centers[mask]), np.log(rad_obs[mask]), 1)
+    kk = np.array([centers[mask][0], centers[mask][-1]])
+    _plot_data(cv, x2, y2, w, h, kk, np.exp(fitline[1]) * kk ** fitline[0],
+               xlo, xhi, ylo - pad, yhi2 + pad, (214, 39, 40), logx=True, logy=True)
+    _line(cv, x2 + w - 260, y2 + 18, x2 + w - 210, y2 + 18, (31, 119, 180), 3)
+    _draw_text(cv, x2 + w - 202, y2 + 10, "OBSERVED", (0, 0, 0), 1)
+    _line(cv, x2 + w - 260, y2 + 40, x2 + w - 210, y2 + 40, (214, 39, 40), 3)
+    _draw_text(cv, x2 + w - 202, y2 + 32, f"SLOPE = {decay_exponent:.2f}", (0, 0, 0), 1)
+    _center_text(cv, x2 + w / 2, y2 - 32, f"LOG-LOG PSD (DECAY_EXPONENT = {decay_exponent:.2f})", (0, 0, 0), 2)
+    _write_png("spectral_visualization.png", cv)
+    print("[plot] matplotlib not available; rendered with built-in pure-numpy renderer")
+
+# ----------------------------------------------------------------------
+# 8. Evidence summary
+# ----------------------------------------------------------------------
+print("\n================ EVIDENCE SUMMARY ================")
+if pde_accepted:
+    print("Model used for prediction : PDE (accepted strict validation)")
+else:
+    print(f"Model used for prediction : mode-space reduced-order (K = {Kbest}, "
+          f"laws = {law_counts})")
+print("Holdout back-prediction   : " +
+      ", ".join(f"K={K}: mean={v[0]:.5f}/min={v[1]:.5f}" for K, v in holdout_report.items()))
+print(f"Predicted field           : finite, |mean| = {abs(pred.mean()):.2e}, std = {pred.std():.4f}")
+print(f"spectral_density          : 65 bins, finite, sum = {spectral_density.sum():.4e}")
+print("data_exploration.json     :", json.dumps(data_exploration))
+print("physical_quantities.json  :", json.dumps(physical_quantities))
+print("Files written             : simulation.py, predicted_field.npy, spectral_density.npy, "
+      "data_exploration.json, physical_quantities.json, field_visualization.png, "
+      "spectral_visualization.png")

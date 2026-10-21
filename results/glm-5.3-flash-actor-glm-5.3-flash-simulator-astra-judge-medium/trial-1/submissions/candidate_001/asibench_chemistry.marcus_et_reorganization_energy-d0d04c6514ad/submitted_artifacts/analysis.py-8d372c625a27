@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+Solution-phase electron-transfer response calculation.
+
+Reads the files in data/ and writes the required outputs under results/.
+
+Pipeline
+--------
+1. Reindex every frame's raw rows to ascending site_id (frame_site_order.csv).
+2. Kabsch rigid alignment (unweighted): forward = frame B into frame A,
+   backward = frame A into frame B.  Signed displacement = aligned source
+   minus reference target.
+3. Mass-weighted quadratic forms H_mw = M^-1/2 H M^-1/2 (per-atom scalar
+   masses); 6 rigid (null) modes discarded, 15 resolved modes retained
+   (ascending eigenvalue) as the vibrational basis.
+4. Cross-frame mode overlap |V_ref^T (R V_src)| (magnitude-based,
+   sign-insensitive), transported-mode pairing, modal projections.
+5. Reorganization energies: 4-point quadratic-form estimators, resolved
+   ("nm") normal-mode estimators, closure errors, inner/outer/total
+   decomposition.  Outer-sphere term uses the nonequilibrium Pekar factor
+   (1/eps_fast - 1/eps_slow) in the classical two-sphere Marcus dielectric
+   continuum formula.
+6. Nonadiabatic classical Marcus rate on the supplied driving-force grid
+   (axis_eV interpreted as the reaction free energy dG, negative = exergonic).
+7. Diagnostics: alignment RMSDs, closure errors, norms, dominant modes,
+   rate peak, inverted (non-monotonic) region, retained-mode eigen ranges.
+
+Units: coordinates Angstrom, Hessian eV/Angstrom^2, mass amu,
+lambda in eV, rates in s^-1, frequencies cm^-1 (freq_scale_factor).
+"""
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+# physical constants (CODATA)
+E2_OVER_4PE0 = 14.399645478425669          # e^2/(4 pi eps0), eV*Angstrom
+HBAR_EV_S = 6.582119569e-16                # eV*s
+KB_EV_K = 8.617333262e-5                   # eV/K
+TWO_PI_OVER_HBAR = 2.0 * np.pi / HBAR_EV_S  # s^-1 eV^-1
+
+DATA = "data"
+RESULTS = "results"
+os.makedirs(RESULTS, exist_ok=True)
+
+
+def kabsch(source, reference):
+    """Optimal rigid superposition of `source` onto `reference` (row vectors).
+
+    Returns (R, t, rmsd) with source @ R + t ~ reference; rmsd in Angstrom.
+    """
+    p = np.asarray(source, float)
+    q = np.asarray(reference, float)
+    pc = p - p.mean(axis=0)
+    qc = q - q.mean(axis=0)
+    u, s, vt = np.linalg.svd(pc.T @ qc)
+    d = np.sign(np.linalg.det(u @ vt))
+    rot = u @ np.diag([1.0, 1.0, d]) @ vt
+    aligned = pc @ rot + q.mean(axis=0)
+    rmsd = float(np.sqrt(((aligned - q) ** 2).sum(axis=1).mean()))
+    trans = q.mean(axis=0) - p.mean(axis=0) @ rot
+    return rot, trans, rmsd
+
+
+def rotate_components(vec, rot, n_sites):
+    """Apply rotation R to a site-major (n_sites*3,) Cartesian vector."""
+    return (vec.reshape(n_sites, 3) @ rot.T).ravel()
+
+
+def site_major_perm(site_ids):
+    """Kronecker permutation putting frame rows into ascending site_id order."""
+    return np.array([3 * s + c for s in np.argsort(site_ids) for c in range(3)])
+
+
+# 1. load inputs --------------------------------------------------------------
+site_table = pd.read_csv(os.path.join(DATA, "site_table.csv"))
+frame_order = pd.read_csv(os.path.join(DATA, "frame_site_order.csv"))
+grid = pd.read_csv(os.path.join(DATA, "driving_force_grid.csv"))
+
+with open(os.path.join(DATA, "system_manifest.json")) as fh:
+    manifest = json.load(fh)
+with open(os.path.join(DATA, "medium_response.json")) as fh:
+    medium = json.load(fh)
+
+n_sites = len(site_table)
+n_comp = 3 * n_sites
+site_ids = site_table["site_id"].to_numpy()
+assert np.array_equal(site_ids, np.arange(n_sites)), "site_table must be ascending"
+masses = site_table["mass_amu"].to_numpy(float)
+msqrt = np.sqrt(np.repeat(masses, 3))
+
+order_a = frame_order.loc[frame_order.frame_id == "frame_a", "site_id"].to_numpy()
+order_b = frame_order.loc[frame_order.frame_id == "frame_b", "site_id"].to_numpy()
+
+coords_raw = {
+    "frame_a": np.load(os.path.join(DATA, "frame_a_coords.npy")).astype(float),
+    "frame_b": np.load(os.path.join(DATA, "frame_b_coords.npy")).astype(float),
+}
+hess_raw = {
+    "frame_a": np.load(os.path.join(DATA, "frame_a_hessian.npy")).astype(float),
+    "frame_b": np.load(os.path.join(DATA, "frame_b_hessian.npy")).astype(float),
+}
+orders = {"frame_a": order_a, "frame_b": order_b}
+
+# reindex to ascending site_id
+coords, hess = {}, {}
+for fr in ("frame_a", "frame_b"):
+    p = np.argsort(orders[fr])
+    coords[fr] = coords_raw[fr][p]
+    pk = site_major_perm(orders[fr])
+    h = hess_raw[fr][np.ix_(pk, pk)]
+    hess[fr] = 0.5 * (h + h.T)          # enforce exact symmetry
+
+assert coords["frame_a"].shape == (n_sites, 3)
+assert hess["frame_a"].shape == (n_comp, n_comp)
+
+# sanity: null space of each reindexed Hessian == rigid-body space
+def rigid_vectors(x):
+    x = x - x.mean(axis=0)
+    cols = [np.tile(np.eye(3)[ax], n_sites) for ax in range(3)]
+    for ax in range(3):
+        cols.append(np.cross(np.eye(3)[ax], x).ravel())
+    return np.stack(cols, axis=1)
+
+
+for fr in ("frame_a", "frame_b"):
+    w = np.linalg.eigvalsh(hess[fr])
+    res = max(np.linalg.norm(hess[fr] @ t) for t in rigid_vectors(coords[fr]).T)
+    assert res / w.max() < 1e-10, f"{fr}: rigid space not in null space"
+    assert np.sum(np.abs(w) < 1e-8 * w.max()) == manifest["null_rank"]
+
+# 2. alignment (forward: B into A; backward: A into B) ------------------------
+rot_f, trans_f, rmsd_f = kabsch(coords["frame_b"], coords["frame_a"])
+rot_b, trans_b, rmsd_b = kabsch(coords["frame_a"], coords["frame_b"])
+
+# displacement = aligned source - reference target (Angstrom, site-major)
+disp_cart = {
+    "forward": (coords["frame_b"] @ rot_f + trans_f) - coords["frame_a"],
+    "backward": (coords["frame_a"] @ rot_b + trans_b) - coords["frame_b"],
+}
+# mass-weighted displacements (Angstrom * amu^1/2)
+disp_mw = {d: disp_cart[d].ravel() * msqrt for d in ("forward", "backward")}
+aligned_displacement_mw = np.stack([disp_mw["forward"], disp_mw["backward"]])
+
+# 3. mass-weighted vibrational bases (15 resolved modes per frame) ------------
+n_ret = int(manifest["resolved_rank"])
+bases, eigvals, rigid_basis = {}, {}, {}
+for fr in ("frame_a", "frame_b"):
+    h_mw = hess[fr] / np.outer(msqrt, msqrt)
+    h_mw = 0.5 * (h_mw + h_mw.T)
+    w, v = np.linalg.eigh(h_mw)
+    tol = 1e-8 * max(w.max(), 1.0)
+    null_mask = np.abs(w) < tol
+    assert null_mask.sum() == manifest["null_rank"], fr
+    rigid_basis[fr] = v[:, null_mask]
+    keep = np.where(~null_mask)[0]
+    keep = keep[np.argsort(w[keep])]           # ascending eigenvalue
+    bases[fr] = v[:, keep]
+    eigvals[fr] = w[keep]
+    assert len(keep) == n_ret
+
+vibrational_basis_mw = np.stack([bases["frame_a"], bases["frame_b"]])
+freq_scale = float(manifest["freq_scale_factor"])
+freqs = {fr: freq_scale * np.sqrt(eigvals[fr]) for fr in ("frame_a", "frame_b")}
+
+# 4. cross-frame mode overlap (magnitude-based, sign-insensitive) -------------
+def transport_basis(basis, rot):
+    """Rotate a site-major basis into another Cartesian frame."""
+    out = np.empty_like(basis)
+    for k in range(basis.shape[1]):
+        out[:, k] = rotate_components(basis[:, k], rot, n_sites)
+    return out
+
+
+# forward: frame B modes transported into frame A's Cartesian frame
+ov_f = np.abs(bases["frame_a"].T @ transport_basis(bases["frame_b"], rot_f))
+# backward: frame A modes transported into frame B's Cartesian frame
+ov_b = np.abs(bases["frame_b"].T @ transport_basis(bases["frame_a"], rot_b))
+mode_overlap = np.stack([ov_f, ov_b])
+
+# transported-mode pairing: source mode -> best target mode + |overlap|
+transported = np.empty((2, n_ret, 2))
+for d, ov in enumerate((ov_f, ov_b)):
+    best = np.argmax(ov, axis=1)
+    transported[d, :, 0] = best.astype(float)          # zero-based target index
+    transported[d, :, 1] = ov[np.arange(n_ret), best]  # |overlap| magnitude
+
+# 5. projections of the aligned displacement onto the resolved subspace -------
+ref_frame = {"forward": "frame_a", "backward": "frame_b"}
+projected_displacement_mw = np.empty((2, n_comp))
+mode_projection = np.empty((2, n_ret, 3))
+rigid_norm, projected_norm = {}, {}
+lambda_4pt, lambda_nm, lam_modes = {}, {}, {}
+for d, (src, ref) in enumerate((("frame_b", "frame_a"), ("frame_a", "frame_b"))):
+    dname = "forward" if d == 0 else "backward"
+    q = disp_mw[dname]
+    V = bases[ref]                       # reference-frame retained modes
+    N = rigid_basis[ref]                 # reference-frame null (rigid) space
+    g = V.T @ q                          # signed modal coordinates
+    lam_k = 0.5 * g**2 * eigvals[ref]    # eV per retained mode
+    q_proj = V @ g
+    q_rigid = N @ (N.T @ q)
+    projected_displacement_mw[d] = q_proj
+    mode_projection[d, :, 0] = g
+    mode_projection[d, :, 1] = g**2
+    mode_projection[d, :, 2] = lam_k
+    rigid_norm[dname] = float(np.linalg.norm(q_rigid))
+    projected_norm[dname] = float(np.linalg.norm(q_proj))
+    lam_modes[dname] = lam_k
+    h_mw_ref = hess[ref] / np.outer(msqrt, msqrt)
+    lambda_4pt[dname] = float(0.5 * q @ h_mw_ref @ q)   # full quadratic form
+    lambda_nm[dname] = float(lam_k.sum())               # resolved-subspace est.
+
+closure_error = {d: abs(lambda_4pt[d] - lambda_nm[d]) for d in ("forward", "backward")}
+dominant_mode = {
+    "forward": int(np.argmax(lam_modes["forward"])),
+    "backward": int(np.argmax(lam_modes["backward"])),
+}
+
+# 6. reorganization energies: inner / outer / total ---------------------------
+lambda_inner_effective = 0.5 * (lambda_4pt["forward"] + lambda_4pt["backward"])
+a_d = float(medium["shell_0_A"])
+a_a = float(medium["shell_1_A"])
+r_da = float(medium["span_A"])
+pekar = (1.0 / float(medium["eps_fast"]) - 1.0 / float(medium["eps_slow"]))
+geom = (1.0 / (2.0 * a_d) + 1.0 / (2.0 * a_a) - 1.0 / r_da)
+lambda_outer = E2_OVER_4PE0 * pekar * geom
+lambda_total = lambda_inner_effective + lambda_outer
+effective_inner_consistency = abs(
+    0.5 * (lambda_4pt["forward"] + lambda_4pt["backward"])
+    - 0.5 * (lambda_nm["forward"] + lambda_nm["backward"])
+)
+
+# 7. rates (classical nonadiabatic Marcus, nonequilibrium outer sphere) -------
+temperature = float(medium["temp_K"])
+coupling = float(medium["coupling_eV"])
+kbt = KB_EV_K * temperature
+prefactor = TWO_PI_OVER_HBAR * coupling**2 / np.sqrt(4.0 * np.pi * lambda_total * kbt)
+
+
+def marcus_rate(dg):
+    return prefactor * np.exp(-((dg + lambda_total) ** 2) / (4.0 * lambda_total * kbt))
+
+
+k_self_exchange = float(marcus_rate(0.0))
+
+axis = grid["axis_eV"].to_numpy(float)
+k_curve = marcus_rate(axis)
+rate_curve = pd.DataFrame({
+    "grid_id": grid["grid_id"].to_numpy(),
+    "axis_eV": axis,
+    "k_et_s_inv": k_curve,
+    "log10_k_et_s_inv": np.log10(k_curve),
+})
+rate_curve.to_csv(os.path.join(RESULTS, "rate_curve.csv"), index=False)
+
+# peak and inverted (non-monotonic) region
+srt = np.argsort(axis)
+ax_s, k_s, gid_s = axis[srt], k_curve[srt], grid["grid_id"].to_numpy()[srt]
+i_peak = int(np.argmax(k_s))
+peak_axis, peak_k, peak_gid = float(ax_s[i_peak]), float(k_s[i_peak]), int(gid_s[i_peak])
+peak_inside = bool(ax_s[0] < peak_axis < ax_s[-1])
+
+inv_mask = (ax_s < peak_axis) & (k_s < peak_k * (1.0 - 1e-12))
+inverted_detected = bool(inv_mask.any())
+if inverted_detected:
+    first_inv_gid = int(gid_s[inv_mask][np.argmin(ax_s[inv_mask])])
+    first_inv_axis = float(ax_s[inv_mask].min())
+else:
+    first_inv_gid, first_inv_axis = None, None
+
+# alternative (opposite sign) reading: peak would sit at +lambda_total
+alt_peak_axis = float(lambda_total)
+alt_diag = {"rate_peak_inside_grid": peak_inside}
+if not peak_inside:
+    alt_diag["alternative_reading_peak_axis_eV"] = alt_peak_axis
+    alt_diag["alternative_reading_inverted_region_detected"] = bool(
+        (ax_s > alt_peak_axis).any() and (k_s[ax_s > alt_peak_axis] < k_peak).any()
+    )
+
+# 8. write contracted artifacts -----------------------------------------------
+np.save(os.path.join(RESULTS, "aligned_displacement_mw.npy"),
+        aligned_displacement_mw)
+np.save(os.path.join(RESULTS, "vibrational_basis_mw.npy"), vibrational_basis_mw)
+np.save(os.path.join(RESULTS, "mode_overlap.npy"), mode_overlap)
+np.save(os.path.join(RESULTS, "projected_displacement_mw.npy"),
+        projected_displacement_mw)
+np.save(os.path.join(RESULTS, "transported_mode_projection.npy"), transported)
+np.save(os.path.join(RESULTS, "mode_projection.npy"), mode_projection)
+
+lambda_summary = pd.DataFrame([{
+    "lambda_4pt_forward_eV": lambda_4pt["forward"],
+    "lambda_4pt_backward_eV": lambda_4pt["backward"],
+    "lambda_nm_forward_eV": lambda_nm["forward"],
+    "lambda_nm_backward_eV": lambda_nm["backward"],
+    "lambda_inner_effective_eV": lambda_inner_effective,
+    "lambda_outer_eV": lambda_outer,
+    "lambda_total_eV": lambda_total,
+    "k_self_exchange_s_inv": k_self_exchange,
+}])
+lambda_summary.to_csv(os.path.join(RESULTS, "lambda_summary.csv"), index=False)
+
+diagnostics = {
+    "alignment_rmsd_forward_A": rmsd_f,
+    "alignment_rmsd_backward_A": rmsd_b,
+    "closure_error_forward_eV": closure_error["forward"],
+    "closure_error_backward_eV": closure_error["backward"],
+    "effective_inner_consistency_eV": effective_inner_consistency,
+    "rigid_norm_forward": rigid_norm["forward"],
+    "rigid_norm_backward": rigid_norm["backward"],
+    "projected_norm_forward": projected_norm["forward"],
+    "projected_norm_backward": projected_norm["backward"],
+    "dominant_mode_forward": dominant_mode["forward"],
+    "dominant_mode_backward": dominant_mode["backward"],
+    "rate_peak_grid_id": peak_gid,
+    "rate_peak_axis_eV": peak_axis,
+    "rate_peak_s_inv": peak_k,
+    "inverted_region_detected": inverted_detected,
+    "first_inverted_grid_id": first_inv_gid,
+    "first_inverted_axis_eV": first_inv_axis,
+    # cross-check extras (traceability to the inspection report)
+    "retained_eigval_range_frame_a_eV_per_A2_amu":
+        [float(eigvals["frame_a"].min()), float(eigvals["frame_a"].max())],
+    "retained_eigval_range_frame_b_eV_per_A2_amu":
+        [float(eigvals["frame_b"].min()), float(eigvals["frame_b"].max())],
+    "retained_freq_range_frame_a_cm_inv":
+        [float(freqs["frame_a"].min()), float(freqs["frame_a"].max())],
+    "retained_freq_range_frame_b_cm_inv":
+        [float(freqs["frame_b"].min()), float(freqs["frame_b"].max())],
+    "axis_sign_convention": "axis_eV = reaction free energy dG (negative = exergonic)",
+}
+diagnostics.update(alt_diag)
+with open(os.path.join(RESULTS, "diagnostics.json"), "w") as fh:
+    json.dump(diagnostics, fh, indent=2)
+
+# --- dependency-free PNG fallback renderer (no matplotlib required) -----------
+def _render_overview_png(path, p):
+    import math
+    import struct
+    import zlib
+
+    W, H = 1280, 960
+    pix = bytearray([255]) * (W * H * 3)
+
+    def px(x, y, c):
+        if 0 <= x < W and 0 <= y < H:
+            i = (y * W + x) * 3
+            pix[i] = c[0]; pix[i + 1] = c[1]; pix[i + 2] = c[2]
+
+    def line(x0, y0, x1, y1, c):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            px(x0, y0, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x0 += sx
+            if e2 <= dx:
+                err += dx; y0 += sy
+
+    def rect(x0, y0, x1, y1, c):
+        for yy in range(max(0, y0), min(H, y1 + 1)):
+            for xx in range(max(0, x0), min(W, x1 + 1)):
+                px(xx, yy, c)
+
+    FONT = {
+        '0': ['111', '101', '101', '101', '111'], '1': ['010', '110', '010', '010', '111'],
+        '2': ['111', '001', '111', '100', '111'], '3': ['111', '001', '011', '001', '111'],
+        '4': ['101', '101', '111', '001', '001'], '5': ['111', '100', '111', '001', '111'],
+        '6': ['100', '100', '111', '101', '111'], '7': ['111', '001', '010', '010', '010'],
+        '8': ['111', '101', '111', '101', '111'], '9': ['111', '101', '111', '001', '001'],
+        'A': ['010', '101', '111', '101', '101'], 'B': ['110', '101', '110', '101', '110'],
+        'C': ['011', '100', '100', '100', '011'], 'D': ['110', '101', '101', '101', '110'],
+        'E': ['111', '100', '110', '100', '111'], 'F': ['111', '100', '110', '100', '100'],
+        'G': ['011', '100', '101', '101', '011'], 'H': ['101', '101', '111', '101', '101'],
+        'I': ['111', '010', '010', '010', '111'], 'J': ['001', '001', '001', '101', '010'],
+        'K': ['101', '110', '100', '110', '101'], 'L': ['100', '100', '100', '100', '111'],
+        'M': ['101', '111', '111', '101', '101'], 'N': ['110', '101', '101', '101', '101'],
+        'O': ['010', '101', '101', '101', '010'], 'P': ['110', '101', '110', '100', '100'],
+        'Q': ['010', '101', '101', '110', '011'], 'R': ['110', '101', '110', '110', '101'],
+        'S': ['011', '100', '010', '001', '110'], 'T': ['111', '010', '010', '010', '010'],
+        'U': ['101', '101', '101', '101', '111'], 'V': ['101', '101', '101', '101', '010'],
+        'W': ['101', '101', '111', '111', '101'], 'X': ['101', '101', '010', '101', '101'],
+        'Y': ['101', '101', '010', '010', '010'], 'Z': ['111', '001', '010', '100', '111'],
+        ' ': ['000'] * 5, '-': ['000', '000', '111', '000', '000'],
+        '.': ['000', '000', '000', '000', '010'], '(': ['001', '010', '010', '010', '001'],
+        ')': ['100', '010', '010', '010', '100'], '=': ['000', '111', '000', '111', '000'],
+        '/': ['001', '001', '010', '100', '100'], ',': ['000', '000', '000', '010', '100'],
+        ':': ['000', '010', '000', '010', '000'], '^': ['010', '101', '000', '000', '000'],
+        '+': ['000', '010', '111', '010', '000'], '_': ['000', '000', '000', '000', '111'],
+    }
+
+    def text(x, y, s, c, scale=2):
+        for ch in s.upper():
+            g = FONT.get(ch, FONT[' '])
+            for r, row in enumerate(g):
+                for coln, bit in enumerate(row):
+                    if bit == '1':
+                        rect(x + coln * scale, y + r * scale,
+                             x + coln * scale + scale - 1,
+                             y + r * scale + scale - 1, c)
+            x += 4 * scale
+
+    VIR = [(68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37)]
+
+    def viridis(v):
+        v = min(max(v, 0.0), 1.0)
+        t = v * (len(VIR) - 1)
+        i = min(int(t), len(VIR) - 2)
+        f = t - i
+        return tuple(int(VIR[i][k] + f * (VIR[i + 1][k] - VIR[i][k])) for k in range(3))
+
+    text(8, 4, "ET RESPONSE - %s (FALLBACK RASTER RENDERER)" % p["case_id"],
+         (20, 20, 20), 2)
+    panels = []
+    for r in range(2):
+        for col in range(2):
+            x0 = 30 + col * 620
+            y0 = 30 + r * 460
+            rect(x0, y0, x0 + 600, y0 + 430, (210, 210, 210))
+            panels.append((x0, y0))
+
+    def mapper(pi, xmin, xmax, ymin, ymax, mx=60, my=50):
+        x0, y0 = panels[pi]
+        pw, ph = 600, 430
+        def m(xv, yv):
+            fx = (xv - xmin) / (xmax - xmin)
+            fy = (yv - ymin) / (ymax - ymin)
+            return (int(x0 + mx + fx * (pw - 2 * mx)),
+                    int(y0 + ph - my - fy * (ph - 2 * my)))
+        return m
+
+    BLACK = (30, 30, 30); BLUE = (20, 70, 190); ORANGE = (235, 120, 10)
+    GRAY = (150, 150, 150); RED = (200, 30, 30)
+
+    ref = p["ref"]; src = p["src"]
+    xs = [q[0] for q in ref + src]; ys = [q[1] for q in ref + src]
+    m = mapper(0, min(xs) - 0.5, max(xs) + 0.5, min(ys) - 0.5, max(ys) + 0.5)
+    for a, b in zip(ref, src):
+        pa = m(a[0], a[1]); pb = m(b[0], b[1])
+        line(pa[0], pa[1], pb[0], pb[1], GRAY)
+    for q0 in ref:
+        x, y = m(q0[0], q0[1]); rect(x - 2, y - 2, x + 2, y + 2, BLUE)
+    for q0 in src:
+        x, y = m(q0[0], q0[1]); rect(x - 2, y - 2, x + 2, y + 2, ORANGE)
+    x0, y0 = panels[0]
+    text(x0 + 8, y0 + 6, "FORWARD DISPLACEMENT, RMSD = %.4f A" % p["rmsd_f"], BLACK, 2)
+    text(x0 + 8, y0 + 26, "BLUE: FRAME A (REFERENCE)  ORANGE: FRAME B ALIGNED", GRAY, 1)
+
+    x0, y0 = panels[1]
+    text(x0 + 8, y0 + 6, "MODE OVERLAP |V_A^T R V_B| (FORWARD)", BLACK, 2)
+    cell = 24
+    ox, oy = x0 + 90, y0 + 60
+    for i in range(15):
+        for j in range(15):
+            rect(ox + j * cell, oy + i * cell, ox + (j + 1) * cell - 2,
+                 oy + (i + 1) * cell - 2, viridis(p["overlap"][i][j]))
+    text(ox, oy + 15 * cell + 8, "FRAME B MODE ->", GRAY, 1)
+
+    x0, y0 = panels[2]
+    text(x0 + 8, y0 + 6, "PER-MODE LAMBDA (EV), LOG SCALE", BLACK, 2)
+    text(x0 + 8, y0 + 26, "DOMINANT FWD %d  BWD %d" % (p["dom_f"], p["dom_b"]), GRAY, 1)
+    vals = [v for v in p["lam_f"] + p["lam_b"] if v > 0]
+    lo = math.log10(min(vals)) - 0.2
+    hi = math.log10(max(vals)) + 0.2
+    base_y = y0 + 400
+    for k in range(15):
+        for off, vv, c in ((0, p["lam_f"][k], BLUE), (12, p["lam_b"][k], ORANGE)):
+            lv = math.log10(max(vv, 1e-18))
+            hgt = int((lv - lo) / (hi - lo) * 320)
+            bx = x0 + 50 + k * 34 + off
+            rect(bx, base_y - hgt, bx + 10, base_y, c)
+    line(x0 + 40, base_y, x0 + 590, base_y, BLACK)
+
+    x0, y0 = panels[3]
+    text(x0 + 8, y0 + 6, "RATE CURVE, LAMBDA_TOTAL = %.4f EV" % p["lambda_total"], BLACK, 2)
+    text(x0 + 8, y0 + 26, "PEAK GRID %d, FIRST INVERTED GRID %s"
+         % (p["peak_gid"], p["first_inv"]), GRAY, 1)
+    axs, ks = p["ax"], p["k"]
+    lx = [math.log10(v) for v in ks]
+    xmin, xmax = min(axs), max(axs)
+    ymin, ymax = min(lx), max(lx)
+    m = mapper(3, xmin, xmax, ymin, ymax)
+    for xa in p["inv_ax"]:
+        x, _ = m(xa, ymin)
+        rect(x, y0 + 40, x, y0 + 410, (235, 225, 250))
+    for i in range(len(axs) - 1):
+        pa = m(axs[i], lx[i]); pb = m(axs[i + 1], lx[i + 1])
+        line(pa[0], pa[1], pb[0], pb[1], RED)
+    x, y = m(p["peak_axis"], math.log10(p["peak_k"]))
+    rect(x - 3, y - 3, x + 3, y + 3, BLACK)
+    text(x0 + 380, y0 + 410, "AXIS = DG (EV)", GRAY, 1)
+
+    raw = bytearray()
+    for yy in range(H):
+        raw.append(0)
+        raw += pix[yy * W * 3:(yy + 1) * W * 3]
+
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
+
+    out = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(out)
+
+
+# 9. overview figure -----------------------------------------------------------
+overview_path = os.path.join(RESULTS, "overview.png")
+payload = {
+    "case_id": manifest["case_id"],
+    "rmsd_f": rmsd_f, "rmsd_b": rmsd_b,
+    "ref": coords["frame_a"].tolist(),
+    "src": (coords["frame_b"] @ rot_f + trans_f).tolist(),
+    "overlap": mode_overlap[0].tolist(),
+    "lam_f": lam_modes["forward"].tolist(),
+    "lam_b": lam_modes["backward"].tolist(),
+    "dom_f": dominant_mode["forward"], "dom_b": dominant_mode["backward"],
+    "ax": ax_s.tolist(), "k": k_s.tolist(),
+    "peak_axis": peak_axis, "peak_k": peak_k, "peak_gid": peak_gid,
+    "inv_ax": ax_s[inv_mask].tolist(), "inv_k": k_s[inv_mask].tolist(),
+    "lambda_total": lambda_total, "first_inv": first_inv_gid,
+    "lambda_fwd": lambda_4pt["forward"], "lambda_bwd": lambda_4pt["backward"],
+}
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    fig.suptitle(f"ET response calculation - {manifest['case_id']}", fontsize=13)
+
+    ax = axes[0, 0]
+    ref = coords["frame_a"]
+    src_al = coords["frame_b"] @ rot_f + trans_f
+    ax.scatter(ref[:, 0], ref[:, 1], c="tab:blue", s=60, label="frame A (reference)")
+    ax.scatter(src_al[:, 0], src_al[:, 1], c="tab:orange", s=60, marker="^",
+               label="frame B (aligned)")
+    for i in range(n_sites):
+        ax.annotate("", xy=src_al[i, :2], xytext=ref[i, :2],
+                    arrowprops=dict(arrowstyle="->", color="gray", lw=0.8))
+    ax.set_title(f"Forward displacement (RMSD {rmsd_f:.4f} A)")
+    ax.set_xlabel("x (A)"); ax.set_ylabel("y (A)"); ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    im = ax.imshow(mode_overlap[0], vmin=0, vmax=1, cmap="viridis")
+    ax.set_title("Mode overlap |V_A^T R V_B| (forward)")
+    ax.set_xlabel("frame B retained mode"); ax.set_ylabel("frame A retained mode")
+    fig.colorbar(im, ax=ax, fraction=0.046)
+
+    ax = axes[1, 0]
+    idxm = np.arange(n_ret)
+    ax.bar(idxm - 0.2, lam_modes["forward"], width=0.4, label="forward (A modes)")
+    ax.bar(idxm + 0.2, lam_modes["backward"], width=0.4, label="backward (B modes)")
+    ax.set_title("Per-mode reorganization-energy contributions")
+    ax.set_xlabel("retained mode index (zero-based)")
+    ax.set_ylabel("lambda_k (eV)")
+    ax.set_yscale("log"); ax.legend(fontsize=8)
+    ax.annotate(f"dominant fwd mode {dominant_mode['forward']}, "
+                f"bwd mode {dominant_mode['backward']}",
+                xy=(0.03, 0.92), xycoords="axes fraction", fontsize=8)
+
+    ax = axes[1, 1]
+    ax.plot(ax_s, k_s, "-", color="tab:red", lw=1.5, label="Marcus rate (sorted)")
+    ax.scatter([peak_axis], [peak_k], c="k", zorder=5, label=f"peak (grid {peak_gid})")
+    if inverted_detected:
+        ax.fill_between(ax_s[inv_mask], k_s[inv_mask].min(), k_s[inv_mask],
+                        alpha=0.25, color="tab:purple", label="inverted region")
+    ax.set_yscale("log")
+    ax.set_title(f"Rate curve (lambda_total = {lambda_total:.4f} eV)")
+    ax.set_xlabel("axis_eV = dG (eV)"); ax.set_ylabel("k_et (s^-1)")
+    ax.legend(fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(overview_path, dpi=150)
+    plt.close(fig)
+except ImportError:
+    _render_overview_png(overview_path, payload)
+
+# console evidence trail
+print("lambda_4pt forward/backward (eV):", lambda_4pt["forward"], lambda_4pt["backward"])
+print("lambda_nm  forward/backward (eV):", lambda_nm["forward"], lambda_nm["backward"])
+print("closure errors (eV):", closure_error)
+print("lambda_inner_effective (eV):", lambda_inner_effective)
+print("lambda_outer (eV):", lambda_outer)
+print("lambda_total  (eV):", lambda_total)
+print("k_self_exchange (s^-1):", k_self_exchange)
+print("peak:", peak_gid, peak_axis, peak_k, "| inverted:", inverted_detected,
+      "| first inverted:", first_inv_gid, first_inv_axis)
+print("dominant modes:", dominant_mode)
+print("rigid norms:", rigid_norm)
+print("projected norms:", projected_norm)
+print("retained eig ranges (eV/A^2/amu):", eigvals["frame_a"].min(),
+      eigvals["frame_a"].max(), "|", eigvals["frame_b"].min(), eigvals["frame_b"].max())
+print("alignment RMSD fwd/bwd (A):", rmsd_f, rmsd_b)
+print("artifacts written to", RESULTS)

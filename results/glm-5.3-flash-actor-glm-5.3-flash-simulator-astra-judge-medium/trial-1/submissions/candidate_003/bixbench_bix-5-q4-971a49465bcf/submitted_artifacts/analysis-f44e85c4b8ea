@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-5-q4 : ASXL1 fibroblast RNA-seq DE + GO BP enrichment (executed script).
+Data-handling decision (researcher-approved): MGD1640F/MGD1641F present in counts but
+absent from coldata -> dropped (coldata authoritative).
+Offline DESeq2-style pipeline: median-of-ratios size factors, NB2 GLM (batched IRLS),
+method-of-moments dispersion -> log-log trend -> EB shrinkage, Wald tests, BH FDR.
+Primary design ~condition+sex; sensitivity ~condition. GO BP enrichment attempted via
+network only; if unreachable, the blocker is reported honestly (no invented gene sets).
+"""
+import json, os, socket, sys, time
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+DATA = "/workspace/data"; OUT = "/workspace/results"
+os.makedirs(OUT, exist_ok=True)
+LOG = []
+def log(m):
+    print(m, flush=True); LOG.append(str(m))
+
+def probe_network(timeout=4):
+    tests = []
+    for host, port in [("pypi.org",443),("maayanlab.cloud",443),("rest.ensembl.org",443),("8.8.8.8",53)]:
+        try:
+            ip = host if host.replace(".","").isdigit() else socket.gethostbyname(host)
+            s = socket.create_connection((ip,port),timeout=timeout); s.close()
+            tests.append((host,"OK",ip))
+        except Exception as e:
+            tests.append((host,"FAIL",f"{type(e).__name__}: {e}"))
+    return tests
+
+t0 = time.time()
+net = probe_network(); net_ok = all(t[1]=="OK" for t in net[:3])
+log("[1] NETWORK PROBE: " + "; ".join(f"{h}={s}({d})" for h,s,d in net))
+log(f"    -> network_available = {net_ok}")
+
+log("[2] INGESTION & QC")
+counts_all = pd.read_csv(f"{DATA}/Issy_ASXL1_fibro_featureCounts_GeneTable_final.txt",
+                         sep=r"\s+", engine="python").set_index("Geneid")
+log(f"    count table: {counts_all.shape[0]} genes x {counts_all.shape[1]} samples (whitespace-delimited)")
+coldata = pd.read_excel(f"{DATA}/Issy_ASXL1_fibro_coldata_gender.xlsx", sheet_name="Sheet1")
+samples = coldata["sample"].tolist()
+dropped = [s for s in counts_all.columns if s not in samples]
+counts = counts_all[samples].astype(np.float64)
+assert counts.columns.tolist() == samples
+log(f"    coldata: {len(samples)} samples; condition={coldata['condition'].value_counts().to_dict()}; "
+    f"sex={coldata['sex'].value_counts().to_dict()}")
+log(f"    DATA-HANDLING DECISION: dropped {dropped} (in count table, absent from coldata)")
+
+gencode = pd.read_csv(f"{DATA}/gencode.v31.primary_assembly.genes.csv", low_memory=False).set_index("gene_id")
+pc_ids = gencode.index[gencode["gene_type"]=="protein_coding"]
+mat = counts.loc[counts.index.intersection(pc_ids)]
+log(f"    protein_coding genes: {mat.shape[0]} / {counts.shape[0]}")
+mat = mat.loc[(mat>=10).sum(axis=1) >= 7]
+log(f"    after expression filter (>=10 counts in >=7 samples): {mat.shape[0]} genes")
+
+hgnc = pd.read_csv(f"{DATA}/HGNC_05-09-19.txt", sep="\t", low_memory=False)
+hgnc = hgnc[hgnc["Status"]=="Approved"]
+sym_by_hgncid = dict(zip(hgnc["HGNC ID"], hgnc["Approved symbol"]))
+ens_col = "Ensembl ID(supplied by Ensembl)"
+e = hgnc[ens_col].dropna()
+sym_by_ens = dict(zip(e, hgnc.loc[e.index, "Approved symbol"]))
+annot = gencode.loc[mat.index, ["gene_name","hgnc_id"]]
+def map_symbol(i):
+    h = annot.loc[i,"hgnc_id"]
+    if isinstance(h,str) and h.startswith("HGNC:") and h in sym_by_hgncid: return sym_by_hgncid[h]
+    return sym_by_ens.get(i.split(".")[0], annot.loc[i,"gene_name"])
+symbols = pd.Series([map_symbol(i) for i in mat.index], index=mat.index, name="symbol")
+
+logc = np.log(mat.replace(0,np.nan)); geo = np.exp(logc.mean(axis=1))
+sf = mat[geo.notna().values].div(geo[geo.notna()],axis=0).median(axis=0)
+sf = sf/np.exp(np.log(sf).mean())
+log(f"    size factors: min={sf.min():.3f} max={sf.max():.3f}")
+
+norm_log = np.log2(mat.div(sf,axis=1)+1.0)
+top_var = norm_log.var(axis=1).nlargest(5000).index
+Xp = norm_log.loc[top_var].T.values; Xc_ = Xp-Xp.mean(0)
+U,S,Vt = np.linalg.svd(Xc_, full_matrices=False)
+pcs = U[:,:4]*S[:4]; var_exp = (S[:4]**2)/(S**2).sum()
+pca_df = pd.DataFrame(pcs[:,:2], index=mat.columns, columns=["PC1","PC2"])
+pca_df["condition"]=coldata["condition"].values; pca_df["sex"]=coldata["sex"].values
+for pi in range(2):
+    rc = stats.pointbiserialr((pca_df.condition=="disease").astype(int),pcs[:,pi])[0]
+    rs = stats.pointbiserialr((pca_df.sex=="M").astype(int),pcs[:,pi])[0]
+    log(f"    PC{pi+1} ({var_exp[pi]*100:.1f}% var): corr(condition)={rc:+.2f}, corr(sex)={rs:+.2f}")
+for s_,r in pca_df.iterrows(): log(f"      {s_}  PC1={r.PC1:+8.2f} PC2={r.PC2:+8.2f}  {r.condition:<8} {r.sex}")
+pca_df.round(3).to_csv(f"{OUT}/pca_coordinates.csv")
+
+# ---------------------------------------------------------------- 3. DE
+log("[3] DIFFERENTIAL EXPRESSION (DESeq2-style, offline Python implementation)")
+
+def irls_nb(y, X, off, alpha, max_iter=200, tol=1e-7):
+    """Batched NB2 GLM, log link. y:(G,n) X:(n,p) off:(n,) alpha:(G,).
+    Var(y_i)=mu_i+alpha*mu_i^2. Returns (beta(G,p), converged(G)).
+    Convergence is tracked PER GENE (max |step| < tol); genes that oscillate
+    or fail are flagged rather than blocking the whole batch."""
+    n,p = X.shape; G = y.shape[0]
+    beta = np.zeros((G,p))
+    beta[:,0] = np.log(y.sum(1)/np.exp(off).sum()+1e-8)
+    conv = np.zeros(G,bool)
+    for _ in range(max_iter):
+        eta = beta@X.T + off
+        np.clip(eta,-20,25,out=eta)
+        mu = np.exp(eta)
+        w = mu/(1.0+alpha[:,None]*mu)
+        r = (y-mu)/(1.0+alpha[:,None]*mu)
+        U = r@X
+        H = np.einsum("gn,ni,nj->gij", w, X, X)
+        step = np.linalg.solve(H, U[...,None])[...,0]
+        bad = ~np.isfinite(step)
+        if bad.any(): step[bad]=0.0
+        active = ~conv
+        beta[active] += step[active]
+        smax = np.abs(step).max(axis=1)
+        conv |= (smax < tol)
+        if conv.all(): break
+    return beta, conv
+
+def fit_glm(y, X, off, alpha):
+    beta, conv = irls_nb(y, X, off, alpha)
+    eta = np.clip(beta@X.T+off,-20,25); mu = np.exp(eta)
+    w = mu/(1.0+alpha[:,None]*mu)
+    H = np.einsum("gn,ni,nj->gij", w, X, X)
+    Hinv = np.linalg.inv(H)
+    diag = Hinv[:, np.arange(X.shape[1]), np.arange(X.shape[1])]
+    se = np.sqrt(np.maximum(diag,0))
+    return beta, se, mu, conv
+
+def run_pipeline(y, X, off):
+    a0 = np.full(y.shape[0],1e-8)
+    _, _, mu0, _ = fit_glm(y, X, off, a0)
+    num = ((y-mu0)**2).sum(1) - mu0.sum(1)
+    den = (mu0**2).sum(1)
+    alpha_g = np.maximum(num,0)/np.maximum(den,1e-12)
+    m = mu0.mean(1); pos = alpha_g>1e-8
+    coef = np.polyfit(np.log(m[pos]), np.log(alpha_g[pos]+1e-8), 1)
+    alpha_trend = np.exp(coef[1])*m**coef[0]
+    d = y.shape[1]-X.shape[1]; wgt = d/(d+2.0)
+    alpha_f = np.exp(wgt*np.log(np.maximum(alpha_g,1e-8)) + (1-wgt)*np.log(np.maximum(alpha_trend,1e-8)))
+    alpha_f = np.clip(alpha_f,1e-6,100.0)
+    beta, se, mu, conv = fit_glm(y, X, off, alpha_f)
+    return dict(beta=beta, se=se, mu=mu, conv=conv, alpha=alpha_f, trend_coef=coef, frac_pos_trend=float(pos.mean()))
+
+y = mat.values; off = np.log(sf.values)
+cond = (coldata["condition"]=="disease").astype(int).values
+sexM = (coldata["sex"]=="M").astype(int).values
+X_ps = np.column_stack([np.ones(len(cond)), cond, sexM])
+X_c  = np.column_stack([np.ones(len(cond)), cond])
+
+# self-validation on simulated NB2 data with known LFCs (realistic abundances)
+rng = np.random.default_rng(0)
+Gv = 500; alpha_true = 0.1
+true_lfc = rng.normal(0,1,Gv)
+mu_sim = np.outer(np.exp(rng.normal(np.log(2000),1.0,Gv)), np.exp(off))*np.exp(true_lfc[:,None]*cond)
+k = 1/alpha_true
+ysim = rng.negative_binomial(k, k/(k+mu_sim)).astype(float)
+res_sim = run_pipeline(ysim, X_ps, off)
+corr = np.corrcoef(res_sim["beta"][:,1]/np.log(2), true_lfc)[0,1]
+log(f"    self-validation (simulated NB2, alpha=0.1, base mean ~2000, n=500 genes): "
+    f"corr(estimated,true LFC)={corr:.4f}; converged {int(res_sim['conv'].sum())}/{Gv}; "
+    f"mean fitted dispersion={res_sim['alpha'].mean():.3f} (true 0.1)")
+
+
+# first estimate dispersions once (shared by both designs for the statsmodels cross-check)
+a0 = np.full(y.shape[0],1e-8)
+_, _, mu0, _ = fit_glm(y, X_ps, off, a0)
+num = ((y-mu0)**2).sum(1) - mu0.sum(1); den = (mu0**2).sum(1)
+alpha_g = np.maximum(num,0)/np.maximum(den,1e-12)
+m = mu0.mean(1); pos = alpha_g>1e-8
+tcoef = np.polyfit(np.log(m[pos]), np.log(alpha_g[pos]+1e-8), 1)
+alpha_trend = np.exp(tcoef[1])*m**tcoef[0]
+d = y.shape[1]-X_ps.shape[1]; wgt = d/(d+2.0)
+alpha_f = np.clip(np.exp(wgt*np.log(np.maximum(alpha_g,1e-8))+(1-wgt)*np.log(np.maximum(alpha_trend,1e-8))),1e-6,100.0)
+res_ps_alpha_check = alpha_f
+beta_check, _, _, _ = fit_glm(y, X_ps, off, alpha_f)
+
+# cross-check custom IRLS vs statsmodels GLM on 10 genes (same alpha)
+try:
+    import statsmodels.api as sm
+    from statsmodels.discrete.discrete_model import NegativeBinomial as _NB  # noqa
+    fam_checks = []
+    for i in range(0, len(y), max(1,len(y)//10))[:10]:
+        fam = sm.GLM(y[i], X_ps, family=sm.families.NegativeBinomial(alpha=res_ps_alpha_check[i]),
+                     offset=off)
+        rsm = fam.fit(maxiter=200, tol=1e-10)
+        fam_checks.append(np.abs(rsm.params - beta_check[i]).max())
+    log(f"    cross-check vs statsmodels GLM (10 genes, same fixed alpha): max |beta diff| = "
+        f"{max(fam_checks):.2e}")
+except Exception as e:
+    log(f"    statsmodels cross-check skipped: {type(e).__name__}: {e}")
+
+res_ps = run_pipeline(y, X_ps, off)
+res_c  = run_pipeline(y, X_c,  off)
+log(f"    ~condition+sex: trend coef(log-log)={res_ps['trend_coef'].round(3).tolist()}; "
+    f"{res_ps['frac_pos_trend']:.1%} of genes overdispersed vs Poisson; "
+    f"median dispersion={np.median(res_ps['alpha']):.3f}")
+
+def assemble(res, label):
+    beta, se, conv = res["beta"], res["se"], res["conv"]
+    lfc = beta[:,1]/np.log(2); lfc_se = se[:,1]/np.log(2)
+    zstat = beta[:,1]/np.where(se[:,1]>0, se[:,1], np.inf)
+    pval = 2*stats.norm.sf(np.abs(zstat))
+    out = pd.DataFrame({"gene_id":mat.index,"symbol":symbols.values,
+        "baseMean":res["mu"].mean(1),"log2FoldChange":lfc,"lfcSE":lfc_se,"stat":zstat,
+        "pvalue":pval,"dispersion":res["alpha"],"converged":conv})
+    valid = out["converged"] & np.isfinite(out["pvalue"])
+    padj = np.full(len(out), np.nan)
+    padj[valid.values] = stats.false_discovery_control(out.loc[valid,"pvalue"].values, method="bh")
+    out["padj"] = padj
+    out.to_csv(f"{OUT}/de_table_{label}.csv", index=False)
+    return out
+
+de_ps = assemble(res_ps, "condition_plus_sex")
+de_c  = assemble(res_c,  "condition_only")
+
+for lbl, de in [("~condition + sex", de_ps), ("~condition", de_c)]:
+    sig = de[(de.padj<0.05)&(de.log2FoldChange.abs()>1)]
+    log(f"    {lbl}: tested={int(de.converged.sum())}; sig(padj<0.05 & |LFC|>1)={len(sig)} "
+        f"(up={int((sig.log2FoldChange>0).sum())}, down={int((sig.log2FoldChange<0).sum())})")
+top_ps = set(de_ps.nlargest(200,"stat").gene_id); top_c = set(de_c.nlargest(200,"stat").gene_id)
+jac = len(top_ps&top_c)/len(top_ps|top_c)
+log(f"    design concordance: top-200-by-stat overlap={len(top_ps&top_c)}/200 (Jaccard {jac:.2f})")
+sps = set(de_ps.loc[(de_ps.padj<0.05)&(de_ps.log2FoldChange.abs()>1),"gene_id"])
+sc_ = set(de_c.loc[(de_c.padj<0.05)&(de_c.log2FoldChange.abs()>1),"gene_id"])
+log(f"    sig-set overlap (~cond+sex vs ~cond): {len(sps&sc_)} shared; "
+    f"Jaccard={len(sps&sc_)/len(sps|sc_):.2f}")
+tested = de_ps[de_ps.converged]
+log(f"    p-value distribution (~cond+sex): frac p<0.05={ (tested.pvalue<0.05).mean():.3f}, "
+    f"frac p<0.01={(tested.pvalue<0.01).mean():.3f}, median p={tested.pvalue.median():.3f} "
+    f"(uniform-ish null expected for bulk of genes)")
+de_ps.sort_values('stat',ascending=False).head(50).to_csv(f"{OUT}/de_top50_up.csv", index=False)
+de_ps.sort_values('stat').head(50).to_csv(f"{OUT}/de_top50_down.csv", index=False)
+
+for g in ["ASXL1","ACTB","GAPDH","TBP"]:
+    row = de_ps[de_ps.symbol==g]
+    log(f"    sanity {g}: " + (f"baseMean={row.iloc[0].baseMean:.1f}, LFC={row.iloc[0].log2FoldChange:+.3f}, "
+        f"padj={row.iloc[0].padj:.3g}" if len(row) else "not in tested set"))
+
+for direction, head in [("up", de_ps.sort_values("stat",ascending=False).head(15)),
+                        ("down", de_ps.sort_values("stat").head(15))]:
+    log(f"    Top 15 {direction}-regulated (disease vs control, ~condition+sex):")
+    log(head[["symbol","log2FoldChange","stat","pvalue","padj"]].round(4).to_string(index=False))
+
+# ---------------------------------------------------------------- 4. enrichment
+log("[4] ENRICHMENT: GO Biological Process")
+sig_ps = de_ps[(de_ps.padj<0.05)&(de_ps.log2FoldChange.abs()>1)&de_ps.converged]
+universe = de_ps[de_ps.converged].symbol.dropna().unique().tolist()
+log(f"    ORA DE set: {len(sig_ps)} genes (padj<0.05 & |LFC|>1, ~condition+sex); "
+    f"universe of tested protein-coding genes mapped to symbols: {len(universe)}")
+ranked = (np.sign(de_ps.stat.fillna(0))*-np.log10(np.maximum(de_ps.pvalue,1e-300))).fillna(0)
+ranked.index = de_ps.symbol.values
+ranked = ranked[ranked.index.notna()].sort_values(ascending=False)
+ranked.to_csv(f"{OUT}/ranked_list_gsea_input.csv")
+
+enrichment_status = {"network_available":bool(net_ok),"performed":False,"blocker":None,"method":None}
+if net_ok:
+    try:
+        import subprocess
+        subprocess.run([sys.executable,"-m","pip","install","--quiet","gseapy"],
+                       check=True, timeout=900)
+        import gseapy
+        gene_list = sig_ps.symbol.dropna().tolist()
+        enr = gseapy.enrichr(gene_list=gene_list, gene_sets="GO_Biological_Process_2023",
+                             organism="Human", outdir=f"{OUT}/enrichr_ora", cutoff=0.05)
+        top10 = enr.res2d.head(10)
+        top10.to_csv(f"{OUT}/enrichr_ora_top10.csv", index=False)
+        log("    ORA (Enrichr GO_Biological_Process_2023) top 10:")
+        log(top10[["Term","Overlap","Adjusted P-value"]].to_string(index=False))
+        pre = gseapy.prerank(rnk=ranked, gene_sets="GO_Biological_Process_2023",
+                             outdir=f"{OUT}/gsea_prerank", min_size=15, max_size=500, threads=1)
+        pre.res2d.head(10).to_csv(f"{OUT}/gsea_top10.csv", index=False)
+        log("    GSEA prerank top 10:")
+        log(pre.res2d.head(10)[["Term","NES","FDR q-val"]].to_string(index=False))
+        enrichment_status.update(performed=True, method="gseapy/Enrichr GO_Biological_Process_2023")
+    except Exception as e:
+        enrichment_status["blocker"] = f"network present but enrichment failed: {type(e).__name__}: {e}"
+        log(f"    ENRICHMENT FAILED DESPITE NETWORK: {enrichment_status['blocker']}")
+else:
+    enrichment_status["blocker"] = ("Environment is fully offline (DNS and raw-IP connections fail). "
+        "No GO annotation resource exists in the capsule (HGNC file has no GO columns; GENCODE 'ont' "
+        "all-NaN; no .gaf/.obo/MSigDB/clusterProfiler/org.Hs.eg.db anywhere on the filesystem) and none "
+        "can be downloaded. Per researcher instruction: DE results reported in full; no gene-set "
+        "collection invented or substituted; enrichment escalated back to the researcher.")
+    log(f"    ENRICHMENT BLOCKER: {enrichment_status['blocker']}")
+
+# ---------------------------------------------------------------- 5. summary
+qc = {"n_genes_total":int(counts.shape[0]), "n_samples_coldata":len(samples),
+      "dropped_samples":dropped, "n_protein_coding_tested":int(de_ps.converged.sum()),
+      "sig_ps":int(((de_ps.padj<0.05)&(de_ps.log2FoldChange.abs()>1)).sum()),
+      "sig_c":int(((de_c.padj<0.05)&(de_c.log2FoldChange.abs()>1)).sum()),
+      "top200_jaccard_ps_vs_c":float(jac), "sim_validation_corr":float(corr),
+      "pca_variance_explained":[float(v) for v in var_exp[:2]],
+      "enrichment":enrichment_status, "runtime_seconds":round(time.time()-t0,1)}
+with open(f"{OUT}/summary.json","w") as f: json.dump(qc,f,indent=2)
+with open(f"{OUT}/run_log.txt","w") as f: f.write("\n".join(LOG))
+log(f"[5] DONE in {qc['runtime_seconds']}s. Outputs in {OUT}/")

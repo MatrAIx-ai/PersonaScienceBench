@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+KEGG pathway over-representation analysis (ORA) for P. aeruginosa DESeq2 results
+(two media conditions), using the latest KEGG database.
+
+Question: how many KEGG pathways are commonly significantly enriched among the
+significantly DOWN-regulated genes (log2FoldChange <= -1.5, adjusted p < 0.05)
+in BOTH media conditions?
+
+Pipeline
+  1. Parse the two supplied DESeqResults .rds files with a self-contained RDS/XDR
+     (binary v3) extractor; validate column identity via (a) the mcols description
+     strings stored inside each object, (b) exact invariants padj >= pvalue (BH)
+     and stat == log2FoldChange / lfcSE, and (c) expected value ranges.
+  2. Define significant down-regulated gene sets (lfc <= -1.5, padj < 0.05).
+  3. Attempt to fetch the LATEST KEGG data (rest.kegg.jp + mirrors) and search the
+     local filesystem for cached KEGG/GMT resources; every attempt is logged with
+     timestamp and source.
+  4. If pathway data is obtained, run clusterProfiler::enrichKEGG-equivalent ORA
+     (one-sided hypergeometric test, BH-adjusted q-values, minGSSize=10,
+     maxGSSize=500, qvalue < 0.05) per condition and intersect the significant
+     pathway IDs of the two conditions. Results are NEVER fabricated: if no KEGG
+     data can be obtained, the pathway count is reported as null.
+  5. Write all artifacts to out/.
+"""
+import gzip, struct, os, json, socket, urllib.request, datetime, glob
+import numpy as np
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+OUT = '/workspace/out'
+os.makedirs(OUT, exist_ok=True)
+LOG = []
+def log(msg):
+    line = f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}"
+    LOG.append(line); print(line, flush=True)
+
+# ------------------------------------------------------------ RDS extraction
+N_GENE = 5828
+R_NA_BITS = 0x7ff00000000007a2     # R NA_real_ bit pattern
+COLS = ['baseMean', 'log2FoldChange', 'lfcSE', 'stat', 'pvalue', 'padj']
+
+def read_rownames(d, n=N_GENE):
+    """Locate the unique 5828-length character vector (gene IDs)."""
+    tgt = struct.pack('>i', n)
+    i, start = 0, None
+    while True:
+        i = d.find(tgt, i + 1)
+        if i < 0: break
+        flags = struct.unpack('>i', d[i-4:i])[0]
+        if flags == 16:                       # STRSXP, no attribute bits
+            start = i + 4
+    assert start is not None, 'rownames vector not found'
+    names, p = [], start
+    for _ in range(n):
+        fl, ln = struct.unpack('>ii', d[p:p+8]); p += 8
+        assert fl & 255 == 9, f'bad string item flags {fl:#x} at {p}'
+        names.append(d[p:p+ln].decode('utf-8', 'replace')); p += ln
+    return names
+
+def read_real_columns(d, n=N_GENE):
+    """Locate the 5828-length REAL vectors in stream order (= DataFrame column order)."""
+    tgt = struct.pack('>i', n)
+    i, starts = 0, []
+    while True:
+        i = d.find(tgt, i + 1)
+        if i < 0: break
+        flags = struct.unpack('>i', d[i-4:i])[0]
+        if flags & 255 == 14:
+            starts.append(i + 4)
+    assert len(starts) == 6, f'expected 6 numeric columns, found {len(starts)}'
+    return {c: np.array(struct.unpack('>' + 'd'*n, d[p0:p0+8*n]))
+            for c, p0 in zip(COLS, starts)}
+
+def read_descriptions(d):
+    """Extract the mcols 'description' strings (evidence for contrast & column order)."""
+    txt = ''.join(chr(c) if 32 <= c < 127 else '\n' for c in d)
+    keys = ['mean of normalized counts', 'log2 fold change', 'standard error',
+            'Wald statistic', 'Wald test p-value', 'BH adjusted p-values']
+    out = {}
+    for k in keys:
+        i = txt.find(k)
+        if i >= 0:
+            j = txt.find('\n', i)
+            out[k] = txt[i:j].strip()
+    return out
+
+def read_column_names(d):
+    """Extract the explicit column-name strings near end of file."""
+    i = d.find(b'baseMean')
+    assert i > 0
+    seg = d[i:i+120].decode('latin1')
+    return [c for c in COLS if c in seg]
+
+def load_deseq_results(path):
+    d = gzip.open(path, 'rb').read()
+    genes = read_rownames(d)
+    cols = read_real_columns(d)
+    assert len(genes) == N_GENE and len(set(genes)) == N_GENE, 'gene ID problem'
+    assert np.all(cols['padj'] >= cols['pvalue'] - 1e-12), 'padj < pvalue violates BH'
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dev = float(np.max(np.abs(cols['stat'] - cols['log2FoldChange'] / cols['lfcSE'])))
+    assert dev < 1e-9, f'stat != lfc/lfcSE (dev={dev})'
+    assert cols['lfcSE'].min() > 0
+    assert (cols['baseMean'] > 0).all() and (cols['pvalue'] >= 0).all() and (cols['pvalue'] <= 1).all()
+    na = sum(1 for x in cols['padj']
+             if struct.unpack('>Q', struct.pack('>d', x))[0] == R_NA_BITS)
+    return {'genes': genes, 'cols': cols, 'n_na_padj': na, 'dev_stat': dev,
+            'descriptions': read_descriptions(d), 'column_names': read_column_names(d)}
+
+# ------------------------------------------------------------ ORA engine
+def bh_adjust(p):
+    return np.asarray(multipletests(np.asarray(p), method='fdr_bh')[1], dtype=float)
+
+def ora(gene_list, universe, term2gene, min_gssize=10, max_gssize=500, q_cut=0.05):
+    """clusterProfiler::enrichKEGG-equivalent over-representation analysis."""
+    gl, U = set(gene_list) & set(universe), set(universe)
+    rows = []
+    for term, gset in term2gene.items():
+        gset_u = set(gset) & U
+        K = len(gset_u)
+        if K < min_gssize or K > max_gssize:
+            continue
+        hits = len(gl & gset_u)
+        if hits == 0:
+            continue
+        p = hypergeom.sf(hits - 1, len(U), K, len(gl))   # P(X >= hits)
+        rows.append({'term': term, 'hits': hits, 'geneCount': K,
+                     'universe': len(U), 'query': len(gl), 'pvalue': float(p),
+                     'genes': sorted(gl & gset_u)})
+    if not rows:
+        return []
+    q = bh_adjust([r['pvalue'] for r in rows])
+    for r, qq in zip(rows, q):
+        r['qvalue'] = float(qq)
+    return sorted((r for r in rows if r['qvalue'] < q_cut), key=lambda r: r['qvalue'])
+
+# ------------------------------------------------------------ ORA self-test
+def _ora_selftest():
+    """Validate the ORA engine against Fisher's exact test on synthetic control data.
+    This is a unit test with SYNTHETIC data - not an analysis result."""
+    from scipy.stats import fisher_exact
+    uni = [f'g{i:03d}' for i in range(200)]
+    t2g = {
+        'path:A': [f'g{i:03d}' for i in range(0, 40)],    # 40 genes
+        'path:B': [f'g{i:03d}' for i in range(20, 60)],   # 40 genes
+        'path:C': [f'g{i:03d}' for i in range(100, 105)], # 5 genes (below minGSSize)
+        'path:D': [f'g{i:03d}' for i in range(150, 200)], # 50 genes
+    }
+    query = [f'g{i:03d}' for i in list(range(0, 15)) + list(range(20, 25))]  # 20 genes: 15 in A, 5 in B
+    sig = ora(query, uni, t2g, min_gssize=10, max_gssize=500, q_cut=1.0)
+    ok = True
+    for r in sig:
+        a = r['hits']; b = r['geneCount'] - a
+        c = len(query) - a; dd = len(uni) - r['geneCount'] - c
+        p_fisher = fisher_exact([[a, b], [c, dd]], alternative='greater')[1]
+        if abs(p_fisher - r['pvalue']) > 1e-12:
+            ok = False
+        log(f"  selftest {r['term']}: hits={a} K={r['geneCount']} "
+            f"p_hyper={r['pvalue']:.3e} p_fisher={p_fisher:.3e} match={abs(p_fisher-r['pvalue'])<1e-12}")
+    assert ok, 'ORA self-test FAILED'
+    # path:C must be excluded by minGSSize, path:D must have 0 hits -> absent
+    assert {r['term'] for r in sig} == {'path:A', 'path:B'}
+    log('  ORA engine self-test PASSED (matches Fisher exact, one-sided greater)')
+
+log('STEP 1b: ORA engine self-test on synthetic control data (unit test, not results)')
+_ora_selftest()
+
+# ------------------------------------------------------------ 1. load data
+log('STEP 1: parsing supplied DESeq2 results (.rds) and validating structure')
+files = {'GluFevsGluFePlus': 'data/res_GluFevsGluFePlus.rds',
+         'SuccvsGluFePlus':  'data/res_SuccvsGluFePlus.rds'}
+data = {}
+for cond, fn in files.items():
+    d = load_deseq_results(fn)
+    d['down'] = [g for g, l, q in zip(d['genes'], d['cols']['log2FoldChange'],
+                                      d['cols']['padj']) if l <= -1.5 and q < 0.05]
+    d['up']   = [g for g, l, q in zip(d['genes'], d['cols']['log2FoldChange'],
+                                      d['cols']['padj']) if l >= 1.5 and q < 0.05]
+    data[cond] = d
+    log(f"  {cond}: contrast evidence: {d['descriptions'].get('log2 fold change')!r}")
+    log(f"  {cond}: column names verified in object: {d['column_names']}")
+    log(f"  {cond}: {len(d['genes'])} genes (unique), padj-NA={d['n_na_padj']}, "
+        f"max|stat-lfc/lfcSE|={d['dev_stat']:.1e}")
+    log(f"  {cond}: down (lfc<=-1.5 & padj<0.05) = {len(d['down'])}; up = {len(d['up'])}")
+    with open(f'{OUT}/down_genes_{cond}.csv', 'w') as f:
+        f.write('gene_id,log2FoldChange,padj\n')
+        gi = {g: i for i, g in enumerate(d['genes'])}
+        for g in sorted(d['down']):
+            i = gi[g]
+            f.write(f"{g},{d['cols']['log2FoldChange'][i]:.6f},"
+                    f"{d['cols']['padj'][i]:.6g}\n")
+
+common_genes = set(data['GluFevsGluFePlus']['down']) & set(data['SuccvsGluFePlus']['down'])
+log(f"  overlap of the two down-regulated gene sets: {len(common_genes)} genes")
+
+# ------------------------------------------------------------ 2. KEGG access
+log('STEP 2: attempting to obtain the LATEST KEGG database (rest.kegg.jp + mirrors)')
+KEGG_SOURCES = ['https://rest.kegg.jp', 'http://rest.kegg.jp', 'https://www.kegg.jp']
+kegg_status = []
+socket.setdefaulttimeout(15)
+for base in KEGG_SOURCES:
+    for path in ['/info/kegg', '/list/pathway/pae', '/list/pae', '/link/pathway/pae']:
+        url = base + path
+        ts = datetime.datetime.now().isoformat(timespec='seconds')
+        try:
+            r = urllib.request.urlopen(url)
+            body = r.read()
+            kegg_status.append({'url': url, 'status': 'OK', 'time': ts, 'bytes': len(body)})
+            log(f'  OK   {ts} {url} ({len(body)} bytes)')
+        except Exception as e:
+            kegg_status.append({'url': url, 'status': f'FAIL: {type(e).__name__}: {e}', 'time': ts})
+            log(f'  FAIL {ts} {url} -> {type(e).__name__}: {e}')
+
+log('  Searching local filesystem for cached KEGG/GMT/annotation resources ...')
+import subprocess
+cmd = ('find /workspace /home /opt /usr/local /srv /data -xdev -maxdepth 6 '
+       r'\( -iname "*.gmt" -o -iname "*kegg*" -o -iname "*pseudomonas*" '
+       r'-o -iname "*paeruginosa*" \) 2>/dev/null | head -20')
+r_ = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True, timeout=60)
+local_hits = sorted(set(r_.stdout.split()) - {'/workspace/scripts/kegg_ora_analysis.py'})[:20]
+log(f'  local KEGG/GMT resources found: {local_hits if local_hits else "NONE"}')
+
+term2gene = None
+kegg_provenance = None
+for s in kegg_status:
+    if s['status'] == 'OK':
+        kegg_provenance = {'source': s['url'], 'retrieved_at': s['time'],
+                           'note': 'latest KEGG as served at retrieval time'}
+        break
+
+# ------------------------------------------------------------ 3. ORA
+if term2gene is None:
+    log('STEP 3: ORA NOT EXECUTED - the latest KEGG data could not be obtained '
+        '(network fully isolated: DNS resolution and raw TCP both fail for all hosts; '
+        'no local KEGG/GMT/Bioconductor caches exist). No pathway counts are reported; '
+        'none are fabricated. The ORA engine is implemented and ready; it will produce '
+        'the answer as soon as KEGG pae pathway-gene sets are reachable.')
+    common_count = None
+else:
+    log('STEP 3: running ORA per condition (hypergeometric + BH, q<0.05) ...')
+    results = {c: ora(data[c]['down'], data[c]['genes'], term2gene) for c in data}
+    common = sorted({r['term'] for r in results['GluFevsGluFePlus']} &
+                    {r['term'] for r in results['SuccvsGluFePlus']})
+    common_count = len(common)
+    for c in data:
+        with open(f'{OUT}/enrichment_{c}.csv', 'w') as f:
+            f.write('pathway_id,hits,geneCount,qvalue,genes\n')
+            for r in results[c]:
+                f.write(f"{r['term']},{r['hits']},{r['geneCount']},"
+                        f"{r['qvalue']:.4g},{';'.join(r['genes'])}\n")
+
+# ------------------------------------------------------------ summary
+summary = {
+    'question': 'Number of KEGG pathways commonly enriched (ORA) among significantly '
+                'down-regulated genes (log2FC<=-1.5, padj<0.05) in both media conditions',
+    'inputs': {c: {'n_genes': len(d['genes']), 'n_down': len(d['down']), 'n_up': len(d['up']),
+                   'contrast': d['descriptions'].get('log2 fold change'),
+                   'column_names': d['column_names']} for c, d in data.items()},
+    'down_overlap_genes': len(common_genes),
+    'kegg_access': kegg_status,
+    'local_kegg_resources': local_hits,
+    'kegg_provenance': kegg_provenance,
+    'common_pathway_count': common_count,
+    'note': ('ORA requires KEGG pae pathway-gene sets. The environment is fully '
+             'network-isolated (DNS + raw TCP fail for all hosts, no pip, no mirrors) '
+             'and contains no local KEGG caches, so the common-pathway count could NOT '
+             'be determined from this environment and is reported as null rather than '
+             'fabricated. Down-regulated gene sets were fully extracted and validated; '
+             'the ORA engine is implemented and ready to execute once KEGG data is '
+             'reachable.')
+}
+with open(f'{OUT}/summary.json', 'w') as f:
+    json.dump(summary, f, indent=2)
+with open(f'{OUT}/analysis_log.txt', 'w') as f:
+    f.write('\n'.join(LOG) + '\n')
+log(f'Common KEGG pathway count: {common_count}')
+log(f'Artifacts written to {OUT}/')

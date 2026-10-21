@@ -1,0 +1,726 @@
+"""
+Deployment prediction sets under a label-weighted miss-risk target.
+
+Task (asibench:computer_science.deployment_prediction_sets)
+============================================================
+Build prediction sets for the 5911 unlabeled deployment records so that the
+label-weighted miss risk stays under target_risk = 0.1084 while the mean set
+size stays far below the trivial all-label set (9 labels).
+
+Method (approved by the researcher)
+===================================
+1.  Strata recovery (public, feature-only).  Features are standardized on the
+    pooled calibration+deployment sample (public inputs only).  The projection
+    mean(v000, v001, v002) separates a "hard" region from an "easy" region
+    (calibration top-1 accuracy 0.419 vs 0.860) and is also the direction of
+    the strongest calibration->deployment shift (KS ~0.15 on v000-v002).
+    Strata are the calibration-median (or tertile) cells of this projection:
+    s0 = hard, s1 = easy (s2 = middle when 3 strata are compared).
+
+2.  Per-(stratum, label) conformal thresholds.  For each cell (s, l) with n
+    calibration records of true label l, the threshold is the m-th smallest
+    true-label score with m = ceil(alpha * (n + 1)) - 1 (lower order
+    statistic).  Under exchangeability this gives the exact finite-sample
+    guarantee  P(miss | s, true label = l) <= alpha.  A deployment record in
+    stratum s receives every label l whose score >= threshold(s, l); the
+    argmax label is always added so that sets are never empty (risk_spec
+    forbids empty sets).
+
+3.  Finite-sample risk control (RCPS style).  The record loss is
+    L = c(true_label) * 1{true_label not in set}, bounded in [0, 1.65]
+    (c_max = max label cost).  Per-stratum calibration means are combined
+    with DEPLOYMENT stratum weights w_s^dep (this reweighting makes the
+    estimate honest under the observed mix shift: only ~28% of deployment
+    records fall in the easy stratum vs ~50% of calibration).  The upper
+    confidence bound uses Hoeffding's inequality with a union bound over
+    strata at level delta = 0.1366:
+        UCB_s = r_hat_s + c_max * sqrt( ln(S / delta) / (2 n_s) )
+        UCB_overall = sum_s w_s^dep * UCB_s
+    alpha is selected on a grid as the one minimizing the deployment-projected
+    mean set size subject to:
+        UCB_overall <= 0.95 * target_risk  (extra conservative margin on the
+        bound itself, per the researcher's instruction to stay away from the
+        boundary rather than press against it),
+        plug-in deployment risk <= 0.9 * target_risk  (conservative buffer),
+        cross-fitted (2-fold, parity split) deployment risk <= target_risk,
+        per-stratum risk <= target_risk.
+    The cross-fitted check protects against the plug-in optimism of thresholds
+    evaluated on the data that calibrated them.
+
+RISK CONVENTIONS (per researcher instruction #1)
+================================================
+* PRIMARY convention (used for all decisions and for the main rows of every
+  output file):  risk = E[ c(true_label) * 1{true_label not in prediction_set} ]
+  ("label_weighted_miss" of data/risk_spec.json, cost-weighted, max 1.65).
+* SECONDARY, reported as an annotation: cost-normalized risk
+  = E[c(true)*1{miss}] / E[c(true)] (in [0,1]); written into
+  results/constraint_audit.csv as extra rows with scope values
+  'overall_cost_normalized' and 'proxy_stratum_cost_normalized'.
+
+DEPLOYMENT LABELS ARE NEVER READ.  Any deployment "empirical_risk" value in
+the output files is an ESTIMATE: the calibration within-stratum mean loss
+re-weighted by the deployment stratum fractions.  This is noted here and in
+the meta rows of results/calibration_diagnostics.csv; the constraint audit
+records the final upper confidence bound next to the target.
+"""
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------------
+# 0. Load inputs
+# ----------------------------------------------------------------------------
+with open("data/risk_spec.json") as f:
+    SPEC = json.load(f)
+with open("data/metadata.json") as f:
+    META = json.load(f)
+
+LABELS = META["label_columns"]
+N_LABELS = len(LABELS)
+COST = np.array([SPEC["label_costs"][l] for l in LABELS])
+C_MAX = COST.max()
+TARGET = SPEC["target_risk"]
+DELTA = SPEC["delta"]
+assert not SPEC["empty_prediction_sets_allowed"]
+
+cal_feat = pd.read_csv("data/calibration_features.csv")
+cal_lab = pd.read_csv("data/calibration_labels.csv")
+cal_sco = pd.read_csv("data/calibration_scores.csv")
+dep_feat = pd.read_csv("data/deployment_features.csv")
+dep_sco = pd.read_csv("data/deployment_scores.csv")
+
+for t in (cal_feat, cal_lab, cal_sco, dep_feat, dep_sco):
+    assert t.isna().sum().sum() == 0
+assert (cal_feat.record_id.values == cal_lab.record_id.values).all()
+assert (cal_feat.record_id.values == cal_sco.record_id.values).all()
+assert (dep_feat.record_id.values == dep_sco.record_id.values).all()
+
+Sc = cal_sco[LABELS].values                      # calibration scores (n_cal, 9)
+Sd = dep_sco[LABELS].values                      # deployment scores (n_dep, 9)
+n_cal, n_dep = len(Sc), len(Sd)
+y_idx = np.array([LABELS.index(v) for v in cal_lab.true_label.values])
+assert set(cal_lab.true_label) <= set(LABELS)
+
+# ----------------------------------------------------------------------------
+# 1. Stratum recovery from public features
+# ----------------------------------------------------------------------------
+FEATS = META["feature_columns"]
+F_all = np.vstack([cal_feat[FEATS].values, dep_feat[FEATS].values])
+mu, sd = F_all.mean(0), F_all.std(0)
+pc = (cal_feat[FEATS].values - mu) / sd
+pd_ = (dep_feat[FEATS].values - mu) / sd
+PROJ_COLS = [0, 1, 2]          # v000, v001, v002: most shifted / most informative
+proj_c = pc[:, PROJ_COLS].mean(1)
+proj_d = pd_[:, PROJ_COLS].mean(1)
+
+
+def assign_strata(n_strata):
+    if n_strata == 2:
+        cuts = [float(np.median(proj_c))]
+    else:  # 3
+        cuts = [float(v) for v in np.quantile(proj_c, [1 / 3, 2 / 3])]
+    return np.digitize(proj_c, cuts), np.digitize(proj_d, cuts), cuts
+
+
+def dep_strata(n_strata):
+    cuts = ([float(np.median(proj_c))] if n_strata == 2
+            else [float(v) for v in np.quantile(proj_c, [1 / 3, 2 / 3])])
+    return np.digitize(proj_c, cuts), np.digitize(proj_d, cuts)
+
+
+def thresholds_for(alpha, scores, strata_c, y_idx_):
+    """Per-(stratum,label) conformal lower order statistic; thr=-1 => all labels."""
+    S = int(strata_c.max()) + 1
+    thr = np.full((S, N_LABELS), -1.0)
+    n_cell = np.zeros((S, N_LABELS), dtype=int)
+    m_cell = np.zeros((S, N_LABELS), dtype=int)
+    for s in range(S):
+        for k in range(N_LABELS):
+            v = np.sort(scores[(strata_c == s) & (y_idx_ == k), k])
+            n_cell[s, k] = len(v)
+            m = int(np.ceil(alpha * (len(v) + 1))) - 1
+            m_cell[s, k] = m
+            thr[s, k] = -1.0 if m < 1 else float(v[m - 1])
+    return thr, n_cell, m_cell
+
+
+def apply_policy(scores, strata, thr):
+    """Set = {l : p_l >= thr[stratum,l]} union argmax (nonempty guarantee)."""
+    sets = scores >= thr[strata]
+    am = scores.argmax(1)
+    sets[np.arange(len(scores)), am] = True
+    return sets
+
+
+def evaluate(alpha, strata_c, strata_d, thr):
+    sets_c = apply_policy(Sc, strata_c, thr)
+    miss_c = ~sets_c[np.arange(n_cal), y_idx]
+    loss_c = COST[y_idx] * miss_c
+    S = thr.shape[0]
+    rs, ns, ucb_s = [], [], []
+    for s in range(S):
+        m = strata_c == s
+        rs.append(float(loss_c[m].mean()))
+        ns.append(int(m.sum()))
+        ucb_s.append(rs[-1] + C_MAX * np.sqrt(np.log(S / DELTA) / (2 * ns[-1])))
+    wc = np.array([(strata_c == s).mean() for s in range(S)])
+    wd = np.array([(strata_d == s).mean() for s in range(S)])
+    r_dep = float(wd @ np.array(rs))
+    ucb = float(wd @ np.array(ucb_s))
+    mean_cost_s = np.array([COST[y_idx][strata_c == s].mean() for s in range(S)])
+    r_dep_norm = r_dep / float(wd @ mean_cost_s)
+    sets_d = apply_policy(Sd, strata_d, thr)
+    size_d = sets_d.sum(1)
+    size_s = [float(size_d[strata_d == s].mean()) for s in range(S)]
+    return dict(alpha=alpha, S=S, rs=rs, ns=ns, ucb_s=ucb_s, wc=wc, wd=wd,
+                r_dep=r_dep, ucb=ucb, r_dep_norm=r_dep_norm,
+                mean_cost_s=mean_cost_s, size_dep=float(size_d.mean()),
+                size_s=size_s, thr=thr, n_cell=n_cell, m_cell=m_cell,
+                sets_c=sets_c, sets_d=sets_d, size_d=size_d)
+
+
+def cross_fitted(alpha, n_strata):
+    """2-fold cross-fitted deployment risk estimate (parity split)."""
+    fold = np.arange(n_cal) % 2
+    losses = np.empty(n_cal)
+    for a, b in ((0, 1), (1, 0)):
+        st_a = np.digitize(proj_c[fold == a],
+                           ([float(np.median(proj_c[fold == a]))] if n_strata == 2
+                            else [float(v) for v in
+                                  np.quantile(proj_c[fold == a], [1 / 3, 2 / 3])]))
+        thr_a, _, _ = thresholds_for(alpha, Sc[fold == a], st_a, y_idx[fold == a])
+        st_b = np.digitize(proj_c[fold == b],
+                           ([float(np.median(proj_c[fold == a]))] if n_strata == 2
+                            else [float(v) for v in
+                                  np.quantile(proj_c[fold == a], [1 / 3, 2 / 3])]))
+        sets_b = apply_policy(Sc[fold == b], st_b, thr_a)
+        miss_b = ~sets_b[np.arange((fold == b).sum()), y_idx[fold == b]]
+        losses[fold == b] = COST[y_idx[fold == b]] * miss_b
+    st_cal, st_dep = dep_strata(n_strata)
+    rs = [float(losses[st_cal == s].mean()) for s in range(n_strata)]
+    wd = np.array([(st_dep == s).mean() for s in range(n_strata)])
+    return float(wd @ np.array(rs)), rs
+
+
+# ----------------------------------------------------------------------------
+# 2. Model selection: strata count (2 vs 3) and alpha on a grid
+# ----------------------------------------------------------------------------
+grid = np.round(np.arange(0.01, 0.2001, 0.002), 4)
+candidates = []
+for n_strata in (2, 3):
+    st_c, st_d, cuts = assign_strata(n_strata)
+    for alpha in grid:
+        thr, n_cell, m_cell = thresholds_for(alpha, Sc, st_c, y_idx)
+        if (m_cell < 1).any():
+            continue                      # cell too thin: would include all labels
+        ev = evaluate(alpha, st_c, st_d, thr)
+        r_cf, _ = cross_fitted(alpha, n_strata)
+        ev.update(r_cf=r_cf, n_strata=n_strata, cuts=cuts,
+                  feasible=(ev["ucb"] <= 0.95 * TARGET
+                            and ev["r_dep"] <= 0.9 * TARGET
+                            and r_cf <= TARGET
+                            and max(ev["rs"]) <= TARGET))
+        candidates.append(ev)
+
+feas = [c for c in candidates if c["feasible"]]
+assert feas, "no feasible (strata, alpha) combination"
+best = sorted(feas, key=lambda c: (round(c["size_dep"], 6), c["alpha"]))[0]
+
+ALPHA, N_STRATA = best["alpha"], best["n_strata"]
+st_c, st_d, cuts = assign_strata(N_STRATA)
+THR, N_CELL, M_CELL = thresholds_for(ALPHA, Sc, st_c, y_idx)
+EV = evaluate(ALPHA, st_c, st_d, THR)
+R_CF, RS_CF = cross_fitted(ALPHA, N_STRATA)
+STRATA_IDS = [f"s{s}" for s in range(N_STRATA)]
+print(f"selected: n_strata={N_STRATA} alpha={ALPHA} r_dep={EV['r_dep']:.4f} "
+      f"ucb={EV['ucb']:.4f} r_cf={R_CF:.4f} size_dep={EV['size_dep']:.3f}")
+print(f"feasible candidates: {len(feas)} / {len(candidates)}")
+
+
+# ----------------------------------------------------------------------------
+# 3. Write outputs
+# ----------------------------------------------------------------------------
+os.makedirs("results", exist_ok=True)
+
+# --- prediction_sets.csv ---
+sets_d = EV["sets_d"]
+rows = []
+for i in range(n_dep):
+    labs = [LABELS[k] for k in range(N_LABELS) if sets_d[i, k]]
+    assert labs, "empty prediction set (forbidden)"
+    rows.append({"record_id": dep_sco.record_id.values[i],
+                 "prediction_set": " ".join(labs)})
+pd.DataFrame(rows).to_csv("results/prediction_sets.csv", index=False)
+
+# --- set_size_summary.csv ---
+pd.DataFrame({"record_id": dep_sco.record_id.values,
+              "set_size": EV["size_d"].astype(int),
+              "proxy_stratum": [STRATA_IDS[s] for s in st_d]}
+             ).to_csv("results/set_size_summary.csv", index=False)
+
+# --- policy_parameters.csv ---
+pol = []
+for s in range(N_STRATA):
+    for k in range(N_LABELS):
+        pol.append({"proxy_stratum": STRATA_IDS[s], "label": LABELS[k],
+                    "n_calibration": EV["ns"][s],
+                    "n_calibration_label": int(N_CELL[s, k]),
+                    "threshold": float(THR[s, k]),
+                    "group_empirical_weighted_miss_risk": float(EV["rs"][s]),
+                    "group_upper_confidence_risk": float(EV["ucb_s"][s]),
+                    "group_expected_set_size": float(EV["size_s"][s]),
+                    "calibration_target_risk": float(ALPHA),
+                    "target_risk": TARGET})
+pd.DataFrame(pol).to_csv("results/policy_parameters.csv", index=False)
+
+# --- distribution_diagnostics.csv ---
+dist = []
+for s in range(N_STRATA):
+    fc, fd = float(EV["wc"][s]), float(EV["wd"][s])
+    dist.append({"proxy_stratum": STRATA_IDS[s],
+                 "calibration_fraction": fc, "deployment_fraction": fd,
+                 "density_ratio_estimate": fd / max(fc, 1.0 / n_cal),
+                 "absolute_fraction_shift": abs(fd - fc)})
+pd.DataFrame(dist).to_csv("results/distribution_diagnostics.csv", index=False)
+
+# --- calibration_diagnostics.csv (bins of the true-label score per stratum) ---
+BIN_EDGES = np.array([0.0, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 1.0 + 1e-9])
+tl_scores = Sc[np.arange(n_cal), y_idx]
+diag = []
+for s in range(N_STRATA):
+    v = tl_scores[st_c == s]
+    b = np.digitize(v, BIN_EDGES[1:-1], right=False)
+    for bi in range(len(BIN_EDGES) - 1):
+        msk = b == bi
+        if not msk.any():
+            continue
+        diag.append({"proxy_stratum": STRATA_IDS[s], "bin_id": f"b{bi}",
+                     "score_left": float(BIN_EDGES[bi]),
+                     "score_right": float(BIN_EDGES[bi + 1]),
+                     "n_records": int(msk.sum()),
+                     "mean_true_label_score": float(v[msk].mean())})
+# meta rows: bound used, delta, selected alpha, selected statistic, key numbers
+meta = [("bound_inequality", None, "hoeffding on losses in [0,1.65], union bound over strata"),
+        ("delta", DELTA, "confidence level from risk_spec.json"),
+        ("selected_alpha", ALPHA, "conformal per-cell miss level"),
+        ("selected_statistic", None,
+         "lower order statistic m=ceil(alpha*(n+1))-1 per (stratum,label)"),
+        ("strata_cut_values", None, ";".join(f"{c:.6f}" for c in cuts)),
+        ("cross_fitted_risk_estimate", R_CF, "2-fold parity split, deployment-reweighted"),
+        ("plug_in_deployment_risk_estimate", EV["r_dep"], "primary convention"),
+        ("overall_upper_confidence_bound", EV["ucb"], "hoeffding, delta=0.1366"),
+        ("target_risk", TARGET, "from risk_spec.json")]
+for name, val, note in meta:
+    diag.append({"proxy_stratum": "__meta__", "bin_id": f"{name}={val if val is not None else note}",
+                 "score_left": float(val) if isinstance(val, (int, float)) else np.nan,
+                 "score_right": np.nan, "n_records": n_cal,
+                 "mean_true_label_score": float(val) if isinstance(val, (int, float)) else np.nan})
+pd.DataFrame(diag).to_csv("results/calibration_diagnostics.csv", index=False)
+
+# --- audit_summary.csv ---
+def p90(x):
+    return float(np.percentile(x, 90))
+
+aud = [{"scope": "overall", "stratum_id": "all", "n_records": n_dep,
+        "empirical_risk": EV["r_dep"], "mean_set_size": EV["size_dep"],
+        "p90_set_size": p90(EV["size_d"]), "target_risk": TARGET,
+        "risk_violation": bool(EV["r_dep"] > TARGET)}]
+for s in range(N_STRATA):
+    md = st_d == s
+    aud.append({"scope": "proxy_stratum", "stratum_id": STRATA_IDS[s],
+                "n_records": int(md.sum()),
+                "empirical_risk": float(EV["rs"][s]),
+                "mean_set_size": float(EV["size_s"][s]),
+                "p90_set_size": p90(EV["size_d"][md]),
+                "target_risk": TARGET,
+                "risk_violation": bool(EV["rs"][s] > TARGET)})
+pd.DataFrame(aud).to_csv("results/audit_summary.csv", index=False)
+
+# --- partition_diagnostics.csv ---
+part = [{"scope": a["scope"], "stratum_id": a["stratum_id"],
+         "n_records": a["n_records"], "empirical_risk": a["empirical_risk"],
+         "mean_set_size": a["mean_set_size"], "p90_set_size": a["p90_set_size"],
+         "target_risk": a["target_risk"],
+         "risk_margin": a["target_risk"] - a["empirical_risk"]} for a in aud]
+pd.DataFrame(part).to_csv("results/partition_diagnostics.csv", index=False)
+
+# --- constraint_audit.csv ---
+# primary rows: scope='overall' + scope='proxy_stratum' (cost-weighted convention)
+# annotation rows (extra, clearly labeled): UCB vs target, cross-fitted estimate,
+# and the cost-normalized secondary convention (both overall and per stratum).
+con = []
+for a in aud:
+    con.append({"scope": a["scope"], "stratum_id": a["stratum_id"],
+                "empirical_risk": a["empirical_risk"], "target_risk": a["target_risk"],
+                "risk_violation": a["risk_violation"], "violates": a["risk_violation"]})
+con.append({"scope": "overall_upper_confidence_bound", "stratum_id": "all",
+            "empirical_risk": EV["ucb"], "target_risk": TARGET,
+            "risk_violation": bool(EV["ucb"] > TARGET), "violates": bool(EV["ucb"] > TARGET)})
+con.append({"scope": "overall_cross_fitted_estimate", "stratum_id": "all",
+            "empirical_risk": R_CF, "target_risk": TARGET,
+            "risk_violation": bool(R_CF > TARGET), "violates": bool(R_CF > TARGET)})
+con.append({"scope": "overall_cost_normalized", "stratum_id": "all",
+            "empirical_risk": EV["r_dep_norm"], "target_risk": TARGET,
+            "risk_violation": bool(EV["r_dep_norm"] > TARGET),
+            "violates": bool(EV["r_dep_norm"] > TARGET)})
+for s in range(N_STRATA):
+    rn = EV["rs"][s] / EV["mean_cost_s"][s]
+    con.append({"scope": "proxy_stratum_cost_normalized", "stratum_id": STRATA_IDS[s],
+                "empirical_risk": float(rn), "target_risk": TARGET,
+                "risk_violation": bool(rn > TARGET), "violates": bool(rn > TARGET)})
+pd.DataFrame(con).to_csv("results/constraint_audit.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 4. Figures (dependency-free PNG renderer: matplotlib is not installed in this
+#    workspace and there is no network access, so plots are rasterized directly
+#    with numpy + zlib; identical figures are produced on any environment).
+# ----------------------------------------------------------------------------
+import struct
+import zlib
+
+GLYPHS = {
+'0':['.XXX.','X...X','X..XX','X.X.X','XX..X','X...X','.XXX.'],
+'1':['..X..','.XX..','..X..','..X..','..X..','..X..','.XXX.'],
+'2':['.XXX.','X...X','....X','...X.','..X..','.X...','XXXXX'],
+'3':['XXXXX','...X.','..X..','...X.','....X','X...X','.XXX.'],
+'4':['...X.','..XX.','.X.X.','X..X.','XXXXX','...X.','...X.'],
+'5':['XXXXX','X....','XXXX.','....X','....X','X...X','.XXX.'],
+'6':['..XX.','.X...','X....','XXXX.','X...X','X...X','.XXX.'],
+'7':['XXXXX','....X','...X.','..X..','.X...','.X...','.X...'],
+'8':['.XXX.','X...X','X...X','.XXX.','X...X','X...X','.XXX.'],
+'9':['.XXX.','X...X','X...X','.XXXX','....X','...X.','.XX..'],
+'A':['.XXX.','X...X','X...X','XXXXX','X...X','X...X','X...X'],
+'B':['XXXX.','X...X','X...X','XXXX.','X...X','X...X','XXXX.'],
+'C':['.XXX.','X...X','X....','X....','X....','X...X','.XXX.'],
+'D':['XXXX.','X...X','X...X','X...X','X...X','X...X','XXXX.'],
+'E':['XXXXX','X....','X....','XXXX.','X....','X....','XXXXX'],
+'F':['XXXXX','X....','X....','XXXX.','X....','X....','X....'],
+'G':['.XXX.','X...X','X....','X.XXX','X...X','X...X','.XXX.'],
+'H':['X...X','X...X','X...X','XXXXX','X...X','X...X','X...X'],
+'I':['XXXXX','..X..','..X..','..X..','..X..','..X..','XXXXX'],
+'J':['..XXX','...X.','...X.','...X.','...X.','X..X.','.XX..'],
+'K':['X...X','X..X.','X.X..','XX...','X.X..','X..X.','X...X'],
+'L':['X....','X....','X....','X....','X....','X....','XXXXX'],
+'M':['X...X','XX.XX','X.X.X','X.X.X','X...X','X...X','X...X'],
+'N':['X...X','XX..X','X.X.X','X..XX','X...X','X...X','X...X'],
+'O':['.XXX.','X...X','X...X','X...X','X...X','X...X','.XXX.'],
+'P':['XXXX.','X...X','X...X','XXXX.','X....','X....','X....'],
+'Q':['.XXX.','X...X','X...X','X...X','X.X.X','X..X.','.XX.X'],
+'R':['XXXX.','X...X','X...X','XXXX.','X.X..','X..X.','X...X'],
+'S':['.XXXX','X....','X....','.XXX.','....X','....X','XXXX.'],
+'T':['XXXXX','..X..','..X..','..X..','..X..','..X..','..X..'],
+'U':['X...X','X...X','X...X','X...X','X...X','X...X','.XXX.'],
+'V':['X...X','X...X','X...X','X...X','X...X','.X.X.','..X..'],
+'W':['X...X','X...X','X...X','X.X.X','X.X.X','XX.XX','X...X'],
+'X':['X...X','X...X','.X.X.','..X..','.X.X.','X...X','X...X'],
+'Y':['X...X','X...X','.X.X.','..X..','..X..','..X..','..X..'],
+'Z':['XXXXX','....X','...X.','..X..','.X...','X....','XXXXX'],
+'.':['.....','.....','.....','.....','..X..','..X..','.....'],
+'-':['.....','.....','.....','.XXX.','.....','.....','.....'],
+'=':['.....','.....','.XXX.','.....','.XXX.','.....','.....'],
+':':['.....','..X..','..X..','.....','..X..','..X..','.....'],
+'/':['....X','...X.','...X.','..X..','.X...','.X...','X....'],
+'_':['.....','.....','.....','.....','.....','.....','XXXXX'],
+'(':['...X.','..X..','.X...','.X...','.X...','..X..','...X.'],
+')':['.X...','..X..','...X.','...X.','...X.','..X..','.X...'],
+',':['.....','.....','.....','.....','.....','..X..','.X...'],
+'%':['XX..X','XX..X','...X.','..X..','.X...','X..XX','X..XX'],
+'+':['.....','..X..','..X..','XXXXX','..X..','..X..','.....'],
+' ':['.....']*7,
+}
+
+
+def write_png(path, arr):
+    h, w, _ = arr.shape
+    raw = b''.join(b'\x00' + arr[y].tobytes() for y in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack('>I', len(data)) + tag + data
+                + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF))
+    png = (b'\x89PNG\r\n\x1a\n'
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw, 9))
+           + chunk(b'IEND', b''))
+    with open(path, 'wb') as f:
+        f.write(png)
+
+
+class Canvas:
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.a = np.zeros((h, w, 3), dtype=np.uint8)
+        self.a[:] = bg
+
+    def px(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.a[y, x] = c
+
+    def rect(self, x0, y0, x1, y1, c):
+        for yy in range(max(0, y0), min(self.h, y1 + 1)):
+            self.a[yy, max(0, x0):min(self.w, x1 + 1)] = c
+
+    def line(self, x0, y0, x1, y1, c, t=1):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        n = int(max(abs(x1 - x0), abs(y1 - y0), 1))
+        for i in range(n + 1):
+            x = int(round(x0 + (x1 - x0) * i / n))
+            y = int(round(y0 + (y1 - y0) * i / n))
+            for dx in range(-(t // 2), t // 2 + 1):
+                for dy in range(-(t // 2), t // 2 + 1):
+                    self.px(x + dx, y + dy, c)
+
+    def text(self, x, y, s, c=(0, 0, 0), scale=1):
+        cx = x
+        for ch in s.upper():
+            g = GLYPHS.get(ch, GLYPHS[' '])
+            for r, row in enumerate(g):
+                for col, v in enumerate(row):
+                    if v == 'X':
+                        for dx in range(scale):
+                            for dy in range(scale):
+                                self.px(cx + col * scale + dx,
+                                        y + r * scale + dy, c)
+            cx += 6 * scale
+
+
+class Axes:
+    """One plot region with data mapping, frame, ticks and numeric labels."""
+
+    def __init__(self, cv, x0, y0, x1, y1, xlim, ylim, xticks, yticks,
+                 xfmt='{:.2f}', yfmt='{:.2f}', xlabel=None, ylabel=None,
+                 title=None):
+        self.cv, self.box = cv, (x0, y0, x1, y1)
+        self.xlim, self.ylim = xlim, ylim
+
+        def mx(v):
+            return x0 + (v - xlim[0]) / (xlim[1] - xlim[0]) * (x1 - x0)
+
+        def my(v):
+            return y1 - (v - ylim[0]) / (ylim[1] - ylim[0]) * (y1 - y0)
+        self.mx, self.my = mx, my
+        cv.rect(x0, y0, x1, y1, (255, 255, 255))
+        for e, w in (((x0, y0, x1, y0), 1), ((x1, y0, x1, y1), 1),
+                     ((x0, y1, x1, y1), 1), ((x0, y0, x0, y1), 1)):
+            cv.line(*e, (60, 60, 60), w)
+        for t in xticks:
+            X = int(round(mx(t)))
+            cv.line(X, y1, X, y1 + 4, (60, 60, 60))
+            s = xfmt.format(t)
+            cv.text(X - 3 * len(s), y1 + 7, s, scale=1)
+        for t in yticks:
+            Y = int(round(my(t)))
+            cv.line(x0 - 4, Y, x0, Y, (60, 60, 60))
+            s = yfmt.format(t)
+            cv.text(x0 - 8 - 6 * len(s), Y - 3, s, scale=1)
+        if xlabel:
+            cv.text((x0 + x1) // 2 - 3 * len(xlabel), y1 + 20, xlabel, scale=1)
+        if ylabel:
+            for i, ch in enumerate(ylabel):
+                cv.text(x0 - 46, (y0 + y1) // 2 - 3 * len(ylabel) + 6 * i, ch, scale=1)
+        if title:
+            cv.text((x0 + x1) // 2 - 3 * len(title), max(0, y0 - 18), title, scale=1)
+
+    def polyline(self, xs, ys, c, t=1):
+        pts = [(self.mx(v), self.my(u)) for v, u in zip(xs, ys) if
+               self.xlim[0] <= v <= self.xlim[1] and self.ylim[0] <= u <= self.ylim[1]]
+        for (ax, ay), (bx, by) in zip(pts[:-1], pts[1:]):
+            self.cv.line(ax, ay, bx, by, c, t)
+
+    def hline(self, v, c, t=1):
+        self.cv.line(self.box[0], int(round(self.my(v))), self.box[2],
+                     int(round(self.my(v))), c, t)
+
+    def vline(self, v, c, t=1):
+        self.cv.line(int(round(self.mx(v))), self.box[1], int(round(self.mx(v))),
+                     self.box[3], c, t)
+
+    def marker(self, xv, yv, c, r=4):
+        X, Y = self.mx(xv), self.my(yv)
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    self.cv.px(int(X + dx), int(Y + dy), c)
+
+    def bars(self, cats, vals, c, bw_frac=.5, baseline=0):
+        n = len(cats)
+        span = (self.box[2] - self.box[0]) / n
+        for i, v in enumerate(vals):
+            cx = self.box[0] + span * (i + .5)
+            wq = span * bw_frac / 2
+            Y = self.my(max(v, baseline))
+            Y0 = self.my(baseline)
+            self.cv.rect(int(cx - wq), int(min(Y, Y0)), int(cx + wq),
+                         int(max(Y, Y0)), c)
+            self.cv.text(int(cx - 6), int(self.box[3]) + 8, cats[i], scale=1)
+
+    def hist(self, values, edges, c):
+        counts, _ = np.histogram(values, bins=edges)
+        mxv = counts.max() if counts.max() else 1
+        pts = [(edges[0], 0)]
+        for i, ct in enumerate(counts):
+            pts += [(edges[i], ct / mxv), (edges[i + 1], ct / mxv)]
+        pts += [(edges[-1], 0)]
+        self.polyline([p[0] for p in pts], [p[1] for p in pts], c, t=1)
+
+    def legend(self, x, y, items, scale=1):
+        for i, (c, s) in enumerate(items):
+            yy = y + i * 10 * scale
+            self.cv.rect(x, yy, x + 5 * scale, yy + 5 * scale, c)
+            self.cv.text(x + 8 * scale, yy, s, scale=scale)
+
+# colors
+BLUE, ORANGE, GREEN, RED, PURPLE, GRAY = (31,119,180), (255,127,14), (44,160,44), \
+                                          (214,39,40), (148,103,189), (150,150,150)
+BLACK, WHITE = (0, 0, 0), (255, 255, 255)
+
+def nice_ticks(lo, hi, k=5):
+    step = (hi - lo) / (k - 1)
+    mag = 10 ** np.floor(np.log10(step))
+    step = (round(step / mag) or 1) * mag
+    t0 = np.ceil(lo / step) * step
+    return list(np.arange(t0, hi + 1e-9, step))
+
+# --- set_size_tradeoff.png ---
+cv = Canvas(900, 620)
+rmax = max(max(c['ucb'] for c in candidates), TARGET) * 1.15
+smin = min(c['size_dep'] for c in candidates) - .1
+smax = max(c['size_dep'] for c in candidates) + .1
+ax = Axes(cv, 70, 60, 860, 520, (smin, smax), (0, rmax),
+          nice_ticks(smin, smax), nice_ticks(0, rmax),
+          xlabel='DEPLOYMENT PROJECTED MEAN SET SIZE',
+          ylabel='WEIGHTED MISS RISK',
+          title='RISK VS SET SIZE TRADEOFF (CONFORMAL-ALPHA SWEEP)')
+for n_strata, c_r, c_u, ls in ((2, BLUE, ORANGE, 1), (3, (100,160,255), (255,200,120), 1)):
+    cand = sorted([c for c in candidates if c['n_strata'] == n_strata],
+                  key=lambda c: c['alpha'])
+    ax.polyline([c['size_dep'] for c in cand], [c['r_dep'] for c in cand], c_r)
+    ax.polyline([c['size_dep'] for c in cand], [c['ucb'] for c in cand], c_u)
+ax.hline(TARGET, RED, 2)
+ax.marker(best['size_dep'], best['r_dep'], GREEN, 5)
+ax.legend(580, 80, [(BLUE, 'EST DEP RISK 2 STRATA'), (ORANGE, 'UCB 2 STRATA'),
+                    ((100,160,255), 'EST DEP RISK 3 STRATA'),
+                    ((255,200,120), 'UCB 3 STRATA'), (RED, 'TARGET=0.1084'),
+                    (GREEN, 'SELECTED ALPHA=%.3f' % ALPHA)])
+cv.text(70, 575, 'SELECTED: ALPHA=%.3f  MEAN SIZE=%.2f  EST RISK=%.4f  UCB=%.4f'
+        % (ALPHA, best['size_dep'], best['r_dep'], best['ucb']))
+write_png('results/set_size_tradeoff.png', cv.a)
+
+# --- partition_audit.png ---
+cv = Canvas(1240, 440)
+ids = STRATA_IDS + ['ALL']
+x0s = [60, 470, 880]
+w0 = 340
+# panel 1: fractions
+ax = Axes(cv, x0s[0], 60, x0s[0] + w0, 330, (0, len(ids)), (0, 1.0),
+          [], [0, .25, .5, .75, 1.0], yfmt='{:.2f}',
+          title='STRATUM FRACTIONS')
+span = (ax.box[2] - ax.box[0]) / len(ids)
+for i, (fc, fd) in enumerate(zip(list(EV['wc']) + [1.0], list(EV['wd']) + [1.0])):
+    cx = ax.box[0] + span * (i + .5)
+    for off, v, c in ((-.12, fc, BLUE), (.12, fd, ORANGE)):
+        Y = ax.my(v)
+        ax.cv.rect(int(cx + off * span - 8), int(Y), int(cx + off * span + 8),
+                   int(ax.my(0)), c)
+    ax.cv.text(int(cx - 10), 345, ids[i])
+ax.legend(x0s[0] + 10, 66, [(BLUE, 'CALIBRATION'), (ORANGE, 'DEPLOYMENT')])
+# panel 2: risks
+ax = Axes(cv, x0s[1], 60, x0s[1] + w0, 330, (0, len(ids)), (0, rmax),
+          [], nice_ticks(0, rmax), yfmt='{:.2f}',
+          title='EST WEIGHTED MISS RISK')
+span = (ax.box[2] - ax.box[0]) / len(ids)
+for i, (r, u) in enumerate(zip(list(EV['rs']) + [EV['r_dep']],
+                               list(EV['ucb_s']) + [EV['ucb']])):
+    cx = ax.box[0] + span * (i + .5)
+    for off, v, c in ((-.12, r, BLUE), (.12, u, ORANGE)):
+        Y = ax.my(v)
+        ax.cv.rect(int(cx + off * span - 8), int(Y), int(cx + off * span + 8),
+                   int(ax.my(0)), c)
+    ax.cv.text(int(cx - 10), 345, ids[i])
+ax.hline(TARGET, RED, 2)
+ax.legend(x0s[1] + 10, 66, [(BLUE, 'EST RISK'), (ORANGE, 'UCB'), (RED, 'TARGET')])
+# panel 3: sizes
+ax = Axes(cv, x0s[2], 60, x0s[2] + w0, 330, (0, len(ids)), (0, 9.5),
+          [], [0, 3, 6, 9], yfmt='{:.0f}', title='MEAN SET SIZE')
+span = (ax.box[2] - ax.box[0]) / len(ids)
+for i, v in enumerate(list(EV['size_s']) + [EV['size_dep']]):
+    cx = ax.box[0] + span * (i + .5)
+    Y = ax.my(v)
+    ax.cv.rect(int(cx - 16), int(Y), int(cx + 16), int(ax.my(0)), PURPLE)
+    ax.cv.text(int(cx - 10), 345, ids[i])
+ax.hline(N_LABELS, BLACK, 1)
+cv.text(x0s[2] + 10, 66, 'DOTTED: ALL-LABEL SET = 9')
+cv.text(380, 415, 'PARTITION AUDIT (STRATA FROM MEAN(V000,V001,V002))')
+write_png('results/partition_audit.png', cv.a)
+
+# --- score_diagnostics.png ---
+cv = Canvas(1280, 440)
+x0s = [60, 470, 880]
+w0 = 340
+ax = Axes(cv, x0s[0], 60, x0s[0] + w0, 330, (0, 1), (0, 1),
+          [0, .5, 1.0], [], xfmt='{:.1f}',
+          title='MAX-PROB SCORE: CAL VS DEP')
+edges = np.linspace(0, 1, 31)
+ax.hist(Sc.max(1), edges, BLUE)
+ax.hist(Sd.max(1), edges, ORANGE)
+ax.legend(x0s[0] + 10, 66, [(BLUE, 'CALIBRATION'), (ORANGE, 'DEPLOYMENT')])
+ax = Axes(cv, x0s[1], 60, x0s[1] + w0, 330, (0, 1), (0, 1),
+          [0, .5, 1.0], [], xfmt='{:.1f}',
+          title='TRUE LABEL SCORE: LABEL_07 VS OTHERS')
+ax.hist(tl_scores[y_idx == 7], edges, RED)
+ax.hist(tl_scores[y_idx != 7], edges, BLUE)
+ax.legend(x0s[1] + 10, 66, [(RED, 'LABEL_07'), (BLUE, 'OTHER LABELS')])
+ax = Axes(cv, x0s[2], 60, x0s[2] + w0, 330, (0, N_LABELS), (0, 1),
+          list(range(N_LABELS)), [0, .25, .5, .75, 1.0], xfmt='', yfmt='{:.2f}',
+          title='PER LABEL CONFORMAL THRESHOLDS')
+span = (ax.box[2] - ax.box[0]) / N_LABELS
+for k in range(N_LABELS):
+    cx = ax.box[0] + span * (k + .5)
+    for off, s_id, c in ((-.18, 0, BLUE), (.18, 1, ORANGE)):
+        Y = ax.my(max(THR[s_id, k], 0))
+        ax.cv.rect(int(cx + off * span - 6), int(Y), int(cx + off * span + 6),
+                   int(ax.my(0)), c)
+    lab = LABELS[k].replace('label_', 'L')
+    ax.cv.text(int(cx - 10), 345, lab)
+ax.legend(x0s[2] + 10, 66, [(BLUE, 'STRATUM S0 HARD'), (ORANGE, 'STRATUM S1 EASY')])
+cv.text(400, 415, 'SCORE DIAGNOSTICS (ALPHA=%.3f, THRESHOLDS BY STRATUM AND LABEL)' % ALPHA)
+write_png('results/score_diagnostics.png', cv.a)
+
+# ----------------------------------------------------------------------------
+# 5. Contract checks + summary
+# ----------------------------------------------------------------------------
+required = META["output_files"]
+missing = [p for p in required if not os.path.exists(p)]
+assert not missing, f"missing outputs: {missing}"
+ps = pd.read_csv("results/prediction_sets.csv")
+assert list(ps.columns) == ["record_id", "prediction_set"]
+assert len(ps) == n_dep and ps.prediction_set.str.len().min() > 0
+assert all(set(v.split()) <= set(LABELS) for v in ps.prediction_set)
+for path, cols in META["output_schemas"].items():
+    got = list(pd.read_csv(path).columns)
+    assert got == cols, (path, got, cols)
+for p in required:
+    if p.endswith('.png'):
+        with open(p, 'rb') as f:
+            assert f.read(8) == b'\x89PNG\r\n\x1a\n', p
+
+print("\n=== FINAL SUMMARY ===")
+print(f"n_strata={N_STRATA}, cuts={np.round(cuts, 4)}, alpha={ALPHA}")
+for s in range(N_STRATA):
+    print(f"  {STRATA_IDS[s]}: n_cal={EV['ns'][s]}, cal_frac={EV['wc'][s]:.3f}, "
+          f"dep_frac={EV['wd'][s]:.3f}, risk_est={EV['rs'][s]:.4f}, "
+          f"UCB={EV['ucb_s'][s]:.4f}, mean_cost={EV['mean_cost_s'][s]:.3f}, "
+          f"dep_mean_size={EV['size_s'][s]:.2f}")
+print(f"overall: est. dep risk (cost-weighted)={EV['r_dep']:.4f} "
+      f"(target {TARGET}, margin {TARGET - EV['r_dep']:.4f})")
+print(f"overall: Hoeffding UCB (delta={DELTA})={EV['ucb']:.4f} "
+      f"<= target: {EV['ucb'] <= TARGET}")
+print(f"overall: cross-fitted est={R_CF:.4f}; cost-normalized={EV['r_dep_norm']:.4f}")
+print(f"mean set size (deployment, exact)={EV['size_dep']:.3f}; "
+      f"p90={p90(EV['size_d']):.1f}; all-label set=9")
+for s in range(N_STRATA):
+    print(f"thresholds {STRATA_IDS[s]}: " +
+          ", ".join(f"{LABELS[k]}={THR[s, k]:.4f}" for k in range(N_LABELS)))
+print("all contract checks passed; 12 output files written.")

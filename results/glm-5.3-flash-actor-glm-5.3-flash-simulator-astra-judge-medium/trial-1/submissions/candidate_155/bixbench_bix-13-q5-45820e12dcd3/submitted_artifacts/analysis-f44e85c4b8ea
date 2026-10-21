@@ -1,0 +1,232 @@
+"""
+DESeq2-equivalent differential expression analysis (Python reimplementation).
+
+Pipeline (faithful to the DESeq2 statistical core; NOT R DESeq2 itself):
+  1. Median-of-ratios size-factor normalization (DESeq2 `estimateSizeFactors`).
+  2. Mean model: NB GLM with log link, design ~ media + strain (strain coded
+     with JBX1 = code 1 as reference level), initial fit at alpha = 1.
+  3. Gene-wise dispersion MLE (profile likelihood over alpha, mu refit by IRLS).
+  4. Parametric dispersion trend alpha(mu) = a1/mu + a0 (local/running-median
+     fallback if the parametric fit fails), as in `estimateDispersions`.
+  5. Posterior (MAP) shrinkage of dispersions toward the trend with a
+     log-scale prior variance estimated from the gene-wise spread around the
+     trend; final testing dispersion = MLE if MLE < trend else MAP.
+  6. Wald tests on strain coefficients (z = beta/SE, SE from GLM information;
+     Cox-Reid adjustment not applied - a documented approximation).
+  7. Benjamini-Hochberg correction per contrast (independent filtering
+     assessed separately; the matrix is dense so the filter is expected inert).
+"""
+import numpy as np, pandas as pd
+from scipy import optimize, special, stats
+
+# ---------------------------------------------------------------- data
+md = pd.read_csv('data/experiment_metadata.csv')
+cnt = pd.read_csv('data/raw_counts.csv', index_col=0)
+cnt = cnt.loc[:, md.AzentaName]                      # align columns to metadata
+Y = cnt.to_numpy(dtype=np.float64)                   # genes x samples
+genes = cnt.index.to_numpy()
+
+media = md.Media.to_numpy()
+strain = md.Strain.to_numpy()                        # codes 1,97,98,99
+
+# design ~ media + strain, reference: media=MMGluFeMinus, strain=1 (JBX1)
+media_lv = ['MMGluFeMinus', 'MMGluFePlus', 'Succinate']
+M = np.column_stack([(media == m).astype(float) for m in media_lv[1:]])   # 2 cols
+S = np.column_stack([(strain == s).astype(float) for s in [97, 98, 99]])  # 3 cols vs JBX1
+X = np.column_stack([np.ones(len(md)), M, S])        # 6 coefficients
+names = ['Intercept', 'mediaPlus', 'mediaSucc', 'strain97', 'strain98', 'strain99']
+n, p = X.shape
+
+# ------------------------------------------------------- size factors
+loggm = np.log(Y.clip(1e-8)).mean(axis=1)            # geometric mean per gene
+ratio = Y / np.exp(loggm)[:, None]
+ok = Y > 0
+sizef = np.exp(np.nanmedian(np.log(np.where(ok, ratio, np.nan)), axis=0))
+sizef /= sizef.mean()
+print("size factors:", np.round(sizef, 3))
+
+# ------------------------------------------------------------ NB IRLS
+L2 = np.log(2.0)
+
+def irls(y, X, sf, alpha, maxit=60, tol=1e-9):
+    """NB GLM, log link, offset log sf. Returns (beta, mu, w)."""
+    off = np.log(sf)
+    mu = np.maximum(y / sf, 0.5)                     # size-factor adjusted init
+    beta = np.linalg.lstsq(X, np.log(mu), rcond=None)[0]
+    for it in range(maxit):
+        eta = X @ beta + off
+        mu = np.maximum(np.exp(eta), 1e-10)
+        w = mu / (1.0 + alpha * mu)
+        z = eta - off + (y - mu) / mu
+        XTWX = X.T @ (w[:, None] * X)
+        XtWz = X.T @ (w * z)
+        try:
+            beta_new = np.linalg.solve(XTWX, XtWz)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.lstsq(XTWX, XtWz, rcond=None)[0]
+        if np.max(np.abs(beta_new - beta)) < tol * (1 + np.abs(beta).max()):
+            beta = beta_new
+            break
+        beta = beta_new
+    eta = X @ beta + off
+    mu = np.maximum(np.exp(eta), 1e-10)
+    w = mu / (1.0 + alpha * mu)
+    return beta, mu, w
+
+def nb_loglik(y, mu, alpha):
+    r = 1.0 / alpha
+    return (special.gammaln(y + r) - special.gammaln(r) - special.gammaln(y + 1)
+            + r * (np.log(r) - np.log(r + mu))
+            + y * (np.log(mu) - np.log(r + mu))).sum()
+
+# ------------------------------------------ gene-wise dispersion MLE
+def disp_mle(y, X, sf):
+    beta0, mu0, _ = irls(y, X, sf, 1.0)              # mean fit at alpha = 1
+    def negll(loga, refit):
+        a = np.exp(loga)
+        mu = mu0
+        if refit:
+            _, mu, _ = irls(y, X, sf, a, maxit=30)
+        return -nb_loglik(y, mu, a)
+    for it in range(4):                              # alternate mu / alpha
+        res = optimize.minimize_scalar(
+            negll, args=(it > 0,), bounds=(-10, 4), method='bounded',
+            options={'xatol': 1e-4})
+        a = np.exp(res.x)
+    return a, mu0
+
+# ---------------------------------------------------------------- run
+n_genes = Y.shape[0]
+alpha_mle = np.empty(n_genes)
+mu_base = np.empty_like(Y)
+for i in range(n_genes):
+    a, mu0 = disp_mle(Y[i], X, sizef)
+    alpha_mle[i] = a
+    mu_base[i] = mu0
+print("gene-wise MLE dispersions: min %.4g median %.4g max %.4g"
+      % (alpha_mle.min(), np.median(alpha_mle), alpha_mle.max()))
+
+base_mean = mu_base.mean(axis=1)                     # normalized base mean
+
+# --------------------------------------- parametric dispersion trend
+def trend_fit(alpha, bmean):
+    ok = (bmean > 1e-3) & np.isfinite(alpha) & (alpha > 0)
+    a, m = alpha[ok], bmean[ok]
+    def f(p):
+        a0, a1 = np.exp(p)
+        return np.log(a0 + a1 / m) - np.log(a)
+    try:
+        res = optimize.least_squares(f, np.log([1e-4, 1e-2]), method='lm', max_nfev=5000)
+        a0, a1 = np.exp(res.x)
+        pred = a0 + a1 / bmean.clip(1e-8)
+        if np.all(np.isfinite(pred)) and (pred > 0).all():
+            # quality check vs local running median (nonparametric)
+            order = np.argsort(np.log(bmean[ok]))
+            lm_, la_ = np.log(bmean[ok])[order], np.log(a)[order]
+            k = max(50, len(lm_) // 20)
+            med = pd.Series(la_).rolling(k, center=True, min_periods=1).median().to_numpy()
+            sse_par = np.sum((la_ - med) ** 2)
+            sse_null = np.sum((la_ - np.median(la_)) ** 2)
+            if sse_par < sse_null:
+                return pred, a0, a1
+    except Exception as e:
+        print("parametric trend failed:", e)
+    # fallback: local running median on log-log scale
+    lo, hi = np.log(bmean.clip(1e-8)), np.log(alpha)
+    o = np.argsort(lo)
+    lo_s, hi_s = lo[o], hi[o]
+    k = max(50, n_genes // 20)
+    med = pd.Series(hi_s).rolling(k, center=True, min_periods=1).median().to_numpy()
+    trend_s = np.empty(n_genes); trend_s[o] = med
+    return np.exp(trend_s), None, None
+
+trend, a0, a1 = trend_fit(alpha_mle, base_mean)
+if a0 is not None:
+    print("parametric trend: a0 = %.4g, a1 = %.4g" % (a0, a1))
+else:
+    print("parametric trend failed; used local (running-median) trend")
+
+# --------------------------------------------- dispersion shrinkage
+resid = np.log(alpha_mle) - np.log(trend)
+okf = np.isfinite(resid)
+sig2 = max((1.4826 * np.median(np.abs(resid[okf] - np.median(resid[okf]))))**2 * (n - p) / (n - p + 2), 1e-3)
+print("prior variance on log dispersion (approx.): %.4g" % sig2)
+
+alpha_final = np.empty(n_genes)
+for i in range(n_genes):
+    if alpha_mle[i] < trend[i]:                      # MLE below trend -> keep MLE
+        alpha_final[i] = alpha_mle[i]
+        continue
+    y = Y[i]
+    def obj(loga):
+        a = np.exp(loga)
+        _, mu, _ = irls(y, X, sizef, a, maxit=25)
+        return -nb_loglik(y, mu, a) + (loga - np.log(trend[i]))**2 / (2 * sig2)
+    res = optimize.minimize_scalar(obj, bounds=(-10, 4), method='bounded',
+                                   options={'xatol': 1e-3})
+    alpha_final[i] = np.exp(res.x)
+print("final dispersions: min %.4g median %.4g max %.4g"
+      % (alpha_final.min(), np.median(alpha_final), alpha_final.max()))
+
+# --------------------------------------------------- Wald tests
+pvals = {c: np.full(n_genes, np.nan) for c in ['strain97', 'strain98', 'strain99']}
+l2fc = {c: np.full(n_genes, np.nan) for c in pvals}
+for i in range(n_genes):
+    beta, mu, w = irls(Y[i], X, sizef, alpha_final[i])
+    XtWX = X.T @ (w[:, None] * X)
+    try:
+        cov = np.linalg.inv(XtWX)
+        se = np.sqrt(np.diag(cov))
+    except np.linalg.LinAlgError:
+        continue
+    for j, c in enumerate(['strain97', 'strain98', 'strain99'], start=3):
+        z = beta[j] / se[j]
+        pvals[c][i] = 2 * stats.norm.sf(abs(z))
+        l2fc[c][i] = beta[j] / L2
+
+def bh(p):
+    p = np.asarray(p, float); valid = np.isfinite(p)
+    q = np.full_like(p, np.nan)
+    pv = p[valid]; m = len(pv)
+    o = np.argsort(pv)
+    ranked = pv[o] * m / (np.arange(m) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    qv = np.clip(ranked, 0, 1)
+    qv_sorted = np.empty(m); qv_sorted[o] = qv
+    q[valid] = qv_sorted
+    return q
+
+padj = {c: bh(pvals[c]) for c in pvals}
+
+print("min normalized base mean across genes: %.4g" % base_mean.min())
+
+res = pd.DataFrame({'gene': genes, 'baseMean': base_mean, 'dispersion_trend': trend,
+                    'dispersion_MLE': alpha_mle, 'dispersion_final': alpha_final})
+for c in pvals:
+    res[c + '_log2FC'] = l2fc[c]; res[c + '_pval'] = pvals[c]; res[c + '_padj'] = padj[c]
+
+res.to_csv('results/deseq2_equivalent_results.csv', index=False)
+
+# ------------------------------------------------- target set & scenarios
+THR = 0.05
+sig = {c: res[c + '_padj'] < THR for c in ['strain97', 'strain98', 'strain99']}
+
+print("\n=== significant genes (BH padj < 0.05) per contrast vs JBX1 ===")
+for c in ['strain97', 'strain98', 'strain99']:
+    print(f"{c}: {int(sig[c].sum())}")
+
+scenarios = {
+    "convention 97=lasI, 98=rhlI, 99=double": (('strain97', 'strain98'), 'strain99'),
+    "alt 99=lasI, 97=rhlI, 98=double":        (('strain99', 'strain97'), 'strain98'),
+    "alt 98=lasI, 99=rhlI, 97=double":        (('strain98', 'strain99'), 'strain97'),
+}
+print("\n=== target set counts by mapping scenario ===")
+for name, (singles, dbl) in scenarios.items():
+    sel = (sig[singles[0]] | sig[singles[1]]) & ~sig[dbl]
+    print(f"{name}: target = {int(sel.sum())}")
+
+main = (sig['strain97'] | sig['strain98']) & ~sig['strain99']
+res['sig_97'] = sig['strain97']; res['sig_98'] = sig['strain98']; res['sig_99'] = sig['strain99']
+res['target_main'] = main
+res[main].to_csv('results/target_gene_set.csv', index=False)
+print("\nMAIN ANSWER (convention 97=lasI, 98=rhlI, 99=double):", int(main.sum()))

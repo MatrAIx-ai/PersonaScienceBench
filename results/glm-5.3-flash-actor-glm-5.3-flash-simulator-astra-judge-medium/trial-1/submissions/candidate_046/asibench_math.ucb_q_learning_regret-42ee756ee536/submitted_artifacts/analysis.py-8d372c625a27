@@ -1,0 +1,226 @@
+"""Optimistic dual-estimator tabular Q-learning for finite-horizon episodic MDPs.
+
+Design (online, model-free, O(H*S*A) storage):
+
+Two statistically distinct estimators of Q*(h, s, a) are maintained per
+(horizon index h, state s, action a), each with scalar visit count, running
+mean and centered second moment (Welford):
+
+  E1 (one-step bootstrap):  target = r + V(h+1, s'),  V(h+1,s') = max_a Q[h+1,s',a]
+      -> low bias, but targets drift while downstream Q is learned, so its
+         empirical variance is inflated early (the burn-in cost of plain
+         UCB-B that this design softens).
+
+  E2 (bounded multi-step return): target = sum of the next `m` realized
+      rewards plus a single bootstrap V(h+m, s_{h+m}) taken BEFORE the end of
+      the episode from the current episode trace (bounded to H transitions).
+      -> propagates deferred credit within the episode; targets are far less
+         sensitive to the drifting downstream Q estimate.
+
+Both estimators get explicit, visit-dependent optimism bonuses built from
+their centered moments (Bernstein-style, variance-sensitive):
+      bonus_i = c_var * sqrt(2 * var_hat_i * L / n_i) + c_cnt * L / n_i,
+with a shared confidence level L (per parent state, per known episode budget,
+or global) and rewards bounded in [0, 1].
+
+The acting / bootstrapping value combines the two optimistic indices either
+by max (union of optimism) or by inverse-variance weighting ("invvar").
+Unvisited entries are initialized optimistically at the maximum possible
+remaining return (H - h + 1). All stored Q values are clipped to the valid
+remaining-horizon range [0, H - h + 1].
+
+Storage: eight (H+2, S, A)-shaped scalar arrays (one of them reduced to
+(H+2, S)) plus one episode trace of at most H transitions -> O(H*S*A).
+No transition model, no next-state count tensors, no replay/planning, no
+posterior sampling, no policy gradients, no enumeration of possible next
+states. One shared CONFIG for every MDP (no branching on case_id,
+dimensions or action patterns).
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+CONFIG = {
+    # Single shared configuration, selected on the three public diagnostics only
+    # (official 3-seed protocol), with a multi-seed robustness filter.
+    "m_trunc": 6,      # multi-step truncation length; 0 => full remaining-episode return
+    "c_var": 0.4,      # scale of the variance-sensitive (Bernstein) bonus term
+    "c_cnt": 0.05,     # scale of the count-based bonus term (reward range = 1)
+    "comb": "invvar",  # inverse-variance weighted combination of the two indices
+    "prior_var": 0.5,  # assumed target variance before two samples exist
+    "w_floor": 0.02,   # inverse-variance weight floor (keeps both estimators alive)
+    "eps0": 0.0,       # exploration floor (0 => pure optimistic greedy)
+    "log_mode": "parent",  # confidence level L = log(1 + visits of (h, s))
+    "v_cap": 0,        # variance cap off
+    "boot": "mixed",   # E1 targets bootstrap optimistically; E2 targets bootstrap
+                       # with the drift-free inverse-variance mean (stable targets)
+}
+
+
+class Agent:
+    def __init__(self, env_spec, seed):
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.H = int(env_spec["H"])
+        self.K = int(env_spec.get("K", 0))
+        self.seed = int(seed)
+        self._rng = np.random.default_rng(self.seed)
+        self.t = 0            # global interaction step counter
+        self.trace = []       # bounded episode trace (<= H transitions)
+        shape = (self.H + 2, self.S, self.A)
+        self.n1 = np.zeros(shape)        # E1 visit counts
+        self.mu1 = np.zeros(shape)       # E1 running means
+        self.m21 = np.zeros(shape)       # E1 centered second moments (Welford M2)
+        self.n2 = np.zeros(shape)        # E2 visit counts
+        self.mu2 = np.zeros(shape)       # E2 running means
+        self.m22 = np.zeros(shape)       # E2 centered second moments
+        self.npar = np.zeros((self.H + 2, self.S))  # visits per (h, s), all actions
+        self.episodes = 0
+
+    # ---------------- core optimistic index ----------------
+
+    def _L(self, h, s):
+        mode = CONFIG["log_mode"]
+        if mode == "parent":
+            return math.log(1.0 + self.npar[h, s])
+        if mode == "constK":
+            return math.log(2.0 + max(self.K, 1))
+        return math.log(2.0 + self.t)
+
+    def _idx(self, h, s):
+        """Optimistic value indices for all actions at (h, s). O(A)."""
+        A = self.A
+        remaining = self.H - h + 1
+        L = self._L(h, s)
+        vc = 0.25 * remaining * remaining if CONFIG["v_cap"] else float("inf")
+        out = np.empty(A)
+        cfg = CONFIG
+        info = []
+        for a in range(A):
+            n1 = self.n1[h, s, a]
+            n2 = self.n2[h, s, a]
+            i1 = i2 = v1 = v2 = None
+            if n1 > 0:
+                v1 = self.m21[h, s, a] / (n1 - 1) if n1 >= 2 else cfg["prior_var"]
+                v1 = min(v1, vc)
+                b1 = cfg["c_var"] * math.sqrt(2.0 * v1 * L / n1) + cfg["c_cnt"] * L / n1
+                i1 = self.mu1[h, s, a] + b1
+            if n2 > 0:
+                v2 = self.m22[h, s, a] / (n2 - 1) if n2 >= 2 else cfg["prior_var"]
+                v2 = min(v2, vc)
+                b2 = cfg["c_var"] * math.sqrt(2.0 * v2 * L / n2) + cfg["c_cnt"] * L / n2
+                i2 = self.mu2[h, s, a] + b2
+            if i1 is None and i2 is None:
+                out[a] = float(remaining)      # optimistic initialization
+                info.append((0, 0.0, 0.0, out[a]))
+            elif cfg["comb"] == "max" or i1 is None or i2 is None:
+                out[a] = i1 if i2 is None else (i2 if i1 is None else max(i1, i2))
+                info.append((n1 + n2, v1 if v1 is not None else v2, L, out[a]))
+            else:  # inverse-variance weighted combination of the two indices
+                w1 = 1.0 / (v1 / n1 + cfg["w_floor"])
+                w2 = 1.0 / (v2 / n2 + cfg["w_floor"])
+                out[a] = (w1 * i1 + w2 * i2) / (w1 + w2)
+                info.append((n1 + n2, min(v1, v2), L, out[a]))
+        np.clip(out, 0.0, float(remaining), out=out)  # valid remaining-horizon range
+        return out
+
+    def _v(self, h, s):
+        if h > self.H:
+            return 0.0
+        return float(np.max(self._idx(h, s)))
+
+    def _v_mean(self, h, s):
+        """Non-optimistic (drift-free) value: inverse-variance weighted mean."""
+        if h > self.H:
+            return 0.0
+        cfg = CONFIG
+        vals, prec = [], []
+        for mu, n, m2 in ((self.mu1[h, s], self.n1[h, s], self.m21[h, s]),
+                          (self.mu2[h, s], self.n2[h, s], self.m22[h, s])):
+            for a in range(self.A):
+                if n[a] > 0:
+                    v = m2[a] / (n[a] - 1) if n[a] >= 2 else cfg["prior_var"]
+                    prec.append(1.0 / (v / n[a] + cfg["w_floor"]))
+                    vals.append(mu[a])
+        if not vals:
+            return 0.0
+        p = np.asarray(prec); v = np.asarray(vals)
+        return float(np.sum(p * v) / np.sum(p))
+
+    def act(self, h, state):
+        s = int(state)
+        row = self._idx(h, s)
+        a = int(np.argmax(row))
+        eps = CONFIG["eps0"]
+        if eps > 0.0 and self._rng.random() < eps:
+            a = int(self._rng.integers(self.A))
+        return a
+
+    # ---------------- online updates ----------------
+
+    @staticmethod
+    def _update(n_arr, mu_arr, m2_arr, h, s, a, x):
+        n = n_arr[h, s, a] + 1.0
+        mu = mu_arr[h, s, a]
+        d = x - mu
+        mu = mu + d / n
+        m2 = m2_arr[h, s, a] + d * (x - mu)
+        n_arr[h, s, a] = n
+        mu_arr[h, s, a] = mu
+        m2_arr[h, s, a] = m2
+
+    def observe(self, h, state, action, reward, next_state, done):
+        s = int(state)
+        a = int(action)
+        h = int(h)
+        self.npar[h, s] += 1.0
+        # E1: one-step bootstrapped target (drifting but low-bias)
+        boot = CONFIG["boot"]
+        v_next = 0.0 if done or h >= self.H else (
+            self._v(h + 1, int(next_state)) if boot in ("opt", "mixed")
+            else self._v_mean(h + 1, int(next_state)))
+        t1 = float(reward) + v_next
+        self._update(self.n1, self.mu1, self.m21, h, s, a, t1)
+        # bounded episode trace for the multi-step estimator
+        self.trace.append((h, s, a, float(reward), int(next_state), bool(done)))
+        self.t += 1
+        if done:
+            self._flush()
+
+    def _flush(self):
+        """Backward multi-step (truncated) returns from the episode trace."""
+        tr = self.trace
+        self.trace = []
+        L = len(tr)
+        if L == 0:
+            return
+        m = CONFIG["m_trunc"]
+        suffix = [0.0] * (L + 1)
+        for j in range(L - 1, -1, -1):
+            suffix[j] = tr[j][3] + suffix[j + 1]
+        for j in range(L):
+            h, s, a, r, s2, _ = tr[j]
+            if m <= 0 or j + m >= L:
+                target = suffix[j]           # full remaining-episode return
+            else:
+                jend = j + m
+                target = suffix[j] - suffix[jend]          # next m realized rewards
+                h_next, s_next = tr[jend][0], tr[jend][1]  # bootstrap BEFORE episode end
+                target += (self._v(h_next, s_next) if CONFIG["boot"] == "opt"
+                           else self._v_mean(h_next, s_next))
+            self._update(self.n2, self.mu2, self.m22, h, s, a, target)
+        self.episodes += 1
+
+    # optional hooks (the official runner calls these if present)
+    def reset_episode(self, episode, state):
+        self.trace = []
+
+    def end_episode(self, episode, episode_reward):
+        if self.trace:
+            self._flush()
+
+
+def make_agent(env_spec, seed):
+    return Agent(env_spec, seed)

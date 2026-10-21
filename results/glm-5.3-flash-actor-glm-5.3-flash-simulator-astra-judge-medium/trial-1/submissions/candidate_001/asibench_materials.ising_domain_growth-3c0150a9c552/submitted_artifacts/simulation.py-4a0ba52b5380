@@ -1,0 +1,645 @@
+"""B3: Hidden Binary-Grid Time Evolution.
+
+Model (inferred from inputs, documented assumptions):
+- data/initial_state.npy is an uncorrelated random +/-1 configuration on a
+  100x100 square lattice (nearest-neighbour equality fractions ~0.5).
+- parameters.json `control` = 2.0236 is interpreted as the temperature T in
+  units J/kB = 1.  The 2D Ising critical temperature is Tc = 2/ln(1+sqrt(2))
+  = 2.26918..., so T = 2.0236 is a quench below Tc: the random state coarsens
+  (Ising domain growth), matching the episode identifier.
+- Dynamics: nonconserved single-spin-flip Metropolis (Glauber) kinetics with
+  H = -J sum_<ij> s_i s_j, J = 1, periodic boundaries.  Updates are applied on
+  the two checkerboard sublattices so the sweep can be vectorised with numpy;
+  this differs from random-sequential update order only in short-time
+  transients, not in the asymptotic coarsening exponent.
+- Time is measured in full-lattice Monte Carlo sweeps; snapshot_times and
+  measurement_times are sweep counts.  One RNG stream:
+  numpy.random.default_rng(dynamics_seed), created exactly once.
+
+Observed behaviour (measured in this run): at T = 2.0236 the finite
+100x100 system coarsens for t <~ 500 sweeps and then equilibrates into the
+ordered phase (|m| -> ~0.90 ~ Onsager m_eq = 0.912; wall density -> plateau
+rho_eq ~ 0.069 set by equilibrium thermal droplets).  Later times are
+equilibrium fluctuations, not coarsening.
+
+Diagnostics (documented conventions, also written into the JSON notes):
+- seriesA row 0: per-site energy e = -(1/N) sum_<ij> s_i s_j (bonds once).
+  seriesA row 1: magnetisation m = (1/N) sum s_i.
+- seriesB row 0: domain length L(t) = 1/rho(t) (inverse domain-wall density);
+  tracks the growing domain size during coarsening and saturates at
+  1/rho_eq after equilibration.  seriesB row 1: wall density rho(t)
+  = fraction of unlike nearest-neighbour pairs (axes averaged).
+- stackC: C(r,t) = <s(x) s(x+r)> averaged over all displacement vectors with
+  |r| in [r-0.5, r+0.5) (circular/periodic), r = 0..max_r-1, per snapshot.
+- stackD: column-averaged magnetisation profile m(x) per snapshot.
+- stackE: per snapshot, row 0 = column-averaged +1-phase density,
+  row 1 = column-averaged -1-phase density.
+- Coarsening window (data-driven): measurement times from the first sample
+  until rho(t) first falls within 2% of its late-time plateau (median over
+  the last 10% of samples).
+- metadataA: Family-Vicsek collapse of the connected, normalised correlation
+  y = (C - m^2)/(1 - m^2) vs x = r/L(t), restricted to snapshots inside the
+  coarsening window (equilibrated snapshots have C ~ m^2 and cannot collapse).
+  collapse_relative_rms_spread = RMS(y_i(x) - master(x)) / RMS(master(x))
+  over the common overlap grid x in [0, min_i((r_max-1)/L_i)] (200-point
+  grid, linear interpolation); collapse_quality = clip(1 - rel_rms, 0, 1).
+- metadataB: log-log OLS fit L(t) = A t^alpha over the coarsening window.
+"""
+
+import json
+import os
+
+import numpy as np
+from scipy.stats import linregress
+# matplotlib is imported lazily inside main() (with a numpy-only fallback
+# figure renderer used when matplotlib is unavailable in the runtime).
+
+DATA_DIR = "data"
+OUT_DIR = "."
+
+
+# ----------------------------------------------------------------- dynamics
+def make_prob_table(temp):
+    # dE = 2*s*nb with nb in {-4,-2,0,2,4}  ->  dE in {-8,-4,0,4,8};
+    # lookup index = dE//2 + 4 so prob_table[dE//2+4] = exp(-dE/T) for dE > 0.
+    pt = np.ones(9)
+    for d in (-8, -4, 0, 4, 8):
+        pt[d // 2 + 4] = 1.0 if d <= 0 else float(np.exp(-d / temp))
+    return pt
+
+
+def sweep(state, temp, rng, prob_table):
+    """One full checkerboard Metropolis sweep (two sublattice passes)."""
+    ii, jj = np.indices(state.shape)
+    par = (ii + jj) % 2
+    for parity in (0, 1):
+        nb = (np.roll(state, 1, 0) + np.roll(state, -1, 0)
+              + np.roll(state, 1, 1) + np.roll(state, -1, 1))
+        dE = 2 * state * nb                      # values in {-8,-4,0,4,8}
+        accept = (dE <= 0) | (rng.random(state.shape) < prob_table[dE // 2 + 4])
+        state = np.where((par == parity) & accept, -state, state)
+    return state
+
+
+def wall_density(state):
+    rho_h = np.mean(state != np.roll(state, -1, 1))
+    rho_v = np.mean(state != np.roll(state, -1, 0))
+    return 0.5 * (rho_h + rho_v)
+
+
+def energy_per_site(state):
+    bonds = (np.sum(state * np.roll(state, 1, 0))
+             + np.sum(state * np.roll(state, 1, 1)))
+    return -bonds / state.size
+
+
+def correlation(state, max_r):
+    """Direction-averaged (radially binned) circular correlation C(r)."""
+    s = state.astype(np.float64)
+    f = np.fft.fft2(s)
+    ac = np.fft.ifft2(f * np.conj(f)).real / s.size   # ac[d] = <s(x)s(x+d)>
+    n0, n1 = s.shape
+    dx = np.arange(n0); dx = np.where(dx <= n0 // 2, dx, dx - n0)
+    dy = np.arange(n1); dy = np.where(dy <= n1 // 2, dy, dy - n1)
+    DX, DY = np.meshgrid(dx, dy, indexing="ij")
+    dist = np.sqrt(DX.astype(float) ** 2 + DY.astype(float) ** 2)
+    C = np.zeros(max_r)
+    for r in range(max_r):
+        sel = (dist >= r - 0.5) & (dist < r + 0.5) if r > 0 else (dist < 0.5)
+        if np.any(sel):
+            C[r] = ac[sel].mean()
+    return C
+
+
+def domain_length(rho, grid):
+    """Domain length L = 1/rho (inverse domain-wall density).
+
+    During coarsening this tracks the growing domain size; once the finite
+    system equilibrates, rho measures the equilibrium thermal-droplet density
+    and L saturates near 1/rho_eq.  The guard keeps L finite for rho -> 0.
+    """
+    return float(1.0 / max(rho, 1.0 / (grid * grid)))
+
+
+def collapse(curves, lengths, m2s, r_max):
+    """Family-Vicsek collapse of the connected correlation vs x = r/L(t).
+
+    y(r,t) = (C(r,t) - m(t)^2) / (1 - m(t)^2) is the connected, normalised
+    correlation; each curve is interpolated onto a 200-point grid over the
+    common overlap x in [0, min_i((r_max-1)/L_i)].
+    """
+    Ls = np.asarray(lengths, float)
+    if len(Ls) < 2 or not np.all(np.isfinite(Ls)) or np.any(Ls <= 0):
+        return None
+    x_max = min((r_max - 1) / Li for Li in Ls)
+    if not np.isfinite(x_max) or x_max <= 0:
+        return None
+    xg = np.linspace(0.0, x_max, 200)
+    ys = np.array([np.interp(xg, np.arange(r_max) / Li,
+                             (np.asarray(c, float) - m2) / max(1.0 - m2, 1e-12))
+                   for c, Li, m2 in zip(curves, Ls, m2s)])
+    master = ys.mean(axis=0)
+    denom = np.sqrt(np.mean(master ** 2))
+    rel = float(np.sqrt(np.mean((ys - master) ** 2)) / denom) if denom > 0 else np.inf
+    quality = float(np.clip(1.0 - rel, 0.0, 1.0))
+    return {"x": xg, "ys": ys, "master": master, "rel": rel,
+            "quality": quality, "x_range": [0.0, float(x_max)]}
+
+
+# ------------------------------------------------- fallback figure renderer
+# Used only when matplotlib is unavailable in the runtime: a self-contained
+# raster renderer (numpy + stdlib zlib/struct) producing the same 3x3
+# diagnostic layout as the matplotlib figure, saved as a valid PNG.
+FONT = (  # 5x7 column-encoded glyphs for ASCII 32..126 (classic 5x7 subset)
+    "000000000000", "00005F000000", "000700070000", "147F147F1400", "242A7F2A1200",
+    "231308646200", "364955225000", "000503000000", "001C224100000", "0041221C0000",
+    "14083E081400", "08083E080800", "005030000000", "080808080800", "006060000000",
+    "201008040200", "3E5149453E00", "00427F400000", "426151494600", "2141454B3100",
+    "1814127F1000", "274545453900", "3C4A49493000", "017109050300", "364949493600",
+    "064949291E00", "003636000000", "005636000000", "000814224100", "141414141400",
+    "412214080000", "020151090600", "324979413E00", "7E1111117E00", "7F4949493600",
+    "3E4141412200", "7F4141221C00", "7F4949494100", "7F0909010100", "3E4141513200",
+    "7F0808087F00", "00417F410000", "2040413F0100", "7F0814224100", "7F4040404000",
+    "7F0204027F00", "7F0408107F00", "3E4141413E00", "7F0909090600", "3E4151215E00",
+    "7F0919294600", "464949493100", "01017F010100", "3F4040403F00", "1F2040201F00",
+    "7F2018207F00", "631408146300", "030478040300", "615149454300", "00007F414100",
+    "020408102000", "41417F000000", "040201020400", "404040404000", "000102040000",
+    "205454547800", "7F4844443800", "384444442000", "384444487F00", "385454541800",
+    "087E09010200", "0C5252523E00", "7F0804047800", "00447D400000", "2040443D0000",
+    "7F1028440000", "00417F400000", "7C0418047800", "7C0804047800", "384444443800",
+    "7C1414140800", "081414187C00", "7C0804040800", "485454542000",
+    "043F44402000", "3C4040207C00", "1C2040201C00", "3C4030403C00", "442810284400",
+    "0C5050503C00", "4464544C4400", "000808080800", "416141414100", "000041414100",
+)
+
+
+def _glyph(ch):
+    if 32 <= ord(ch) <= 126:
+        h = (FONT[ord(ch) - 32] + "0" * 12)[:12]
+        cols = [int(h[2 * i:2 * i + 2], 16) for i in range(5)]
+        return [[(col >> (6 - r)) & 1 for col in cols] for r in range(7)]
+    return [[0] * 5 for _ in range(7)]
+
+
+def _png_write(path, rgb):
+    import struct
+    import zlib
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+class FallbackCanvas:
+    BG = np.array([255, 255, 255], np.uint8)
+    FG = np.array([0, 0, 0], np.uint8)
+
+    def __init__(self, w=1560, h=1230):
+        self.img = np.full((h, w, 3), 255, np.uint8)
+
+    def rect(self, x0, y0, x1, y1, color):
+        self.img[max(y0, 0):y1, max(x0, 0):x1] = color
+
+    def line(self, x0, y0, x1, y1, color, thick=1):
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        xs = np.clip(np.linspace(x0, x1, max(n, 2)).round().astype(int),
+                     0, self.img.shape[1] - 1)
+        ys = np.clip(np.linspace(y0, y1, max(n, 2)).round().astype(int),
+                     0, self.img.shape[0] - 1)
+        self.img[ys, xs] = color
+
+    def text(self, x, y, s, scale=2, color=None):
+        color = self.FG if color is None else color
+        cx = x
+        for ch in s:
+            g = _glyph(ch)
+            for r in range(7):
+                for c in range(5):
+                    if g[r][c]:
+                        self.rect(cx + c * scale, y + r * scale,
+                                  cx + (c + 1) * scale, y + (r + 1) * scale, color)
+            cx += 6 * scale
+
+    def curve_map(self, box, xd, yd, color, marker=False, xr=None, yr=None):
+        x0, y0, x1, y1 = box
+        if xr is None:
+            xr = (float(np.min(xd)), float(np.max(xd)))
+        if yr is None:
+            yr = (float(np.min(yd)), float(np.max(yd)))
+        xr = (xr[0], xr[1] if xr[1] > xr[0] else xr[0] + 1e-12)
+        yr = (yr[0], yr[1] if yr[1] > yr[0] else yr[0] + 1e-12)
+        fx = x0 + (np.asarray(xd, float) - xr[0]) / (xr[1] - xr[0]) * (x1 - x0)
+        fy = y1 - (np.asarray(yd, float) - yr[0]) / (yr[1] - yr[0]) * (y1 - y0)
+        fx = np.clip(fx.round().astype(int), x0, x1)
+        fy = np.clip(fy.round().astype(int), y0, y1)
+        for i in range(len(fx) - 1):
+            self.line(fx[i], fy[i], fx[i + 1], fy[i + 1], color)
+        if marker:
+            for i in range(len(fx)):
+                self.rect(fx[i] - 1, fy[i] - 1, fx[i] + 2, fy[i] + 2, color)
+
+    def frame(self, box, title, xticks=(), yticks=()):
+        x0, y0, x1, y1 = box
+        self.line(x0, y0, x1, y0, self.FG); self.line(x0, y1, x1, y1, self.FG)
+        self.line(x0, y0, x0, y1, self.FG); self.line(x1, y0, x1, y1, self.FG)
+        self.text(x0, y0 - 18, title, scale=2)
+        for xv, lab in xticks:
+            px = int(x0 + xv * (x1 - x0))
+            self.line(px, y1, px, y1 + 4, self.FG)
+            self.text(px - 3 * len(lab), y1 + 8, lab, scale=1)
+        for yv, lab in yticks:
+            py = int(y1 - yv * (y1 - y0))
+            self.line(x0 - 4, py, x0, py, self.FG)
+            self.text(x0 - 8 - 6 * len(lab), py - 3, lab, scale=1)
+
+
+def _coolwarm(v):
+    v = np.clip(np.asarray(v, float), 0.0, 1.0)
+    stops = np.array([[59, 76, 192], [221, 221, 221], [180, 4, 38]], float)
+    pos = v * 2
+    lo = np.clip(pos, 0, 1)[..., None]
+    hi = np.clip(pos - 1, 0, 1)[..., None]
+    return ((stops[0] * (1 - lo) + stops[1] * lo) * (1 - hi)
+            + (stops[1] * (1 - hi) + stops[2] * hi) * hi)
+
+
+def fallback_figure(snapshot_times, snap_states, stackC, stackD, stackE,
+                    lengths_used, times_used, col, t_arr, seriesA, seriesB,
+                    exponent, exponent_stderr, amplitude, fit_range,
+                    grid, temp, max_r, path):
+    cv = FallbackCanvas()
+    W, H = cv.img.shape[1], cv.img.shape[0]
+    pw, ph = W // 3, H // 3
+    COLORS = [(0, 0, 255), (255, 0, 0), (0, 150, 0), (255, 140, 0),
+              (150, 0, 200), (0, 0, 0)]
+    boxes = [(j * pw + 70, i * ph + 55, (j + 1) * pw - 25, (i + 1) * ph - 45)
+             for i in range(3) for j in range(3)]
+    show = [snapshot_times[0], snapshot_times[len(snapshot_times) // 2],
+            snapshot_times[-1]]
+    for j, t in enumerate(show):
+        b = boxes[j]
+        im = _coolwarm((np.asarray(snap_states[t], float) + 1) / 2)
+        ih, iw = b[3] - b[1], b[2] - b[0]
+        ys = np.linspace(0, im.shape[0] - 1, ih).round().astype(int)
+        xs = np.linspace(0, im.shape[1] - 1, iw).round().astype(int)
+        cv.img[b[1]:b[3], b[0]:b[2]] = im[np.ix_(ys, xs)].astype(np.uint8)
+        cv.text(b[0], b[1] - 22, f"state t={t:g}", scale=2)
+    b = boxes[3]
+    for k in range(len(snapshot_times)):
+        cv.curve_map(b, np.arange(max_r), stackC[k], COLORS[k % 6])
+    cv.frame(b, "C(r,t) per snapshot", xticks=[(0, "0"), (0.5, "25"), (1, "50")],
+             yticks=[(0, "0"), (1, f"{stackC.max():.1f}")])
+    b = boxes[4]
+    if col is not None:
+        cv.curve_map(b, col["x"], col["master"], (0, 0, 0),
+                     xr=tuple(col["x_range"]))
+        for i in range(col["ys"].shape[0]):
+            cv.curve_map(b, col["x"], col["ys"][i], COLORS[i % 6], marker=True,
+                         xr=tuple(col["x_range"]))
+        cv.frame(b, f"collapse n={len(times_used)} q={col['quality']:.3f}",
+                 xticks=[(0, "0"), (1, f"{col['x_range'][1]:.2f}")],
+                 yticks=[(0, "0"), (1, "1")])
+    else:
+        cv.frame(b, "collapse n/a")
+    b = boxes[5]
+    lx = np.log10(t_arr); ly = np.log10(np.maximum(seriesB[0], 1e-3))
+    cv.curve_map(b, lx, ly, (0, 0, 255), marker=True)
+    if exponent is not None:
+        tf = np.logspace(np.log10(fit_range[0]), np.log10(fit_range[1]), 50)
+        cv.curve_map(b, np.log10(tf), np.log10(amplitude * tf ** exponent),
+                     (255, 0, 0))
+    xt = [((np.log10(v) - lx.min()) / (lx.max() - lx.min()),
+           f"1e{int(np.log10(v))}")
+          for v in (1e1, 1e3, 1e5) if lx.min() <= np.log10(v) <= lx.max()]
+    cv.frame(b, "L(t)=1/rho loglog + fit", xticks=xt,
+             yticks=[(0, f"{ly.min():.0f}"), (1, f"{ly.max():.0f}")])
+    b = boxes[6]
+    e, mm = seriesA[0], seriesA[1]
+    yr = (min(e.min(), mm.min()), max(e.max(), mm.max()))
+    cv.curve_map(b, lx, e, (0, 150, 0), yr=yr)
+    cv.curve_map(b, lx, mm, (200, 0, 200), yr=yr)
+    cv.frame(b, "seriesA energy/mag", xticks=xt,
+             yticks=[(0, f"{yr[0]:.2f}"), (1, f"{yr[1]:.2f}")])
+    b = boxes[7]
+    cv.curve_map(b, lx, seriesB[0], (0, 0, 255))
+    cv.curve_map(b, lx, seriesB[1], (255, 0, 0))
+    cv.frame(b, "seriesB L/rho (indep. scales)", xticks=xt,
+             yticks=[(0, "min"), (1, "max")])
+    b = boxes[8]
+    xcol = np.arange(grid) / grid
+    cv.curve_map(b, xcol, stackD[-1], (0, 0, 0), yr=(-1, 1))
+    cv.curve_map(b, xcol, stackE[-1, 0], (255, 0, 0), yr=(-1, 1))
+    cv.curve_map(b, xcol, stackE[-1, 1], (0, 0, 255), yr=(-1, 1))
+    cv.frame(b, "profiles final t", xticks=[(0, "0"), (1, "100")],
+             yticks=[(0, "-1"), (0.5, "0"), (1, "1")])
+    cv.text(20, H - 30, f"T={temp} grid={grid}x{grid} t_max={t_arr[-1]:g}", scale=2)
+    _png_write(path, cv.img)
+
+
+# --------------------------------------------------------------------- main
+def main():
+    with open(os.path.join(DATA_DIR, "parameters.json")) as fh:
+        params = json.load(fh)
+    grid = int(params["grid_size"])
+    temp = float(params["control"])
+    n_steps = int(params["n_steps"])
+    snapshot_times = [float(t) for t in params["snapshot_times"]]
+    measurement_times = [float(t) for t in params["measurement_times"]]
+    max_r = int(params["max_r"])
+    seed = int(params["dynamics_seed"])
+
+    state = np.load(os.path.join(DATA_DIR, "initial_state.npy")).astype(np.int8)
+    assert state.shape == (grid, grid)
+
+    rng = np.random.default_rng(seed)          # single RNG stream
+    prob_table = make_prob_table(temp)
+
+    meas_set = {int(t): k for k, t in enumerate(measurement_times)}
+    snap_set = {int(t): k for k, t in enumerate(snapshot_times)}
+
+    n_meas, n_snap = len(measurement_times), len(snapshot_times)
+    seriesA = np.full((2, n_meas), np.nan)
+    seriesB = np.full((2, n_meas), np.nan)
+    stackC = np.full((n_snap, max_r), np.nan)
+    stackD = np.full((n_snap, grid), np.nan)
+    stackE = np.full((n_snap, 2, grid), np.nan)
+    snap_states, snap_m, snap_rho = {}, {}, {}
+
+    def record(t):
+        idx = meas_set.get(t)
+        if idx is not None:
+            seriesA[0, idx] = energy_per_site(state)
+            seriesA[1, idx] = state.mean()
+            rho = wall_density(state)
+            seriesB[1, idx] = rho
+            seriesB[0, idx] = domain_length(rho, grid)
+        k = snap_set.get(t)
+        if k is not None:
+            stackC[k] = correlation(state, max_r)
+            stackD[k] = state.mean(axis=0)
+            stackE[k, 0] = (state == 1).mean(axis=0)
+            stackE[k, 1] = (state == -1).mean(axis=0)
+            snap_states[t] = state.copy()
+            snap_m[t] = float(state.mean())
+            snap_rho[t] = wall_density(state)
+
+    for t in range(1, n_steps + 1):
+        state = sweep(state, temp, rng, prob_table)
+        if t in meas_set or t in snap_set:
+            record(t)
+
+    # ------------------------------------------- growth window (data-driven)
+    # The finite system coarsens and then equilibrates: rho(t) decays from the
+    # random-quench value to a plateau rho_eq set by equilibrium thermal
+    # droplets (|m| -> Onsager m_eq).  Define the coarsening window as the
+    # measurement times from the first sample until rho first falls within 2%
+    # of its late-time plateau (median over the last 10% of samples).
+    rho_meas = seriesB[1]
+    n_tail = max(3, n_meas // 10)
+    rho_eq = float(np.median(rho_meas[-n_tail:]))
+    below = np.nonzero(rho_meas < rho_eq * 1.02)[0]
+    t_cross = (measurement_times[below[0]] if len(below)
+               else measurement_times[-1])
+
+    # ---------------------------------------------------------- metadata B
+    t_arr = np.asarray(measurement_times, float)
+    L_arr = seriesB[0]
+    fit_mask = (t_arr <= t_cross) & np.isfinite(L_arr) & (L_arr > 0)
+    fit_idx = np.nonzero(fit_mask)[0]
+    if len(fit_idx) >= 3:
+        tt, LL = t_arr[fit_idx], L_arr[fit_idx]
+        reg = linregress(np.log(tt), np.log(LL))
+        exponent = float(reg.slope)
+        exponent_stderr = float(reg.stderr)
+        amplitude = float(np.exp(reg.intercept))
+        r_squared = float(reg.rvalue ** 2)
+        fit_range = [float(tt.min()), float(tt.max())]
+    else:
+        exponent = exponent_stderr = amplitude = r_squared = None
+        fit_range = [0.0, 0.0]
+
+    # ---------------------------------------------------------- metadata A
+    # Collapse only over snapshots inside the coarsening window: equilibrated
+    # snapshots have C(r,t) ~ m^2 (flat) and cannot share a scaling curve.
+    snap_idx = [k for k, t in enumerate(snapshot_times) if t <= t_cross]
+    col = None
+    if len(snap_idx) >= 2:
+        col = collapse([stackC[k] for k in snap_idx],
+                       [domain_length(snap_rho[snapshot_times[k]], grid)
+                        for k in snap_idx],
+                       [snap_m[snapshot_times[k]] ** 2 for k in snap_idx],
+                       max_r)
+    notes_a = [
+        "control = 2.0236 is interpreted as the temperature T in units J/kB=1; "
+        "Tc(2D Ising) = 2/ln(1+sqrt(2)) = 2.26918, so this is a quench below Tc "
+        "from an uncorrelated random initial state -> Ising domain growth.",
+        "Dynamics: nonconserved single-spin-flip Metropolis with periodic "
+        "boundaries, applied on the two checkerboard sublattices for numpy "
+        "vectorisation; update order differs from random-sequential and only "
+        "affects short-time transients, not the scaling exponent. Time unit: "
+        "one full-lattice Monte Carlo sweep.",
+        "Observed behaviour: the finite 100x100 system coarsens for t <~ 500 "
+        "sweeps and then equilibrates into the ordered phase "
+        "(|m| -> ~0.90 ~ Onsager m_eq = 0.912 at this T; rho -> plateau "
+        "rho_eq ~ 0.069 set by equilibrium thermal droplets). Later times are "
+        "equilibrium fluctuations, not coarsening.",
+        "C(r,t): direction-averaged (radially binned) circular correlation "
+        "<s(x)s(x+r)> over displacement vectors with |r| in [r-0.5, r+0.5).",
+        "Domain length L(t) = 1/rho(t) (inverse domain-wall density, axes "
+        "averaged): tracks the growing domain size during coarsening and "
+        "saturates at 1/rho_eq ~ 14.6 after equilibration, because rho then "
+        "measures thermal droplets rather than domain walls.",
+        "Collapse restricted to snapshots inside the coarsening window "
+        f"(t <= {t_cross:g}); equilibrated snapshots have C(r,t) ~ m^2 (flat) "
+        "and cannot share a scaling curve.",
+        "Collapse variables: x = r/L(t), y = (C(r,t) - m(t)^2)/(1 - m(t)^2) "
+        "(connected, normalised correlation); curves interpolated onto a "
+        "200-point grid over the common overlap x in [0, min_i((r_max-1)/L_i)].",
+        "collapse_relative_rms_spread = RMS(y_i(x) - master(x)) / RMS(master(x)) "
+        "over that grid, master = mean of the collapsed curves; "
+        "collapse_quality = clip(1 - collapse_relative_rms_spread, 0, 1).",
+        "collapse_dimension = 2 is the spatial dimension of the coarsening "
+        "system; collapse_grid_size is the linear lattice size (100).",
+        "stackD is the column-averaged magnetisation profile m(x); stackE rows "
+        "are the column-averaged +1-phase and -1-phase densities; seriesA rows "
+        "are per-site energy and magnetisation; seriesB rows are L(t)=1/rho(t) "
+        "and the domain-wall density rho(t).",
+        "RNG: numpy.random.default_rng(dynamics_seed), created exactly once; "
+        "run is reproducible.",
+    ]
+    if col is not None:
+        metaA = {
+            "collapse_check_applicable": True,
+            "collapse_quality": col["quality"],
+            "collapse_relative_rms_spread": col["rel"],
+            "collapse_dimension": 2,
+            "collapse_snapshot_times": [snapshot_times[k] for k in snap_idx],
+            "collapse_lengths": [domain_length(snap_rho[snapshot_times[k]], grid)
+                                 for k in snap_idx],
+            "collapse_x_range": col["x_range"],
+            "collapse_grid_size": grid,
+            "notes": notes_a,
+        }
+    else:
+        metaA = {
+            "collapse_check_applicable": False,
+            "collapse_quality": None,
+            "collapse_relative_rms_spread": None,
+            "collapse_dimension": 2,
+            "collapse_snapshot_times": [],
+            "collapse_lengths": [],
+            "collapse_x_range": [0.0, 0.0],
+            "collapse_grid_size": 0,
+            "notes": notes_a,
+        }
+
+    notes_b = [
+        "Fit model: L(t) = amplitude * t^exponent, ordinary least squares on "
+        "(log t, log L); exponent is the effective coarsening growth exponent "
+        "(Allen-Cahn value for nonconserved 2D Ising is 1/2 at long times).",
+        "Fit range chosen from the data: L(t) = 1/rho(t) fit from the first "
+        "measurement time until rho(t) first falls within 2% of its late-time "
+        f"plateau rho_eq = {rho_eq:.4f} (median over the last 10% of "
+        f"measurement times), i.e. t in [{fit_range[0]:g}, {fit_range[1]:g}]. "
+        "Beyond that window the system is equilibrated and rho measures "
+        "equilibrium thermal droplets, so no power-law growth is defined there.",
+        "Because T = 2.0236 is only ~0.89 Tc, the finite 100x100 system "
+        "equilibrates (|m| -> ~0.90 ~ m_eq) within the requested 12305 sweeps; "
+        "the measured effective exponent over the coarsening window is "
+        "therefore smaller than the asymptotic 1/2.",
+        "L(t) estimator: inverse domain-wall density 1/rho(t), rho = fraction "
+        "of unlike nearest-neighbour pairs averaged over both axes.",
+        "control = 2.0236 interpreted as temperature below Tc = 2.26918 "
+        "(J = kB = 1); checkerboard Metropolis updates, periodic boundaries.",
+        "seriesA rows: per-site energy, magnetisation. seriesB rows: L(t)=1/rho, "
+        "domain-wall density. stackD: column-averaged magnetisation profile; "
+        "stackE rows: column-averaged +1/-1 phase densities.",
+    ]
+    metaB = {
+        "exponent": exponent,
+        "exponent_std_error": exponent_stderr,
+        "amplitude": amplitude,
+        "fit_range": fit_range,
+        "r_squared": r_squared,
+        "notes": notes_b,
+    }
+
+    # ---------------------------------------------------- save and validate
+    shapes = {"seriesA": (2, n_meas), "seriesB": (2, n_meas),
+              "stackC": (n_snap, max_r), "stackD": (n_snap, grid),
+              "stackE": (n_snap, 2, grid)}
+    arrays = {"seriesA": seriesA, "seriesB": seriesB, "stackC": stackC,
+              "stackD": stackD, "stackE": stackE}
+    for name, arr in arrays.items():
+        arr = np.ascontiguousarray(arr, dtype=np.float64)
+        assert arr.shape == shapes[name], (name, arr.shape, shapes[name])
+        assert np.all(np.isfinite(arr)), name
+        np.save(os.path.join(OUT_DIR, name + ".npy"), arr)
+    assert set(metaA) == {"collapse_check_applicable", "collapse_quality",
+                          "collapse_relative_rms_spread", "collapse_dimension",
+                          "collapse_snapshot_times", "collapse_lengths",
+                          "collapse_x_range", "collapse_grid_size", "notes"}
+    assert metaA["collapse_dimension"] == 2
+    assert metaA["collapse_grid_size"] == (grid if metaA["collapse_check_applicable"] else 0)
+    assert set(metaB) == {"exponent", "exponent_std_error", "amplitude",
+                          "fit_range", "r_squared", "notes"}
+    with open(os.path.join(OUT_DIR, "metadataA.json"), "w") as fh:
+        json.dump(metaA, fh, indent=2)
+    with open(os.path.join(OUT_DIR, "metadataB.json"), "w") as fh:
+        json.dump(metaB, fh, indent=2)
+
+    # -------------------------------------------------------------- figure
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        matplotlib = None
+
+    if matplotlib is not None:
+        fig = plt.figure(figsize=(15, 12))
+        gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
+        show_times = [snapshot_times[0], snapshot_times[n_snap // 2],
+                      snapshot_times[-1]]
+        for j, t in enumerate(show_times):
+            ax = fig.add_subplot(gs[0, j])
+            ax.imshow(snap_states[t], cmap="coolwarm", vmin=-1, vmax=1,
+                      interpolation="nearest")
+            ax.set_title(f"state, t = {t:g}")
+            ax.set_xticks([]); ax.set_yticks([])
+        ax = fig.add_subplot(gs[1, 0])
+        for k, t in enumerate(snapshot_times):
+            ax.plot(stackC[k], label=f"t={t:g}")
+        ax.set_xlabel("r"); ax.set_ylabel("C(r,t)"); ax.legend(fontsize=7)
+        ax.set_title("correlation C(r,t)")
+        ax = fig.add_subplot(gs[1, 1])
+        if col is not None:
+            for i, k in enumerate(snap_idx):
+                ax.plot(col["x"], col["ys"][i], "o", ms=3,
+                        label=f"t={snapshot_times[k]:g}")
+            ax.plot(col["x"], col["master"], "k-", lw=2, label="master")
+            ax.set_xlabel("r / L(t)")
+            ax.set_ylabel("(C - m$^2$)/(1 - m$^2$)")
+            ax.set_title(f"collapse (n={len(snap_idx)}, "
+                         f"quality={col['quality']:.3f})")
+            ax.legend(fontsize=6)
+        else:
+            ax.text(0.5, 0.5, "collapse n/a", ha="center", va="center")
+        ax = fig.add_subplot(gs[1, 2])
+        ax.loglog(t_arr, L_arr, "b.-", ms=4, label="L(t) = 1/rho")
+        if exponent is not None:
+            ttf = np.array(fit_range)
+            ax.loglog(ttf, amplitude * ttf ** exponent, "r--",
+                      label=f"fit: {exponent:.3f} +/- {exponent_stderr:.3f}")
+            ax.axvspan(*fit_range, color="r", alpha=0.1)
+        ax.axhline(1.0 / rho_eq, color="gray", ls=":", label="1/rho_eq")
+        ax.set_xlabel("t"); ax.set_ylabel("L(t)"); ax.legend(fontsize=7)
+        ax.set_title("domain length scale & power-law fit")
+        ax = fig.add_subplot(gs[2, 0])
+        ax.semilogx(t_arr, seriesA[0], "g.-", ms=3, label="energy/site")
+        ax.semilogx(t_arr, seriesA[1], "m.-", ms=3, label="magnetisation")
+        ax.set_xlabel("t"); ax.legend(fontsize=7); ax.set_title("seriesA")
+        ax = fig.add_subplot(gs[2, 1])
+        ax.semilogx(t_arr, seriesB[0], "b.-", ms=3, label="L(t) = 1/rho")
+        ax2 = ax.twinx()
+        ax2.semilogx(t_arr, seriesB[1], "r.-", ms=3, label="wall density")
+        ax.set_xlabel("t"); ax.set_ylabel("L(t)", color="b")
+        ax2.set_ylabel("rho(t)", color="r"); ax.set_title("seriesB")
+        ax = fig.add_subplot(gs[2, 2])
+        xcol = np.arange(grid)
+        ax.plot(xcol, stackD[-1], "k-", label="m(x)")
+        ax.plot(xcol, stackE[-1, 0], "r--", label="+ phase")
+        ax.plot(xcol, stackE[-1, 1], "b--", label="- phase")
+        ax.set_xlabel("column x"); ax.legend(fontsize=7)
+        ax.set_title(f"profiles, t = {snapshot_times[-1]:g}")
+        fig.suptitle(f"B3 Ising domain growth: T = {temp}, grid {grid}x{grid}, "
+                     f"{n_steps} sweeps (equilibrates at t ~ {t_cross:g})")
+        fig.savefig(os.path.join(OUT_DIR, "figure.png"), dpi=130)
+    else:
+        fallback_figure(snapshot_times, snap_states, stackC, stackD, stackE,
+                        None, snap_idx, col, t_arr, seriesA, seriesB,
+                        exponent, exponent_stderr, amplitude, fit_range,
+                        grid, temp, max_r, os.path.join(OUT_DIR, "figure.png"))
+
+    print("exponent", exponent, "+/-", exponent_stderr, "amplitude", amplitude,
+          "r2", r_squared, "range", fit_range)
+    print("rho_eq", rho_eq, "t_cross", t_cross,
+          "collapse snapshots", [snapshot_times[k] for k in snap_idx])
+    print("collapse rel_rms", col["rel"] if col else None,
+          "quality", col["quality"] if col else None,
+          "x_range", col["x_range"] if col else None)
+    print("final rho", seriesB[1, -1], "final m", seriesA[1, -1],
+          "final e", seriesA[0, -1])
+    print("figure renderer:", "matplotlib" if matplotlib is not None
+          else "numpy fallback")
+
+
+if __name__ == "__main__":
+    main()

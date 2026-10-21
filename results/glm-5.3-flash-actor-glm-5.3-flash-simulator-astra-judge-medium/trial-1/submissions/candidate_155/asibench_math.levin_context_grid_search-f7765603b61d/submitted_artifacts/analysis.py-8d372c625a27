@@ -1,0 +1,447 @@
+"""analysis.py — policy for hidden symbolic grid-search instances.
+
+Learns from solved training levels a statistical mapping from *local compound
+observations* to actions, exposed to the scorer as:
+
+    make_policy(training_data, config) -> policy
+    policy.action_probs(level, state, legal_actions) -> {action: prob}
+
+Design (validated by leave-one-level-out experiments on training data):
+  * The correct action is nearly determined by a *relative* encoding of the
+    four neighbor tiles: (neighbor_letter - cell_letter) mod 4, with walls /
+    goal kept as distinct symbols.
+  * Conditioning additionally on the previous action raises LOO top-1
+    accuracy from 0.864 to 0.975 (measured over all 6464 training steps).
+  * A recursive backoff hierarchy provides robustness:
+        (rel4 pattern, prev) -> rel4 pattern -> (abs4 pattern, prev)
+        -> abs4 pattern -> uniform over the action order
+    where abs4 encodes absolute neighbor letters mod 4 (usable even if the
+    cell letter is unavailable).
+  * Only non-spatial `level` metadata and the supplied `state` observation
+    fields are used; the grid is never read from `level` at eval time.
+  * All parsing of scorer-supplied fields is defensive: any unexpected format
+    degrades gracefully down the backoff chain, ultimately to the uniform
+    distribution over legal actions; action_probs never raises.
+
+Run `python analysis.py` for a self-test (LOO accuracy on training data plus
+an end-to-end search self-test on the public eval levels using a locally
+reconstructed wall='#' transition system -- the local simulator is an
+assumption, not the hidden scorer).
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from heapq import heappush, heappop
+
+# ---------------------------------------------------------------- constants
+
+DIRS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+LETTERS = "abcdefghijklmnopqrst"
+IDX = {c: i for i, c in enumerate(LETTERS)}
+GOAL_SYMBOL = "G"
+WALL_SYMBOL = "#"
+
+DEFAULT_CONFIG = {
+    "backoff_gamma": 1.0,        # recursive smoothing strength per level
+    "use_prev_action": True,     # include previous_action in the deepest keys
+    "use_absolute_branch": True, # include the absolute-mod-4 safety branch
+}
+
+# accepted spellings for each direction when `neighbors` is a dict
+_ALIASES = {
+    "U": ("u", "up", "north", "n"),
+    "D": ("d", "down", "south", "s"),
+    "L": ("l", "left", "west", "w"),
+    "R": ("r", "right", "east", "e"),
+}
+
+
+# ------------------------------------------------------------ observations
+
+def _clean_action(a):
+    """Normalize an action token to one of U/D/L/R, else None."""
+    if not isinstance(a, str):
+        return None
+    a = a.strip().upper()
+    return a if a in DIRS else None
+
+
+def _cell_value(v):
+    """Extract a tile letter/symbol from a possibly-nested neighbor value."""
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        for k in ("cell", "tile", "char", "symbol", "value", "letter"):
+            if k in v:
+                v = v[k]
+                break
+        else:
+            return None
+    if isinstance(v, bool) or isinstance(v, (list, tuple)):
+        return None
+    if isinstance(v, (int, float)):
+        # possibly already-encoded relative class (0..3) or wall marker
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if 0 <= iv <= 3 else WALL_SYMBOL
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    if not v:
+        return None
+    ch = v[0]
+    if ch == GOAL_SYMBOL:          # goal is uppercase 'G' (letters a-t are lowercase)
+        return GOAL_SYMBOL
+    lch = ch.lower()
+    if lch in IDX:
+        return lch
+    return WALL_SYMBOL  # walls and any unknown token act as opaque blocks
+
+
+def _parse_cell(state):
+    """Current-cell letter from `state`, or None."""
+    if not isinstance(state, dict):
+        return None
+    for key in ("cell", "tile", "current", "current_cell", "cell_char"):
+        if key in state:
+            v = _cell_value(state[key])
+            if v in IDX or v == GOAL_SYMBOL:
+                return v
+    return None
+
+
+def _parse_neighbors(state, order):
+    """Four neighbor tile values in `order`, or None if unusable."""
+    if not isinstance(state, dict):
+        return None
+    nb = state.get("neighbors")
+    if nb is None:
+        nb = state.get("nbrs", state.get("adjacent"))
+    if nb is None:
+        return None
+    out = {}
+    if isinstance(nb, dict):
+        lowered = {}
+        for k, v in nb.items():
+            if isinstance(k, str):
+                lowered[k.strip().lower()] = v
+        for act in order:
+            got = None
+            for key in (act.lower(),) + _ALIASES[act]:
+                if key in lowered:
+                    got = lowered[key]
+                    break
+            out[act] = _cell_value(got)
+        return out
+    if isinstance(nb, (list, tuple)):
+        vals = list(nb)
+        if len(vals) < len(order):
+            return None
+        for i, act in enumerate(order):  # assume first entries follow the order
+            out[act] = _cell_value(vals[i])
+        return out
+    if isinstance(nb, str) and len(nb) >= len(order):
+        for i, act in enumerate(order):
+            out[act] = _cell_value(nb[i])
+        return out
+    return None
+
+
+def _encode_pattern(nvals, cell):
+    """Encode 4 neighbor values relative to `cell` (absolute if cell is None).
+
+    Per direction: (letter - cell) mod 4 | letter mod 4 | 'G' | '#'.
+    """
+    ci = IDX.get(cell) if cell else None
+    code = []
+    for act in ("U", "D", "L", "R"):
+        v = nvals.get(act)
+        if v is None or v == WALL_SYMBOL:
+            code.append(WALL_SYMBOL)
+        elif v == GOAL_SYMBOL:
+            code.append(GOAL_SYMBOL)
+        elif isinstance(v, int):          # pre-encoded relative class
+            code.append(v % 4 if ci is not None else v)
+        elif v in IDX:
+            iv = IDX[v]
+            code.append((iv - ci) % 4 if ci is not None else iv % 4)
+        else:
+            code.append(WALL_SYMBOL)
+    return tuple(code)
+
+
+def _encode_absolute(nvals):
+    return _encode_pattern(nvals, None)
+
+
+# ------------------------------------------------------------ model builder
+
+class Policy:
+    """Lookup-based action model with recursive backoff smoothing."""
+
+    def __init__(self, training_data, config=None):
+        cfg = dict(DEFAULT_CONFIG)
+        if config:
+            for k, v in config.items():
+                if k in cfg:
+                    cfg[k] = v
+        self.cfg = cfg
+        order = training_data.get("action_order") if isinstance(training_data, dict) else None
+        self.order = [a for a in (order or ["U", "D", "L", "R"]) if _clean_action(a)]
+        if not self.order:
+            self.order = ["U", "D", "L", "R"]
+
+        gamma = float(cfg["backoff_gamma"])
+        self.gamma = gamma if gamma > 0 else 2.0
+        self.use_prev = bool(cfg["use_prev_action"])
+        self.use_abs = bool(cfg["use_absolute_branch"])
+
+        # counts, from deepest (most specific) to shallowest
+        self.c_rel_prev = defaultdict(lambda: defaultdict(int))  # (rel, prev) -> a
+        self.c_rel = defaultdict(lambda: defaultdict(int))       # rel -> a
+        self.c_abs_prev = defaultdict(lambda: defaultdict(int))  # (abs, prev) -> a
+        self.c_abs = defaultdict(lambda: defaultdict(int))       # abs -> a
+        self.n_samples = 0
+        self.n_levels = 0
+
+        levels = training_data.get("levels", []) if isinstance(training_data, dict) else []
+        for level in levels:
+            if self._absorb(level):
+                self.n_levels += 1
+
+    # -- training ----------------------------------------------------------
+    def _absorb(self, level):
+        if not isinstance(level, dict):
+            return False
+        grid = level.get("grid")
+        solution = level.get("solution")
+        start = level.get("start")
+        if not grid or not solution or start is None:
+            return False
+        h, w = len(grid), len(grid[0])
+        try:
+            r, c = int(start[0]), int(start[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if not (0 <= r < h and 0 <= c < w):
+            return False
+        prev = None
+        for action in solution:
+            a = _clean_action(action)
+            if a is None or a not in self.order:
+                break
+            nvals = {act: _cell_value(grid[r + DIRS[act][0]][c + DIRS[act][1]])
+                     if 0 <= r + DIRS[act][0] < h and 0 <= c + DIRS[act][1] < w
+                     else WALL_SYMBOL
+                     for act in self.order}
+            cell = _cell_value(grid[r][c])
+            rel = _encode_pattern(nvals, cell if cell in IDX else None)
+            tables = [(self.c_rel_prev, (rel, prev)), (self.c_rel, rel)]
+            if self.use_abs:
+                ab = _encode_absolute(nvals)
+                tables += [(self.c_abs_prev, (ab, prev)), (self.c_abs, ab)]
+            for table, key in tables:
+                table[key][a] += 1
+            self.n_samples += 1
+            # advance along the solution; stop if replay leaves the grid
+            r += DIRS[a][0]
+            c += DIRS[a][1]
+            if not (0 <= r < h and 0 <= c < w):
+                break
+            prev = a
+        return True
+
+    # -- scoring -----------------------------------------------------------
+    def _mix(self, counts, key, backoff):
+        """Smoothed distribution: (count + gamma * backoff) / (total + gamma)."""
+        c = counts.get(key)
+        if not c:
+            return backoff
+        total = sum(c.values())
+        g = self.gamma
+        return {a: (c.get(a, 0) + g * backoff.get(a, 0.0)) / (total + g)
+                for a in self.order}
+
+    def action_probs(self, level, state, legal_actions):
+        legal = []
+        seen = set()
+        for a in (legal_actions or []):
+            aa = _clean_action(a)
+            if aa and aa not in seen:
+                seen.add(aa)
+                legal.append(aa)
+        if not legal:
+            return {}
+
+        uniform = {a: 1.0 / len(self.order) for a in self.order}
+
+        rel = abs_ = prev = None
+        try:
+            nvals = _parse_neighbors(state, self.order)
+            if nvals is not None:
+                cell = _parse_cell(state)
+                rel = _encode_pattern(nvals, cell if cell in IDX else None)
+                if self.use_abs:
+                    abs_ = _encode_absolute(nvals)
+            if isinstance(state, dict):
+                pa = state.get("previous_action", state.get("prev_action"))
+                prev = _clean_action(pa) if self.use_prev else None
+        except Exception:
+            rel = abs_ = None
+            prev = None
+
+        # ultimate backoff: (optionally) absolute branch, else uniform
+        base = uniform
+        if self.use_abs and abs_ is not None:
+            base = self._mix(self.c_abs, abs_, base)
+            if prev is not None:
+                base = self._mix(self.c_abs_prev, (abs_, prev), base)
+        # primary branch: relative pattern (optionally + previous action)
+        dist = uniform
+        if rel is not None:
+            dist = self._mix(self.c_rel, rel, base)
+            if prev is not None:
+                dist = self._mix(self.c_rel_prev, (rel, prev), dist)
+        else:
+            dist = base
+
+        # restrict to legal actions, renormalize; never emit negative mass
+        raw = {a: max(0.0, float(dist.get(a, 0.0))) for a in legal}
+        total = sum(raw.values())
+        if total <= 0.0:
+            u = 1.0 / len(legal)
+            return {a: u for a in legal}
+        return {a: raw[a] / total for a in legal}
+
+
+def make_policy(training_data, config=None):
+    """Build a policy from solved training instances."""
+    return Policy(training_data, config)
+
+
+# ------------------------------------------------------------------ self-test
+
+def _loo_accuracy(training_data):
+    """Leave-one-level-out top-1 accuracy of the full backoff model."""
+    levels = training_data.get("levels", [])
+    total = covered = correct = 0
+    for i, held in enumerate(levels):
+        subset = {"action_order": training_data.get("action_order"),
+                  "levels": [l for j, l in enumerate(levels) if j != i]}
+        pol = Policy(subset)
+        grid = held["grid"]
+        h, w = len(grid), len(grid[0])
+        r, c = held["start"]
+        prev = None
+        for a in held["solution"]:
+            nvals = {act: grid[r + DIRS[act][0]][c + DIRS[act][1]]
+                     if 0 <= r + DIRS[act][0] < h and 0 <= c + DIRS[act][1] < w
+                     else WALL_SYMBOL for act in pol.order}
+            cell = grid[r][c]
+            probs = pol.action_probs({}, {"cell": cell, "neighbors": nvals,
+                                          "previous_action": prev},
+                                     ["U", "D", "L", "R"])
+            total += 1
+            best = max(probs, key=probs.get) if probs else None
+            correct += (best == a)
+            r += DIRS[a][0]
+            c += DIRS[a][1]
+            prev = a
+    return total, correct
+
+
+def _local_search(level, policy, budget):
+    """Guided best-first search on a locally reconstructed transition system.
+
+    Transition semantics (ASSUMPTION, mirrors training data): cells that are
+    not '#' are walkable; U/D/L/R move one step; goal reached on the 'G' cell.
+    Returns (reached, expansions_used, path_length).
+    """
+    grid = level["grid"]
+    h, w = len(grid), len(grid[0])
+    start = tuple(level["start"])
+    heap = []
+    counter = 0
+    heappush(heap, (0.0, counter, start, None, ""))
+    visited = {start}
+    expansions = 0
+    while heap and expansions < budget:
+        cost, _, pos, prev, hist = heappop(heap)
+        expansions += 1
+        r, c = pos
+        if grid[r][c] == GOAL_SYMBOL:
+            return True, expansions, len(hist)
+        legal = []
+        for act in policy.order:
+            dr, dc = DIRS[act]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and grid[nr][nc] != WALL_SYMBOL:
+                legal.append(act)
+        if not legal:
+            continue
+        nvals = {act: grid[r + DIRS[act][0]][c + DIRS[act][1]] for act in legal}
+        probs = policy.action_probs({}, {"cell": grid[r][c], "neighbors": nvals,
+                                         "previous_action": prev,
+                                         "history": hist}, legal)
+        for act in legal:
+            dr, dc = DIRS[act]
+            np_ = (r + dr, c + dc)
+            if np_ in visited:
+                continue
+            visited.add(np_)
+            p = max(probs.get(act, 0.0), 1e-9)
+            counter += 1
+            heappush(heap, (cost - math.log(p), counter, np_, act, hist + act))
+    return False, expansions, 0
+
+
+class _UniformPolicy:
+    """Baseline policy for the self-test comparison."""
+
+    order = ["U", "D", "L", "R"]
+
+    def action_probs(self, level, state, legal_actions):
+        legal = [_clean_action(a) for a in (legal_actions or [])]
+        legal = [a for a in legal if a]
+        if not legal:
+            return {}
+        u = 1.0 / len(legal)
+        return {a: u for a in legal}
+
+
+def _self_test():
+    import json
+    report = []
+    with open("data/training_levels.json") as f:
+        td = json.load(f)
+    total, correct = _loo_accuracy(td)
+    report.append("LOO: samples=%d top1=%d (%.3f)" % (total, correct, correct / total))
+
+    pol = Policy(td)
+    try:
+        with open("data/public_eval_levels.json") as f:
+            pe = json.load(f)
+    except FileNotFoundError:
+        report.append("public_eval_levels.json not found; self-test skipped")
+        return "\n".join(report)
+    budget = int(pe.get("budget", 95))
+    uni = _UniformPolicy()
+    tot_exp = tot_exp_u = 0
+    for level in pe["levels"]:
+        ok, exp, plen = _local_search(level, pol, budget)
+        ok_u, exp_u, _ = _local_search(level, uni, budget)
+        tot_exp += exp
+        tot_exp_u += exp_u
+        report.append("public %s: reached=%s expansions=%d path_len=%d | uniform reached=%s exp=%d"
+                      % (level["id"], ok, exp, plen, ok_u, exp_u))
+    report.append("total expansions: learned=%d, uniform-baseline=%d (budget %d/level)"
+                  % (tot_exp, tot_exp_u, budget))
+    return "\n".join(report)
+
+
+if __name__ == "__main__":
+    print(_self_test())

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+KEGG over-representation analysis (ORA) of significant DOWNREGULATED genes in
+Pseudomonas aeruginosa PA14 quorum-sensing mutants (strains 97, 98, 99)
+versus wildtype (strain 1).
+
+Pipeline (approved design):
+  1. Parse the three DESeq2 `DESeqResults` objects. The supplied .rds files are
+     gzip-compressed *custom* serializations (not standard RDS); a validated
+     decoder reads 5,828 rownames (PA14 locus tags) and 6 numeric columns.
+  2. Per mutant, select significant downregulated genes:
+         pvalue < 0.05  AND  log2FoldChange < -1.5
+     (raw Wald p-value and MLE log2FC; contrast is "Strain 9X vs 1", so
+      negative lfc = down in the mutant relative to wildtype strain 1).
+  3. Fetch PA14 -> KEGG Ortholog (KO) and KO -> KEGG pathway mappings from
+     rest.kegg.jp AT RUNTIME (KO-based mapping; no direct gene-to-pae match).
+  4. Hypergeometric over-representation test per pathway, per mutant, with the
+     full 5,828-gene set as the background (standard enrichKEGG behaviour).
+  5. Benjamini-Hochberg adjust the per-pathway p-values WITHIN each mutant.
+  6. Report the two KEGG pathways with adjusted p < 0.05 in ALL THREE mutants.
+
+If the KEGG network is unavailable at runtime, a clear error is logged and the
+script exits non-zero (it never silently skips the KEGG step).
+"""
+import sys
+import os
+import gzip
+import struct
+import math
+import time
+import json
+import urllib.request
+from collections import defaultdict
+
+# ---------------- 1. Custom DESeqResults decoder (validated) ----------------
+N = 5828
+RN_OFF = 0x5d
+RN_UNIT = 18
+COLS = [
+    ("baseMean",         0x1a87e),
+    ("log2FoldChange",   0x25ea6),
+    ("lfcSE",            0x314ce),
+    ("stat",             0x3caf6),
+    ("pvalue",           0x4811e),
+    ("padj",             0x53746),
+]
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE, "data")
+MUTANTS = {97: "res_1vs97.rds", 98: "res_1vs98.rds", 99: "res_1vs99.rds"}
+P_THRESH = 0.05
+LFC_THRESH = -1.5
+ORA_ADJ_P = 0.05
+
+
+def parse_deq_results(path):
+    with open(path, "rb") as fh:
+        dec = gzip.decompress(fh.read())
+    rn = [dec[RN_OFF + i * RN_UNIT + 7: RN_OFF + i * RN_UNIT + 17].decode()
+          for i in range(N)]
+    data = {}
+    for name, off in COLS:
+        data[name] = [struct.unpack(">d", dec[off + i * 8: off + i * 8 + 8])[0]
+                      for i in range(N)]
+    return rn, data
+
+
+def significant_downregulated(rn, data):
+    pv = data["pvalue"]
+    lf = data["log2FoldChange"]
+    return {rn[i] for i in range(N) if pv[i] < P_THRESH and lf[i] < LFC_THRESH}
+
+
+# ---------------- 2. KEGG REST client (runtime fetch) ----------------
+KEGG = "https://rest.kegg.jp"
+
+
+def http_get(url, retries=4, timeout=40):
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"GET {url} failed after {retries} attempts: {last!r}")
+
+
+def _sid(s):
+    return s.split(":")[-1]
+
+
+def fetch_kegg_organism():
+    """Find the KEGG organism whose gene IDs are PA14 locus tags."""
+    orgs = http_get(f"{KEGG}/list/organism").strip().split("\n")
+    candidates = []
+    for line in orgs:
+        p = line.split("\t")
+        if len(p) >= 2 and "Pseudomonas aeruginosa" in p[1]:
+            candidates.append((p[0], p[1]))
+    for code, name in candidates:
+        try:
+            raw = http_get(f"{KEGG}/link/ko/{code}")
+        except Exception:
+            continue
+        keys = [_sid(l.split("\t")[0]) for l in raw.strip().split("\n") if l.strip()]
+        pa14 = sum(1 for k in keys if k.startswith("PA14_"))
+        if pa14 > 0:
+            return code, name, pa14, len(keys)
+    if candidates:
+        return candidates[0][0], candidates[0][1], 0, 0
+    return "pae", "?", 0, 0
+
+
+def fetch_gene2ko(org):
+    g2k = defaultdict(set)
+    for line in http_get(f"{KEGG}/link/ko/{org}").strip().split("\n"):
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        if len(p) == 2:
+            g2k[_sid(p[0])].add(_sid(p[1]))
+    return g2k
+
+
+def fetch_ko2pathway():
+    k2p = defaultdict(set)
+    for line in http_get(f"{KEGG}/link/pathway/ko").strip().split("\n"):
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        if len(p) == 2:
+            k2p[_sid(p[1])].add(_sid(p[0]))
+    return k2p
+
+
+def fetch_pathway_names(org):
+    names = {}
+    for line in http_get(f"{KEGG}/list/pathway/{org}").strip().split("\n"):
+        if not line.strip():
+            continue
+        p = line.split("\t")
+        if len(p) >= 2:
+            names[_sid(p[0])] = p[1].split(" - ")[0]
+    return names
+
+
+# ---------------- 3. Statistics: hypergeometric ORA + BH ----------------
+def hypergeom_sf(k, N, K, n):
+    """P(X >= k) for X ~ Hypergeometric(N, K, n)."""
+    if K == 0 or n == 0 or k <= 0:
+        return 1.0
+    try:
+        from scipy.stats import hypergeom
+        return float(hypergeom.sf(k - 1, N, K, n))
+    except Exception:
+        def lcomb(a, b):
+            if b < 0 or b > a:
+                return None
+            return (math.lgamma(a + 1) - math.lgamma(b + 1) -
+                    math.lgamma(a - b + 1))
+        log_den = lcomb(N, n)
+        total = 0.0
+        for i in range(k, min(n, K) + 1):
+            t1 = lcomb(K, i)
+            t2 = lcomb(N - K, n - i)
+            if t1 is None or t2 is None:
+                continue
+            total += math.exp(t1 + t2 - log_den)
+        return min(1.0, total)
+
+
+def benjamini_hochberg(pvals):
+    """pvals: dict name->p. Returns dict name->BH adj_p."""
+    if not pvals:
+        return {}
+    m = len(pvals)
+    asc = sorted(pvals.items(), key=lambda x: x[1])
+    out = {}
+    running = 1.0
+    for i in range(len(asc) - 1, -1, -1):
+        name, p = asc[i]
+        running = min(running, (m * p) / (i + 1))
+        out[name] = min(1.0, running)
+    return out
+
+
+def genes_in_paths(ids, gene2ko, ko2path, valid_paths):
+    """Return dict pathway -> set(gene) for the given gene ids."""
+    gp = defaultdict(set)
+    for g in ids:
+        for ko in gene2ko.get(g, ()):
+            for p in ko2path.get(ko, ()):
+                if p in valid_paths:
+                    gp[p].add(g)
+    return gp
+
+
+def run_ora(gene_ids, down_ids, gene2ko, ko2path, valid_paths, N):
+    bg_paths = genes_in_paths(gene_ids, gene2ko, ko2path, valid_paths)
+    dn_paths = genes_in_paths(down_ids, gene2ko, ko2path, valid_paths)
+    n = len(down_ids)
+    pvals = {}
+    rows = []
+    for p in bg_paths:
+        K = len(bg_paths[p])
+        k = len(dn_paths.get(p, ()))
+        if k == 0:
+            continue
+        pvals[p] = hypergeom_sf(k, N, K, n)
+        rows.append((p, K, k))
+    adj = benjamini_hochberg(pvals)
+    return [(p, K, k, pvals[p], adj[p]) for (p, K, k) in rows]
+
+
+# ---------------- main ----------------
+def main():
+    print("=" * 78)
+    print("KEGG ORA: downregulated genes in PA14 QS mutants (97/98/99) vs WT (1)")
+    print("=" * 78)
+
+    # --- step 1+2: parse & filter (offline) ---
+    all_genes = set()
+    down = {}
+    for m, fn in MUTANTS.items():
+        rn, data = parse_deq_results(os.path.join(DATA_DIR, fn))
+        all_genes |= set(rn)
+        down[m] = significant_downregulated(rn, data)
+        print(f"\n[parse] {fn}: {len(rn)} genes")
+        print(f"        significant downregulated (p<{P_THRESH} & lfc<{LFC_THRESH}): "
+              f"{len(down[m])}")
+    bg = len(all_genes)
+    print(f"\n[background] union of gene sets = {bg} genes "
+          f"(ORA background = {bg}, per approved design)")
+
+    # --- step 3: KEGG mapping (runtime network) ---
+    print("\n[kegg] fetching PA14 -> KO and KO -> pathway from rest.kegg.jp ...")
+    try:
+        org, org_name, n_pa14, n_org = fetch_kegg_organism()
+        print(f"[kegg] organism: {org} ({org_name}); PA14 genes in KEGG gene->KO: "
+              f"{n_pa14}/{n_org}")
+        gene2ko = fetch_gene2ko(org)
+        ko2path = fetch_ko2pathway()
+        path_names = fetch_pathway_names(org)
+        valid_paths = set(path_names)
+        mapped = sum(1 for g in all_genes if g in gene2ko)
+        print(f"[kegg] background genes with >=1 KO: {mapped}/{bg}")
+        if mapped == 0:
+            raise RuntimeError(
+                "No PA14 locus tags mapped to KEGG KOs under this organism "
+                "code; an alternative PA14->KO source (e.g. NCBI KEGG "
+                "Orthology annotation) is required. Refusing an empty mapping.")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("\n" + "=" * 78 + "\n")
+        sys.stderr.write("FATAL: KEGG mapping could not be obtained.\n")
+        sys.stderr.write(f"  {type(e).__name__}: {e}\n")
+        sys.stderr.write("No network access to rest.kegg.jp in this "
+                         "environment. Re-run in the networked analysis "
+                         "runner to complete the ORA.\n")
+        sys.stderr.write("=" * 78 + "\n")
+        sys.exit(1)
+
+    # --- step 4+5: ORA per mutant + BH ---
+    per_mutant = {}
+    for m in sorted(MUTANTS):
+        res = run_ora(all_genes, down[m], gene2ko, ko2path, valid_paths, bg)
+        res.sort(key=lambda r: r[3])
+        per_mutant[m] = res
+        print(f"\n[ora] mutant {m}: {len(res)} pathways with >=1 downreg gene; "
+              f"top 15 by raw p:")
+        print(f"    {'pathway':10s} {'name':36s} {'K':>5s} {'k':>4s} "
+              f"{'p':>12s} {'adj_p':>12s}")
+        for (p, K, k, pv, ap) in res[:15]:
+            nm = path_names.get(p, p)
+            if len(nm) > 36:
+                nm = nm[:35] + "."
+            print(f"    {p:10s} {nm:36s} {K:5d} {k:4d} {pv:12.3e} {ap:12.3e}")
+
+    # --- step 6: conserved pathways (adj p < 0.05 in all three) ---
+    sig = {m: {p for (p, K, k, pv, ap) in per_mutant[m] if ap < ORA_ADJ_P}
+           for m in MUTANTS}
+    print("\n" + "=" * 78)
+    for m in sorted(MUTANTS):
+        print(f"mutant {m}: {len(sig[m])} pathways with BH adj p < {ORA_ADJ_P}")
+    common = sig[97] & sig[98] & sig[99]
+    print(f"CONSERVED (adj p < {ORA_ADJ_P} in ALL THREE mutants): {len(common)}")
+
+    def mean_adj(p):
+        vals = [ap for m in MUTANTS for (pp, K, k, pv, ap) in per_mutant[m]
+                if pp == p]
+        return sum(vals) / len(vals) if vals else 1.0
+
+    ranked = sorted(common, key=mean_adj)
+    for p in ranked:
+        print(f"  - {p}: {path_names.get(p, p)}")
+    print("\n>>> TWO CONSERVED PATHWAYS (answer):")
+    for p in ranked[:2]:
+        print(f"    {p}  --  {path_names.get(p, p)}")
+
+    out = {"background": bg,
+           "significant_downregulated": {str(m): len(down[m]) for m in down},
+           "conserved_pathways": [{"id": p, "name": path_names.get(p, p)}
+                                  for p in ranked]}
+    with open(os.path.join(BASE, "kegg_ora_summary.json"), "w") as fh:
+        json.dump(out, fh, indent=2)
+    print("\nSaved summary to kegg_ora_summary.json")
+
+
+if __name__ == "__main__":
+    main()

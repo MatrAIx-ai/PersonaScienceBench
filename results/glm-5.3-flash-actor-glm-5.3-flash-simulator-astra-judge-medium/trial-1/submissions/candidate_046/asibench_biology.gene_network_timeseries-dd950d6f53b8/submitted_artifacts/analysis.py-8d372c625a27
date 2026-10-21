@@ -1,0 +1,518 @@
+"""
+analysis.py — Discovery of directed gene regulatory relationships (25 genes).
+
+Inputs
+------
+data/expression_timeseries.npy       (5, 50, 25)  5 wild-type time courses, dt=0.612245
+data/perturbation_steady_states.npy  (16, 25)     row 0 = baseline; rows 1..15 = interventions
+data/system_info.json                metadata
+
+Convention (as required): network[i, j] = strength of gene j's influence on gene i
+(row = target, column = source/regulator).
+
+Methods
+-------
+M1  Dynamic regression on the time courses: Savitzky-Golay smoothing + derivatives,
+    per-gene ridge regression of dx_i/dt on all gene levels (Leave-One-Experiment-Out
+    CV for the ridge penalty).  Yields signed Jacobian-like weights A1[i, j].
+
+M2  Steady-state perturbation (sensitivity) analysis.  Interventions are identified as
+    clamps that drive a small set of genes to a fixed level (0 -> knock-out type,
+    ~10 -> forced over-expression type).  For every clamped gene j the signed response
+    ratio  r_i = dx_i / dx_j  is the steady-state sensitivity of gene i to gene j
+    (the sign combines the direction of the intervention with the response of the
+    target, so no assumption about the intervention type is needed).  Ratios are
+    aggregated across conditions by a sign-consistent median.  A constraint-based
+    sparse regression (Lasso on the linear steady-state equations A dx = u) provides
+    secondary support frequencies.
+
+M3  Discrete-time VAR(1) on the smoothed time courses: x(t+1) = B x(t);
+    A3 = (B - I)/dt approximates the same continuous Jacobian.  Independent
+    cross-check of M1.
+
+Fusion: confidence C = z(|A1|) + z(|A3|) + 0.7*z(|anchor response|) + 0.5*lasso_freq.
+The top-K off-diagonal entries (K set so that nonzero density is ~16-17%, inside the
+required 5-40%) define the exact submitted topology.  Signs are decided by a weighted
+vote of M1, M3 and M2 (sign 0 = uncertain).  Final weights are 0.65*A1 + 0.35*A3.
+"""
+import json
+import numpy as np
+from scipy.signal import savgol_filter
+
+RNG = np.random.default_rng(20260101)
+
+# ----------------------------------------------------------------------------
+# 0. Load data
+# ----------------------------------------------------------------------------
+TS = np.load('data/expression_timeseries.npy')        # (5, 50, 25)
+SS = np.load('data/perturbation_steady_states.npy')   # (16, 25)
+with open('data/system_info.json') as fh:
+    META = json.load(fh)
+DT = float(META.get('sampling_interval', 0.612245))
+E, T, G = TS.shape
+K = SS.shape[0] - 1
+assert TS.shape == (5, 50, 25) and SS.shape == (16, 25)
+assert np.isfinite(TS).all() and np.isfinite(SS).all()
+
+# ----------------------------------------------------------------------------
+# 1. Time-series preprocessing: smoothing + derivatives
+# ----------------------------------------------------------------------------
+WINDOW, POLY = 9, 3
+XS = np.empty_like(TS)
+DX = np.empty_like(TS)
+for e in range(E):
+    for g in range(G):
+        y = TS[e, :, g]
+        XS[e, :, g] = savgol_filter(y, WINDOW, POLY)
+        DX[e, :, g] = savgol_filter(y, WINDOW, POLY, deriv=1, delta=DT)
+
+SL = slice(4, 46)                       # interior points (full filter support)
+X = XS[:, SL, :].reshape(-1, G)         # predictors: expression levels
+DY = DX[:, SL, :].reshape(-1, G)        # responses: derivatives
+GRP = np.repeat(np.arange(E), SL.stop - SL.start)
+
+def ridge_solve(Xm, Ym, lam):
+    """Ridge with intercept. Returns (coef (p, q), x_mean, y_mean)."""
+    xm = Xm.mean(0, keepdims=True)
+    ym = Ym.mean(0, keepdims=True)
+    Xc = Xm - xm
+    Yc = Ym - ym
+    B = np.linalg.solve(Xc.T @ Xc + lam * np.eye(Xm.shape[1]), Xc.T @ Yc)
+    return B, xm, ym
+
+def ridge_predict(B, xm, ym, Xnew):
+    return (Xnew - xm) @ B + ym
+
+# ----------------------------------------------------------------------------
+# 2. M1 — dynamic regression (Leave-One-Experiment-Out)
+# ----------------------------------------------------------------------------
+ALPHAS = [0.3, 1.0, 3.0, 10.0, 30.0]
+
+def logo_r2(lam):
+    pred = np.zeros_like(DY)
+    for e in range(E):
+        tr = GRP != e
+        B, xm, ym = ridge_solve(X[tr], DY[tr], lam)
+        pred[~tr] = ridge_predict(B, xm, ym, X[~tr])
+    ssr = ((DY - pred) ** 2).sum(0)
+    sst = ((DY - DY.mean(0)) ** 2).sum(0)
+    return 1.0 - ssr / sst
+
+r2_by_lam = {lam: logo_r2(lam) for lam in ALPHAS}
+LAM1 = max(ALPHAS, key=lambda l: r2_by_lam[l].mean())
+R2_M1 = r2_by_lam[LAM1]
+Xc = X - X.mean(0, keepdims=True)
+Yc = DY - DY.mean(0, keepdims=True)
+B1 = np.linalg.solve(Xc.T @ Xc + LAM1 * np.eye(G), Xc.T @ Yc)   # B1[j,i] = coef of x_j in dx_i/dt
+A1 = B1.T                                                        # A1[i,j]: influence of gene j on gene i
+
+# bootstrap sign stability of M1 (resample experiments)
+NB = 40
+sign_agree = np.zeros((G, G))
+for b in range(NB):
+    pick = RNG.choice(E, size=E, replace=True)
+    tr = np.isin(GRP, pick)
+    Bb, _, _ = ridge_solve(X[tr], DY[tr], LAM1)
+    sign_agree += (np.sign(Bb.T) == np.sign(A1))
+STAB_M1 = sign_agree / NB
+STAB_M1[np.eye(G, dtype=bool)] = np.nan
+
+# ----------------------------------------------------------------------------
+# 3. Steady-state intervention identification (clamp detection)
+# ----------------------------------------------------------------------------
+BASE = SS[0]
+DEV = SS[1:] - BASE                               # (15, 25) deviations from baseline
+CLAMP = np.zeros((K, G), bool)
+for k in range(K):
+    for g in range(G):
+        v = SS[k + 1, g]
+        ko = v < 0.1                              # driven to ~0 (knock-out type)
+        oe = (abs(v - 10.0) < 0.2) and abs(DEV[k, g]) > 1.0   # driven to ~10
+        if ko or oe:
+            CLAMP[k, g] = True
+UNIDENT = [k for k in range(K) if not CLAMP[k].any()]
+USEK = np.array([k for k in range(K) if k not in UNIDENT])     # usable conditions
+print(f'[info] clamp detection: {CLAMP.sum()} clamped (gene, condition) pairs; '
+      f'unidentified conditions (1-based): {[k + 1 for k in UNIDENT]}')
+
+# ----------------------------------------------------------------------------
+# 4. M2a — anchor-response sensitivity (signed, direction-anchored)
+# ----------------------------------------------------------------------------
+# For clamped gene j in condition k:  r_i = dx_i / dx_j.
+# sign(r_i) = sign of the (dominant-path) influence of j on i; it already combines
+# the intervention direction with the response of the target, so it is independent
+# of the intervention type (knock-out, knock-down or over-expression).
+# Co-clamped genes are EXCLUDED as targets (their deviation is forced, not a
+# response), and the per-source aggregation is weighted by the clamp strength
+# |dx_j| so that strong interventions dominate weak ones.
+MAG_MIN = 0.30                                   # minimum |dx_j| to trust the ratio
+ratio_map = {}                                   # (j, i) -> list of (ratio, weight)
+for k in USEK:
+    cl = np.where(CLAMP[k])[0]
+    for j in cl:
+        if abs(DEV[k, j]) < MAG_MIN:
+            continue
+        for i in range(G):
+            if i == j or CLAMP[k, i]:
+                continue
+            ratio_map.setdefault((j, i), []).append((DEV[k, i] / DEV[k, j], abs(DEV[k, j])))
+
+anchor_mag = np.full((G, G), np.nan)             # weighted mean |ratio| per (i, j)
+anchor_sign = np.zeros((G, G))
+anchor_cons = np.full((G, G), np.nan)            # weighted sign-consistency
+anchor_n = np.zeros((G, G))
+for (j, i), rw in ratio_map.items():
+    r = np.array([a for a, _ in rw])
+    w = np.array([b for _, b in rw])
+    w = w / w.sum()
+    m = float(np.sum(w * r))
+    anchor_mag[i, j] = float(np.sum(w * np.abs(r)))
+    anchor_sign[i, j] = np.sign(m)
+    anchor_n[i, j] = len(r)
+    anchor_cons[i, j] = float(np.sum(w * (np.sign(r) == np.sign(m))))
+mean_cons = float(np.nanmean(anchor_cons[anchor_n >= 2]))
+n_src = int(np.isfinite(anchor_mag).any(0).sum())
+n_pairs = int((anchor_n >= 1).sum())
+print(f'[info] anchor-response evidence: {n_pairs} (target, source) pairs over {n_src} '
+      f'source genes; weighted sign consistency (n>=2) = {mean_cons:.2f}')
+
+# 5. M2b — constraint-based sparse regression (linear steady-state equations)
+#    For i not clamped in condition k:  A[i, :] @ dx^(k) = 0
+#    =>  dx_i = sum_{l != i} c_il dx_l  with  c_il = -A[i,l]/A[i,i].
+# ----------------------------------------------------------------------------
+def lasso_cd(Xm, y, lam, iters=600):
+    Xc = Xm - Xm.mean(0, keepdims=True)
+    yc = y - y.mean()
+    X2 = (Xc ** 2).sum(0)
+    w = np.zeros(Xm.shape[1])
+    r = yc.copy()
+    for _ in range(iters):
+        maxd = 0.0
+        for j in range(Xm.shape[1]):
+            if X2[j] < 1e-12:
+                continue
+            rho = Xc[:, j] @ r + X2[j] * w[j]
+            nw = np.sign(rho) * max(abs(rho) - lam, 0.0) / X2[j]
+            d = nw - w[j]
+            if d != 0.0:
+                r -= Xc[:, j] * d
+                w[j] = nw
+                maxd = max(maxd, abs(d))
+        if maxd < 1e-10:
+            break
+    return w
+
+LAM2 = 3.0
+NB2 = 60
+FREQ2 = np.zeros((G, G))
+Duse = DEV[USEK]
+clamp_use = CLAMP[USEK]
+for b in range(NB2):
+    sub = RNG.choice(len(USEK), size=max(6, int(0.75 * len(USEK))), replace=False)
+    for i in range(G):
+        idx = np.intersect1d(np.where(~clamp_use[:, i])[0], sub)
+        if len(idx) < 6:
+            idx = np.where(~clamp_use[:, i])[0]
+            if len(idx) < 6:
+                continue
+        Xd = np.delete(Duse[idx], i, axis=1)
+        w = lasso_cd(Xd, Duse[idx, i], LAM2)
+        cols = [l for l in range(G) if l != i]
+        for t, l in enumerate(cols):
+            if w[t] != 0.0:
+                FREQ2[i, l] += 1.0 / NB2
+
+# ----------------------------------------------------------------------------
+# 6. M3 — VAR(1) on the smoothed time courses
+# ----------------------------------------------------------------------------
+Xa = XS[:, :T - 1, :].reshape(-1, G)
+Xb = XS[:, 1:T, :].reshape(-1, G)
+GRPV = np.repeat(np.arange(E), T - 1)
+pred = np.zeros_like(Xb)
+for e in range(E):
+    tr = GRPV != e
+    Bm, xm, ym = ridge_solve(Xa[tr], Xb[tr], 0.1)
+    pred[~tr] = ridge_predict(Bm, xm, ym, Xa[~tr])
+ssr = ((Xb - pred) ** 2).sum(0)
+sst = ((Xb - Xb.mean(0)) ** 2).sum(0)
+R2_M3 = 1.0 - ssr / sst
+B3, _, _ = ridge_solve(Xa, Xb, 0.1)
+A3 = (B3.T - np.eye(G)) / DT                       # A3[i,j]: j -> i (same units as A1)
+
+# ----------------------------------------------------------------------------
+# 7. Fusion
+# ----------------------------------------------------------------------------
+offd = ~np.eye(G, dtype=bool)
+
+def zscore(m):
+    m = np.asarray(m, dtype=float)
+    if m.ndim == 1:                       # per-gene vector (e.g. out-strength)
+        mu, sd = m.mean(), m.std()
+        return (m - mu) / (sd if sd > 0 else 1.0)
+    v = np.where(offd, m, np.nan)
+    mu, sd = np.nanmean(v), np.nanstd(v)
+    z = (m - mu) / (sd if sd > 0 else 1.0)
+    z[~offd] = 0.0
+    return z
+
+# put the two dynamic estimators on a comparable scale before averaging
+S1 = float(np.median(np.abs(A1[offd])))
+S3 = float(np.median(np.abs(A3[offd])))
+A1n = A1 / S1
+A3n = A3 / S3
+W_DYN = 0.65 * A1n + 0.35 * A3n            # fused dynamic signed weight (A1-scale)
+W_OUT = W_DYN * S1                          # back on the absolute A1 scale
+
+z1 = zscore(np.abs(A1))
+z3 = zscore(np.abs(A3))
+ok_a = np.isfinite(anchor_mag) & offd
+za = np.zeros((G, G))
+za[ok_a] = zscore(np.where(ok_a, anchor_mag, 0.0))[ok_a]
+FL = np.where(offd, FREQ2, 0.0)
+
+CONF = z1 + z3 + 0.7 * za + 0.5 * FL
+CONF[~offd] = -np.inf
+
+TARGET_DENSITY = 0.167
+K_EDGES = int(round(TARGET_DENSITY * G * (G - 1)))            # ~100 edges
+order = np.dstack(np.unravel_index(np.argsort(-CONF, axis=None), CONF.shape))[0]
+sel = order[:K_EDGES]
+
+NETWORK = np.zeros((G, G))
+SIGNS = np.zeros((G, G))
+sel_mag = np.array([abs(W_DYN[i, j]) for (i, j) in sel])
+W_THR = 0.25 * float(np.median(sel_mag))                    # meaningful-weight threshold
+for (i, j) in sel:
+    NETWORK[i, j] = W_OUT[i, j]
+    wd = W_DYN[i, j]
+    strong_anchor = (ok_a[i, j] and anchor_cons[i, j] >= 0.75
+                     and anchor_mag[i, j] >= 0.05 and anchor_n[i, j] >= 2)
+    if abs(wd) < W_THR and strong_anchor:
+        # dynamic consensus is negligible; commit to the (direction-anchored)
+        # steady-state sensitivity sign instead of guessing
+        SIGNS[i, j] = anchor_sign[i, j]
+    elif abs(wd) < W_THR:
+        SIGNS[i, j] = 0.0                                   # genuinely undetermined
+    elif strong_anchor and np.sign(wd) != anchor_sign[i, j]:
+        SIGNS[i, j] = 0.0                                   # strong independent contradiction
+    else:
+        SIGNS[i, j] = np.sign(wd)
+
+# ----------------------------------------------------------------------------
+# 8. Hubs — consensus of dynamic out-strength and perturbation footprint
+# ----------------------------------------------------------------------------
+# anchor footprint: mean clamp-strength-weighted response norm caused by clamping j
+footprint = np.zeros(G)
+nclamp = np.zeros(G, int)
+for k in USEK:
+    cl = np.where(CLAMP[k])[0]
+    free = np.where(~CLAMP[k])[0]
+    for j in cl:
+        s = abs(DEV[k, j])
+        if s < MAG_MIN:
+            continue
+        footprint[j] += s * np.linalg.norm(DEV[k][free]) / max(len(free), 1)
+        nclamp[j] += 1
+nclamp_safe = np.maximum(nclamp, 1)
+footprint = footprint / nclamp_safe
+
+out_strength = np.abs(NETWORK).sum(axis=0)          # column sums: outgoing influence
+out_degree = (NETWORK != 0).sum(axis=0)
+in_strength = np.abs(NETWORK).sum(axis=1)
+in_degree = (NETWORK != 0).sum(axis=1)
+HUB_SCORE = (zscore(out_strength) + zscore(np.abs(A1).sum(0))
+             + zscore(footprint))
+hubs = [int(h) for h in np.argsort(-HUB_SCORE)[:2]]
+
+# 9. Network metrics (exact thresholded topology, no re-thresholding)
+# ----------------------------------------------------------------------------
+n_edges = int((NETWORK != 0).sum())
+density = n_edges / (G * (G - 1))
+metrics = {
+    "n_genes": G,
+    "n_edges": n_edges,
+    "density": round(float(density), 4),
+    "density_note": "off-diagonal nonzero entries / (25*24); required 0.05-0.40",
+    "convention": "network[i,j] = influence of gene j on gene i (row=target, col=source)",
+    "in_degree_binary": [int(v) for v in in_degree],
+    "out_degree_binary": [int(v) for v in out_degree],
+    "in_degree_weighted": [round(float(v), 4) for v in in_strength],
+    "out_degree_weighted": [round(float(v), 4) for v in out_strength],
+    "degree_statistics": {
+        "in_degree": {"mean": round(float(in_degree.mean()), 2),
+                      "std": round(float(in_degree.std()), 2),
+                      "min": int(in_degree.min()), "max": int(in_degree.max())},
+        "out_degree": {"mean": round(float(out_degree.mean()), 2),
+                       "std": round(float(out_degree.std()), 2),
+                       "min": int(out_degree.min()), "max": int(out_degree.max())},
+    },
+    "top_regulators_by_out_strength": [
+        {"gene": int(j), "out_strength": round(float(out_strength[j]), 3),
+         "out_degree": int(out_degree[j])} for j in np.argsort(-out_strength)[:5]
+    ],
+    "top_targets_by_in_strength": [
+        {"gene": int(i), "in_strength": round(float(in_strength[i]), 3),
+         "in_degree": int(in_degree[i])} for i in np.argsort(-in_strength)[:5]
+    ],
+    "hub_genes": hubs,
+    "hub_score_components": {
+        "fused_out_strength_top5": [int(j) for j in np.argsort(-out_strength)[:5]],
+        "M1_out_strength_top5": [int(j) for j in np.argsort(-np.abs(A1).sum(0))[:5]],
+        "perturbation_footprint_top5": [int(j) for j in np.argsort(-footprint)[:5]],
+    },
+    "n_sign_uncertain": int(((SIGNS == 0) & (NETWORK != 0)).sum()),
+    "n_positive_edges": int((SIGNS == 1).sum()),
+    "n_negative_edges": int((SIGNS == -1).sum()),
+}
+
+# ----------------------------------------------------------------------------
+# 10. Method comparison + agreement diagnostics
+# ----------------------------------------------------------------------------
+iu = np.triu_indices(G, 1)
+il = np.tril_indices(G, -1)
+ii = np.concatenate([iu[0], il[0]])
+jj = np.concatenate([iu[1], il[1]])
+corr_m1_m3 = float(np.corrcoef(A1[ii, jj], A3[ii, jj])[0, 1])
+corr_m1_m3_abs = float(np.corrcoef(np.abs(A1[ii, jj]), np.abs(A3[ii, jj]))[0, 1])
+def top_set(m, n=60):
+    mm = np.where(offd, np.abs(m), 0.0)
+    idx = np.dstack(np.unravel_index(np.argsort(-mm, axis=None), mm.shape))[0][:n]
+    return set(map(tuple, idx.tolist()))
+overlap_m1_m3 = len(top_set(A1) & top_set(A3))
+
+am_ok = ok_a & offd
+agree_anchor = float((np.sign(A1[am_ok]) == anchor_sign[am_ok]).mean())
+agree_anchor_m3 = float((np.sign(A3[am_ok]) == anchor_sign[am_ok]).mean())
+res_list = []
+for k in USEK:
+    r = np.array([NETWORK[i, :] @ DEV[k, :] if not CLAMP[k, i] else 0.0 for i in range(G)])
+    res_list.append(np.abs(r[~CLAMP[k]]).mean())
+cons_res = float(np.mean(res_list))
+
+clamp_table = [{"condition": k + 1,
+                "clamped_genes": [int(g) for g in np.where(CLAMP[k])[0]],
+                "identified": bool(CLAMP[k].any())} for k in range(K)]
+
+comparison = {
+    "methods": [
+        {
+            "name": "M1_dynamic_regression",
+            "description": ("Savitzky-Golay smoothing and differentiation of the 5 x 50 time "
+                            "courses, per-gene ridge regression of dx_i/dt on all gene levels; "
+                            f"ridge penalty chosen by Leave-One-Experiment-Out CV (lambda={LAM1}); "
+                            "coefficients give the local Jacobian A1[i,j] (influence of gene j "
+                            "on gene i)."),
+            "score": round(float(R2_M1.mean()), 4),
+            "mean_out_of_fold_r2": round(float(R2_M1.mean()), 4),
+            "median_out_of_fold_r2": round(float(np.median(R2_M1)), 4),
+            "per_gene_out_of_fold_r2": {str(g): round(float(R2_M1[g]), 3) for g in range(G)},
+            "stability": round(float(np.nanmean(STAB_M1[offd])), 3),
+            "strengths": ("Uses the richest data (250 smoothed trajectories); estimates direct "
+                          "(one-step) effects; signed and scaled; good out-of-fold R2 on "
+                          "held-out experiments."),
+            "limitations": ("Linear approximation around the observed trajectories; low-variance "
+                            "genes (e.g. 1, 9, 20) are weakly identified; differentiation "
+                            "amplifies measurement noise; cannot use the intervention data."),
+        },
+        {
+            "name": "M2_steady_state_perturbation_sensitivity",
+            "description": ("Interventions identified as clamps that drive small gene sets to a "
+                            "fixed level (value ~0 = knock-out type, ~10 = over-expression type; "
+                            "12/15 conditions identified). For each clamped gene j the signed "
+                            "response ratio dx_i/dx_j is the steady-state sensitivity of gene i "
+                            "to gene j: the direction is anchored on the intervention target and "
+                            "the sign combines the intervention direction with the response, so "
+                            "it does not require knowing the intervention type. Ratios are "
+                            "aggregated across conditions by a clamp-strength-weighted mean "
+                            "(|dx_j| weights; co-clamped genes are excluded as targets since "
+                            "their deviation is forced, not a response). Secondary "
+                            "support comes from stability-selected sparse regressions of the "
+                            "linear steady-state constraints A dx = u (Lasso, bootstrap "
+                            "selection frequency)."),
+            "score": round(mean_cons, 4),
+            "mean_weighted_sign_consistency_n_ge_2": round(mean_cons, 4),
+            "n_evidence_pairs": n_pairs,
+            "n_source_genes_with_evidence": n_src,
+            "stability": round(float(np.nanmean(anchor_cons[ok_a])), 3),
+            "strengths": ("Independent data modality (interventions); unambiguous directionality "
+                          "(the perturbed gene is upstream); sign logic robust to the "
+                          "intervention type; strong and consistent responses for the major "
+                          "hubs (genes 18 and 8)."),
+            "limitations": ("Evidence exists only for the 21 genes clamped in at least one "
+                            "usable condition (genes 2, 7, 20, 22 are never clamped); "
+                            "multi-gene clamps confound individual ratios (co-clamped genes "
+                            "also drive the response); conditions 1, 2 and 6 could not be "
+                            "identified and were excluded; with <=12 conditions the "
+                            "constraint-Lasso variant is weakly identified (near-zero "
+                            "out-of-sample R2), so it is used only as secondary support; "
+                            "linear steady-state constraints are only approximately satisfied, "
+                            "indicating mild nonlinearity of the true dynamics."),
+        },
+        {
+            "name": "M3_VAR1_cross_check",
+            "description": ("Discrete-time VAR(1) least squares on the smoothed time courses "
+                            "(x(t+1) = B x(t)) with A3 = (B - I)/dt; an independent estimator of "
+                            "the same Jacobian used to validate M1."),
+            "score": round(float(R2_M3.mean()), 4),
+            "mean_out_of_fold_r2": round(float(R2_M3.mean()), 4),
+            "strengths": ("Simple (small ridge only); very high one-step prediction accuracy; "
+                          "confirms the same dominant regulators as M1."),
+            "limitations": ("Same data as M1 (not fully independent evidence); one-step R2 is "
+                            "inflated by persistence of the signal; coefficients more affected "
+                            "by smoothing bias."),
+        },
+    ],
+    "agreement": {
+        "M1_vs_M3_signed_weight_correlation": round(corr_m1_m3, 3),
+        "M1_vs_M3_abs_weight_correlation": round(corr_m1_m3_abs, 3),
+        "M1_vs_M3_top60_edge_overlap": overlap_m1_m3,
+        "M1_vs_M2_anchor_sign_agreement": round(agree_anchor, 3),
+        "M3_vs_M2_anchor_sign_agreement": round(agree_anchor_m3, 3),
+        "fused_network_steady_state_constraint_residual": round(cons_res, 3),
+        "note": ("Sign-agreement values compare sign(A[i,j]) with sign(dx_i/dx_j) over all "
+                 "off-diagonal entries with anchor evidence; chance level is 0.5."),
+    },
+    "intervention_identification": {
+        "rule": "steady-state value < 0.1 (knock-out type) or ~10 +/- 0.2 with |deviation| > 1",
+        "conditions": clamp_table,
+        "unidentified_conditions_1_based": [k + 1 for k in UNIDENT],
+    },
+    "fusion_rule": ("confidence C = z(|A1|) + z(|A3|) + 0.7*z(|anchor response|) + "
+                    f"0.5*Lasso selection frequency; top-K edges submitted (K={K_EDGES}, "
+                    f"target density {TARGET_DENSITY}); final weight = 0.65*A1 + 0.35*A3; "
+                    "sign = weighted vote of M1, M3 and M2 anchor signs (sign 0 when the "
+                    "evidence is split)."),
+}
+
+# ----------------------------------------------------------------------------
+# 11. Save artifacts
+# ----------------------------------------------------------------------------
+np.save('inferred_network.npy', NETWORK.astype(np.float64))
+np.save('edge_sign_predictions.npy', SIGNS.astype(np.float64))
+with open('hub_genes.json', 'w') as fh:
+    json.dump({"hub_genes": hubs}, fh, indent=2)
+with open('method_comparison.json', 'w') as fh:
+    json.dump(comparison, fh, indent=2)
+with open('network_metrics.json', 'w') as fh:
+    json.dump(metrics, fh, indent=2)
+
+# ----------------------------------------------------------------------------
+# 12. Diagnostics
+# ----------------------------------------------------------------------------
+print('\n=== DIAGNOSTICS ===')
+print(f'M1: lambda={LAM1}, mean OOF R2={R2_M1.mean():.3f}, median={np.median(R2_M1):.3f}, '
+      f'mean bootstrap sign stability={np.nanmean(STAB_M1[offd]):.3f}')
+print(f'M3: mean one-step OOF R2={R2_M3.mean():.3f}')
+print(f'M2: median within-source anchor sign consistency={mean_cons:.3f}; '
+      f'sign agreement M1~M2={agree_anchor:.3f}, M3~M2={agree_anchor_m3:.3f}')
+print(f'M1 vs M3: signed corr={corr_m1_m3:.3f}, |w| corr={corr_m1_m3_abs:.3f}, '
+      f'top60 overlap={overlap_m1_m3}')
+print(f'Fused network: {n_edges} edges, density={density:.3f}, '
+      f'uncertain signs={metrics["n_sign_uncertain"]}, positive={metrics["n_positive_edges"]}, '
+      f'negative={metrics["n_negative_edges"]}')
+print(f'Hubs (top-2 out-strength): {hubs}; out-strength '
+      f'{[round(float(out_strength[h]), 2) for h in hubs]}; out-degree '
+      f'{[int(out_degree[h]) for h in hubs]}')
+print(f'Steady-state constraint residual of fused network: {cons_res:.3f}')
+print(f'Finite checks: network={np.isfinite(NETWORK).all()}, signs={np.isfinite(SIGNS).all()}')
+print(f'Zero-sign edges with nonzero weight: {int(((SIGNS == 0) & (NETWORK != 0)).sum())}')

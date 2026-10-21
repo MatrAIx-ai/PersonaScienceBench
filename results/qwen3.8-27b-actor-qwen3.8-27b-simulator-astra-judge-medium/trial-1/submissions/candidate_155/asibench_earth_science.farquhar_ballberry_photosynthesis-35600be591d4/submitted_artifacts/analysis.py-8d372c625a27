@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+Leaf Physiological Response Reconstruction
+==========================================
+Land-surface coupled Farquhar(C3) / Collatz(C4) photosynthesis + Ball-Berry
+stomatal conductance, closed with a gas-diffusion chain to a common
+(Ci, A) fixed point, following the exact scientific convention in the task.
+
+Outputs (under results/):
+  leaf_fluxes.csv       one row per forcing.csv row
+  case_convergence.csv  one row per test_cases.json record
+  diurnal.png           diurnal A and rs for sunlit + shaded leaves (5 days)
+
+The figure is rendered with a small self-contained PNG writer (numpy +
+zlib + struct) so the script runs without matplotlib / PIL.
+"""
+import os
+import json
+import math
+import zlib
+import struct
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------
+# Physical constants / conventions
+# ----------------------------------------------------------------------
+R = 8.314                 # J mol-1 K-1
+Kc25 = 30.0               # Pa   (C3 CO2 affinity at 25 C)
+Ko25 = 30000.0            # Pa   (C3 O2 affinity at 25 C)
+Q10_Kc = 2.1              # Q10 for Kc
+Q10_Ko = 1.2              # Q10 for Ko
+# (Vcmax Q10 = 2.4 is in the Vcmax(T) formula)
+
+NIGHT_PAR_THRESH = 1e-6   # W m-2 ; below this -> night (respiratory)
+TOL = 1e-8                # Ci convergence tolerance (Pa)
+MAXIT = 1000              # max Picard iterations
+
+
+def esat_water(T_K):
+    """Saturation vapour pressure over liquid water (Pa), Magnus/Tetens."""
+    Tc = T_K - 273.15
+    return 611.21 * np.exp(17.502 * Tc / (T_K - 38.15))
+
+
+def vcmax_T(vcmax25, T_K):
+    """CLM/Noah-MP Q10 Vcmax with high-temperature inhibition (umol m-2 s-1)."""
+    Tc = T_K - 273.16
+    Tk = Tc + 273.16
+    base = vcmax25 * 2.4 ** ((Tc - 25.0) / 10.0)
+    inhib = 1.0 + np.exp((-2.2e5 + 710.0 * Tk) / (R * Tk))
+    return base / inhib
+
+
+def kc_ko_gs(T_K, o2_pa):
+    """C3 temperature-scaled Kc, Ko and CO2 compensation point Gamma_star."""
+    Tc = T_K - 273.16
+    Kc = Kc25 * Q10_Kc ** ((Tc - 25.0) / 10.0)
+    Ko = Ko25 * Q10_Ko ** ((Tc - 25.0) / 10.0)
+    gamma_star = 0.5 * (Kc / Ko) * o2_pa * 0.21
+    return Kc, Ko, gamma_star
+
+
+class LeafModel:
+    """Leaf parameters + per-row forcing -> coupled (Ci, A) solve."""
+
+    def __init__(self, params):
+        self.pathway = params["pathway"]
+        self.vcmax25 = float(params["vcmax25"])
+        self.bb_slope = float(params["bb_slope"])      # m
+        self.b0 = float(params["bb_intercept"])        # intercept conductance
+        self.alpha_q = float(params["alpha_q"])
+        self.n_factor = float(params["n_factor"])
+
+    def _derived(self, row):
+        T = float(row["t_air_K"])
+        p_atm = float(row["p_atm_Pa"])
+        Vc_T = vcmax_T(self.vcmax25, T)
+        Vc_eff = Vc_T * self.n_factor * float(row["btran"])
+        Rd = 0.015 * Vc_eff
+        cf = p_atm / (R * T)
+        es = esat_water(T)
+        h_s = min(max(1.0 - float(row["vpd_Pa"]) / es, 0.25), 1.0)
+        return T, p_atm, Vc_eff, Rd, cf, h_s
+
+    def _gross(self, Ci, Vc_eff, Rd, APAR, p_atm, o2_pa, T):
+        """min(Wc, Wj, We) - Rd  (Ci in Pa, umol m-2 s-1)."""
+        if self.pathway == "C4":
+            Wc = Vc_eff
+            Wj = self.alpha_q * APAR
+            We = 4000.0 * Vc_eff * Ci / p_atm
+        else:  # C3 (Farquhar)
+            Kc, Ko, gamma_star = kc_ko_gs(T, o2_pa)
+            Wc = Vc_eff * (Ci - gamma_star) / (Ci + Kc * (1.0 + o2_pa / Ko))
+            J = self.alpha_q * APAR
+            Wj = J * (Ci - gamma_star) / (4.0 * Ci + 8.0 * gamma_star)
+            We = 0.5 * Vc_eff
+        return min(Wc, Wj, We) - Rd
+
+    def _diffusion(self, A_umol, ca, rb, cf, p_atm, h_s, gs_override=None):
+        """Given A (umol), return cs, gs, rs, Ci (Pa)."""
+        A_mol = A_umol / 1e6
+        cs = ca - 1.37 * rb * A_mol / cf * p_atm
+        if gs_override is not None:
+            gs = gs_override
+        else:
+            gs = self.bb_slope * A_mol * h_s / cs * p_atm + self.b0
+        rs = cf / gs
+        ci = cs - 1.65 * rs * A_mol / cf * p_atm
+        return cs, gs, rs, ci
+
+    def solve_day(self, row, par, ci0, tol=TOL, maxit=MAXIT):
+        """Coupled (Ci, A) fixed point under light."""
+        T, p_atm, Vc_eff, Rd, cf, h_s = self._derived(row)
+        ca = float(row["co2_pa"]); o2 = float(row["o2_pa"])
+        rb = float(row["rb_sm"])
+        APAR = 4.6 * max(par, 0.0)
+
+        ci = ci0
+        n_iter = 0
+        A = self._gross(ci, Vc_eff, Rd, APAR, p_atm, o2, T)
+        for it in range(1, maxit + 1):
+            cs, gs, rs, ci_new = self._diffusion(A, ca, rb, cf, p_atm, h_s)
+            n_iter = it
+            if abs(ci_new - ci) < tol:
+                ci = ci_new
+                break
+            ci = ci_new
+            A = self._gross(ci, Vc_eff, Rd, APAR, p_atm, o2, T)
+        A = self._gross(ci, Vc_eff, Rd, APAR, p_atm, o2, T)
+        cs, gs, rs, ci = self._diffusion(A, ca, rb, cf, p_atm, h_s)
+        return {"A": A, "ci": ci, "gs": gs, "rs": rs, "n_iter": n_iter}
+
+    def solve_night(self, row):
+        """Night: respiratory assimilation A=-Rd, intercept conductance b0."""
+        T, p_atm, Vc_eff, Rd, cf, h_s = self._derived(row)
+        ca = float(row["co2_pa"]); rb = float(row["rb_sm"])
+        A = -Rd
+        cs, gs, rs, ci = self._diffusion(A, ca, rb, cf, p_atm, h_s,
+                                         gs_override=self.b0)
+        return {"A": A, "ci": ci, "gs": gs, "rs": rs, "n_iter": 0}
+
+    def solve(self, row, par, ci0):
+        """Dispatch day/night for a given PAR value (ci0 used for day only)."""
+        if par <= NIGHT_PAR_THRESH:
+            return self.solve_night(row)
+        return self.solve_day(row, par, ci0)
+
+
+# ----------------------------------------------------------------------
+# Minimal PNG writer (no external image library)
+# ----------------------------------------------------------------------
+def write_png(path, img):
+    """img: uint8 HxWx3 RGB array."""
+    h, w = img.shape[:2]
+
+    def chunk(typ, data):
+        c = typ + data
+        return struct.pack(">I", len(data)) + c + struct.pack(
+            ">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                 # filter type 0 (None)
+        raw.extend(img[y].tobytes())
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+    with open(path, "wb") as f:
+        f.write(sig)
+        f.write(chunk(b"IHDR", ihdr))
+        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+FONT = {
+ 'A':("01110","10001","10001","11111","10001","10001","10001"),
+ 'B':("11110","10001","10001","11110","10001","10001","11110"),
+ 'C':("01110","10001","10000","10000","10000","10001","01110"),
+ 'D':("11110","10001","10001","10001","10001","10001","11110"),
+ 'E':("11111","10000","10000","11110","10000","10000","11111"),
+ 'F':("11111","10000","10000","11110","10000","10000","10000"),
+ 'G':("01110","10001","10000","10111","10001","10001","01111"),
+ 'H':("10001","10001","10001","11111","10001","10001","10001"),
+ 'I':("01110","00100","00100","00100","00100","00100","01110"),
+ 'J':("00111","00010","00010","00010","00010","10010","01100"),
+ 'K':("10001","10010","10100","11000","10100","10010","10001"),
+ 'L':("10000","10000","10000","10000","10000","10000","11111"),
+ 'M':("10001","11011","10101","10101","10001","10001","10001"),
+ 'N':("10001","11001","10101","10011","10001","10001","10001"),
+ 'O':("01110","10001","10001","10001","10001","10001","01110"),
+ 'P':("11110","10001","10001","11110","10000","10000","10000"),
+ 'R':("11110","10001","10001","11110","10100","10010","10001"),
+ 'S':("01111","10000","10000","01110","00001","00001","11110"),
+ 'T':("11111","00100","00100","00100","00100","00100","00100"),
+ 'U':("10001","10001","10001","10001","10001","10001","01110"),
+ 'V':("10001","10001","10001","10001","10001","01010","00100"),
+ 'W':("10001","10001","10001","10101","10101","10101","01010"),
+ 'a':("00000","00000","01110","00001","01111","10001","01111"),
+ 'b':("10000","10000","10110","11001","10001","10001","11110"),
+ 'c':("00000","00000","01110","10000","10000","10001","01110"),
+ 'd':("00001","00001","01101","10011","10001","10001","01111"),
+ 'e':("00000","00000","01110","10001","11111","10000","01110"),
+ 'f':("00110","01001","01000","11110","01000","01000","01000"),
+ 'g':("00000","01111","10001","10001","01111","00001","01110"),
+ 'h':("10000","10000","10110","11001","10001","10001","10001"),
+ 'i':("00100","00000","01100","00100","00100","00100","01110"),
+ 'k':("10000","10000","10010","10100","11000","10100","10010"),
+ 'l':("01100","00100","00100","00100","00100","00100","01110"),
+ 'm':("00000","00000","11010","10101","10101","10001","10001"),
+ 'n':("00000","00000","10110","11001","10001","10001","10001"),
+ 'o':("00000","00000","01110","10001","10001","10001","01110"),
+ 'p':("00000","00000","10110","11001","10110","10000","10000"),
+ 'r':("00000","00000","10110","11001","10000","10000","10000"),
+ 's':("00000","00000","01111","10000","01110","00001","11110"),
+ 't':("01000","01000","11110","01000","01000","01001","00110"),
+ 'u':("00000","00000","10001","10001","10001","10011","01101"),
+ 'v':("00000","00000","10001","10001","10001","01010","00100"),
+ 'w':("00000","00000","10001","10001","10101","10101","01010"),
+ 'y':("00000","00001","10001","10001","01111","00001","01110"),
+ '0':("01110","10001","10011","10101","11001","10001","01110"),
+ '1':("00100","01100","00100","00100","00100","00100","01110"),
+ '2':("01110","10001","00001","00110","01000","10000","11111"),
+ '3':("11111","00010","00100","00010","00001","10001","01110"),
+ '4':("00010","00110","01010","10010","11111","00010","00010"),
+ '5':("11111","10000","11110","00001","00001","10001","01110"),
+ '6':("00110","01000","10000","11110","10001","10001","01110"),
+ '7':("11111","00001","00010","00100","01000","01000","01000"),
+ '8':("01110","10001","10001","01110","10001","10001","01110"),
+ '9':("01110","10001","10001","01111","00001","00010","01100"),
+ ' ':("00000","00000","00000","00000","00000","00000","00000"),
+ '(':("00010","00100","01000","01000","01000","00100","00010"),
+ ')':("01000","00100","00010","00010","00010","00100","01000"),
+ '-':("00000","00000","00000","01110","00000","00000","00000"),
+ '/':("00001","00010","00010","00100","01000","01000","10000"),
+ '.':("00000","00000","00000","00000","00000","00110","00110"),
+ ':':("00000","00110","00110","00000","00110","00110","00000"),
+}
+
+
+def _stamp(img, x, y, r, color):
+    x = int(round(x)); y = int(round(y))
+    H, W = img.shape[:2]
+    for dy in range(-r, r + 1):
+        yy = y + dy
+        if yy < 0 or yy >= H:
+            continue
+        for dx in range(-r, r + 1):
+            xx = x + dx
+            if 0 <= xx < W:
+                img[yy, xx] = color
+
+
+def _line(img, x0, y0, x1, y1, color, r=2, dash=None):
+    dx = x1 - x0; dy = y1 - y0
+    L = math.hypot(dx, dy)
+    if L == 0:
+        _stamp(img, x0, y0, r, color); return
+    n = max(2, int(L))
+    for i in range(n + 1):
+        t = i / n
+        if dash and (i % dash) > dash * 0.55:
+            continue
+        _stamp(img, x0 + dx * t, y0 + dy * t, r, color)
+
+
+def _rect(img, x0, y0, x1, y1, color, r=1):
+    _line(img, x0, y0, x1, y0, color, r)
+    _line(img, x1, y0, x1, y1, color, r)
+    _line(img, x1, y1, x0, y1, color, r)
+    _line(img, x0, y1, x0, y0, color, r)
+
+
+def _text(img, x, y, s, color, scale=2):
+    cx = x
+    H, W = img.shape[:2]
+    for ch in s:
+        g = FONT.get(ch)
+        if g is not None:
+            for ry in range(7):
+                row = g[ry]
+                for rx in range(5):
+                    if row[rx] == '1':
+                        for sy in range(scale):
+                            yy = int(round(y + ry * scale + sy))
+                            if yy < 0 or yy >= H:
+                                continue
+                            for sx in range(scale):
+                                xx = int(round(cx + rx * scale + sx))
+                                if 0 <= xx < W:
+                                    img[yy, xx] = color
+        cx += 6 * scale
+    return cx
+
+
+def _text_w(s, scale=2):
+    return len(s) * 6 * scale
+
+
+def _nice_ticks(lo, hi, n=5):
+    if hi <= lo:
+        hi = lo + 1.0
+    span = hi - lo
+    step0 = span / max(1, n)
+    mag = 10 ** math.floor(math.log10(step0))
+    step = mag
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * mag
+        if step >= step0:
+            break
+    start = math.ceil(lo / step) * step
+    ticks = []
+    v = start
+    while v <= hi + 1e-9:
+        ticks.append(v)
+        v += step
+    return ticks
+
+
+def make_figure(flux, path):
+    W, H = 1000, 700
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    BLACK = (0, 0, 0)
+    GRAY = (205, 205, 205)
+    SUN = (232, 119, 30)
+    SHADE = (218, 165, 32)
+
+    t = flux["time_hr"].to_numpy(dtype=float)
+    x_lo, x_hi = float(t.min()), float(t.max())
+    LX, RX = 75, 940
+
+    title = "Diurnal A and rs (sun vs shade) - 5 days"
+    _text(img, (W - _text_w(title)) // 2, 12, title, BLACK, 3)
+
+    def draw_panel(y0, y1, y_sun, y_shd, ylab, y_lo, y_hi):
+        def X(x): return LX + (x - x_lo) / (x_hi - x_lo) * (RX - LX)
+        def Y(y): return y1 - (y - y_lo) / (y_hi - y_lo) * (y1 - y0)
+        _rect(img, LX, y0, RX, y1, BLACK, 1)
+        for gx in _nice_ticks(x_lo, x_hi, 6):
+            _line(img, X(gx), y0, X(gx), y1, GRAY, 1)
+        for gy in _nice_ticks(y_lo, y_hi, 5):
+            _line(img, LX, Y(gy), RX, Y(gy), GRAY, 1)
+        if y_lo < 0 < y_hi:
+            _line(img, LX, Y(0), RX, Y(0), (150, 150, 150), 1)
+        for i in range(len(t) - 1):
+            _line(img, X(t[i]), Y(y_shd[i]), X(t[i + 1]), Y(y_shd[i + 1]),
+                  SHADE, 2, dash=9)
+        for i in range(len(t) - 1):
+            _line(img, X(t[i]), Y(y_sun[i]), X(t[i + 1]), Y(y_sun[i + 1]),
+                  SUN, 2)
+        for gx in _nice_ticks(x_lo, x_hi, 6):
+            lab = "%d" % int(round(gx))
+            _text(img, X(gx) - _text_w(lab) // 2, y1 + 6, lab, BLACK, 2)
+        for gy in _nice_ticks(y_lo, y_hi, 5):
+            lab = "%d" % int(round(gy))
+            _text(img, LX - _text_w(lab) - 6, Y(gy) - 7, lab, BLACK, 2)
+        _text(img, 8, (y0 + y1) // 2 - 7, ylab, BLACK, 2)
+
+    A_sun = flux["A_sun"].to_numpy(dtype=float)
+    A_shd = flux["A_shade"].to_numpy(dtype=float)
+    rs_sun = flux["rs_sun"].to_numpy(dtype=float)
+    rs_shd = flux["rs_shade"].to_numpy(dtype=float)
+
+    # A panel: include 0 and a little pad
+    a_lo = min(A_sun.min(), A_shd.min(), 0.0)
+    a_hi = max(A_sun.max(), A_shd.max())
+    a_pad = (a_hi - a_lo) * 0.07
+    draw_panel(60, 330, A_sun, A_shd, "A (umol m-2 s-1)", a_lo - a_pad,
+               a_hi + a_pad)
+
+    # rs panel: from 0
+    r_hi = max(rs_sun.max(), rs_shd.max())
+    draw_panel(400, 655, rs_sun, rs_shd, "rs (s m-1)", 0.0, r_hi * 1.07)
+
+    xtitle = "time (h)"
+    _text(img, (W - _text_w(xtitle)) // 2, H - 22, xtitle, BLACK, 2)
+
+    # legend (top-right of A panel)
+    lx, ly = RX - 150, 60 + 12
+    _line(img, lx, ly, lx + 34, ly, SUN, 2)
+    _text(img, lx + 42, ly - 7, "sun", BLACK, 2)
+    _line(img, lx, ly + 22, lx + 34, ly + 22, SHADE, 2, dash=9)
+    _text(img, lx + 42, ly + 15, "shade", BLACK, 2)
+
+    write_png(path, img)
+
+
+def main():
+    base = os.path.dirname(os.path.abspath(__file__))
+    data = os.path.join(base, "data")
+    out = os.path.join(base, "results")
+    os.makedirs(out, exist_ok=True)
+
+    with open(os.path.join(data, "leaf_params.json")) as f:
+        params = json.load(f)
+    forcing = pd.read_csv(os.path.join(data, "forcing.csv"))
+    with open(os.path.join(data, "test_cases.json")) as f:
+        cases = json.load(f)
+
+    model = LeafModel(params)
+
+    # ---- leaf_fluxes.csv (one row per forcing row) --------------------
+    records = []
+    prev_ci = {"sun": float(forcing["co2_pa"].iloc[0]),
+               "shade": float(forcing["co2_pa"].iloc[0])}
+    for _, row in forcing.iterrows():
+        sun = model.solve(row, float(row["par_sun_wm2"]), prev_ci["sun"])
+        shd = model.solve(row, float(row["par_shade_wm2"]), prev_ci["shade"])
+        prev_ci["sun"] = sun["ci"]
+        prev_ci["shade"] = shd["ci"]
+        records.append({
+            "time_hr": row["time_hr"],
+            "A_sun": sun["A"], "A_shade": shd["A"],
+            "rs_sun": sun["rs"], "rs_shade": shd["rs"],
+            "ci_sun": sun["ci"], "ci_shade": shd["ci"],
+            "gs_sun": sun["gs"], "gs_shade": shd["gs"],
+        })
+    flux = pd.DataFrame(records, columns=[
+        "time_hr", "A_sun", "A_shade", "rs_sun", "rs_shade",
+        "ci_sun", "ci_shade", "gs_sun", "gs_shade"])
+    flux.to_csv(os.path.join(out, "leaf_fluxes.csv"), index=False)
+
+    # ---- case_convergence.csv (iterate from ci_init to convergence) ---
+    crecords = []
+    for c in cases:
+        row = forcing.iloc[int(c["forcing_index"])].copy()
+        ci0 = float(c["ci_init_pa"])
+        res = model.solve(row, float(row["par_sun_wm2"]), ci0)
+        crecords.append({
+            "case_id": c["case_id"],
+            "ci_init_pa": ci0,
+            "ci_final_pa": res["ci"],
+            "A_final": res["A"],
+            "rs_final": res["rs"],
+            "n_iterations": res["n_iter"],
+        })
+    cdf = pd.DataFrame(crecords, columns=[
+        "case_id", "ci_init_pa", "ci_final_pa", "A_final", "rs_final",
+        "n_iterations"])
+    cdf.to_csv(os.path.join(out, "case_convergence.csv"), index=False)
+
+    # ---- diurnal.png ---------------------------------------------------
+    make_figure(flux, os.path.join(out, "diurnal.png"))
+
+    # ---- console summary ----------------------------------------------
+    pd.set_option("display.width", 200)
+    print("=== leaf_fluxes.csv (head/tail) ===")
+    print(flux.head(3).to_string(index=False))
+    print("...")
+    print(flux.tail(3).to_string(index=False))
+    print("\nA_sun range   :", round(float(flux["A_sun"].min()), 4),
+          "to", round(float(flux["A_sun"].max()), 4))
+    print("A_shade range :", round(float(flux["A_shade"].min()), 4),
+          "to", round(float(flux["A_shade"].max()), 4))
+    print("rs_sun range  :", round(float(flux["rs_sun"].min()), 3),
+          "to", round(float(flux["rs_sun"].max()), 3))
+    print("ci range      :",
+          round(float(min(flux["ci_sun"].min(), flux["ci_shade"].min())), 3),
+          "to",
+          round(float(max(flux["ci_sun"].max(), flux["ci_shade"].max())), 3))
+    print("\n=== case_convergence.csv ===")
+    print(cdf.to_string(index=False))
+    print("\nWrote:", sorted(os.listdir(out)))
+
+
+if __name__ == "__main__":
+    main()

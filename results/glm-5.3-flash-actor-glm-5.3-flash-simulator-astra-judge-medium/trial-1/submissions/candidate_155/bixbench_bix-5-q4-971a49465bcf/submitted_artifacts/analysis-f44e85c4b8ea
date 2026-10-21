@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+ASXL1-mutated fibroblasts: differential expression + functional enrichment
+==========================================================================
+Question: Which is the most enriched process in the ASXL1-mutated fibroblasts?
+
+Explicit assumptions (approved by researcher):
+  * coldata 'disease' = ASXL1-mutated fibroblasts, 'control' = control
+    (ASSUMPTION - metadata does not itself name the mutated gene).
+  * MGD1640F, MGD1641F (2 extra count columns with no metadata) are DROPPED.
+  * Primary model ~ condition; sex only as a sensitivity analysis.
+  * Environment is offline, no R/Bioconductor, no pydeseq2/gseapy/goatools,
+    no local GO annotation (probed and recorded). DE is implemented as a
+    DESeq2-style negative-binomial GLM pipeline in pure Python.
+  * GO enrichment uses a RESEARCHER-APPROVED FALLBACK: systematic manual
+    classification into GO-branch-guided curated gene sets, tested by
+    hypergeometric ORA + pre-ranked GSEA. This is a SURROGATE, NOT a formal
+    full-GO-BP enrichment.
+"""
+import os, json
+import numpy as np, pandas as pd
+import scipy.stats as st
+import statsmodels.api as sm
+from statsmodels.genmod.families import NegativeBinomial
+from statsmodels.stats.multitest import multipletests
+
+os.makedirs("/workspace/outputs", exist_ok=True)
+log = lambda *a: print(*a, flush=True)
+
+probe = {}
+for m in ['numpy','pandas','scipy','statsmodels','openpyxl','pydeseq2','gseapy','goatools']:
+    try: __import__(m); probe[m] = "OK"
+    except Exception: probe[m] = "MISSING"
+log("ENV PROBE:", probe)
+
+CNT = "/workspace/data/Issy_ASXL1_fibro_featureCounts_GeneTable_final.txt"
+CD  = "/workspace/data/Issy_ASXL1_fibro_coldata_gender.xlsx"
+GEN = "/workspace/data/gencode.v31.primary_assembly.genes.csv"
+HGN = "/workspace/data/HGNC_05-09-19.txt"
+
+counts_full = pd.read_csv(CNT, sep=r"\s+")            # file is SPACE-separated, not tab!
+coldata = pd.read_excel(CD)
+gencode = pd.read_csv(GEN, index_col=0, low_memory=False)
+hgnc    = pd.read_csv(HGN, sep="\t", low_memory=False)
+log(f"counts {counts_full.shape}, coldata {coldata.shape}, gencode {gencode.shape}, hgnc {hgnc.shape}")
+
+cnt_samples = list(counts_full.columns[1:])
+extra = [s for s in cnt_samples if s not in set(coldata['sample'])]
+log("extra count columns dropped (no metadata):", extra)
+assert list(coldata['sample']) == cnt_samples[:len(coldata)], "order mismatch"
+counts = counts_full[['Geneid'] + list(coldata['sample'])].set_index('Geneid')
+counts = counts.loc[gencode['gene_id'].values]        # align rows with gencode (same order, verified)
+
+# --- ID mapping: Ensembl -> HGNC approved symbol (fallback: gencode gene_name)
+hgnc_ok = hgnc[hgnc['Status'] == 'Approved'].copy()
+ens2sym = {}
+for ens, sym in zip(hgnc_ok['Ensembl ID(supplied by Ensembl)'], hgnc_ok['Approved symbol']):
+    if isinstance(ens, str):
+        for e in ens.split(','):
+            e = e.strip()
+            if e: ens2sym[e] = sym
+gencode = gencode.copy()
+gencode['ens0'] = gencode['gene_id'].str.split('.').str[0]
+n_hgnc = gencode['ens0'].map(ens2sym).notna().sum()
+gencode['symbol'] = gencode['ens0'].map(ens2sym).fillna(gencode['gene_name'])
+gencode['symbol'] = gencode['symbol'].astype(str).str.upper()
+log(f"symbol mapped via HGNC: {n_hgnc} / {len(gencode)}")
+
+counts.index = gencode['symbol'].values
+dups = int(counts.index.duplicated(keep=False).sum())
+counts = counts.groupby(level=0).sum()
+gencode_ann = gencode.groupby('symbol').agg(gene_type=('gene_type', lambda x: ','.join(sorted(set(x)))))
+gencode_ann = gencode_ann.loc[~gencode_ann.index.duplicated(keep='first')]
+log(f"after symbol aggregation: {counts.shape[0]} unique symbols (dup rows collapsed: {dups})")
+counts.to_csv("/workspace/outputs/counts_symbol.csv")
+
+# --- Low-expression filter + DESeq2 median-of-ratios size factors
+lib = counts.sum(axis=0).values.astype(float)
+cpm = counts.values / lib * 1e6
+keep = (cpm > 1).sum(axis=1) >= 7                    # >= min group size (7 vs 7)
+log(f"genes before/after filter: {counts.shape[0]} -> {keep.sum()}")
+pd.DataFrame({'n_samples_cpm_gt1': (cpm > 1).sum(axis=1)}, index=counts.index
+             ).to_csv("/workspace/outputs/filter_stats_per_gene.csv")
+
+Y = counts.values[keep].astype(float)
+genes_kept = counts.index[keep]
+types_kept = gencode_ann['gene_type'].reindex(genes_kept).fillna('').values
+
+gmean = st.gmean(np.maximum(Y, 1e-3), axis=1)
+sf = np.median((Y / gmean[:, None])[gmean > 0], axis=0)
+sf = sf / sf.mean()
+NF = Y / sf[None, :]
+log("size factors:", np.round(sf, 4).tolist())
+pd.DataFrame({'sample': coldata['sample'], 'size_factor': sf,
+              'condition': coldata['condition'], 'sex': coldata['sex']}).to_csv(
+    "/workspace/outputs/size_factors.csv", index=False)
+
+L = np.log2(NF + 1); Xc = L - L.mean(1, keepdims=True)
+U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+pc = Vt[:2].T * S[:2]
+pd.DataFrame({'PC1': pc[:, 0], 'PC2': pc[:, 1]}).assign(
+    sample=coldata['sample'], condition=coldata['condition'], sex=coldata['sex']
+).to_csv("/workspace/outputs/pca.csv", index=False)
+log("PCA variance frac PC1 %.3f PC2 %.3f" % tuple((S[:2]**2 / (S**2).sum())[[0, 1]]))
+
+# ----------------------------------------------------------------------
+# 4. DESeq2-style NB GLM differential expression (pure Python)
+# ----------------------------------------------------------------------
+def disp_trend(mu_mean, alpha_raw):
+    m = (mu_mean > 0.5) & (alpha_raw > 1e-6)
+    if m.sum() < 100:
+        return np.full_like(mu_mean, np.median(alpha_raw[m]) if m.sum() else np.median(alpha_raw))
+    x, y = np.log10(mu_mean[m]), np.log10(np.maximum(alpha_raw[m], 1e-6))
+    try:
+        tr = sm.nonparametric.lowess(y, x, frac=0.6, it=3)
+        return 10**np.interp(np.log10(np.maximum(mu_mean, 1e-3)), tr[:, 0], tr[:, 1])
+    except Exception:
+        b, a = np.polyfit(x, y, 1)
+        return 10**(a + b * np.log10(np.maximum(mu_mean, 1e-3)))
+
+def fit_design(Ymat, Xdesign, sf_vec):
+    n = Ymat.shape[1]
+    mu0 = np.empty_like(Ymat)
+    for j in range(Ymat.shape[0]):
+        try:
+            g = sm.GLM(Ymat[j], Xdesign, family=NegativeBinomial(alpha=1e-8),
+                       offset=np.log(sf_vec)).fit()
+            mu0[j] = g.fittedvalues
+        except Exception:
+            mu0[j] = np.maximum(Ymat[j].mean(), 0.5)
+    mu_mean = mu0.mean(1)
+    alpha_raw = np.maximum(0, ((Ymat - mu0)**2).sum(1) - mu0.sum(1)) / np.maximum((mu0**2).sum(1), 1e-12)
+    alpha_tr = disp_trend(mu_mean, alpha_raw)
+    W = 25.0
+    alpha_fin = np.clip((n*alpha_raw + W*alpha_tr) / (n + W), 1e-8, 50)
+    coef = np.full(Ymat.shape[0], np.nan); z = np.full(Ymat.shape[0], np.nan)
+    for j in range(Ymat.shape[0]):
+        yj = Ymat[j]
+        if yj.sum() == 0: continue
+        try:
+            g = sm.GLM(yj, Xdesign, family=NegativeBinomial(alpha=alpha_fin[j]),
+                       offset=np.log(sf_vec)).fit(maxiter=100)
+            c = float(g.params[1]); v = float(g.cov_params()[1, 1])
+            coef[j] = c; z[j] = c / max(np.sqrt(max(v, 1e-12)), 1e-12)
+        except Exception:
+            pass
+    return coef, z, alpha_fin, mu_mean
+
+cond = (coldata['condition'] == 'disease').astype(int).values
+Xd = np.column_stack([np.ones(len(cond)), cond])
+log("fitting primary model ~ condition ...")
+coef, z, alpha_fin, mu_mean = fit_design(Y, Xd, sf)
+ok = ~np.isnan(z)
+pval = np.full_like(z, 1.0); pval[ok] = 2*st.norm.sf(np.abs(z[ok]))
+padj = np.full_like(z, 1.0); padj[ok] = multipletests(pval[ok], method='fdr_bh')[1]
+lfc = coef / np.log(2)
+
+sexm = (coldata['sex'] == 'M').astype(int).values
+Xs = np.column_stack([np.ones(len(cond)), cond, sexm])
+log("fitting sensitivity model ~ condition + sex ...")
+cs, zs, _, _ = fit_design(Y, Xs, sf)
+oks = ~np.isnan(zs)
+pvals = np.full_like(zs, 1.0); pvals[oks] = 2*st.norm.sf(np.abs(zs[oks]))
+padjs = np.full_like(zs, 1.0); padjs[oks] = multipletests(pvals[oks], method='fdr_bh')[1]
+
+de = pd.DataFrame({'symbol': genes_kept, 'gene_type': types_kept,
+                   'baseMean': mu_mean, 'log2FC': lfc, 'wald_z': z,
+                   'pval': pval, 'padj': padj,
+                   'log2FC_sex_model': cs/np.log(2), 'padj_sex_model': padjs})
+de.to_csv("/workspace/outputs/de_results.csv", index=False)
+
+FDR = 0.05
+up   = de[(de.padj < FDR) & (de.log2FC >  0.58)]
+down = de[(de.padj < FDR) & (de.log2FC < -0.58)]
+sig  = de[de.padj < FDR]
+summary = {
+    "tested_genes": int((~np.isnan(z)).sum()), "sig_FDR05": int(len(sig)),
+    "up_FDR05_lfc0.58": int(len(up)), "down_FDR05_lfc0.58": int(len(down)),
+    "up_FDR05_lfc1": int(len(de[(de.padj < FDR) & (de.log2FC > 1)])),
+    "down_FDR05_lfc1": int(len(de[(de.padj < FDR) & (de.log2FC < -1)])),
+    "sex_model_spearman_lfc": float(st.spearmanr(de.log2FC, de.log2FC_sex_model, nan_policy='omit').statistic),
+    "sex_model_sig_overlap": int(len(de[(de.padj < FDR) & (de.padj_sex_model < FDR)])),
+}
+log("DE summary:", json.dumps(summary, indent=1))
+pd.Series(summary).to_csv("/workspace/outputs/de_summary.csv")
+sig.sort_values('padj').head(50).to_csv("/workspace/outputs/de_top50.csv", index=False)
+
+# ----------------------------------------------------------------------
+# 5. RESEARCHER-APPROVED FALLBACK enrichment (surrogate, offline):
+#    curated GO-branch-guided gene sets + hypergeometric ORA + pre-ranked GSEA
+# ----------------------------------------------------------------------
+GS = {
+"Chromatin organization & histone modification": """KMT2A KMT2B KMT2C KMT2D KMT5A EP300 CREBBP KAT2A KAT2B KAT5 KAT6A KAT6B KAT7 KAT8
+ KDM1A KDM1B KDM2A KDM3A KDM4A KDM4B KDM4C KDM5A KDM5B KDM5C KDM6A KDM6B KDM8 SETD1A SETD1B SETD2 SETDB1 SETD7 SUV39H1 SUV39H2
+ EZH1 EZH2 EED SUZ12 RBBP4 RBBP5 RBBP7 PRMT1 PRMT2 PRMT5 PRMT6 PRMT7 SMYD2 SMYD3 SMYD4 WHSC1 ASH1L NSD2 NSD3 ATRX SMARCA1 SMARCA2
+ SMARCA4 SMARCA5 SMARCB1 SMARCC1 SMARCC2 SMARCD1 SMARCD2 SMARCE1 ARID1A ARID1B ARID2 CHD1 CHD2 CHD3 CHD4 CHD5 CHD6 CHD7 CHD8 CHD9
+ HDAC1 HDAC2 HDAC3 HDAC4 HDAC5 HDAC6 HDAC7 HDAC8 HDAC9 HDAC10 HDAC11 SIRT1 SIRT2 SIRT5 SIRT6 SIRT7 DNMT1 DNMT3A DNMT3B TET1 TET2 TET3
+ MBD1 MBD2 MBD3 MBD4 MECP2 CTCF RAD21 SMC1A SMC3 STAG1 STAG2 WDR5 RUVBL1 RUVBL2 ING3 BRPF1 TAF1 TAF6L PHF1 PHF2 PHF6 PHF8 BRD2 BRD3 BRD4
+ H2AFZ H2AFY H3F3A H3F3B H4C1 H2AC4""".split(),
+"DNA damage response & DNA repair": """ATM ATR ATMIN CHEK1 CHEK2 TP53 TP53BP1 MDM2 MDM4 CDKN1A GADD45A GADD45B GADD45G BRCA1 BRCA2
+ PALB2 RAD51 RAD51B RAD51C RAD51D RAD52 RAD54L RAD54B RAD23A RAD23B XRCC1 XRCC2 XRCC3 XRCC4 XRCC5 XRCC6 PARP1 PARP2 PARP3 POLB POLQ
+ LIG1 LIG3 LIG4 MLH1 MLH3 MSH2 MSH3 MSH6 PMS1 PMS2 ERCC1 ERCC2 ERCC3 ERCC4 ERCC5 ERCC6 ERCC8 XPA XPC DDB1 DDB2 FANCA FANCB FANCC
+ FANCD2 FANCE FANCF FANCG FANCI FANCL FANCM BRIP1 PCNA RPA1 RPA2 RPA3 PRKDC MRE11A RAD50 NBN H2AX BLM WRN RECQL RECQL4 RECQL5
+ MUS81 EME1 GEN1 SLX4 FEN1 MGMT ALKBH2 ALKBH3 NEIL1 NEIL2 NEIL3 OGG1 MUTYH NUDT1 APEX1 POLA1 POLD1 POLE PRIM1 PRIM2 RFC1 RFC2 RFC3
+ RFC4 RFC5 TIMELESS TIPIN CLASPIN ATRIP TOPBP1 RIF1 UNG SMUG1 TDP1 APTX PNKP APEX2 HELLS""".split(),
+"Apoptosis & regulated cell death": """BCL2 BCL2L1 BCL2L11 BAX BAK1 BOK BAD BID BIK BCL2L2 BCL2L13 BCL2L14 PMAIP1 BBC3 HRK BNIP3 BNIP3L
+ BNIP2 MCL1 CASP1 CASP2 CASP3 CASP4 CASP6 CASP7 CASP8 CASP9 CASP10 CASP14 APAF1 FAS FASLG FADD CFLAR TNFRSF10A TNFRSF10B TNFRSF10C
+ TNFRSF10D TNFRSF1A TNFRSF1B TNFRSF6B TRADD TRAF1 TRAF2 TRAF3 TRAF4 TRAF5 TRAF6 RIPK1 RIPK3 MLKL CYCS DIABLO BIRC2 BIRC3 BIRC5 BIRC6
+ XIAP NAIP AKT1 AKT2 AKT3 PIK3CA PIK3CB PIK3CD PIK3CG PIK3R1 PIK3R2 PIK3R3 MTOR RPTOR RICTOR TSC1 TSC2 PTEN FOXO1 FOXO3 FOXO4 TP73
+ DAPK1 DAPK2 DAPK3""".split(),
+"Interferon & antiviral innate immune response": """IFNA1 IFNA2 IFNA5 IFNA7 IFNA8 IFNA10 IFNA13 IFNA16 IFNA17 IFNA21 IFNB1 IFNG IFNL1 IFNL2
+ IFNL3 IFNL4 IFNAR1 IFNAR2 IFNGR1 IFNGR2 IFIT1 IFIT1B IFIT2 IFIT3 IFIT5 IFITM1 IFITM2 IFITM3 IFI6 IFI16 IFI27 IFI30 IFI35 IFI44
+ IFI44L IFIH1 STAT1 STAT2 STAT4 IRF1 IRF2 IRF3 IRF5 IRF7 IRF8 IRF9 JAK1 JAK2 TYK2 SOCS1 SOCS3 USP18 ISG15 MX1 MX2 OAS1 OAS2 OAS3
+ OASL DDX58 MAVS TBK1 IKBKE DHX58 ISG20 RSAD2 SAMHD1 DDX60 HERC5 EPSTI1 GBP1 GBP2 GBP3 GBP4 GBP5 GBP6 BATF2 CMPK2 TRIM14 TRIM25 TRIM56
+ EIF2AK2 UBE2L6 NMI PLSCR1 PLSCR2 PLSCR3 BST2 TAP1 TAP2 TAPBP B2M HLA-A HLA-B HLA-C HLA-E""".split(),
+"Inflammatory cytokine & NF-kB signaling": """NFKB1 NFKB2 REL RELA RELB NFKBIA NFKBIB NFKBIE NFKBIZ IKBKB IKBKG IKBKE MAP3K1 MAP3K7 MAP3K8
+ MAP3K14 MAP4K1 MAPK1 MAPK3 MAPK8 MAPK9 MAPK14 TLR1 TLR2 TLR3 TLR4 TLR5 TLR6 TLR7 TLR8 TLR9 TLR10 MYD88 TIRAP TICAM1 TICAM2 TRAF6
+ IRAK1 IRAK2 IRAK3 IRAK4 NLRP1 NLRP3 NLRC4 NOD1 NOD2 PYCARD CASP1 GSDMD IL1A IL1B IL1R1 IL1R2 IL1RAP IL6 IL6R IL6ST IL18 IL18R1 IL33
+ TNF TNFSF10 TNFSF11 TNFSF13 TNFSF13B TNFSF14 TNFAIP3 TNFRSF11A CXCL1 CXCL2 CXCL3 CXCL5 CXCL6 CXCL8 CXCL10 CXCL11 CXCL12 CCL2 CCL3
+ CCL4 CCL5 CCL7 CCL11 CCL18 CCL20 CCR1 CCR2 CCR5 CCR7 PTGS2 PTGS1 PLA2G4A LTA LTBR CD40 CD40LG CD274 PDCD1LG2""".split(),
+"Hematopoietic lineage specification & stemness": """RUNX1 RUNX2 RUNX3 CEBPA CEBPB CEBPG SPI1 SPIB GATA1 GATA2 GATA3 GATA4 GATA6 IKZF1 IKZF2
+ IKZF3 MEIS1 MEIS2 MEIS3 PBX1 PBX2 PBX3 TAL1 TAL2 LYL1 ERG FLI1 ETS1 ETS2 ETV6 MECOM MLLT3 MLLT10 MLLT4 HOXA3 HOXA5 HOXA7 HOXA9 HOXB4
+ HOXB6 HOXC4 HOXC6 NPM1 DNMT3A TET2 ASXL1 ASXL2 ASXL3 BCOR BCORL1 KMT2A KMT2C EZH2 SUZ12 EED SETD2 NOTCH1 NOTCH2 NOTCH3 JAG1 JAG2
+ DLL1 KIT MPL CSF3R CSF1R CSF2RA CSF2RB CD34 CD33 PTPRC GFI1 GFI1B HHEX PRDM16 WT1 CBFB PAX5 EBF1 TCF3 BCL11A FOXO1 SOX2 POU5F1
+ NANOG KLF4 MYC LIN28B""".split(),
+"Cell cycle & DNA replication": """MKI67 TOP2A PCNA MCM2 MCM3 MCM4 MCM5 MCM6 MCM7 MCM8 MCM10 CDC6 CDC45 CDC20 CDC25A CDC25B CDC25C CDC7
+ DBF4 CCNA1 CCNA2 CCNB1 CCNB2 CCNB3 CCND1 CCND2 CCND3 CCNE1 CCNE2 CDK1 CDK2 CDK3 CDK4 CDK6 CDK7 CDK9 CDK11A CDKN1A CDKN1B CDKN1C
+ CDKN2A CDKN2B CDKN2C CDKN3 E2F1 E2F2 E2F3 E2F4 E2F5 TFDP1 TFDP2 RB1 RBL1 RBL2 PLK1 PLK2 PLK4 AURKA AURKB AURKC BUB1 BUB1B BUB3
+ MAD1L1 MAD2L1 MAD2L2 TTK ESPL1 PTTG1 PTTG2 CENPA CENPB CENPC CENPF SKP2 FBXO5 FBXW7 ORC1 ORC2 ORC3 ORC4 ORC5 ORC6 GMNN GINS1 GINS2
+ GINS3 GINS4 CDC16 CDC23 CDC27 WEE1 MYT1 FOXM1 MYBL2 ZWINT""".split(),
+"Extracellular matrix organization & fibrosis": """COL1A1 COL1A2 COL2A1 COL3A1 COL4A1 COL4A2 COL4A3 COL4A5 COL5A1 COL5A2 COL5A3 COL6A1
+ COL6A2 COL6A3 COL7A1 COL8A1 COL8A2 COL10A1 COL11A1 COL11A2 COL12A1 COL14A1 COL15A1 COL16A1 COL18A1 FN1 LAMA1 LAMA2 LAMA3 LAMA4 LAMA5
+ LAMB1 LAMB2 LAMB3 LAMB4 LAMC1 LAMC2 LAMC3 VIM ACTA2 TAGLN TAGLN2 ELN FBN1 FBN2 FBLN1 FBLN2 FBLN5 THBS1 THBS2 THBS3 THBS4 TNC TNR
+ POSTN LOX LOXL1 LOXL2 LOXL3 LOXL4 MMP1 MMP2 MMP3 MMP7 MMP8 MMP9 MMP10 MMP11 MMP12 MMP13 MMP14 MMP15 MMP16 MMP17 MMP19 MMP24 MMP28
+ TIMP1 TIMP2 TIMP3 TIMP4 ADAM12 ADAM17 ADAMTS1 ADAMTS2 ADAMTS4 ADAMTS5 ADAMTS9 ADAMTS12 TGFB1 TGFB2 TGFB3 TGFBR1 TGFBR2 SMAD2 SMAD3
+ SMAD4 SMAD5 SMAD6 SMAD7 SMAD9 SERPINE1 CTGF CYR61 NOV PDGFA PDGFB PDGFC PDGFD PDGFRA PDGFRB VEGFA VEGFB VEGFC KDR FLT1 FLT4 ITGA1
+ ITGA2 ITGA3 ITGA4 ITGA5 ITGA6 ITGA7 ITGA8 ITGA9 ITGA10 ITGA11 ITGAV ITGB1 ITGB2 ITGB3 ITGB4 ITGB5 ITGB6 ITGB8 VCAN ACAN DCN FMOD
+ LUM PRELP OGN OMD ASPN SPARC SPON1 SPON2 HSPG2 SDC1 SDC2 SDC3 SDC4 FAP MGP CLEC3B PLOD1 PLOD2 PLOD3 P4HA1 P4HA2 P4HA3 HAS1 HAS2
+ HAS3 CD44 CDH2 CDH5 CDH11 P3H1 P3H2""".split(),
+"Epithelial-mesenchymal transition & cell adhesion": """SNAI1 SNAI2 TWIST1 TWIST2 ZEB1 ZEB2 CDH1 CDH2 CDH3 CDH5 CDH6 CDH11 VIM FN1 MMP2
+ MMP9 TJP1 OCLN CLDN1 CLDN2 CLDN3 CLDN4 CLDN5 CLDN7 KRT8 KRT18 KRT19 KRT14 KRT5 KRT17 KRT6A KRT6B KRT1 KRT10 FOXC1 FOXC2 LEF1 CTNNB1
+ SOX9 MSX2 GSC JAG1 DSG2 DSC2 IVL FLG GRHL2 OVOL2 ESRP1 ESRP2 CELF1 ST14""".split(),
+"Cellular senescence & p53 signaling": """TP53 CDKN1A CDKN2A CDKN2B MDM2 MDM4 SESN1 SESN2 SESN3 SERPINE1 GLB1 LMNB1 LMNB2 IGFBP2 IGFBP3
+ IGFBP5 IGFBP7 PLAU PLAUR CXCL1 CXCL2 CXCL8 IL6 CCL2 SOD2 CAT GPX1 GPX4 NQO1 KEAP1 NFE2L2 ATF4 XBP1 HMOX1 DDIT3 EGR1 FOS JUN JUNB
+ RB1 BMI1 TGM2 MMP1 MMP3 MMP13 TGFB1 SNAI1 CEBPB NFKB1""".split(),
+"Oxidative phosphorylation & mitochondrial metabolism": """NDUFA1 NDUFA2 NDUFA3 NDUFA4 NDUFA5 NDUFA6 NDUFA7 NDUFA8 NDUFA9 NDUFA10 NDUFA11
+ NDUFA12 NDUFA13 NDUFB1 NDUFB2 NDUFB3 NDUFB4 NDUFB5 NDUFB6 NDUFB7 NDUFB8 NDUFB9 NDUFB10 NDUFB11 NDUFC1 NDUFC2 NDUFS1 NDUFS2 NDUFS3
+ NDUFS4 NDUFS5 NDUFS6 NDUFS7 NDUFS8 NDUFV1 NDUFV2 NDUFV3 SDHA SDHB SDHC SDHD UQCRC1 UQCRC2 UQCRB UQCRFS1 UQCRQ UQCR10 UQCR11 COX4I1
+ COX5A COX5B COX6A1 COX6B1 COX6C COX7A1 COX7A2 COX7B COX7C COX8A ATP5A1 ATP5B ATP5C1 ATP5D ATP5E ATP5F1 ATP5G1 ATP5G2 ATP5G3 ATP5H
+ ATP5I ATP5J ATP5J2 ATP5L ATP5O ATP5S SLC25A1 SLC25A3 SLC25A4 SLC25A5 SLC25A6 TFAM TFB1M TFB2M PPARGC1A PPARGC1B NRF1 GABPA PRKAA1
+ PRKAA2 PINK1 PARK2 PARK7 CPT1A CPT1B CPT2 ACADM ACADVL HADHA HADHB IDH2 IDH3A IDH3B IDH3G MDH1 MDH2 CS ACO1 ACO2 SUCLA2 SUCLG1 DLD
+ DLAT PDHA1 PDHB PDK1 PDK2 PDK3 PDK4 LDHA LDHB GLS SOD1 TXN TXN2 TXNRD1 TXNRD2 PPARA PPARD PPARG""".split(),
+"Translation & ribosome biogenesis": """RPL3 RPL4 RPL5 RPL6 RPL7 RPL7A RPL8 RPL9 RPL10 RPL10A RPL11 RPL12 RPL13 RPL13A RPL14 RPL15 RPL17
+ RPL18 RPL19 RPL21 RPL22 RPL23 RPL23A RPL24 RPL26 RPL27 RPL27A RPL28 RPL29 RPL30 RPL31 RPL32 RPL34 RPL35 RPL35A RPL36 RPL36A RPL37
+ RPL38 RPL39 RPL40 RPL41 RPS2 RPS3 RPS3A RPS4X RPS5 RPS6 RPS7 RPS8 RPS9 RPS10 RPS11 RPS12 RPS13 RPS14 RPS15 RPS15A RPS16 RPS17 RPS18
+ RPS19 RPS20 RPS21 RPS23 RPS24 RPS25 RPS26 RPS27 RPS27A RPS28 RPS29 RPSA EIF3A EIF3B EIF3C EIF3D EIF3E EIF3F EIF3G EIF3H EIF3I EIF3J
+ EIF4A1 EIF4A2 EIF4B EIF4E EIF4G1 EIF4G2 EIF4H EEF1A1 EEF1A2 EEF1B2 EEF1D EEF1E1 EEF2 EIF2S1 EIF2S2 EIF2S3 EIF2AK1 EIF2AK2 EIF2AK3
+ EIF2AK4 EIF5 EIF5A EIF6 MTOR RPS6KB1 EIF4EBP1 RRS1 DKC1 NOP56 NOP58 FBL RPLP0 RPLP1 RPLP2 UBA52 FAU""".split(),
+"Wnt-Notch-Hedgehog developmental signaling": """WNT1 WNT2 WNT2B WNT3 WNT3A WNT4 WNT5A WNT5B WNT6 WNT7A WNT7B WNT9A WNT10A WNT10B WNT11
+ WNT16 FZD1 FZD2 FZD3 FZD4 FZD5 FZD6 FZD7 FZD8 FZD9 FZD10 DVL1 DVL2 DVL3 LRP5 LRP6 RSPO1 RSPO2 RSPO3 RSPO4 SFRP1 SFRP2 SFRP3 SFRP4
+ SFRP5 DKK1 DKK2 DKK3 DKK4 KREMEN1 KREMEN2 CTNNB1 APC AXIN1 AXIN2 TCF7 TCF7L1 TCF7L2 LEF1 SHH IHH DHH PTCH1 PTCH2 SMO GLI1 GLI2 GLI3
+ SUFU HHIP NOTCH1 NOTCH2 NOTCH3 NOTCH4 JAG1 JAG2 DLL1 DLL3 DLL4 RBPJ RBPJL HES1 HES5 HES6 HEY1 HEY2 HEYL MAML1 MAML2 MAML3 NCSTN
+ APH1A PSEN1 PSEN2 NUMB NUMBL MIB1 MIB2 RFNG LFNG MFNG""".split(),
+"Cytoskeleton organization & cell motility": """ACTB ACTG1 ACTR2 ACTR3 ACTN1 ACTN2 ACTN4 TUBA1A TUBA1B TUBA4A TUBB TUBB2A TUBB4B MYH9
+ MYH10 MYH11 MYL9 MYL12A MYL12B FLNA FLNB FLNC SPTAN1 SPTBN1 SPTBN2 VCL TLN1 TLN2 PXN PTK2 SRC FYN YES1 ABL1 ABL2 ROCK1 ROCK2 PAK1
+ PAK2 PAK3 RHOA RHOB RHOC RHOF RHOG RAC1 RAC2 RAC3 CDC42 ARPC1A ARPC1B ARPC2 ARPC3 ARPC4 ARPC5 CAPZA1 CAPZA2 CAPZB CFL1 CFL2 PFN1
+ PFN2 TMSB4X TMSB10 MAPRE1 MAPRE2 KIF5A KIF5B KIF5C KIF11 KIF20A KIF20B KIF23 DYNC1H1 DYNLRB1 LMNA LMNB1 LMNB2 SYNE1 SYNE2 FERMT1
+ FERMT2 FERMT3 MYO6 MYO9B MYO10 MYH14 DIAPH1 DIAPH2 DIAPH3 FMNL1 FMNL2 FMNL3 ARHGEF1 ARHGEF2 ARHGEF11 ARHGEF12 ARHGAP1 ARHGAP5 WAS
+ WASL EZR MSN MOESIN RDX ADD1 EPB41 PDLIM1 PDLIM5 ZYX PARVA PARVB SVIL""".split(),
+"Response to oxidative & endoplasmic reticulum stress": """NFE2L2 KEAP1 HMOX1 NQO1 SOD1 SOD2 SOD3 CAT GPX1 GPX3 GPX4 GLRX GLRX2 GLRX3
+ GLRX5 TXN TXN2 TXNRD1 TXNRD2 PRDX1 PRDX2 PRDX3 PRDX4 PRDX5 PRDX6 ATF4 ATF6 XBP1 EIF2AK3 DDIT3 HSPA1A HSPA1B HSPA5 HSP90AA1 HSP90AB1
+ HSPB1 HSPH1 DNAJB1 DNAJB9 HERPUD1 DDIT4 SIRT1 FOXO3 ATG5 ATG7 SQSTM1 MAP1LC3B BECN1 GABARAP GSR GCLC GCLM SLC7A11 CBS CTH ATF3 JUN
+ FOS CREB1 PRKAA1 PRKAA2""".split(),
+}
+GS = {k: sorted(set(s.strip().upper() for s in v if s.strip())) for k, v in GS.items()}
+background = set(de['symbol'])
+mapped = {k: sorted(set(v) & background) for k, v in GS.items()}
+maptab = pd.DataFrame([{'gene_set': k, 'set_size_raw': len(GS[k]),
+                        'mapped_to_background': len(mapped[k])} for k in GS])
+log("gene-set mapping:\n" + maptab.to_string(index=False))
+maptab.to_csv("/workspace/outputs/gene_set_mapping.csv", index=False)
+
+def bh(p):
+    p = np.asarray(p, float); n = len(p)
+    o = np.argsort(p); padj = np.empty(n)
+    padj[o] = np.minimum.accumulate((p[o]*n/np.arange(1, n+1))[::-1])[::-1]
+    return np.minimum(padj, 1.0)
+
+def ora(sig_genes, label):
+    rows = []
+    for k, s in mapped.items():
+        hit = len(set(sig_genes) & set(s))
+        K, N, n = len(s), len(background), len(sig_genes)
+        p = st.hypergeom.sf(hit-1, N, K, n) if hit > 0 else 1.0
+        rows.append({'direction': label, 'gene_set': k, 'set_size': K, 'hits': hit,
+                     'fold_enrichment': (hit/n)/(K/N) if hit else 0.0, 'p': p})
+    df = pd.DataFrame(rows); df['padj'] = bh(df['p'].values)
+    return df.sort_values(['padj', 'p'])
+
+def gsea_prerank(rank_z, nperm=2000, seed=1):
+    """pre-ranked GSEA on curated sets; gene-label permutation (vectorized)"""
+    rng = np.random.default_rng(seed)
+    order = np.argsort(-rank_z)
+    genes_r = de['symbol'].values[order]; zr = np.abs(rank_z[order])
+    idx_of = {g: i for i, g in enumerate(genes_r)}
+    N = len(genes_r); rows = []
+    for k, s in mapped.items():
+        hits = sorted(idx_of[g] for g in s if g in idx_of)
+        m = len(hits)
+        if m < 5: continue
+        # observed ES
+        w = zr[hits]; C = np.cumsum(w/w.sum()); p = np.array(hits)
+        cum_hit = C - (p - np.arange(1, m+1))/(N-m)
+        cum_bef = np.concatenate([[0.0], C[:-1]]) - (p - np.arange(0, m))/(N-m)
+        allv = np.concatenate([cum_hit, cum_bef])
+        es = allv[np.argmax(np.abs(allv))]
+        # null: gene-label permutation, vectorized over permutations
+        null = np.empty(nperm)
+        jj = np.arange(1, m+1)
+        for b in range(nperm):
+            H = np.sort(rng.choice(N, m, replace=False))
+            Cn = np.cumsum(zr[H]); Cn = Cn/Cn[-1]
+            chn = Cn - (H - jj)/(N-m)
+            cbn = np.concatenate([[0.0], Cn[:-1]]) - (H - (jj-1))/(N-m)
+            av = np.concatenate([chn, cbn])
+            null[b] = av[np.argmax(np.abs(av))]
+        pos = null[null > 0] if es > 0 else null[null < 0]
+        nes = es/pos.mean() if len(pos) and pos.mean() != 0 else np.nan
+        pv = (np.sum(np.abs(null) >= abs(es)) + 1)/(nperm + 1)
+        rows.append({'direction': ('UP' if es > 0 else 'DOWN') + '_vs_control',
+                     'gene_set': k, 'set_size': m, 'ES': es, 'NES': nes, 'p_perm': pv})
+    df = pd.DataFrame(rows); df['padj'] = bh(df['p_perm'].values)
+    return df.sort_values(['padj', 'NES'], ascending=[True, False])
+
+de_ok = de[~de.wald_z.isna()]
+log("running ORA + GSEA ...")
+up_ora = ora(up['symbol'], 'UP_in_ASXL1_mutant')
+dn_ora = ora(down['symbol'], 'DOWN_in_ASXL1_mutant')
+gsea_all = gsea_prerank(de_ok['wald_z'].values)         # single ranked list (positive z = up in mutant)
+pd.concat([up_ora, dn_ora]).to_csv("/workspace/outputs/ora_results.csv", index=False)
+gsea_all.to_csv("/workspace/outputs/gsea_results.csv", index=False)
+up_gsea = gsea_all[gsea_all.ES > 0].sort_values('NES', ascending=False)   # enriched among UP genes
+dn_gsea = gsea_all[gsea_all.ES < 0].sort_values('NES', ascending=False)   # enriched among DOWN genes
+log("\n=== ORA UP (higher in ASXL1-mutant) ===\n" + up_ora.to_string(index=False))
+log("\n=== ORA DOWN ===\n" + dn_ora.to_string(index=False))
+log("\n=== GSEA among UP genes (top 8) ===\n" + up_gsea.head(8).to_string(index=False))
+log("\n=== GSEA among DOWN genes (top 8) ===\n" + dn_gsea.head(8).to_string(index=False))
+
+def leading_edge(gset, rank_z, sign):
+    o = np.argsort(-rank_z) if sign > 0 else np.argsort(rank_z)
+    g = de['symbol'].values[o]; zz = np.abs(rank_z[o]); hits = np.isin(g, gset)
+    w = zz*hits
+    run = np.cumsum(np.where(hits, w/np.maximum(w.sum(), 1e-12), -1.0/(len(g)-hits.sum())))
+    k = int(np.argmax(np.abs(run)))
+    return sorted(set(g[:k+1][hits[:k+1]]))
+top_up, top_dn = up_gsea.iloc[0], dn_gsea.iloc[0]
+le_up = leading_edge(mapped[top_up['gene_set']], de_ok['wald_z'].values, 1)
+le_dn = leading_edge(mapped[top_dn['gene_set']], de_ok['wald_z'].values, -1)
+pd.DataFrame({'UP_leading_edge': le_up}).to_csv("/workspace/outputs/leading_edge_UP_top_set.csv", index=False)
+pd.DataFrame({'DOWN_leading_edge': le_dn}).to_csv("/workspace/outputs/leading_edge_DOWN_top_set.csv", index=False)
+
+
+# ----------------------------------------------------------------------
+# 6. Sensitivity analysis: limma-style moderated t on log2CPM
+#    (checks robustness of the NB-GLM ranking / enrichment conclusions)
+# ----------------------------------------------------------------------
+Xm = np.column_stack([np.ones(len(cond)), cond])
+logcpm = np.log2(NF + 1)
+dfr = Xm.shape[0] - 2
+B = np.linalg.lstsq(Xm, np.asarray(logcpm).T, rcond=None)[0]
+resid = np.asarray(logcpm).T - Xm @ B
+s2 = (resid**2).sum(0) / dfr
+f = np.sqrt(np.diag(np.linalg.inv(Xm.T @ Xm)))[1]
+t0 = B[1] / (np.sqrt(s2) * f)
+pv_raw = 2*st.t.sf(np.abs(t0), df=dfr)
+usable = np.isfinite(s2) & (s2 > 0)
+lsv2 = np.log(s2[usable]); mu, v = lsv2.mean(), lsv2.var(ddof=1)
+d0 = 2*(1+v)/max(v-1, 1e-6) if v > 1 else 2.0
+d0 = max(d0, 0.05)
+s2_0 = np.exp(mu)
+s2_post = (d0*s2_0 + dfr*s2) / (d0 + dfr)
+tt = B[1] / (np.sqrt(s2_post) * f)
+pv_l = 2*st.t.sf(np.abs(tt), df=d0 + dfr)
+pa_l = multipletests(pv_l, method='fdr_bh')[1]
+lfc_l = B[1] / np.log(2)
+de['t_limma'] = np.where(usable, tt, np.nan)
+de['padj_limma'] = np.where(usable, pa_l, np.nan)
+de['log2FC_limma'] = lfc_l
+rho = st.spearmanr(de.wald_z, de.t_limma, nan_policy='omit').statistic
+up_l = set(de[(de.padj_limma < FDR) & (de.log2FC_limma > 0.58)]['symbol'])
+dn_l = set(de[(de.padj_limma < FDR) & (de.log2FC_limma < -0.58)]['symbol'])
+ora_up_l = ora(sorted(up_l & background), 'limma_UP')
+ora_dn_l = ora(sorted(dn_l & background), 'limma_DOWN')
+sens_summary = {
+    'n_genes_usable': int(usable.sum()),
+    'd0_eb': float(d0),
+    'raw_t_p_lt0.05': int((pv_raw[usable] < .05).sum()),
+    'limma_n_up': len(up_l), 'limma_n_down': len(dn_l),
+    'overlap_up_with_NB': int(len(up_l & set(up['symbol']))),
+    'overlap_down_with_NB': int(len(dn_l & set(down['symbol']))),
+    'limma_ORA_UP_top': (ora_up_l.iloc[0][['gene_set','hits','p','padj']].to_dict()
+                         if len(ora_up_l) else None),
+    'limma_ORA_DOWN_top': (ora_dn_l.iloc[0][['gene_set','hits','p','padj']].to_dict()
+                           if len(ora_dn_l) else None),
+}
+gsea_limma = gsea_prerank(de['t_limma'].values)
+gsea_limma.to_csv("/workspace/outputs/gsea_results_limma.csv", index=False)
+log("\n=== GSEA on limma moderated t (DOWN tail, top 5) ===\n" +
+    gsea_limma[gsea_limma.ES < 0].sort_values('NES', ascending=False).head(5).to_string(index=False))
+log("\n=== GSEA on limma moderated t (UP tail, top 5) ===\n" +
+    gsea_limma[gsea_limma.ES > 0].sort_values('NES', ascending=False).head(5).to_string(index=False))
+log("\nSENSITIVITY (limma-style EB on log2CPM):", json.dumps(sens_summary, indent=1, default=str))
+pd.Series(sens_summary).to_csv("/workspace/outputs/sensitivity_summary.csv")
+de.to_csv("/workspace/outputs/de_results.csv", index=False)
+
+json.dump({'env_probe': probe, 'de_summary': summary,
+           'top_UP_ora': up_ora.iloc[0].to_dict(), 'top_DOWN_ora': dn_ora.iloc[0].to_dict(),
+           'top_UP_gsea': up_gsea.iloc[0].to_dict(), 'top_DOWN_gsea': dn_gsea.iloc[0].to_dict(),
+           'leading_edge_UP': le_up, 'leading_edge_DOWN': le_dn,
+           'note': 'Enrichment uses curated GO-branch-guided gene sets (surrogate, offline); NOT formal GO-BP enrichment'},
+          open("/workspace/outputs/final_metrics.json", "w"), indent=1, default=str)
+log("\nDONE - artifacts in /workspace/outputs")

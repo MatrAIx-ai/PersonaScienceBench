@@ -70,6 +70,7 @@ def main():
     p.add_argument('--model', default='gpt-6-astra')
     p.add_argument('--provider', choices=['openai','openrouter'], default='openai')
     p.add_argument('--judge-max-tokens', type=int, default=4096)
+    p.add_argument('--actor-max-tokens', type=int, default=12288, help='Actor output cap; protocol default 12288')
     p.add_argument('--reasoning-effort', default='low')
     p.add_argument('--actor-model', help='Override only the actor; keep researcher/judge on --model')
     p.add_argument('--actor-reasoning-effort', help='Override only actor reasoning')
@@ -136,6 +137,7 @@ def main():
             for role, spec in config['models'].items():
                 spec.update(models[role])
                 if role == 'judge':spec['max_output_tokens' if kind=='exp' else 'max_tokens']=a.judge_max_tokens
+                if role == 'actor':spec['max_output_tokens' if kind=='exp' else 'max_tokens']=a.actor_max_tokens
                 if kind == 'exp':
                     prices = {'gpt-6-astra': (10, 50), 'gpt-5.6-sol': (4, 20)}
                     if catalog is not None:

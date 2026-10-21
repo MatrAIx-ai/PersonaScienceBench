@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-3-q5 - Paroxetine 2017 RNA-seq (um_mueller_2017)
+Differential expression on 3 tissue comparisons + binomial exact test (5% threshold).
+
+Inputs : data/Data_deposition_RNAseq_Paroxetine_2017.xlsx
+         - 'Mapping_statistics': 90 samples, Tissue/Response/Code metadata
+         - 'NormCount'        : 25,402 genes x 90 size-factor-normalized counts
+           (median-of-ratios size factors on these values = 1.004 for every sample)
+
+Approved method:
+  - DESeq2-style negative-binomial GLM (log link) implemented in Python
+    (no R/DESeq2 and no internet; PyDESeq2 not installable):
+      * per-gene method-of-moments dispersion -> fitted trend alpha = a1/mu + a0
+        -> shrinkage alpha_used = min(gene-wise, trend) (conservative, DESeq2-like)
+      * vectorized IRLS NB GLM; design = tissue factor + Response additive covariate
+        (all 30 samples per tissue pooled: 10 Control + 10 good + 10 bad)
+      * Wald tests; BH padj; DEG = padj < 0.05
+  - contrasts: final vs baseline blood, dentate gyrus vs baseline blood, dentate gyrus vs final blood
+  - binomial exact test: successes = DEGs, n = genes tested, p0 = 0.05, alpha = 0.05 (both tails)
+  - "negligible effect" := DEG proportion NOT significantly above the 5% chance expectation
+  - log2(x+1) linear model (plain t-test) reported in parallel as sensitivity analysis
+  - Limitations (stated): raw integer counts unavailable -> normalized counts rounded to integers
+    for the NB likelihood; no Cook's-distance outlier replacement / independent filtering;
+    possible animal-level pairing across tissues not modeled.
+"""
+import numpy as np
+import pandas as pd
+import re
+from scipy import stats
+
+XLSX = 'data/Data_deposition_RNAseq_Paroxetine_2017.xlsx'
+NOMINAL = 0.05
+
+def bh(pvals):
+    p = np.asarray(pvals, float)
+    out = np.full(p.shape, np.nan)
+    ok = ~np.isnan(p)
+    pv = p[ok]; N = len(pv)
+    order = np.argsort(pv)
+    ranked = pv[order] * N / np.arange(1, N + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    tmp = np.empty(N); tmp[order] = np.clip(ranked, 0, 1)
+    out[ok] = tmp
+    return out
+
+# ---------------- 1. Load data ----------------
+print('=' * 80); print('STEP 1: load and parse workbook'); print('=' * 80)
+ms = pd.read_excel(XLSX, sheet_name='Mapping_statistics')
+raw = pd.read_excel(XLSX, sheet_name='NormCount', header=None)
+data = raw.iloc[4:].reset_index(drop=True)
+data.columns = raw.iloc[3]
+genes = data['GeneID'].astype(str).values
+sample_cols = [str(c) for c in data.columns[2:92]]
+Yn = data[sample_cols].astype(float).values          # genes x samples (normalized counts)
+print(f'Count matrix: {Yn.shape[0]} genes x {Yn.shape[1]} samples; NaNs={int(np.isnan(Yn).sum())}')
+meta = []
+for c in sample_cols:
+    m = re.match(r'(.+)_(baseline_blood|final_blood|dentate_gyrus)(\d+)$', c)
+    meta.append({'Code': c, 'Response': m.group(1), 'Tissue': m.group(2), 'Rep': int(m.group(3))})
+meta = pd.DataFrame(meta)
+print(meta.groupby(['Tissue', 'Response']).size().unstack())
+assert set(sample_cols) == set(ms['Code'].astype(str)), 'Code mismatch between sheets'
+print('Code values in NormCount match Mapping_statistics: OK')
+tis = meta['Tissue'].values; resp = meta['Response'].values
+
+with np.errstate(divide='ignore'):
+    logY = np.where(Yn > 0, np.log(Yn), np.nan)
+gm = np.exp(np.nanmean(logY, axis=1))                # geometric mean per gene (positive values only)
+sf = np.nanmedian(Yn / gm[:, None], axis=0)          # median-of-ratios size factors
+print(f'median-of-ratios size factors re-estimated on NormCount: min={sf.min():.4f} '
+      f'max={sf.max():.4f} median={np.median(sf):.4f}')
+Yn_norm = Yn / sf[None, :]                           # re-normalized counts (used for dispersion + log model)
+
+Y = np.round(Yn).astype(np.int64)                    # integer counts for NB likelihood
+
+# ---------------- 2. DESeq2-like NB GLM ----------------
+print(); print('=' * 80)
+print('STEP 2: DESeq2-style NB GLM (dispersion trend + shrinkage, Wald tests)')
+print('=' * 80)
+
+def make_design(t, r):
+    return np.column_stack([
+        np.ones(len(t)),
+        (t == 'dentate_gyrus').astype(float),
+        (t == 'final_blood').astype(float),
+        (r == 'good_responder').astype(float),
+        (r == 'bad_responder').astype(float),
+    ])
+
+def nb_glm_pipeline(Yint, Ynorm, Xsub, offsets, contrast_vecs):
+    """Yint: genes x samples int counts (likelihood); Ynorm: size-factor-normalized counts
+    (dispersion estimation); Xsub: samples x p design; offsets: log size factors (n,);
+    contrast_vecs: dict name->vector."""
+    G, n = Yint.shape
+    p = Xsub.shape[1]
+    keep = Yint.sum(axis=1) > 0
+    Yk = Yint[keep].astype(float)
+    Ynk = Ynorm[keep]
+    Gk = Yk.shape[0]
+    off = np.asarray(offsets, float)
+
+    # group structure from design (columns 1: define cells)
+    uniq = {tuple(row): i for i, row in enumerate(np.unique(Xsub[:, 1:], axis=0))}
+    gidx = np.array([uniq[tuple(row)] for row in Xsub[:, 1:]])
+    ngr = gidx.max() + 1
+
+    # per-gene method-of-moments dispersion (average positive per-group estimates)
+    acc = np.zeros(Gk); cnt = np.zeros(Gk)
+    for g in range(ngr):
+        sel = gidx == g
+        m = Ynk[:, sel].mean(axis=1)
+        v = Ynk[:, sel].var(axis=1, ddof=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            a = (v - m) / (m ** 2)
+        valid = (m > 0) & np.isfinite(a) & (a > 0)
+        acc[valid] += a[valid]; cnt[valid] += 1
+    alpha_mm = np.where(cnt > 0, acc / np.maximum(cnt, 1), np.nan)
+
+    # dispersion trend: alpha = a1/mu + a0
+    mu_g = Ynk.mean(axis=1)
+    fit_ok = np.isfinite(alpha_mm)
+    A = np.column_stack([1.0 / mu_g[fit_ok], np.ones(fit_ok.sum())])
+    coef, *_ = np.linalg.lstsq(A, alpha_mm[fit_ok], rcond=None)
+    a1, a0 = max(coef[0], 0.0), max(coef[1], 0.0)
+    trend = a1 / mu_g + a0
+    alpha_used = np.where(np.isfinite(alpha_mm),
+                          np.minimum(alpha_mm, np.where(np.isfinite(trend), trend, alpha_mm)),
+                          np.where(np.isfinite(trend), trend, np.nanmedian(alpha_mm)))
+    alpha_used = np.clip(np.nan_to_num(alpha_used, nan=np.nanmedian(alpha_mm)), 1e-8, None)
+    print(f'  dispersion trend fit: a1={a1:.4g}, a0={a0:.4g}; median alpha_used={np.median(alpha_used):.4g}; '
+          f'testable genes={Gk}/{G}')
+
+    # vectorized IRLS NB GLM (log link), per-gene alpha
+    grp_means = np.zeros((n, Gk))
+    for g in range(ngr):
+        sel = gidx == g
+        grp_means[sel, :] = Ynk[:, sel].mean(axis=1)[None, :]
+    mu0 = np.maximum(grp_means, 0.5)
+    beta = np.linalg.lstsq(Xsub, np.log(mu0) - off[:, None], rcond=None)[0]   # p x Gk
+    it = 0
+    for it in range(100):
+        eta = np.clip(off[:, None] + Xsub @ beta, -30, 30)
+        mu = np.exp(eta)
+        W = mu / (1 + alpha_used[None, :] * mu)
+        z = eta + (Yk.T - mu) / mu
+        XtWX = np.einsum('ni,nj,ng->gij', Xsub, Xsub, W)         # Gk x p x p
+        XtWz = (W * z).T @ Xsub                                   # Gk x p
+        ridge = 1e-6 * np.eye(p)[None, :, :] * np.median(np.diagonal(XtWX, axis1=1, axis2=2), axis=1)[:, None, None]
+        beta_new = np.linalg.solve(XtWX + ridge, XtWz[..., None])[..., 0].T
+        bad = ~np.all(np.isfinite(beta_new), axis=0)
+        beta_new[:, bad] = beta[:, bad]
+        if np.median(np.abs(beta_new - beta)) < 1e-6:
+            beta = beta_new; break
+        beta = beta_new
+    print(f'  IRLS converged after {it+1} iterations')
+
+    XtWX_final = XtWX + 1e-6 * np.eye(p)[None, :, :] * np.median(np.diagonal(XtWX, axis1=1, axis2=2), axis=1)[:, None, None]
+    XtWX_inv = np.linalg.inv(XtWX_final)
+    out = {}
+    for name, cvec in contrast_vecs.items():
+        cvec = np.asarray(cvec, float)
+        se2 = np.einsum('gij,i,j->g', XtWX_inv, cvec, cvec)
+        lfc = cvec @ beta
+        zz = lfc / np.sqrt(se2)
+        pval = 2 * stats.norm.sf(np.abs(zz))
+        padj = bh(pval)
+        padj_full = np.ones(G); padj_full[keep] = padj
+        lfc_full = np.full(G, np.nan); lfc_full[keep] = lfc
+        deg = padj_full < NOMINAL
+        out[name] = dict(lfc=lfc_full, padj=padj_full, n_deg=int(deg.sum()),
+                         n_up=int((deg & (lfc_full > 0)).sum()),
+                         n_down=int((deg & (lfc_full < 0)).sum()),
+                         n_testable=int(keep.sum()))
+    return out
+
+X_full = make_design(tis, resp)
+C3 = {
+    'Final vs Baseline blood':          np.array([0, 0, 1, 0, 0], float),
+    'Dentate gyrus vs Baseline blood':  np.array([0, 1, 0, 0, 0], float),
+    'Dentate gyrus vs Final blood':     np.array([0, 1, -1, 0, 0], float),
+}
+nb_res = nb_glm_pipeline(Y, Yn_norm, X_full, np.log(sf), C3)
+for name in C3:
+    r = nb_res[name]
+    print(f'  {name:35s}: DEGs(padj<0.05)={r["n_deg"]:5d} ({r["n_deg"]/len(genes)*100:6.2f}%), '
+          f'up={r["n_up"]:5d}, down={r["n_down"]:5d}')
+
+# ---------------- 3. Binomial exact tests ----------------
+print(); print('=' * 80)
+print('STEP 3: binomial exact test (success = DEG, p0 = 0.05, alpha = 5%)')
+print('=' * 80)
+n_genes = len(genes)
+rows = []
+for name in C3:
+    r = nb_res[name]; k = r['n_deg']
+    p_two = stats.binomtest(k, n_genes, NOMINAL).pvalue
+    p_greater = stats.binomtest(k, n_genes, NOMINAL, alternative='greater').pvalue
+    p_less = stats.binomtest(k, n_genes, NOMINAL, alternative='less').pvalue
+    rows.append({'Comparison': name, 'n_genes': n_genes, 'n_DEG': k,
+                 'DEG_percent': round(100 * k / n_genes, 3),
+                 'binom_p_two_sided': p_two, 'binom_p_greater': p_greater,
+                 'binom_p_less': p_less,
+                 'negligible (DEG% not significantly > 5%)': bool(p_greater > NOMINAL)})
+bt_df = pd.DataFrame(rows)
+print(bt_df.to_string(index=False))
+
+# ---------------- 4. Sensitivity: log-scale linear model ----------------
+print(); print('=' * 80)
+print('STEP 4: sensitivity - log2(x+1) linear model + BH (plain t-test), same design')
+print('=' * 80)
+L = np.log2(Yn_norm + 1.0)
+XtX_inv = np.linalg.pinv(X_full.T @ X_full)
+beta_lin = XtX_inv @ X_full.T @ L.T
+resid = L.T - X_full @ beta_lin
+sigma2 = (resid ** 2).sum(axis=0) / (len(meta) - X_full.shape[1])
+ok_lin = sigma2 > 0
+lin_res = {}
+for name, cvec in C3.items():
+    cvec = np.asarray(cvec, float)
+    se = np.sqrt(sigma2 * (cvec @ XtX_inv @ cvec))
+    tt = np.full(L.shape[0], np.nan)
+    tt[ok_lin] = (cvec @ beta_lin)[ok_lin] / se[ok_lin]
+    pval = 2 * stats.t.sf(np.abs(tt), len(meta) - X_full.shape[1])
+    padj = bh(pval); padj = np.where(np.isnan(padj), 1.0, padj)
+    lfc = cvec @ beta_lin
+    deg = padj < NOMINAL
+    lin_res[name] = dict(n_deg=int(deg.sum()), frac=deg.mean(),
+                         n_up=int((deg & (lfc > 0)).sum()), n_down=int((deg & (lfc < 0)).sum()))
+    print(f'  {name:35s}: DEGs={int(deg.sum()):5d} ({deg.mean()*100:6.2f}%), '
+          f'up={lin_res[name]["n_up"]}, down={lin_res[name]["n_down"]}')
+print('  binomial test on the t-test DEG counts (p0=0.05):')
+for name in C3:
+    k = lin_res[name]['n_deg']
+    print(f'    {name:35s}: p_two={stats.binomtest(k, n_genes, NOMINAL).pvalue:.3e}, '
+          f'p_greater={stats.binomtest(k, n_genes, NOMINAL, alternative="greater").pvalue:.3e}')
+
+# ---------------- 5. Robustness of the binomial mapping ----------------
+print(); print('=' * 80); print('STEP 5: robustness - alternative binomial mappings'); print('=' * 80)
+min_frac = min(nb_res[n]['n_deg'] / n_genes for n in C3)
+print(f'(a) p0 = smallest observed DEG proportion = {min_frac:.6f}')
+for name in C3:
+    k = nb_res[name]['n_deg']
+    bt = stats.binomtest(k, n_genes, min_frac) if min_frac > 0 else None
+    print(f'    {name:35s}: p_two_sided = {"n/a (p0=0)" if bt is None else f"{bt.pvalue:.3e}"}')
+print('(b) up/down balance among DEGs (binomial p=0.5):')
+for name in C3:
+    r = nb_res[name]; tot = r['n_up'] + r['n_down']
+    if tot == 0:
+        print(f'    {name:35s}: no DEGs, test undefined'); continue
+    bt = stats.binomtest(r['n_up'], tot, 0.5)
+    print(f'    {name:35s}: up={r["n_up"]}, down={r["n_down"]}, p_two_sided={bt.pvalue:.3e}')
+print('(c) pairwise DEG-set overlap between the 3 comparisons (binomial on overlap):')
+sets = {name: set(np.where(nb_res[name]['padj'] < NOMINAL)[0]) for name in C3}
+names = list(C3)
+for i, j in [(0, 1), (0, 2), (1, 2)]:
+    A, B = sets[names[i]], sets[names[j]]
+    obs = len(A & B)
+    p_overlap = stats.binomtest(obs, len(A), len(B) / n_genes).pvalue if len(A) > 0 else None
+    print(f'    {names[i]} & {names[j]}: observed={obs}, expected={len(A)*len(B)/n_genes:.0f}, '
+          f'p_two={p_overlap}')
+
+# ---------------- 5b. Effect-size diagnostics and FC-cutoff DEG definition ----------------
+print(); print('=' * 80)
+print('STEP 5b: effect sizes (is "significant" also "large"?) and FC-cutoff DEG definition')
+print('=' * 80)
+for name in C3:
+    lfc = nb_res[name]['lfc']
+    fin = lfc[np.isfinite(lfc)]
+    deg = nb_res[name]['padj'] < NOMINAL
+    big = deg & (np.abs(lfc) >= 1)
+    big15 = deg & (np.abs(lfc) >= np.log2(1.5))
+    print(f'  {name:35s}: median |LFC| among DEGs = {np.median(np.abs(lfc[deg])):.3f}; '
+          f'DEGs with |LFC|>=1: {int(big.sum())} ({big.mean()*100:.2f}%), '
+          f'|LFC|>=1.5x: {int(big15.sum())} ({big15.mean()*100:.2f}%)')
+print('  binomial tests using DEG = padj<0.05 AND |log2FC|>=1 (p0 = 0.05):')
+for name in C3:
+    lfc = nb_res[name]['lfc']
+    k = int(((nb_res[name]['padj'] < NOMINAL) & (np.abs(lfc) >= 1)).sum())
+    p_two = stats.binomtest(k, n_genes, NOMINAL).pvalue
+    p_greater = stats.binomtest(k, n_genes, NOMINAL, alternative='greater').pvalue
+    print(f'    {name:35s}: n_DEG={k:5d} ({100*k/n_genes:.2f}%), p_two={p_two:.3e}, '
+          f'p_greater={p_greater:.3e}, negligible={p_greater > NOMINAL}')
+
+# ---------------- 5c. Paired-design sensitivity (samples come from the same 30 animals) ----------------
+print(); print('=' * 80)
+print('STEP 5c: paired-design sensitivity (animal blocking; Response absorbed by animal)')
+print('=' * 80)
+# animal number is embedded in the Sample ID (e.g. um_mueller_2017_02_08_98_bl -> 98)
+code2animal = dict(zip(ms['Code'].astype(str), ms['Sample ID'].astype(str).str.split('_').str[-2]))
+animal_ids = [code2animal[c] for c in sample_cols]
+animals = sorted(set(animal_ids), key=lambda x: int(x))
+assert len(animals) == 30, f'expected 30 animals, got {len(animals)}'
+# verify each animal contributes exactly one sample per tissue
+import collections
+cnt = collections.Counter(zip(animal_ids, tis))
+assert all(v == 1 for v in cnt.values()), 'animal x tissue not unique'
+print(f'  animals detected: {len(animals)}; each animal has exactly one sample per tissue: OK')
+X_pair = np.column_stack([np.ones(len(meta)),
+                          (tis == 'dentate_gyrus').astype(float),
+                          (tis == 'final_blood').astype(float)] +
+                         [(np.array(animal_ids) == a).astype(float) for a in animals[1:]])
+print(f'  paired design: {X_pair.shape[1]} coefficients, residual df = {len(meta) - X_pair.shape[1]}')
+C3_pair = {name: np.concatenate([cv, np.zeros(X_pair.shape[1] - len(cv))])
+           for name, cv in C3.items()}
+nb_pair = nb_glm_pipeline(Y, Yn_norm, X_pair, np.log(sf), C3_pair)
+for name in C3:
+    r = nb_pair[name]
+    print(f'  {name:35s}: DEGs(padj<0.05)={r["n_deg"]:5d} ({r["n_deg"]/n_genes*100:6.2f}%)')
+
+# ---------------- 6. Cross-check vs sheet's own DESeq blocks ----------------
+print(); print('=' * 80)
+print("STEP 6: magnitude cross-check vs the sheet's own DESeq blocks (within-tissue contrasts)")
+print('=' * 80)
+block_map = {0: ('baseline_blood', 'good vs Control', [0, 1, 0]),
+             1: ('baseline_blood', 'bad vs Control', [0, 0, 1]),
+             2: ('baseline_blood', 'good vs bad', [0, 1, -1]),
+             3: ('dentate_gyrus', 'good vs Control', [0, 1, 0]),
+             4: ('dentate_gyrus', 'bad vs Control', [0, 0, 1]),
+             5: ('dentate_gyrus', 'good vs bad', [0, 1, -1]),
+             6: ('final_blood', 'good vs Control', [0, 1, 0]),
+             7: ('final_blood', 'bad vs Control', [0, 0, 1]),
+             8: ('final_blood', 'good vs bad', [0, 1, -1])}
+print(f'{"tissue":15s} {"contrast":20s} {"sheet U/D":>12s} {"NB-GLM padj<0.05":>18s}')
+for b, (t, con, cv) in block_map.items():
+    v = data.iloc[:, 105 + 9 * b].astype(str)
+    su, sd = int((v == 'U').sum()), int((v == 'D').sum())
+    sub = tis == t
+    Xs = np.column_stack([np.ones(sub.sum()),
+                          (resp[sub] == 'good_responder').astype(float),
+                          (resp[sub] == 'bad_responder').astype(float)])
+    res_s = nb_glm_pipeline(Y[:, sub], Yn_norm[:, sub], Xs, np.log(sf[sub]),
+                            {'x': np.array(cv, float)})
+    print(f'{t:15s} {con:20s} {f"{su}U/{sd}D":>12s} {res_s["x"]["n_deg"]:18d}')
+
+# ---------------- 7. Save outputs ----------------
+out = pd.DataFrame({'GeneID': genes})
+for name in C3:
+    out[f'{name} | log2FC'] = nb_res[name]['lfc']
+    out[f'{name} | padj (NB GLM)'] = nb_res[name]['padj']
+out.to_csv('results/dge_tissue_comparisons_NB.csv', index=False)
+bt_df.to_csv('results/binomial_tests.csv', index=False)
+print()
+print('Saved: results/dge_tissue_comparisons_NB.csv, results/binomial_tests.csv')

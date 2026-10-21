@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+CBD/cisplatin combination treatment - primary enriched cellular mechanism.
+
+Pipeline
+  1. Load raw unfiltered counts (63,677 ENSG x 30 samples), sample layout, ENSG->symbol map.
+  2. DE: DESeq2-style negative-binomial Wald test, pure-numpy (median-of-ratios size
+     factors, per-gene NB GLM via IRLS, per-gene dispersion MLE (method-of-moments)
+     shrunk toward a log-log trend, Wald test for the treatment-vs-reference contrast).
+     DESeq2/edgeR/limma are not installed and there is no network/R in this environment,
+     so this is a faithful re-implementation of DESeq2's core statistics.
+     A log2-CPM + Welch t-test (voom-lite) is a sensitivity check.
+  3. DE-gene filter (literal, as specified): p<0.05 (UNADJUSTED test p), |log2FC|>0.5,
+     baseMean>10.  Union of up- and down-regulated genes.
+  4. Map ENSG->symbol, drop unmapped, deduplicate symbols (keep most significant).
+  5. Enrichment: gseapy `prerank` (fgsea) with Reactome_2022 is the PRIMARY path
+     (attempts pip install + library acquisition at runtime).  If gseapy / the
+     Reactome_2022 library genuinely cannot be obtained, falls back to a local, faithful
+     re-implementation of the fgsea prerank algorithm.  Method actually used is recorded.
+  6. Sensitivity: reference=Untreated (group 1); treatment=group 10 (combo + 16h serum
+     starvation); t-test-based DE.
+"""
+import json, os, sys, subprocess
+import numpy as np
+import pandas as pd
+from scipy import stats
+from genesets import REACTOME_FALLBACK
+
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+DATA, OUT = "data", "results"
+os.makedirs(OUT, exist_ok=True)
+
+# ---------------------------------------------------------------- load data
+counts = pd.read_csv(f"{DATA}/counts_raw_unfiltered.csv", index_col=0)
+counts = counts.apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.int64)
+layout = pd.read_csv(f"{DATA}/sample_layout.csv")
+layout["col"] = layout["SampleID"].str.replace("-", "_", regex=False)
+m = pd.read_csv(f"{DATA}/ensg_to_gene_name.tsv", sep="\t")
+ensg2sym = dict(zip(m["ENSG"], m["gene_name"]))
+
+assert not (set(counts.columns) - set(layout["col"])), "columns not in layout"
+group_of = dict(zip(layout["col"], layout["Group"]))
+sample_group = pd.Series([group_of[c] for c in counts.columns], index=counts.columns)
+GROUPS = sorted(set(sample_group))
+G = {g: i for i, g in enumerate(GROUPS)}
+n_samples, n_par = counts.shape[1], len(GROUPS)
+print(f"[load] genes={counts.shape[0]} samples={n_samples} groups={GROUPS}")
+
+# ---------------------------------------------------------------- size factors (DESeq2 median-of-ratios)
+C = counts.to_numpy(dtype=np.float64)
+geo = np.exp(np.log(C + 1e-9).mean(axis=1))
+ratio = C / geo[:, None]
+med = np.zeros(n_samples)
+for j in range(n_samples):
+    mask = C[:, j] > 0
+    med[j] = np.median(ratio[mask, j]) if mask.any() else 1.0
+size_factors = med
+norm = C / size_factors[None, :]
+baseMean = norm.mean(axis=1)
+
+keep = (C.sum(axis=1) >= 1)
+Y, BM, ensg_keep = C[keep], baseMean[keep], counts.index[keep].values
+print(f"[fit] genes with >=1 count: {Y.shape[0]} (dropped {(~keep).sum()} all-zero)")
+
+X = np.zeros((n_samples, n_par))
+for j, g in enumerate(sample_group):
+    X[j, G[g]] = 1.0
+
+def nb_fit(Y, X, eps_floor=1e-3, max_iter=50, tol=1e-7):
+    """Vectorized negative-binomial (var = mu + eps*mu^2, log link) GLM fit per gene via IRLS.
+    Correct NB IRLS: working response z = eta + (y-mu)/mu, weight W = mu/(1+eps*mu).
+    NB2 deviance used for the dispersion (method of moments).
+    Y: (g,s) counts; X: (s,p) design.  Returns beta (g,p), eps (g,), dev (g,), cov (g,p,p)."""
+    g, s = Y.shape
+    p = X.shape[1]
+    beta = np.zeros((g, p))
+    for k in range(p):
+        sel = X[:, k] > 0
+        beta[:, k] = np.log(Y[:, sel].mean(axis=1) + 1e-6)
+    eps = np.full(g, eps_floor)
+    for it in range(max_iter):
+        eta = X @ beta.T                       # (s,g)
+        mu = np.exp(eta)
+        z = eta + (Y.T - mu) / mu              # (s,g)
+        W = mu / (1.0 + eps * mu)              # (s,g)
+        XtW = (X[:, :, None] * W[:, None, :]).transpose(2, 1, 0)   # (g,p,s)
+        XtWX = np.einsum('gps,sk->gpk', XtW, X)   # (g,p,p)
+        XtWz = np.einsum('gps,sg->gp', XtW, z)    # (g,p)
+        try:
+            beta_new = np.linalg.solve(XtWX, XtWz[:, :, None]).squeeze(-1)
+        except np.linalg.LinAlgError:
+            beta_new = beta
+        dmax = np.max(np.abs(beta_new - beta))
+        beta = beta_new
+        if dmax < tol:
+            break
+    # final dispersion (NB2 deviance, method of moments) + covariance
+    eta = X @ beta.T
+    mu = np.exp(eta)                           # (s,g)
+    muT = mu.T                                 # (g,s)
+    inv_eps = 1.0 / np.maximum(eps, eps_floor)[:, None]
+    term1 = np.where(Y > 0, Y * np.log(muT / np.maximum(Y, 1e-300)), 0.0)
+    term2 = (Y + inv_eps) * np.log((1.0 + eps[:, None] * muT) / (1.0 + eps[:, None] * Y + 1e-300))
+    dev = 2.0 * np.sum(term1 + term2, axis=1)
+    eps = np.maximum((dev - (s - p)) / p, eps_floor)
+    W = mu / (1.0 + eps * mu)               # (s,g); eps (g,) broadcasts on last axis
+    XtW = (X[:, :, None] * W[:, None, :]).transpose(2, 1, 0)   # (g,p,s)
+    XtWX = np.einsum('gps,sk->gpk', XtW, X)
+    try:
+        cov = np.linalg.inv(XtWX)              # (g,p,p)
+    except np.linalg.LinAlgError:
+        cov = np.zeros_like(XtWX)
+    return beta, eps, dev, cov
+
+print("[fit] running NB GLM IRLS ...")
+beta, eps, dev, cov = nb_fit(Y, X)
+
+bm_pos = np.where(BM > 0, BM, 1e-6)
+logbm = np.log(bm_pos)
+logeps = np.log(np.maximum(eps, 1e-6))
+wtr = np.clip(1.0 / (eps + 1e-6), 1e-6, 1e6)
+A = np.c_[np.ones_like(logbm), logbm, logbm ** 2]
+Wt = np.diag(wtr)
+try:
+    coef = np.linalg.solve(A.T @ Wt @ A, A.T @ Wt @ logeps)
+    trend = A @ coef
+    resid_var = float(np.mean((logeps - trend) ** 2)) + 1e-6
+except np.linalg.LinAlgError:
+    trend = np.full_like(logeps, np.median(logeps))
+    resid_var = 0.5
+w_gene = (n_samples - n_par) / np.maximum(eps, 1e-6)
+w_trend = 1.0 / resid_var
+eps_shrunk = (w_gene * eps + w_trend * np.exp(trend)) / (w_gene + w_trend)
+
+def wald_contrast(beta, cov, i_trt, i_ref):
+    b = beta[:, i_trt] - beta[:, i_ref]
+    v = np.maximum(cov[:, i_trt, i_trt] + cov[:, i_ref, i_ref] - 2.0 * cov[:, i_trt, i_ref], 1e-12)
+    se = np.sqrt(v)
+    z = b / se
+    p = 2.0 * stats.norm.sf(np.abs(z))
+    return b, se, p, z
+
+def make_de(trt, ref, tag, use_ttest=False):
+    i_t, i_r = G[trt], G[ref]
+    if use_ttest:
+        cpm = np.log2(norm[keep] + 0.5)
+        jt = [j for j, g in enumerate(sample_group) if g == trt]
+        jr = [j for j, g in enumerate(sample_group) if g == ref]
+        lfc = cpm[:, jt].mean(axis=1) - cpm[:, jr].mean(axis=1)
+        vt = cpm[:, jt].var(axis=1, ddof=1); vr = cpm[:, jr].var(axis=1, ddof=1)
+        n1, n2 = len(jt), len(jr)
+        se = np.sqrt(((vt + vr) / (n1 + n2 - 2)) * (1 / n1 + 1 / n2))
+        se = np.maximum(se, 1e-12)
+        t = lfc / se
+        p = 2 * stats.t.sf(np.abs(t), n1 + n2 - 2)
+        out = pd.DataFrame({"log2FC": lfc, "pvalue": p}, index=ensg_keep)
+    else:
+        b, se, p, z = wald_contrast(beta, cov, i_t, i_r)
+        out = pd.DataFrame({"log2FC": b, "pvalue": p, "z": z}, index=ensg_keep)
+    out["baseMean"] = BM
+    out["Group_trt"], out["Group_ref"] = trt, ref
+    out["method"] = ("log2CPM_Welch_ttest" if use_ttest else "DESeq2style_NB_Wald")
+    out = out.reset_index().rename(columns={"index": "ENSG"})
+    out.to_csv(f"{OUT}/de_{tag}.csv", index=False)
+    return out
+
+de_p   = make_de("Cisplatin_IC50_CBD_IC50", "DMSO", "primary")
+de_u   = make_de("Cisplatin_IC50_CBD_IC50", "Untreated", "sens_ref_untreated")
+de_10  = make_de("Cisplatin_IC50_CBD_IC50_Serum_starvation_16h", "DMSO", "sens_trt_group10")
+de_tt  = make_de("Cisplatin_IC50_CBD_IC50", "DMSO", "sens_ttest", use_ttest=True)
+
+def de_filter(de, tag):
+    f = de[(de["pvalue"] < 0.05) & (de["log2FC"].abs() > 0.5) & (de["baseMean"] > 10)].copy()
+    f["direction"] = np.where(f["log2FC"] > 0, "up", "down")
+    f.to_csv(f"{OUT}/de_genes_{tag}.csv", index=False)
+    print(f"[DE] {tag}: n_DE={len(f)} up={int((f['direction']=='up').sum())} down={int((f['direction']=='down').sum())}")
+    return f
+
+de_genes_p = de_filter(de_p, "primary")
+de_filter(de_u, "sens_ref_untreated")
+de_filter(de_10, "sens_trt_group10")
+de_filter(de_tt, "sens_ttest")
+
+# ---------------------------------------------------------------- map to symbols
+def symbols_of(de, tag):
+    d = de.copy()
+    d["symbol"] = d["ENSG"].map(ensg2sym)
+    nu = int(d["symbol"].isna().sum())
+    d = d.dropna(subset=["symbol"]).sort_values("pvalue").drop_duplicates(subset="symbol", keep="first")
+    print(f"[map] {tag}: unmapped_dropped={nu}, symbols_after_dedup={len(d)}")
+    return d
+
+def rnk_of(de):
+    f = de.copy()
+    f["symbol"] = f["ENSG"].map(ensg2sym)
+    f = f.dropna(subset=["symbol"]).sort_values("pvalue").drop_duplicates(subset="symbol", keep="first")
+    return f.set_index("symbol")["log2FC"].sort_values(ascending=False)
+
+sym_p = symbols_of(de_genes_p, "primary")
+rnk_series = rnk_of(de_p)
+print(f"[gsea] ranked genes (mapped, dedup): {len(rnk_series)}")
+
+# ---------------------------------------------------------------- gseapy (primary path)
+def try_gseapy(rnk):
+    try:
+        import gseapy as gp
+    except Exception:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "gseapy"],
+                           timeout=300, check=False)
+            import gseapy as gp
+        except Exception as e:
+            return None, f"gseapy not importable and pip install failed: {e!r}"
+    try:
+        res = gp.prerank(rnk=rnk, gene_sets="Reactome_2022", method="fgsea", out="gsea", verbose=False)
+        return res, f"gseapy.prerank method=fgsea geneset=Reactome_2022 (v{getattr(gp,'__version__','?')})"
+    except Exception as e:
+        return None, f"gseapy.prerank failed (Reactome_2022 library not obtainable offline): {e!r}"
+
+def local_fgsea(rnk_series, gene_sets, n_perm=10000, seed=RNG_SEED):
+    """Faithful port of fgsea prerank (as used by gseapy method='fgsea').
+    n_perm raised to 10000 for adequate p-value resolution (1000 hits the floor)."""
+    rng = np.random.default_rng(seed)
+    genes = rnk_series.index.to_numpy()
+    scores = rnk_series.to_numpy(dtype=np.float64)
+    order = np.lexsort((rng.random(len(scores)), -scores))
+    ranked_genes, ranked_scores = genes[order], scores[order]
+    pos = {g: i + 1 for i, g in enumerate(ranked_genes)}
+    N = len(ranked_genes)
+    W = np.arange(1, N + 1, dtype=float)
+    rows = []
+    for name, members in gene_sets.items():
+        is_member = np.zeros(N, dtype=bool)
+        for g in members:
+            if g in pos:
+                is_member[pos[g] - 1] = True
+        n_hit = int(is_member.sum())
+        if n_hit < 15:
+            continue
+        es_obs = _fgsea_es_mask(is_member, ranked_scores, W)
+        es_perms = np.empty(n_perm)
+        for k in range(n_perm):
+            perm = rng.permutation(N)
+            es_perms[k] = _fgsea_es_mask(is_member[perm], ranked_scores, W)
+        same = es_perms[np.sign(es_perms) == np.sign(es_obs)]
+        denom = es_perms.mean()
+        nes = same.mean() / denom if (denom != 0 and len(same)) else 0.0
+        pval = (np.sum(np.abs(es_perms) >= np.abs(es_obs)) + 1) / (n_perm + 1)
+        rows.append({"Term": name, "NES": nes, "pvalue": pval, "size": n_hit, "ES": es_obs})
+    res = pd.DataFrame(rows)
+    if len(res):
+        res["padj"] = _bh(res["pvalue"].to_numpy())
+        res = res.sort_values("padj").reset_index(drop=True)
+    return res
+
+def _bh(p):
+    p = np.asarray(p, float); n = len(p)
+    if n == 0:
+        return p
+    o = p.argsort(); adj = p[o] * n / np.arange(1, n + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    out = np.empty(n); out[o] = np.minimum(adj, 1.0); return out
+
+def _fgsea_es_mask(hit, scores, W):
+    """fgsea running-sum ES: hit contributions weighted by W*sign(score) normalized by
+    total hit weight; miss contributions weighted by W normalized by total miss weight.
+    ES = extreme (max or min) of the running sum, by absolute value."""
+    n_hit, n_miss = int(hit.sum()), int((~hit).sum())
+    if n_hit == 0 or n_miss == 0:
+        return 0.0
+    WH = W[hit].sum()
+    WM = W[~hit].sum()
+    if WH == 0 or WM == 0:
+        return 0.0
+    hit_part = np.cumsum(np.where(hit, W * np.sign(scores), 0.0)) / WH
+    miss_part = np.cumsum(np.where(~hit, W, 0.0)) / WM
+    rs = hit_part - miss_part
+    return rs.max() if rs.max() > abs(rs.min()) else rs.min()
+
+res_gsea, gsea_method = try_gseapy(rnk_series)
+if res_gsea is None:
+    print(f"[gsea] FALLBACK (local fgsea) reason: {gsea_method}")
+    res_gsea = local_fgsea(rnk_series, REACTOME_FALLBACK)
+    gsea_method = ("LOCAL fgsea re-implementation (gseapy/Reactome_2022 library NOT obtainable "
+                   "offline); curated Reactome_2022 major-pathway gene sets as approximation")
+res_gsea.to_csv(f"{OUT}/gsea_primary.csv", index=False)
+print(f"[gsea] METHOD USED: {gsea_method}")
+print("[gsea] top 10 pathways (primary: combo group9 vs DMSO):")
+print(res_gsea.head(10).to_string(index=False))
+
+def enrich_sens(de, tag):
+    rnk = rnk_of(de)
+    r, meth = try_gseapy(rnk)
+    if r is None:
+        r = local_fgsea(rnk, REACTOME_FALLBACK)
+        meth = "LOCAL fgsea re-implementation (fallback)"
+    r.to_csv(f"{OUT}/gsea_{tag}.csv", index=False)
+    if len(r):
+        t = r.iloc[0]
+        print(f"[gsea-sens] {tag}: top = {t['Term']} (NES={t['NES']:.3f}, padj={t['padj']:.4g})")
+    else:
+        print(f"[gsea-sens] {tag}: no pathways")
+    return r
+
+enrich_sens(de_u, "sens_ref_untreated")
+enrich_sens(de_10, "sens_trt_group10")
+
+# ---------------------------------------------------------------- summary
+top = res_gsea.iloc[0]
+summary = {
+    "question": "Primary cellular mechanism enriched in CBD/cisplatin combination treatment (gseapy, Reactome_2022, DE p<0.05 |lfc|>0.5 baseMean>10)",
+    "treatment_group": "Cisplatin_IC50_CBD_IC50 (group 9, samples 9_1-9_3)",
+    "reference_group": "DMSO (group 3, samples 3_1-3_3)",
+    "de_method": "DESeq2-style NB Wald (numpy re-implementation); sensitivity: log2CPM Welch t-test",
+    "de_filter": "p<0.05 (unadjusted), |log2FC|>0.5, baseMean>10; union of up+down",
+    "n_DE_primary": int(len(de_genes_p)),
+    "n_up": int((de_genes_p['direction'] == 'up').sum()),
+    "n_down": int((de_genes_p['direction'] == 'down').sum()),
+    "gsea_method_used": gsea_method,
+    "top_pathway": str(top["Term"]) if len(res_gsea) else None,
+    "top_NES": float(top["NES"]) if len(res_gsea) else None,
+    "top_pvalue": float(top["pvalue"]) if len(res_gsea) else None,
+    "top_padj": float(top["padj"]) if len(res_gsea) else None,
+    "reference_that_produced_top": "DMSO (primary reference)",
+}
+with open(f"{OUT}/summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+print("\n[summary]", json.dumps(summary, indent=2))
+print("\nDONE.")

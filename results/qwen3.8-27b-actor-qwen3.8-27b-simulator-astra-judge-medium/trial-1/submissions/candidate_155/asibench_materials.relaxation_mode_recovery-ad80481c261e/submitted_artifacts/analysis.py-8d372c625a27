@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Shared-mode recovery from complex response curves (asibench:materials.relaxation_mode_recovery).
+
+Model (per curve m):
+    R_m(x) = a0_m + sum_{k=1..K} a_{m,k} / (1 + (i * x * tau_k)^{phi_k})
+
+Shared across curves: K, tau_k, phi_k.  Curve-specific: a0_m (free) and
+modal amplitudes a_{m,k} >= 0.  Physical constraints: tau_k > 0,
+0 < phi_k <= 1.
+
+Method
+------
+Variable projection (profiled least squares), fully reproducible (fixed seed):
+  * Outer nonlinear parameters: p = [log10(tau_1..K), phi_1..K],
+    optimized with scipy.optimize.least_squares (method='trf'), multistart.
+    Modes are sorted by log10(tau) inside the objective to defuse the
+    permutation symmetry; a soft repulsion penalty keeps modes from
+    coalescing (factor < 1.3 in tau).
+  * Inner linear parameters, given (tau, phi): per-curve constrained linear
+    least squares with a0 free and a_k >= 0, solved exactly via block
+    elimination (free a0) + NNLS on the K x K Schur complement of the
+    normal equations (complex least squares folded to 2n x (K+1) real).
+  * Unknown K: fit K = 0..4, select by BIC on n = 960 real residuals,
+    p = 2K + M*(K+1) parameters (AIC reported).  Restart stability
+    (fraction of starts reaching within 5% of the best RSS) is reported
+    and used as a sanity check; if the BIC gap between adjacent K is < 2,
+    the ambiguity is flagged explicitly.
+  * MAP prior: effectively flat (uniform in log tau, uniform in phi),
+    enforced through the hard bounds only; no additional regularization.
+
+Outputs: results/modes.csv (header: tau,a_0,...,a_{M-1}; rows sorted by
+tau ascending; a_m = amplitude of the mode in curve m) and a
+self-documenting console summary (per-curve baseline a0_m, BIC/AIC table,
+residual RMS, stability).
+"""
+import json
+import os
+
+import numpy as np
+from scipy.optimize import least_squares, nnls
+
+# ----------------------------- configuration ------------------------------
+SEED = 20261019
+DATA_CSV = "data/curves.csv"
+META_JSON = "data/meta.json"
+OUT_DIR = "results"
+OUT_CSV = os.path.join(OUT_DIR, "modes.csv")
+
+K_MAX = 4
+N_STARTS = {0: 1, 1: 10, 2: 15, 3: 40, 4: 40}
+MAX_NFEV = 150          # per start
+POLISH_NFEV = 300       # final polish from best solution
+
+LOGTAU_LO, LOGTAU_HI = -4.8, 2.8   # padded observed x-range (log10)
+PHI_LO, PHI_HI = 0.05, 1.0
+COALESCE_GAP = np.log10(1.3)       # min allowed log10 tau separation
+COALESCE_W = 1e3                   # soft repulsion weight (RSS units)
+BIC_AMBIGUOUS_GAP = 2.0
+
+RNG = np.random.default_rng(SEED)
+
+# ------------------------------- data load --------------------------------
+def load_data():
+    d = np.genfromtxt(DATA_CSV, delimiter=",", names=True)
+    curves = sorted(set(d["curve"].astype(int)))
+    x = d["x"][d["curve"] == curves[0]]
+    RE = np.array([d["re"][d["curve"] == c] for c in curves], float)
+    IM = np.array([d["im"][d["curve"] == c] for c in curves], float)
+    return curves, x, RE, IM
+
+# ------------------------------ model pieces ------------------------------
+def mode_vec(tau, phi, x):
+    """f(x) = 1 / (1 + (i x tau)^phi), principal branch (x*tau > 0)."""
+    u = x * tau
+    return 1.0 / (1.0 + np.exp(phi * (np.log(u) + 0.5j * np.pi)))
+
+
+def profile(p, K, x, RE, IM):
+    """Profiled evaluation at nonlinear parameters p = [log10 tau, phi].
+
+    Returns (rss, amps (M, K+1), tau_sorted, phi_sorted).
+    """
+    M = RE.shape[0]
+    if K == 0:
+        a0 = RE.mean(axis=1)
+        rss = float(np.sum((RE - a0[:, None]) ** 2) + np.sum(IM ** 2))
+        amps = a0[:, None]
+        return rss, amps, np.array([]), np.array([])
+
+    idx = np.argsort(p[:K])
+    lt = p[:K][idx]
+    ph = p[K:][idx]
+    tau = 10.0 ** lt
+
+    n = x.size
+    F = np.empty((n, K + 1), complex)
+    F[:, 0] = 1.0
+    for k in range(K):
+        F[:, k + 1] = mode_vec(tau[k], ph[k], x)
+
+    A = np.vstack([F.real, F.imag])            # (2n, K+1)
+    N = A.T @ A
+    n00 = N[0, 0]
+    n0a = N[0, 1:]
+    Nr = N[1:, 1:] - np.outer(n0a, n0a) / n00  # Schur complement (K x K)
+
+    amps = np.empty((M, K + 1))
+    rss = 0.0
+    for m in range(M):
+        y = np.concatenate([RE[m], IM[m]])
+        g0 = float(A[:, 0] @ y)
+        ga = A[:, 1:].T @ y
+        a, _ = nnls(Nr, ga - n0a * (g0 / n00))
+        a0 = (g0 - n0a @ a) / n00
+        amps[m, 0] = a0
+        amps[m, 1:] = a
+        res = y - A @ amps[m]
+        rss += float(res @ res)
+
+    # soft repulsion against mode coalescence (safety net)
+    if K >= 2:
+        bad = np.clip(COALESCE_GAP - np.diff(lt), 0.0, None)
+        rss += COALESCE_W * float(bad @ bad)
+    return rss, amps, tau, ph
+
+
+def make_objective(K, x, RE, IM):
+    def obj(p):
+        rss, *_ = profile(p, K, x, RE, IM)
+        return [np.sqrt(rss)]
+    return obj
+
+
+def gen_starts(K):
+    n_start = N_STARTS[K]
+    for _ in range(n_start):
+        lt = np.sort(RNG.uniform(LOGTAU_LO, LOGTAU_HI, K))
+        ph = np.where(RNG.random(K) < 0.5, 1.0, RNG.uniform(0.4, 1.0, K))
+        yield np.concatenate([lt, ph])
+
+
+def fit_start(p0, K, bounds, obj, max_nfev=MAX_NFEV, tight=False):
+    tol = 1e-12 if tight else 1e-10
+    res = least_squares(obj, p0, bounds=bounds, method="trf",
+                        max_nfev=max_nfev, xtol=tol, ftol=tol, gtol=tol)
+    # least_squares reports cost = 0.5 * sum(residuals^2); our residual vector
+    # is [sqrt(rss)], so the profiled RSS is 2 * cost.
+    return res.x, 2.0 * float(res.cost)
+
+
+def mode_distance(p1, p2, K):
+    """Distance between two sorted mode sets (log10 tau, phi)."""
+    if K == 0:
+        return 0.0
+    return max(float(np.max(np.abs(p1[:K] - p2[:K]))),
+               float(np.max(np.abs(p1[K:] - p2[K:]))))
+
+
+# --------------------------------- main ------------------------------------
+def main():
+    curves, x, RE, IM = load_data()
+    M, n = RE.shape
+    n_real = 2 * M * n  # number of real residuals (960)
+
+    with open(META_JSON) as fh:
+        meta = json.load(fh)
+    print(f"Loaded {M} curves x {n} points (x in [{x.min():.4e}, {x.max():.4e}]); "
+          f"meta: {meta}")
+
+    bounds_lo = np.array([LOGTAU_LO] * K_MAX + [PHI_LO] * K_MAX)
+    bounds_hi = np.array([LOGTAU_HI] * K_MAX + [PHI_HI] * K_MAX)
+
+    table = {}
+    best_overall = {}
+    for K in range(K_MAX + 1):
+        lo = bounds_lo[:2 * K] if K else None
+        hi = bounds_hi[:2 * K] if K else None
+        obj = make_objective(K, x, RE, IM)
+        results = []
+        if K == 0:
+            rss0, *_ = profile(np.array([]), 0, x, RE, IM)
+            results.append((rss0, np.array([])))
+            rss_best, p_best = rss0, np.array([])
+        else:
+            for p0 in gen_starts(K):
+                p, rss = fit_start(p0, K, (lo, hi), obj)
+                results.append((rss, p))
+            results.sort(key=lambda t: t[0])
+            rss_best, p_best = results[0]
+            # polish from the best start
+            p_best, rss_best = fit_start(p_best, K, (lo, hi), obj,
+                                         max_nfev=POLISH_NFEV, tight=True)
+        # final amplitude solve + diagnostics
+        rss, amps, tau, ph = profile(p_best, K, x, RE, IM)
+        ph = np.clip(ph, PHI_LO, PHI_HI)
+        if K:
+            Fm = np.stack([mode_vec(t, f, x) for t, f in zip(tau, ph)], axis=1)
+            pred = amps[:, 0:1].T + Fm @ amps[:, 1:].T  # (n, M) complex
+        else:
+            pred = np.broadcast_to(amps[:, 0:1].T, (x.size, M))  # (n, M)
+        resid = np.stack([RE - pred.real.T, IM - pred.imag.T], axis=1)  # (M, n, 2)
+        rms = float(np.sqrt(np.mean(resid ** 2)))
+        rms_per_curve = [float(np.sqrt(np.mean(resid[m] ** 2))) for m in range(M)]
+        n_close = sum(1 for r, _ in results if r <= 1.05 * rss_best)
+        stability = n_close / len(results)
+
+        p_par = 2 * K + M * (K + 1)
+        bic = n_real * np.log(rss / n_real) + p_par * np.log(n_real)
+        aic = n_real * np.log(rss / n_real) + 2 * p_par
+        table[K] = dict(rss=rss, p=p_par, bic=bic, aic=aic,
+                        rms=rms, stability=stability)
+        best_overall[K] = dict(p=p_best, amps=amps, tau=tau, ph=ph,
+                               rms_per_curve=rms_per_curve)
+        print(f"K={K}: best RSS={rss:.5f} (p={p_par}), BIC={bic:.2f}, "
+              f"AIC={aic:.2f}, rms={rms:.4f}, "
+              f"stability={stability:.2f} ({n_close}/{len(results)} starts "
+              f"within 5% of best)")
+
+    # ---------------- model selection (BIC) ----------------
+    K_star = min(table, key=lambda k: table[k]["bic"])
+    bic_sorted = sorted(table.items(), key=lambda kv: kv[1]["bic"])
+    gap = bic_sorted[1][1]["bic"] - bic_sorted[0][1]["bic"]
+    ambiguity = None
+    if gap < BIC_AMBIGUOUS_GAP:
+        ambiguity = (f"BIC is ambiguous: K={bic_sorted[0][0]} (BIC={bic_sorted[0][1]['bic']:.2f}) "
+                     f"vs K={bic_sorted[1][0]} (BIC={bic_sorted[1][1]['bic']:.2f}), "
+                     f"gap={gap:.2f} < {BIC_AMBIGUOUS_GAP}. "
+                     f"Writing CSV for the BIC-preferred K={bic_sorted[0][0]}.")
+
+    print("\n--- BIC / AIC table ---")
+    print(f"{'K':>2} {'RSS':>10} {'p':>3} {'BIC':>10} {'AIC':>10} {'rms':>8} {'stability':>10}")
+    for K in sorted(table):
+        t = table[K]
+        mark = "  <-- selected" if K == K_star else ""
+        print(f"{K:>2} {t['rss']:>10.5f} {t['p']:>3} {t['bic']:>10.2f} "
+              f"{t['aic']:>10.2f} {t['rms']:>8.4f} {t['stability']:>10.2f}{mark}")
+    if ambiguity:
+        print("\n" + ambiguity)
+
+    # ---------------- final solution for K* ----------------
+    sol = best_overall[K_star]
+    tau, ph = sol["tau"], sol["ph"]
+    amps = sol["amps"]  # (M, K+1): col 0 = a0_m, cols 1..K = a_{m,k}
+
+    print(f"\n=== Final solution: K = {K_star} ===")
+    print("Shared modes (sorted by tau):")
+    for k in range(K_star):
+        print(f"  mode {k+1}: tau = {tau[k]:.6g}   phi = {ph[k]:.6f}")
+    print("Per-curve baseline a0_m:")
+    for m in range(M):
+        print(f"  curve {m}: a0 = {amps[m, 0]:.6f}")
+    print("Per-curve mode amplitudes a_{m,k} (>= 0):")
+    for m in range(M):
+        print(f"  curve {m}: " + ", ".join(f"a_{k+1}={amps[m, k+1]:.6f}" for k in range(K_star)))
+    print("Per-curve residual RMS (re+im): " +
+          ", ".join(f"curve {m}={sol['rms_per_curve'][m]:.4f}" for m in range(M)))
+    print(f"Overall residual RMS: {table[K_star]['rms']:.4f}")
+
+    # ---------------- write results/modes.csv ----------------
+    os.makedirs(OUT_DIR, exist_ok=True)
+    order = np.argsort(tau)
+    with open(OUT_CSV, "w") as fh:
+        fh.write("tau," + ",".join(f"a_{m}" for m in range(M)) + "\n")
+        for k in order:
+            row = [f"{tau[k]:.10g}"] + [f"{amps[m, k + 1]:.10g}" for m in range(M)]
+            fh.write(",".join(row) + "\n")
+    print(f"\nWrote {OUT_CSV} ({K_star} mode rows, sorted by tau ascending).")
+
+
+if __name__ == "__main__":
+    main()

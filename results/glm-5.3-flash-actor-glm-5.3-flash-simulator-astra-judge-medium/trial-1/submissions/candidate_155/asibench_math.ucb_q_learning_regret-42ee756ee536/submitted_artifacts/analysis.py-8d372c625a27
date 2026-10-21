@@ -1,0 +1,176 @@
+"""Low-regret online, model-free optimistic Q-learning for finite-horizon
+episodic MDPs (hidden tabular families; rewards in [0, rmax]).
+
+Design — "blend-of-two-streams optimistic Q-learning":
+
+Motivation (the stated research constraint): in plain Bernstein UCB-Q the
+one-step bootstrap targets drift while downstream Q values are still being
+learned, so confidence intervals built on the drifting target stream pay a
+large finite-sample burn-in cost, especially with delayed rewards or
+horizon-dependent continuation variance.
+
+Mechanism (strictly online, model-free, O(H*S*A) storage):
+  * Horizon-indexed values, optimistic initialization
+        val[h] = (H - h) * rmax           (valid remaining-horizon range).
+  * Two SCALAR statistics streams per (h, s, a) cell (no next-state counts,
+    no transition model, no H*S*A*S tensor):
+      - MC stream (nM, muM, m2M): return-to-go observed from this cell along
+        the just-finished episode, written by a single backward sweep over the
+        one bounded current-episode trace at observe(done=True).  These are
+        real observed returns: unbiased by construction and immune to target
+        drift, so early confidence intervals are honest (cheap burn-in).
+      - Bootstrap stream (nB, muB, m2B): one-step targets
+        r + max_a' V(h+1, s') where V(h+1, s') is the honest MC-stream mean of
+        the observed next state (optimistic initialization fallback for cells
+        never visited).  Lower variance once learned; no optimism compounding
+        through the target chain.
+  * Decision value at (h, s, a): weight w(n) = 1/(1 + n/kappa) blends the
+    drift-immune MC mean (early) with the low-variance blended bootstrap mean
+    (late); stored in val[.].
+  * Bernstein-style optimism in the face of uncertainty (no posterior
+    sampling): bonus(h,s,a) =
+        c_var  * sqrt( var_mix * L / n )  +  c_range * (R_h * rmax) * L / n,
+    where var_mix is a capped mixture variance of the two streams (the squared
+    mean difference between streams is included, so stream disagreement --
+    residual drift/bias -- widens the interval), R_h = H - h + 1 is a valid
+    range bound for any target value, L = log(S*A*H*K + 2), n = nM + nB.
+  * Action: greedy optimistic index argmax_a (val + bonus), with visit-based
+    tie-breaking (least-tried action first).  Deterministic; the agent seed is
+    accepted for interface compatibility.
+  * Updates happen only at observed (h, s, a) cells (one-step) or along the
+    current episode trace (single backward pass): no enumeration of possible
+    next states, no replay of past episodes, no planning against a model.
+  * Episode-end consolidation lives inside observe(done=True); the optional
+    reset_episode/end_episode hooks are accepted but never required.
+
+One shared configuration (calibrated once on the public suite through the
+official runner; no branching on case_id, dimensions or action patterns):
+    kappa = 4.0, c_var = 0.05, c_range = 0.03.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+CONFIG = {
+    "kappa": 4.0,     # blend decay of the MC-stream weight, w(n)=1/(1+n/kappa)
+    "c_var": 0.05,    # Bernstein variance-term multiplier
+    "c_range": 0.03,  # Hoeffding/range-term multiplier
+}
+
+
+class BlendOptimisticQAgent:
+    """Optimistic Q-learning with blended MC / one-step-bootstrap streams."""
+
+    def __init__(self, env_spec, seed, cfg=None):
+        self.cfg = dict(CONFIG if cfg is None else cfg)
+        spec = env_spec
+        self.S = int(spec["S"])
+        self.A = int(spec["A"])
+        self.H = int(spec["H"])
+        self.K = max(int(spec.get("K", 0)), 1)
+        self.rmax = float(spec.get("reward_range", [0.0, 1.0])[1])
+        self.L = math.log(self.S * self.A * self.H * self.K + 2.0)
+        shape = (self.H, self.S, self.A)
+        # optimistic initialization inside the valid remaining-horizon range
+        self.val = np.tile(
+            np.arange(self.H, 0, -1, dtype=np.float64)[:, None, None],
+            (1, self.S, self.A),
+        ) * self.rmax
+        # scalar per-(h,s,a) streams: MC (drift-immune) and bootstrap
+        self.nM, self.muM, self.m2M = np.zeros(shape), np.zeros(shape), np.zeros(shape)
+        self.nB, self.muB, self.m2B = np.zeros(shape), np.zeros(shape), np.zeros(shape)
+        self.trace = []  # the single bounded current-episode trace
+
+    # ---- scalar Welford update of one stream at one cell -------------------
+    def _stream_update(self, stream, hi, s, a, x):
+        n_arr, mu_arr, m2_arr = stream
+        n = n_arr[hi, s, a] + 1.0
+        d = x - mu_arr[hi, s, a]
+        mu_arr[hi, s, a] += d / n
+        m2_arr[hi, s, a] += d * (x - mu_arr[hi, s, a])
+        n_arr[hi, s, a] = n
+
+    # ---- blended mean / mixture variance (vectorized over actions) --------
+    def _stats(self, nB, muB, m2B, nM, muM, m2M, fallback, R):
+        vmax = (R * self.rmax) ** 2 / 4.0          # max variance of any target
+        n_tot = nB + nM
+        w = 1.0 / (1.0 + n_tot / self.cfg["kappa"])  # MC-stream weight
+        haveB, haveM = nB > 0.5, nM > 0.5
+        wB = np.where(haveB, 1.0 - w, 0.0)
+        wM = np.where(haveM, w, 0.0)
+        wsum = np.maximum(wB + wM, 1e-12)
+        mean = np.where(wB + wM > 1e-12, (wM * muM + wB * muB) / wsum, fallback)
+        vB = np.where(nB >= 1.5, m2B / np.maximum(nB - 1.0, 1.0), 0.0)
+        vM = np.where(nM >= 1.5, m2M / np.maximum(nM - 1.0, 1.0), 0.0)
+        v = (wM * vM + wB * vB) / wsum \
+            + (wM / wsum) * (wB / wsum) * (muM - muB) ** 2
+        v = np.where(wB + wM > 1e-12, v, vmax)     # unvisited: worst case
+        v = np.minimum(np.maximum(v, 0.0), vmax)
+        return mean, v, n_tot
+
+    def _row_stats(self, hi, s):
+        return self._stats(
+            self.nB[hi, s], self.muB[hi, s], self.m2B[hi, s],
+            self.nM[hi, s], self.muM[hi, s], self.m2M[hi, s],
+            self.val[hi, s], float(self.H - hi),
+        )
+
+    def _bonus(self, v, n_tot, R):
+        return (self.cfg["c_var"] * np.sqrt(v * self.L / np.maximum(n_tot, 1.0))
+                + self.cfg["c_range"] * R * self.rmax * self.L / np.maximum(n_tot, 1.0))
+
+    # ---- interface ---------------------------------------------------------
+    def act(self, h, state):
+        hi = h - 1
+        mean, v, n_tot = self._row_stats(hi, state)
+        values = mean + self._bonus(v, n_tot, float(self.H - hi))
+        best = values.max()
+        tied = values >= best - 1e-9
+        scores = np.where(tied, n_tot, np.inf)   # least-tried among the optimistic ties
+        return int(np.argmin(scores))
+
+    def observe(self, h, state, action, reward, next_state, done):
+        hi = h - 1
+        # one-step bootstrap target with honest next-value estimate:
+        # max over actions of the MC-stream mean (optimistic-init fallback
+        # for never-visited cells); no bonus compounding inside targets.
+        if done or hi + 1 >= self.H:
+            nxt = 0.0
+        else:
+            have = self.nM[hi + 1, next_state] > 0.5
+            nxt = float(np.max(np.where(have, self.muM[hi + 1, next_state],
+                                        self.val[hi + 1, next_state])))
+        self._stream_update((self.nB, self.muB, self.m2B), hi, state, action, reward + nxt)
+        mean, _, _ = self._stats(
+            self.nB[hi, state, action], self.muB[hi, state, action], self.m2B[hi, state, action],
+            self.nM[hi, state, action], self.muM[hi, state, action], self.m2M[hi, state, action],
+            self.val[hi, state, action], float(self.H - hi),
+        )
+        self.val[hi, state, action] = min(max(float(mean), 0.0), (self.H - hi) * self.rmax)
+        # bounded current-episode trace; single backward sweep at episode end
+        self.trace.append((hi, state, action, float(reward)))
+        if done:
+            G = 0.0
+            for hj, sj, aj, rj in reversed(self.trace):
+                G += rj
+                self._stream_update((self.nM, self.muM, self.m2M), hj, sj, aj, G)
+                mean_j, _, _ = self._stats(
+                    self.nB[hj, sj, aj], self.muB[hj, sj, aj], self.m2B[hj, sj, aj],
+                    self.nM[hj, sj, aj], self.muM[hj, sj, aj], self.m2M[hj, sj, aj],
+                    self.val[hj, sj, aj], float(self.H - hj),
+                )
+                self.val[hj, sj, aj] = min(max(mean_j, 0.0), (self.H - hj) * self.rmax)
+            self.trace.clear()
+
+    # optional hooks (the design never relies on them)
+    def reset_episode(self, episode, state):
+        self.trace.clear()
+
+    def end_episode(self, episode, episode_reward):
+        pass
+
+
+def make_agent(env_spec, seed):
+    return BlendOptimisticQAgent(env_spec, seed)

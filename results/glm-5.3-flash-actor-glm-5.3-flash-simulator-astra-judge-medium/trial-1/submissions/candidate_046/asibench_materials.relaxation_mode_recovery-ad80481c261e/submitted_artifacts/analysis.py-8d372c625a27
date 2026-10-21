@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+Shared-mode recovery from complex response curves.
+
+Model:  R(x) = a0 + sum_{k=1..K} a_k / (1 + (i * x * tau_k)^phi_k)
+  - K, tau_k, phi_k are SHARED across all curves (principal branch of the
+    complex power: (i*y)^phi = y^phi * e^{i phi pi/2}).
+  - a0 (baseline) and a_k (modal amplitudes) are curve-specific and >= 0.
+
+Method:
+  1. Load the shared log-grid data; estimate per-curve noise sigma from
+     second differences (homoscedastic assumption verified by decade-wise
+     residual checks).
+  2. Variable projection: for fixed (tau_k, phi_k) the per-curve parameters
+     (a0, a_k) enter linearly -> non-negative least squares (NNLS) per curve
+     on the sigma-weighted stack [Re; Im].
+  3. Shared nonlinear search over theta = (log10 tau_1..K, logit phi_1..K)
+     with multi-start TRF least-squares + differential evolution for
+     K = 1..K_max.
+  4. Model selection by BIC; prune modes with negligible amplitude or
+     duplicated tau (|dlog10 tau| < half grid step), refit, and report the
+     final K after pruning.  Tail structure at the high-x edge is checked;
+     an extra mode is kept only if BIC justifies it.
+  5. Write results/modes.csv with header tau,a_0,...,a_{M-1}, rows sorted
+     by tau ascending; print diagnostics (chi2/dof, BIC per K, mode table).
+"""
+import json
+import os
+import numpy as np
+from scipy.optimize import nnls, least_squares, differential_evolution
+
+DATA_CSV = "data/curves.csv"
+OUT_CSV = "results/modes.csv"
+K_MAX = 8
+RNG = np.random.default_rng(20261019)
+
+
+def load_data():
+    d = np.genfromtxt(DATA_CSV, delimiter=",", names=True)
+    curves = d["curve"].astype(int)
+    curve_ids = np.unique(curves)          # assumed 0..M-1 in order
+    M = len(curve_ids)
+    xg = d["x"][curves == curve_ids[0]].copy()
+    for c in curve_ids[1:]:
+        assert np.allclose(d["x"][curves == c], xg), "x grid must be shared"
+    Y = np.array([d["re"][curves == c] + 1j * d["im"][curves == c]
+                  for c in curve_ids])
+    return xg, Y, M
+
+
+def estimate_sigma(Y):
+    """Per-curve noise sigma from second differences (detrends smooth model)."""
+    sigs = []
+    for c in range(Y.shape[0]):
+        s = []
+        for part in (Y[c].real, Y[c].imag):
+            d2 = part[2:] - 2 * part[1:-1] + part[:-2]
+            s.append(np.std(d2) / np.sqrt(6.0))
+        sigs.append(np.mean(s))
+    return np.array(sigs)
+
+
+def basis(tau, phi, xg):
+    return 1.0 / (1.0 + (1j * xg * tau) ** phi)
+
+
+def solve_linear(taus, phis, xg, Y, sig):
+    """Variable projection: NNLS for [a0, a_1..a_K] of each curve."""
+    cols = [np.ones_like(xg)] + [basis(t, p, xg) for t, p in zip(taus, phis)]
+    A = np.array(cols).T
+    amps = np.empty((Y.shape[0], A.shape[1]))
+    for c in range(Y.shape[0]):
+        Mstack = np.vstack([A.real, A.imag]) / sig[c]
+        b = np.concatenate([Y[c].real, Y[c].imag]) / sig[c]
+        amps[c], _ = nnls(Mstack, b)
+    return amps, A
+
+
+def chi2_shared(theta, K, xg, Y, sig):
+    taus = 10.0 ** theta[:K]
+    phis = 1.0 / (1.0 + np.exp(-theta[K:2 * K]))
+    amps, A = solve_linear(taus, phis, xg, Y, sig)
+    return sum(np.sum(np.abs((Y[c] - A @ amps[c]) / sig[c]) ** 2)
+               for c in range(Y.shape[0]))
+
+
+def resid_shared(theta, K, xg, Y, sig):
+    taus = 10.0 ** np.clip(theta[:K], -9, 9)
+    phis = 1.0 / (1.0 + np.exp(-theta[K:2 * K]))
+    amps, A = solve_linear(taus, phis, xg, Y, sig)
+    parts = []
+    for c in range(Y.shape[0]):
+        r = (Y[c] - A @ amps[c]) / sig[c]
+        parts += [r.real, r.imag]
+    return np.concatenate(parts)
+
+
+def fit_K(K, xg, Y, sig, n_starts=24, seed_pool=None):
+    """Multi-start shared fit for a given K. Returns dict with best result."""
+    n = Y.shape[0] * Y.shape[1] * 2
+    lo = np.concatenate([np.full(K, -9.0), np.full(K, -3.5)])
+    hi = np.concatenate([np.full(K, 9.0), np.full(K, 3.5)])
+    de = differential_evolution(
+        chi2_shared, list(zip(lo, hi)), args=(K, xg, Y, sig),
+        seed=7, maxiter=150, popsize=20, tol=1e-8, polish=True,
+        updating="deferred")
+    starts = [de.x]
+    if seed_pool is not None:
+        for tp in seed_pool:
+            if len(tp[0]) >= K:
+                lts = np.log10(tp[0][:K])
+                lg = np.log(np.clip(tp[1][:K] / (1 - np.clip(tp[1][:K], 1e-6, 1 - 1e-6)), 1e-6, 1e6))
+                starts.append(np.concatenate([lts, lg]))
+    starts += [np.concatenate([RNG.uniform(lo[:K], hi[:K]),
+                               RNG.uniform(lo[K:], hi[K:])])
+               for _ in range(n_starts)]
+    best = None
+    for s in starts:
+        s = np.clip(s, lo, hi)
+        try:
+            r = least_squares(resid_shared, s, args=(K, xg, Y, sig),
+                              method="trf", bounds=(lo, hi), max_nfev=1500)
+        except Exception:
+            continue
+        chi2 = float(np.sum(r.fun ** 2))
+        if best is None or chi2 < best["chi2"]:
+            theta = r.x
+            taus = 10.0 ** theta[:K]
+            phis = 1.0 / (1.0 + np.exp(-theta[K:2 * K]))
+            amps, A = solve_linear(taus, phis, xg, Y, sig)
+            best = dict(chi2=chi2, theta=theta, taus=taus, phis=phis,
+                        amps=amps, A=A)
+    best["bic"] = best["chi2"] + (2 * K + Y.shape[0] * (K + 1)) * np.log(n)
+    best["dof"] = n - (2 * K + Y.shape[0] * (K + 1))
+    return best
+
+
+def prune(fit, xg, Y, sig, grid_step=0.08056):
+    """Drop negligible-amplitude or duplicated-tau modes; refit and compare."""
+    K = len(fit["taus"])
+    order = np.argsort(fit["taus"])
+    taus, phis = fit["taus"][order], fit["phis"][order]
+    amps = np.column_stack([fit["amps"][:, 0], fit["amps"][:, 1:][:, order]])
+    total = max(amps[:, 1:].sum(), 1e-12)
+    keep = []
+    for k in range(K):
+        if amps[:, k + 1].sum() < 1e-3 * total:
+            continue
+        if keep and (taus[k] - taus[keep[-1]]) / taus[keep[-1]] < 0.5 * 10 ** grid_step:
+            continue
+        keep.append(k)
+    if len(keep) == K:
+        return fit, False
+    taus2, phis2 = taus[keep], phis[keep]
+    amps2, A2 = solve_linear(taus2, phis2, xg, Y, sig)
+    chi2 = sum(np.sum(np.abs((Y[c] - A2 @ amps2[c]) / sig[c]) ** 2)
+               for c in range(Y.shape[0]))
+    n = Y.shape[0] * Y.shape[1] * 2
+    bic = chi2 + (2 * len(keep) + Y.shape[0] * (len(keep) + 1)) * np.log(n)
+    pruned = dict(chi2=chi2, taus=taus2, phis=phis2, amps=amps2, A=A2, bic=bic,
+                  dof=n - (2 * len(keep) + Y.shape[0] * (len(keep) + 1)),
+                  theta=None)
+    return pruned, True
+
+
+def decade_residuals(fit, xg, Y, sig):
+    """Mean |residual| per decade of x, real and imag (tail diagnostic)."""
+    lx = np.log10(xg)
+    edges = np.arange(np.floor(lx[0]), np.ceil(lx[-1]) + 1, 1.0)
+    out_re, out_im = [], []
+    for c in range(Y.shape[0]):
+        res = Y[c] - fit["A"] @ fit["amps"][c]
+        out_re.append([np.abs(res.real[(lx >= e) & (lx < e + 1)]).mean()
+                       for e in edges[:-1]])
+        out_im.append([np.abs(res.imag[(lx >= e) & (lx < e + 1)]).mean()
+                       for e in edges[:-1]])
+    return np.array(out_re), np.array(out_im)
+
+
+def main():
+    xg, Y, M = load_data()
+    sig = estimate_sigma(Y)
+    print("curves:", M, " points:", len(xg),
+          " x range: %.4g .. %.4g" % (xg[0], xg[-1]))
+    print("sigma per curve (re/im avg):", np.round(sig, 4).tolist())
+
+    grid_step = np.diff(np.log10(xg)).mean()
+
+    fits = {}
+    seed_pool = []
+    for K in range(1, K_MAX + 1):
+        f = fit_K(K, xg, Y, sig, seed_pool=seed_pool)
+        fits[K] = f
+        seed_pool.append((f["taus"].tolist(), f["phis"].tolist()))
+        print(f"K={K}: chi2={f['chi2']:9.1f}  chi2/dof={f['chi2']/f['dof']:.3f}"
+              f"  BIC={f['bic']:9.1f}")
+
+    K_bic = min(fits, key=lambda k: fits[k]["bic"])
+    print(f"\nBIC selects K = {K_bic}")
+
+    candidates = [K_bic]
+    for k in range(K_bic + 1, K_MAX + 1):
+        if fits[k]["bic"] < fits[K_bic]["bic"] + 10:
+            candidates.append(k)
+    best_final, K_final = None, None
+    for K in candidates:
+        p, changed = prune(fits[K], xg, Y, sig, grid_step)
+        print(f"prune pass on K={K}: -> {len(p['taus'])} modes "
+              f"(pruned={changed}), chi2/dof={p['chi2']/p['dof']:.3f}, "
+              f"BIC={p['bic']:.1f}")
+        if best_final is None or p["bic"] < best_final["bic"]:
+            best_final, K_final = p, len(p["taus"])
+
+    out_re, out_im = decade_residuals(best_final, xg, Y, sig)
+    print("\nmean |residual| per decade (rows = curves):")
+    print("  Re:", np.round(out_re, 3).tolist())
+    print("  Im:", np.round(out_im, 3).tolist())
+    print(f"high-x tail mean |Im resid| = {out_im[:, -9:].mean():.3f} "
+          f"(noise sigma ~ {sig.mean():.3f})")
+
+    # final joint refinement of the pruned solution
+    K = len(best_final["taus"])
+    ph = np.clip(best_final["phis"], 1e-6, 1 - 1e-6)
+    x0 = np.concatenate([np.log10(best_final["taus"]), np.log(ph / (1 - ph))])
+    lo = np.concatenate([np.full(K, -9.0), np.full(K, -3.5)])
+    hi = np.concatenate([np.full(K, 9.0), np.full(K, 3.5)])
+    r = least_squares(resid_shared, np.clip(x0, lo, hi), args=(K, xg, Y, sig),
+                      method="trf", bounds=(lo, hi),
+                      xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=4000)
+    taus = 10.0 ** r.x[:K]
+    phis = 1.0 / (1.0 + np.exp(-r.x[K:2 * K]))
+    amps, A = solve_linear(taus, phis, xg, Y, sig)
+    chi2 = float(np.sum(r.fun ** 2))
+    n = Y.shape[0] * Y.shape[1] * 2
+    npar = 2 * K + M * (K + 1)
+    bic = chi2 + npar * np.log(n)
+    order = np.argsort(taus)
+    taus, phis = taus[order], phis[order]
+    amps = np.column_stack([amps[:, 0], amps[:, 1:][:, order]])
+
+    print(f"\nFINAL: K = {K}")
+    print(f"chi2 = {chi2:.1f}, dof = {n - npar}, chi2/dof = {chi2/(n-npar):.3f},"
+          f" BIC = {bic:.1f}")
+    print("shared modes (tau, phi):")
+    for k in range(K):
+        print(f"  k={k+1}: tau = {taus[k]:.6g}   phi = {phis[k]:.4f}")
+    print("amplitudes per curve (row = curve 0..%d, cols = a0, a_1..a_%d):"
+          % (M - 1, K))
+    print(np.round(amps, 4))
+
+    os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+    header = "tau," + ",".join(f"a_{m}" for m in range(M))
+    lines = [header]
+    for k in range(K):
+        lines.append(",".join([repr(float(taus[k]))] +
+                              [repr(float(amps[m, k + 1])) for m in range(M)]))
+    with open(OUT_CSV, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"\nwrote {OUT_CSV} ({K} modes)")
+
+    summary = dict(
+        K=K, taus=taus.tolist(), phis=phis.tolist(), amps=amps.tolist(),
+        chi2=chi2, dof=int(n - npar), chi2_dof=chi2 / (n - npar), bic=bic,
+        bic_by_K={str(k): fits[k]["bic"] for k in fits},
+        chi2_dof_by_K={str(k): fits[k]["chi2"] / fits[k]["dof"] for k in fits},
+        resid_re_by_decade=out_re.tolist(),
+        resid_im_by_decade=out_im.tolist(),
+        sigma=sig.tolist(),
+    )
+    with open("results/summary.json", "w") as fh:
+        json.dump(summary, fh, indent=1)
+
+
+if __name__ == "__main__":
+    main()

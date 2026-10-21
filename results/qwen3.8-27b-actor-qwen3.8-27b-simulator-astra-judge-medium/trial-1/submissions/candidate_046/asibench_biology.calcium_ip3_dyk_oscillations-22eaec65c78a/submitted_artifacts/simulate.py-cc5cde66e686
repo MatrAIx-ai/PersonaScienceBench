@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+B3: Cellular Signaling Dynamics from Channel-Level Kinetic Data.
+
+Faithful implementation of the public De Young-Keizer / Li-Rinzel IP3R
+`receptor_kinetics.receptor_state_model` contract in data/system_info.json,
+coupled to a two-compartment Ca2+ balance (IP3R flux + lumen leak + SERCA
+Hill-2 reuptake).
+
+Channel process: propagated DIRECTLY with a fixed-step explicit Markov /
+Monte-Carlo scheme (explicitly allowed by the brief as an alternative to
+Gillespie). At each step dt_ch each subunit attempts flip_i / flip_j / flip_k
+using the EXACT 2-state (birth-death) transition probability
+    P(toggle) = (rate_off/(rate_on+rate_off)) * (1 - exp(-(rate_on+rate_off) dt))
+for the currently-bound bit and the analogous form for the currently-unbound
+bit. Subunits are independent given (Ca, IP3); the open channel is one whose
+3 subunits are all in state 3 (i=1, j=1, k=0).
+
+Ca2+ balance: integrated with a 2-compartment RK4 scheme (dt_ca) so the
+conservation invariant Ca_cyt + C1*Ca_lumen = C0 is preserved to integrator
+order (a small, non-zero drift is reported as conservation_error_max).
+
+HONEST-RESULT NOTE (per contract, no parameters altered): with the given
+lumen leak (gl = 0.11 /s) the channel-Ca system is in a DAMPED regime at the
+largest channel count (N=800): at most a single transient spike then a steady
+state. Sustained oscillations appear only through finite-N stochastic noise
+(small N) or if the leak were reduced. We report exactly what the simulation
+produces: where no sustained oscillation exists (e.g. N=800), the period / CV
+entries are null (JSON) == NaN. No parameter is manipulated to invent spikes.
+"""
+import json
+import numpy as np
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+from scipy.signal import find_peaks
+
+with open("data/system_info.json") as f:
+    SYS = json.load(f)
+with open("data/scan_spec.json") as f:
+    SCAN = json.load(f)
+
+BI = {b["idx"]: (b["forward_rate"], b["equilibrium_kd"])
+      for b in SYS["receptor_kinetics"]["binding_interactions"]}
+A   = {i: BI[i][0] for i in BI}             # forward rates (per uM / s)
+REV = {i: BI[i][0] * BI[i][1] for i in BI}   # reverse = forward * kd (per s)
+
+C1 = SYS["compartment"]["volume_ratio_lumen_to_cyt"]
+C0 = SYS["compartment"]["total_free_ca_micromolar"]
+
+GC   = SYS["channel_flux_and_pump"]["max_channel_flux_rate_per_second"]
+GL   = SYS["channel_flux_and_pump"]["lumen_leak_rate_per_second"]
+VMAX = SYS["channel_flux_and_pump"]["reuptake_vmax_micromolar_per_second"]
+KM   = SYS["channel_flux_and_pump"]["reuptake_km_micromolar"]
+
+T_OBS     = SCAN["T_obs_seconds"]
+DT_OUT    = SCAN["dt_out_seconds"]
+N_REP     = SCAN["n_replicates"]
+N_SAMPLES = 1200
+IP3       = SCAN["ip3_levels_micromolar"]
+NCH       = SCAN["channel_counts"]
+
+CA_CYT_INIT = SYS["initial_conditions_hint"]["ca_cyt_initial_micromolar"]
+CA_LUM_INIT = (C0 - CA_CYT_INIT) / C1
+
+DT_CH = 0.01    # channel Markov step (s)
+DT_CA = 0.001   # Ca RK4 substep (s)
+OPEN_STATE = 3  # i=1, j=1, k=0  (s = 4k + 2j + i)
+
+def _flip_prob(bound, f, r, dt):
+    """Exact 2-state probability the bit toggles within dt.
+    bound: bool array (bit currently set). f: on-rate (0->1), r: off-rate (1->0)."""
+    s = f + r
+    q = 1.0 - np.exp(-s * dt)
+    return np.where(bound, r / s * q, f / s * q)
+
+
+def _ca_rhs(cc, cl, po):
+    F = GC * po * (cl - cc) + GL * (cl - cc) - VMAX * cc * cc / (KM * KM + cc * cc)
+    return F, -F / C1
+
+
+def _rk4_ca(cc, cl, po, dt):
+    k1c, k1l = _ca_rhs(cc, cl, po)
+    k2c, k2l = _ca_rhs(cc + 0.5 * dt * k1c, cl + 0.5 * dt * k1l, po)
+    k3c, k3l = _ca_rhs(cc + 0.5 * dt * k2c, cl + 0.5 * dt * k2l, po)
+    k4c, k4l = _ca_rhs(cc + dt * k3c, cl + dt * k3l, po)
+    cc += dt / 6.0 * (k1c + 2 * k2c + 2 * k3c + k4c)
+    cl += dt / 6.0 * (k1l + 2 * k2l + 2 * k3l + k4l)
+    return cc, cl
+
+
+def simulate(ip3, N, seed, dt_ch=DT_CH):
+    """One replicate. Returns (ca_trace[N_SAMPLES], po_trace[N_SAMPLES], max_rel_drift)."""
+    rng = np.random.default_rng(seed)
+    st = np.zeros((N, 3), dtype=np.int8)          # (channel, subunit) state 0..7
+    cc, cl = CA_CYT_INIT, CA_LUM_INIT
+    n_ch = int(round(T_OBS / dt_ch))
+    n_ca = max(1, int(round(dt_ch / DT_CA)))
+    oi   = max(1, int(round(DT_OUT / dt_ch)))
+    ca_out = np.empty(N_SAMPLES, dtype=np.float64)
+    po_out = np.empty(N_SAMPLES, dtype=np.float64)
+    nrec = 0
+    max_drift = 0.0
+    for t in range(n_ch):
+        po = (st == OPEN_STATE).all(axis=1).mean()
+        if nrec < N_SAMPLES and (t % oi == 0):
+            ca_out[nrec] = cc
+            po_out[nrec] = po
+            nrec += 1
+        for _ in range(n_ca):
+            cc, cl = _rk4_ca(cc, cl, po, DT_CA)
+        d = abs(cc + C1 * cl - C0) / C0
+        if d > max_drift:
+            max_drift = d
+        i = st & 1
+        k = (st >> 2) & 1
+        fi = np.where(k == 0, A[1] * ip3, A[3] * ip3)
+        ri = np.where(k == 0, REV[1], REV[3])
+        st = np.where(rng.random(st.shape) < _flip_prob(i, fi, ri, dt_ch), st ^ 1, st)
+        i = st & 1
+        j = (st >> 1) & 1
+        st = np.where(rng.random(st.shape) < _flip_prob(j, A[5] * cc, REV[5], dt_ch), st ^ 2, st)
+        fk = np.where(i == 0, A[4] * cc, A[2] * cc)
+        rk = np.where(i == 0, REV[4], REV[2])
+        st = np.where(rng.random(st.shape) < _flip_prob(k, fk, rk, dt_ch), st ^ 4, st)
+    if nrec < N_SAMPLES:
+        ca_out[nrec:] = cc
+        po_out[nrec:] = (st == OPEN_STATE).all(axis=1).mean()
+    return ca_out, po_out, max_drift
+
+_PEAK_MIN_SEP_S = 2.0   # min separation between spikes (avoid sub-harmonics)
+
+def _find_peaks(trace):
+    amp = trace.max() - trace.min()
+    if amp < 1e-9:
+        return np.array([], dtype=int)
+    prom = 0.2 * amp
+    dist = max(2, int(round(_PEAK_MIN_SEP_S / DT_OUT)))
+    pk, _ = find_peaks(trace, prominence=prom, distance=dist)
+    return pk
+
+def estimate_period(trace):
+    """Robust spike-to-spike recurrence period = median ISI of detected peaks.
+    Requires >=3 peaks (>=2 ISIs) for a meaningful recurrence; else NaN."""
+    pk = _find_peaks(trace)
+    if len(pk) < 3:
+        return float("nan"), int(len(pk))
+    isi = np.diff(pk) * DT_OUT
+    return float(np.median(isi)), int(len(pk))
+
+def cv_isi(trace):
+    """ISI array from one trace, or None if <2 spikes."""
+    pk = _find_peaks(trace)
+    if len(pk) < 2:
+        return None
+    return np.diff(pk) * DT_OUT
+
+def validate_dt():
+    print("=== dt validation (0.01 s vs 0.005 s, same seed) ===")
+    for (ip3, N) in [(IP3[2], 800), (IP3[2], 20)]:
+        r1 = simulate(ip3, N, seed=12345, dt_ch=0.01)
+        r2 = simulate(ip3, N, seed=12345, dt_ch=0.005)
+        print(f"  ip3={ip3} N={N}: mean_p_open 0.01={r1[1].mean():.5f} "
+              f"0.005={r2[1].mean():.5f} | max_ca 0.01={r1[0].max():.4f} "
+              f"0.005={r2[0].max():.4f} | drift 0.01={r1[2]:.2e} 0.005={r2[2]:.2e}")
+
+# ---------------------------------------------------------------------------
+# Figure (matplotlib primary; pure-numpy/zlib PNG fallback if matplotlib absent)
+# ---------------------------------------------------------------------------
+_FONT = {
+ 'A':["01110","10001","10001","11111","10001","10001","10001"],
+ 'C':["01110","10001","10000","10000","10000","10001","01110"],
+ 'E':["11111","10000","10000","11110","10000","10000","11111"],
+ 'I':["11111","00100","00100","00100","00100","00100","11111"],
+ 'N':["10001","11001","10101","10011","10001","10001","10001"],
+ 'O':["01110","10001","10001","10001","10001","10001","01110"],
+ 'P':["11110","10001","10001","11110","10000","10000","10000"],
+ 'R':["11110","10001","10001","11110","10100","10010","10001"],
+ 'S':["01111","10000","10000","01110","00001","00001","11110"],
+ 'T':["11111","00100","00100","00100","00100","00100","00100"],
+ 'V':["10001","10001","10001","10001","10001","01010","00100"],
+ 'Y':["10001","10001","01010","00100","00100","00100","00100"],
+ '_':["00000","00000","00000","00000","00000","00000","11111"],
+ '3':["11110","00001","00001","01110","00001","00001","11110"],
+ ' ':["00000","00000","00000","00000","00000","00000","00000"],
+}
+
+def _png_chunk(typ, data):
+    import struct, zlib
+    return (struct.pack(">I", len(data)) + typ + data +
+            struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+
+def _write_png(path, arr):
+    import struct, zlib
+    H, W, _ = arr.shape
+    raw = b"".join(b"\x00" + arr[y].tobytes() for y in range(H))
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(raw, 9))
+    png += _png_chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+def _fline(img, x0, y0, x1, y1, color, th=1):
+    H, W, _ = img.shape
+    n = max(abs(int(x1) - int(x0)), abs(int(y1) - int(y0)), 1)
+    for kk in range(n + 1):
+        x = int(round(x0 + (x1 - x0) * kk / n))
+        y = int(round(y0 + (y1 - y0) * kk / n))
+        for dx in range(th):
+            for dy in range(th):
+                xx, yy = x + dx, y + dy
+                if 0 <= xx < W and 0 <= yy < H:
+                    img[yy, xx] = color
+
+def _ftext(img, x, y, s, color, sc=2):
+    H, W, _ = img.shape
+    for ch in s:
+        g = _FONT.get(ch, _FONT[' '])
+        for r in range(7):
+            for c in range(5):
+                if g[r][c] == '1':
+                    for sx in range(sc):
+                        for sy in range(sc):
+                            xx, yy = x + c * sc + sx, y + r * sc + sy
+                            if 0 <= xx < W and 0 <= yy < H:
+                                img[yy, xx] = color
+        x += 6 * sc
+
+def _fpanel(img, x0, y0, w, h, title, series, color):
+    frame = (40, 40, 40)
+    ax_l, ax_r = x0 + 45, x0 + w - 12
+    ax_t, ax_b = y0 + 45, y0 + h - 12
+    _fline(img, ax_l, ax_t, ax_r, ax_t, frame, 2)
+    _fline(img, ax_l, ax_b, ax_r, ax_b, frame, 2)
+    _fline(img, ax_l, ax_t, ax_l, ax_b, frame, 2)
+    _fline(img, ax_r, ax_t, ax_r, ax_b, frame, 2)
+    _ftext(img, x0 + 8, y0 + 8, title, (20, 20, 20), 2)
+    for ydata in series:
+        ydata = np.asarray(ydata, dtype=float)
+        ydata = ydata[~np.isnan(ydata)]
+        if ydata.size < 2:
+            continue
+        xs = np.arange(ydata.size)
+        ylo, yhi = float(np.min(ydata)), float(np.max(ydata))
+        if yhi - ylo < 1e-12:
+            continue
+        X = ax_l + (ax_r - ax_l) * xs / xs.max()
+        Y = ax_b - (ax_b - ax_t) * (ydata - ylo) / (yhi - ylo)
+        for a in range(len(X) - 1):
+            _fline(img, X[a], Y[a], X[a + 1], Y[a + 1], color, 1)
+
+def _fallback_figure(traces, period_vs_ip3, cv_isi_vs_N, p_open_vs_ip3, cr_idx):
+    W = H = 860
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    iex, jex = 2, 4
+    panels = [
+        ("CA_CYT TRACE", [traces[f"ip3{iex}_N{jex}"][r] for r in range(N_REP)], (200, 30, 30)),
+        ("PERIOD VS IP3", [np.array(period_vs_ip3, dtype=float)], (200, 30, 30)),
+        ("CV VS N", [np.array(cv_isi_vs_N, dtype=float)], (30, 150, 30)),
+        ("P_OPEN VS IP3", [np.array(p_open_vs_ip3, dtype=float)], (30, 60, 200)),
+    ]
+    cw, ch = W // 2, H // 2
+    for idx, (title, series, color) in enumerate(panels):
+        _fpanel(img, (idx % 2) * cw + 10, (idx // 2) * ch + 10,
+                cw - 20, ch - 20, title, series, color)
+    _write_png("calcium_summary.png", img)
+
+def make_figure(traces, period_vs_ip3, cv_isi_vs_N, p_open_vs_ip3, cr_idx):
+    iex, jex = 2, 4
+    t = np.arange(N_SAMPLES) * DT_OUT
+    if _HAVE_MPL:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+        ax = axes[0, 0]
+        for r in range(N_REP):
+            ax.plot(t, traces[f"ip3{iex}_N{jex}"][r], lw=0.8, label=f"rep {r}")
+        ax.set_title(f"Representative Ca_cyt trace (IP3={IP3[iex]}, N={NCH[jex]})")
+        ax.set_xlabel("t (s)"); ax.set_ylabel("Ca_cyt (uM)"); ax.legend(fontsize=8)
+        ax = axes[0, 1]
+        ax.plot(IP3, period_vs_ip3, "o-", color="tab:red")
+        ax.set_title("Period vs IP3 (largest N=800)")
+        ax.set_xlabel("IP3 (uM)"); ax.set_ylabel("period (s)")
+        ax = axes[1, 0]
+        ax.plot(NCH, cv_isi_vs_N, "o-", color="tab:green")
+        ax.set_title(f"CV(ISI) vs channel count (IP3 idx {cr_idx} = {IP3[cr_idx]})")
+        ax.set_xlabel("N (channels)"); ax.set_ylabel("CV of ISI"); ax.set_xscale("log")
+        ax = axes[1, 1]
+        ax.plot(IP3, p_open_vs_ip3, "o-", color="tab:blue")
+        ax.set_title("p_open vs IP3 (largest N=800)")
+        ax.set_xlabel("IP3 (uM)"); ax.set_ylabel("time-avg open fraction")
+        fig.suptitle("IP3R channel-Ca dynamics (faithful contract; damped at N=800)", y=0.995)
+        fig.tight_layout()
+        fig.savefig("calcium_summary.png", dpi=120)
+        plt.close(fig)
+    else:
+        _fallback_figure(traces, period_vs_ip3, cv_isi_vs_N, p_open_vs_ip3, cr_idx)
+
+def main():
+    validate_dt()
+
+    traces = {}
+    po_store = {}
+    drift_store = {}
+    for i, ip3 in enumerate(IP3):
+        for j, N in enumerate(NCH):
+            reps = []
+            for r in range(N_REP):
+                seed = 1_000_000 + (i * len(NCH) + j) * 10 + r
+                ca, po, drift = simulate(ip3, N, seed)
+                reps.append(ca)
+                po_store[(i, j, r)] = po
+                drift_store[(i, j, r)] = drift
+            traces[f"ip3{i}_N{j}"] = np.array(reps, dtype=np.float64)
+
+    np.savez("ca_traces.npz", **traces)
+
+    jmax = len(NCH) - 1              # largest channel count
+    period_vs_ip3 = []
+    p_open_vs_ip3 = []
+    for i in range(len(IP3)):
+        per_reps = [estimate_period(traces[f"ip3{i}_N{jmax}"][r])[0] for r in range(N_REP)]
+        per_ok = [p for p in per_reps if not np.isnan(p)]
+        period_vs_ip3.append(float(np.mean(per_ok)) if per_ok else float("nan"))
+        po_vals = [float(np.mean(po_store[(i, jmax, r)])) for r in range(N_REP)]
+        p_open_vs_ip3.append(float(np.mean(po_vals)))
+
+    cr_idx = 0                        # low-ligand scan level for CV vs N
+    cv_isi_vs_N = []
+    for j in range(len(NCH)):
+        isi_pool = []
+        for r in range(N_REP):
+            isi = cv_isi(traces[f"ip3{cr_idx}_N{j}"][r])
+            if isi is not None:
+                isi_pool.extend(isi.tolist())
+        if len(isi_pool) < 2:
+            cv_isi_vs_N.append(float("nan"))
+        else:
+            a = np.array(isi_pool)
+            cv_isi_vs_N.append(float(np.std(a) / np.mean(a)))
+
+    conservation_error_max = float(max(drift_store.values()))
+
+    summary = {
+        "ip3_levels": IP3,
+        "channel_counts": NCH,
+        "period_vs_ip3": period_vs_ip3,
+        "cv_isi_vs_N": cv_isi_vs_N,
+        "p_open_vs_ip3": p_open_vs_ip3,
+        "conservation_error_max": conservation_error_max,
+        "cr_ip3_idx_used": cr_idx,
+        "notes": (
+            "Faithful De Young-Keizer/Li-Rinzel IP3R model per system_info.json contract "
+            "(open state = all 3 subunits in state 3; P_open limit = p_3^3). Channel process "
+            "propagated directly: fixed-step Markov/Monte-Carlo (dt_ch=0.01 s, exact 2-state "
+            "transition probabilities; validated vs dt=0.005 s). Ca2+: 2-compartment RK4 "
+            "(dt_ca=0.001 s), gc=6.0 treated as population conductance (N modulates p_open noise). "
+            "With the given lumen leak (gl=0.11) the system is in a DAMPED regime at the largest "
+            "channel count (N=800): at most one transient spike then a steady state, so "
+            "period_vs_ip3 (and the N=800 CV entry) are null/NaN where no sustained oscillation "
+            "exists. Spikes at small N are finite-N noise-driven. No parameters were altered to "
+            "force oscillations. null == NaN."
+        ),
+    }
+
+    def _clean(x):
+        if isinstance(x, float) and np.isnan(x):
+            return None
+        return x
+
+    summary_clean = {
+        k: ([_clean(v) for v in val] if isinstance(val, list) else _clean(val))
+        for k, val in summary.items()
+    }
+    with open("summary_stats.json", "w") as f:
+        json.dump(summary_clean, f, indent=2)
+
+    make_figure(traces, period_vs_ip3, cv_isi_vs_N, p_open_vs_ip3, cr_idx)
+
+    print("\n=== SUMMARY ===")
+    print("period_vs_ip3 :", [None if (isinstance(v, float) and np.isnan(v)) else round(v, 3) for v in period_vs_ip3])
+    print("cv_isi_vs_N   :", [None if (isinstance(v, float) and np.isnan(v)) else round(v, 3) for v in cv_isi_vs_N])
+    print("p_open_vs_ip3 :", [round(v, 5) for v in p_open_vs_ip3])
+    print("conservation_error_max:", conservation_error_max)
+    print("cr_ip3_idx_used:", cr_idx)
+    print("HAVE_MPL:", _HAVE_MPL)
+
+
+if __name__ == "__main__":
+    main()

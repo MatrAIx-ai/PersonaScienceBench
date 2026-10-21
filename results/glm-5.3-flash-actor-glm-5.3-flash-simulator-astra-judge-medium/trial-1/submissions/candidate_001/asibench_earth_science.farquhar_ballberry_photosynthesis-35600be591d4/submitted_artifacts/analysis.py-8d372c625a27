@@ -1,0 +1,402 @@
+"""
+Leaf physiological response reconstruction.
+
+Coupled Collatz (C4) photosynthesis + Ball-Berry stomatal conductance in the
+land-surface (CLM/Noah-MP) form, exactly as specified by the task brief.
+
+  C4 branch (hard minimum):
+      Wc = Vcmax ;  Wj = alpha_q*APAR ;  We = 4000*Vcmax*Ci/p_atm
+      A = min(Wc,Wj,We) - Rd ;  APAR = 4.6*PAR (no extra absorptance)
+
+  CLM/Noah-MP Q10 response (incl. high-T inhibition):
+      Vcmax(T) = Vcmax25_eff * 2.4^((Tc-25)/10)
+                 / (1 + exp((-2.2e5 + 710*(Tc+273.16))/(R*(Tc+273.16))))
+      Vcmax25_eff = vcmax25 * n_factor * btran  (btran scales capacity,
+                          it does NOT scale the Ball-Berry intercept b0)
+      Kc = 30*2.1^((Tc-25)/10) [Pa] ; Ko = 30000*1.2^((Tc-25)/10) [Pa]
+      Gamma_star = 0.5*(Kc/Ko)*O2*0.21 (unused by the C4 minimum; for record)
+      Rd = 0.015*Vcmax(T)
+
+  Gas-diffusion chain (A_mol = A*1e-6, cf = p_atm/(R*T)):
+      cs = ca - 1.37*rb*A_mol/cf*p_atm ; gs = m*A_mol*h_s/cs*p_atm + b0
+      rs = cf/gs ; Ci = cs - 1.65*rs*A_mol/cf*p_atm
+
+  Surface relative humidity h_s = min(max(1 - vpd/esat(T), 0.25), 1).
+  esat(T) uses the standard Tetens formula (Pa):
+      esat = 610.78*exp(17.2694*Tc/(Tc+237.3))
+  (choice documented as required; it only enters through h_s).
+
+  Night rows (PAR == 0): A = -Rd, gs = b0, then the same chain in closed form
+  (A is negative, flipping the signs of the cs/Ci increments).
+
+Daylight solution method: fixed-point iteration on Ci (chain maps
+Ci -> A(Ci) -> (cs,gs,rs) -> Ci'). For C4 only We depends on Ci, so the map is
+piecewise smooth; iteration is damped on oscillation, and if the map is
+expansive (|dg/dCi|>1, possible in the We-limited regime) a safeguarded
+Brent root-find on g(Ci)=F(Ci)-Ci with the identical equations is used.
+"""
+import json
+import numpy as np
+import pandas as pd
+try:  # matplotlib is preferred; a PIL-based renderer is the offline fallback
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
+    import subprocess
+    import sys
+    import tempfile
+    import os
+
+PIL_RENDERER = r"""
+import json, sys
+from PIL import Image, ImageDraw, ImageFont
+data = json.load(open(sys.argv[1]))
+W, H = 1400, 940
+L, Rt, Tp, B = 170, 60, 70, 110
+img = Image.new('RGB', (W, H), 'white')
+d = ImageDraw.Draw(img)
+try:
+    font = ImageFont.load_default(size=20)
+    small = ImageFont.load_default(size=16)
+except TypeError:
+    font = ImageFont.load_default()
+    small = font
+t = data['time']; panels = data['panels']
+PH = (H - Tp - B - 90) // 2
+for k, pn in enumerate(panels):
+    top = Tp + k * (PH + 70)
+    bot = top + PH
+    ys = pn['series']
+    lo = min(min(s['v']) for s in ys)
+    hi = max(max(s['v']) for s in ys)
+    pad = 0.05 * (hi - lo) if hi > lo else 1.0
+    ylo, yhi = lo - pad, hi + pad
+    def X(x): return L + (x - t[0]) / (t[-1] - t[0]) * (W - L - Rt)
+    def Y(y): return bot - (y - ylo) / (yhi - ylo) * (bot - top)
+    d.rectangle([L, top, W - Rt, bot], outline='black', width=2)
+    # y ticks (5 nice values)
+    for j in range(5):
+        yv = ylo + (yhi - ylo) * j / 4.0
+        yy = Y(yv)
+        d.line([L, yy, W - Rt, yy], fill=(220, 220, 220), width=1)
+        d.text((L - 12, yy - 10), ('%g' % yv).rjust(8), fill='black',
+               font=small, anchor='rm')
+    # x ticks every 24 h
+    for xv in range(0, int(t[-1]) + 1, 24):
+        xx = X(xv)
+        d.line([xx, bot, xx, bot + 8], fill='black', width=2)
+        d.text((xx, bot + 12), str(xv), fill='black', font=small, anchor='ma')
+    for s in ys:
+        pts = [(X(x), Y(y)) for x, y in zip(t, s['v'])]
+        d.line(pts, fill=tuple(s['color']), width=3)
+    d.text((L, top - 34), pn['title'], fill='black', font=font)
+    # legend
+    lx = W - Rt - 260
+    for s in ys:
+        d.line([lx, top + 18, lx + 40, top + 18], fill=tuple(s['color']), width=4)
+        d.text((lx + 50, top + 8), s['label'], fill='black', font=small)
+        lx += 130
+d.text((L, H - 55), 'time [h]', fill='black', font=font)
+img.save(data['out'])
+print('PIL figure written to', data['out'])
+"""
+
+def _render_with_pil(flux):
+    payload = {
+        'time': flux.time_hr.tolist(),
+        'out': 'results/diurnal.png',
+        'panels': [
+            {'title': 'A (assimilation) [umol CO2 m-2 s-1]',
+             'series': [
+                 {'label': 'sunlit', 'color': (204, 0, 0),
+                  'v': flux.A_sun.tolist()},
+                 {'label': 'shaded', 'color': (0, 0, 204),
+                  'v': flux.A_shade.tolist()}]},
+            {'title': 'rs (stomatal resistance) [s m-1]',
+             'series': [
+                 {'label': 'sunlit', 'color': (204, 0, 0),
+                  'v': flux.rs_sun.tolist()},
+                 {'label': 'shaded', 'color': (0, 0, 204),
+                  'v': flux.rs_shade.tolist()}]},
+        ],
+    }
+    tmp = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+    json.dump(payload, tmp)
+    tmp.close()
+    try:
+        # PIL lives in the system python (C extensions built for cpython-314)
+        for interp in ('/usr/bin/python3.14', '/usr/bin/python3'):
+            try:
+                subprocess.run([interp, '-c', PIL_RENDERER, tmp.name],
+                               check=True, capture_output=True, text=True)
+                os.unlink(tmp.name)
+                return
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+        raise RuntimeError('no PIL-capable interpreter found for fallback plot')
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+R_GAS = 8.314  # J mol^-1 K^-1
+
+
+def esat_pa(tc):
+    """Saturation vapor pressure (Pa), Tetens formula (documented choice)."""
+    return 610.78 * np.exp(17.2694 * tc / (tc + 237.3))
+
+
+def t_response(tc, q10):
+    """Q10 multiplier with CLM high-temperature inhibition factor.
+
+    tc is degrees C; the brief's form is q10^((Tc-25)/10) with the
+    high-temperature inhibition 1/(1+exp((-2.2e5+710*(Tc+273.16))/(R*(Tc+273.16)))).
+    """
+    tc_k = tc + 273.16
+    inh = 1.0 / (1.0 + np.exp((-2.2e5 + 710.0 * tc_k) / (R_GAS * tc_k)))
+    return q10 ** ((tc - 25.0) / 10.0) * inh
+
+
+def vcmax_kc_ko(tc, p, o2_pa):
+    """T-dependent Vcmax (umol m^-2 s^-1), Kc (Pa), Ko (Pa), Gamma_star (Pa)."""
+    vc = p["vcmax25"] * p["n_factor"] * p["btran"] * t_response(tc, 2.4)
+    kc = 30.0 * t_response(tc, 2.1)
+    ko = 30000.0 * t_response(tc, 1.2)
+    gamma = 0.5 * (kc / ko) * o2_pa * 0.21
+    return vc, kc, ko, gamma
+
+
+def chain(ca, rb, a_umol, hs, cf, p_atm, m, b0):
+    """Ball-Berry chain: A (umol m^-2 s^-1) -> cs, gs, rs, Ci."""
+    a_mol = a_umol * 1e-6
+    cs = ca - 1.37 * rb * a_mol / cf * p_atm
+    gs = m * a_mol * hs / cs * p_atm + b0
+    rs = cf / gs
+    ci = cs - 1.65 * rs * a_mol / cf * p_atm
+    return cs, gs, rs, ci
+
+
+def solve_light(par, tc, ca, o2_pa, p_atm, vpd, rb, p,
+                ci0=None, tol_ci=1e-9, max_it=200):
+    """Coupled fixed-point solve for one daylight row.
+
+    Method: (1) damped fixed-point iteration on Ci seeded at ci0 (default ca),
+    with oscillation damping; (2) if that fails within max_it (the C4
+    We-limited map can have |dg/dCi| > 1, i.e. an expansive fixed-point map),
+    fall back to Brent root-finding on g(Ci) = F(Ci) - Ci over [1e-6, p_atm],
+    where F(Ci) is the identical chain evaluated at A(Ci). Iteration counts
+    are honest: fixed-point iteration count, or max_it + Brent evaluations.
+    """
+    cf = p_atm / (R_GAS * (tc + 273.16))
+    vc, kc, ko, gamma = vcmax_kc_ko(tc, p, o2_pa)
+    rd = 0.015 * vc
+    wj = p["alpha_q"] * 4.6 * par
+    wc = vc
+    hs = min(max(1.0 - vpd / esat_pa(tc), 0.25), 1.0)
+    m, b0 = p["bb_slope"], p["bb_intercept"]
+
+    def state(ci):
+        we = 4000.0 * vc * ci / p_atm
+        a = min(wc, wj, we) - rd
+        cs, gs, rs, ci_new = chain(ca, rb, a, hs, cf, p_atm, m, b0)
+        return a, cs, gs, rs, ci_new
+
+    # ---- stage 1: damped fixed-point iteration ----
+    ci = ca if ci0 is None else ci0
+    prev = None
+    damped = False
+    switches = 0
+    last_branch = None
+    for it in range(1, max_it + 1):
+        a, cs, gs, rs, ci_new = state(ci)
+        if gs <= 0.0:
+            break  # unphysical -> go to safeguarded root-finder
+        branch = "Wc" if wc <= wj and wc <= we_local(vc, ci, p_atm) else (
+            "Wj" if wj <= we_local(vc, ci, p_atm) else "We")
+        if last_branch is not None and branch != last_branch:
+            switches += 1
+        last_branch = branch
+        d = ci_new - ci
+        if prev is not None and d * prev < 0 and not damped:
+            damped = True  # oscillation detected -> damp updates
+        ci_use = 0.5 * (ci + ci_new) if damped else ci_new
+        if prev is not None and abs(ci_use - ci) < tol_ci:
+            a_f, cs_f, gs_f, rs_f, _ = state(ci_use)
+            return dict(ci=ci_use, cs=cs_f, gs=gs_f, rs=rs_f, a=a_f, rd=rd,
+                        vc=vc, hs=hs, n_iter=it, damped=damped,
+                        switches=switches, branch=branch, method="fixed-point")
+        ci = ci_use
+        prev = d
+
+    # ---- stage 2: Brent fallback on g(Ci) = F(Ci) - Ci ----
+    neval = [0]
+
+    def g(ci):
+        neval[0] += 1
+        a, cs, gs, rs, ci_new = state(ci)
+        if gs <= 0.0:
+            return np.nan
+        return ci_new - ci
+
+    lo, hi = 1e-6, p_atm
+    glo, ghi = g(lo), g(hi)
+    if np.isnan(glo) or np.isnan(ghi) or glo * ghi > 0:
+        raise RuntimeError("no bracket for Brent fallback (glo=%g ghi=%g)"
+                           % (glo, ghi))
+    try:
+        from scipy.optimize import brentq
+        ci_f = brentq(g, lo, hi, xtol=1e-12, rtol=8.9e-16, maxiter=200)
+    except ImportError:
+        a_lo, b_hi = lo, hi
+        for _ in range(200):
+            mid = 0.5 * (a_lo + b_hi)
+            gm = g(mid)
+            if g(a_lo) * gm <= 0:
+                b_hi = mid
+            else:
+                a_lo = mid
+            if b_hi - a_lo < 1e-12:
+                break
+        ci_f = 0.5 * (a_lo + b_hi)
+    a_f, cs_f, gs_f, rs_f, _ = state(ci_f)
+    branch = ("Wc" if wc <= wj and wc <= 4000.0 * vc * ci_f / p_atm else
+              "Wj" if wj <= 4000.0 * vc * ci_f / p_atm else "We")
+    return dict(ci=ci_f, cs=cs_f, gs=gs_f, rs=rs_f, a=a_f, rd=rd, vc=vc,
+                hs=hs, n_iter=max_it + neval[0], damped=damped,
+                switches=switches, branch=branch, method="brentq")
+
+
+def we_local(vc, ci, p_atm):
+    return 4000.0 * vc * ci / p_atm
+
+
+def solve_night(tc, ca, o2_pa, p_atm, rb, p, vpd=None):
+    """Night: A = -Rd, gs = b0, closed-form chain (signs flip)."""
+    cf = p_atm / (R_GAS * (tc + 273.16))
+    vc, kc, ko, gamma = vcmax_kc_ko(tc, p, o2_pa)
+    rd = 0.015 * vc
+    a = -rd
+    a_mol = a * 1e-6
+    gs = p["bb_intercept"]
+    cs = ca - 1.37 * rb * a_mol / cf * p_atm
+    rs = cf / gs
+    ci = cs - 1.65 * rs * a_mol / cf * p_atm
+    return dict(ci=ci, cs=cs, gs=gs, rs=rs, a=a, rd=rd, vc=vc, hs=np.nan,
+                n_iter=0, damped=False, switches=0, branch="night")
+
+
+def main():
+    with open("data/leaf_params.json") as f:
+        params = json.load(f)
+    assert params["pathway"] == "C4", "task is fixed to the C4 branch"
+    p = dict(params)
+    forc = pd.read_csv("data/forcing.csv")
+    p["btran"] = float(forc.btran.iloc[0])  # constant in this forcing
+    assert forc.btran.nunique() == 1
+
+    out, diag = [], []
+    for _, row in forc.iterrows():
+        tc_c = row.t_air_K - 273.16  # solver formulas take Tc in degrees C
+        kw = dict(ca=row.co2_pa, o2_pa=row.o2_pa, p_atm=row.p_atm_Pa,
+                  vpd=row.vpd_Pa, rb=row.rb_sm, p=p)
+        night = (row.par_sun_wm2 == 0.0) and (row.par_shade_wm2 == 0.0)
+        rec = {"time_hr": row.time_hr}
+        for tag, par in (("sun", row.par_sun_wm2), ("shade", row.par_shade_wm2)):
+            s = solve_night(tc_c, **kw) if night else \
+                solve_light(par, tc_c, **kw)
+            rec[f"A_{tag}"], rec[f"rs_{tag}"] = s["a"], s["rs"]
+            rec[f"ci_{tag}"], rec[f"gs_{tag}"] = s["ci"], s["gs"]
+            if tag == "sun":
+                diag.append(dict(time_hr=row.time_hr, night=night,
+                                 vcmax=s["vc"], rd=s["rd"], hs=s["hs"],
+                                 branch=s["branch"], n_iter=s["n_iter"],
+                                 damped=s["damped"], switches=s["switches"]))
+        out.append(rec)
+    cols = ["time_hr", "A_sun", "A_shade", "rs_sun", "rs_shade",
+            "ci_sun", "ci_shade", "gs_sun", "gs_shade"]
+    flux = pd.DataFrame(out, columns=cols)
+    flux.to_csv("results/leaf_fluxes.csv", index=False)
+
+    # ---- test cases: genuine coupled fixed point from each supplied guess ----
+    with open("data/test_cases.json") as f:
+        cases = json.load(f)
+    rows, case_meta = [], []
+    for c in cases:
+        assert 0 <= c["forcing_index"] < len(forc)
+        row = forc.iloc[c["forcing_index"]]
+        kw = dict(ca=row.co2_pa, o2_pa=row.o2_pa, p_atm=row.p_atm_Pa,
+                  vpd=row.vpd_Pa, rb=row.rb_sm, p=p)
+        if row.par_sun_wm2 > 0:  # daylight -> light branch, seeded by ci_init
+            s = solve_light(row.par_sun_wm2, row.t_air_K - 273.16,
+                            ci0=c["ci_init_pa"], **kw)
+            ci, a_f, rs_f, gs_f, n_it = s["ci"], s["a"], s["rs"], s["gs"], s["n_iter"]
+        else:  # night branch is closed-form
+            s = solve_night(row.t_air_K, **kw)
+            ci, a_f, rs_f, gs_f, n_it = s["ci"], s["a"], s["rs"], s["gs"], 0
+        rows.append(dict(case_id=c["case_id"], ci_init_pa=c["ci_init_pa"],
+                         ci_final_pa=ci, A_final=a_f, rs_final=rs_f,
+                         n_iterations=n_it))
+        case_meta.append(dict(case_id=c["case_id"], branch=s["branch"],
+                              gs=gs_f, cs=s["cs"], ci_minus_cs=ci - s["cs"],
+                              damped=s["damped"], switches=s["switches"]))
+    cc = pd.DataFrame(rows, columns=["case_id", "ci_init_pa", "ci_final_pa",
+                                     "A_final", "rs_final", "n_iterations"])
+    cc.to_csv("results/case_convergence.csv", index=False)
+
+    # ---- figure ----
+    if HAVE_MPL:
+        fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+        axes[0].plot(flux.time_hr, flux.A_sun, label="sunlit", color="tab:red")
+        axes[0].plot(flux.time_hr, flux.A_shade, label="shaded", color="tab:blue")
+        axes[0].set_ylabel(r"A [$\mu$mol CO$_2$ m$^{-2}$ s$^{-1}$]")
+        axes[0].legend(); axes[0].grid(alpha=0.3)
+        axes[0].set_title("Diurnal cycle: assimilation and stomatal resistance "
+                          "(C4 Collatz + Ball-Berry)")
+        axes[1].plot(flux.time_hr, flux.rs_sun, label="sunlit", color="tab:red")
+        axes[1].plot(flux.time_hr, flux.rs_shade, label="shaded", color="tab:blue")
+        axes[1].set_ylabel(r"$r_s$ [s m$^{-1}$]")
+        axes[1].set_xlabel("time [h]"); axes[1].legend(); axes[1].grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig("results/diurnal.png", dpi=150)
+        plt.close(fig)
+    else:
+        _render_with_pil(flux)  # offline fallback renderer (documented above)
+
+    # ---- diagnostics ----
+    dd = pd.DataFrame(diag)
+    print("=== leaf_fluxes.csv summary ===")
+    print(flux.describe().T[["min", "mean", "max"]].to_string())
+    print("\n=== case_convergence.csv ===")
+    print(cc.to_string(index=False))
+    print("\nci_final spread across cases: %.3e Pa" %
+          (cc.ci_final_pa.max() - cc.ci_final_pa.min()))
+    print("A_final spread across cases:  %.3e umol" %
+          (cc.A_final.max() - cc.A_final.min()))
+    print("\n=== sunlit-branch diagnostics ===")
+    print("night rows: %d, light rows: %d" % (dd.night.sum(), (~dd.night).sum()))
+    print("limiting branch (sunlit, day rows):")
+    print(dd[~dd.night].branch.value_counts().to_string())
+    print("branch switches (day rows):", int(dd[~dd.night].switches.sum()))
+    print("damped iterations flagged (sunlit):", int(dd[~dd.night].damped.sum()))
+    print("sunlit iteration counts: min %d max %d" %
+          (dd[~dd.night].n_iter.min(), dd[~dd.night].n_iter.max()))
+    print("Vcmax(T) range: %.3f..%.3f ; Rd range: %.4f..%.4f" %
+          (dd.vcmax.min(), dd.vcmax.max(), dd.rd.min(), dd.rd.max()))
+    print("hs range (day): %.4f..%.4f" %
+          (dd[~dd.night].hs.min(), dd[~dd.night].hs.max()))
+    night_ci = flux.ci_sun[flux.A_sun <= 0]
+    print("night Ci range: %.4f..%.4f Pa (ca=64.0646)" %
+          (night_ci.min(), night_ci.max()))
+    print("\ncase solution metadata:")
+    for m in case_meta:
+        print(m)
+    print("\nmin gs overall: %.6f mol/m2/s (must be >0)" %
+          flux[["gs_sun", "gs_shade"]].min().min())
+    print("min ci overall: %.4f Pa" % flux[["ci_sun", "ci_shade"]].min().min())
+
+
+if __name__ == "__main__":
+    main()

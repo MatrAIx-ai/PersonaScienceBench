@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+Risk-controlling prediction sets for deployment records (approved plan).
+
+Policy families (all single- or few-parameter, argmax label always included so
+sets are never empty; risk_spec: empty_prediction_sets_allowed = false):
+  * threshold:      Set = { l : s(l) >= tau_g }              (tau per stratum)
+  * cost-aware:     Set = { l : s(l)*cost(l) >= mu }         (exploits the
+    label-weighted miss risk structure: cheap labels are dropped earlier)
+  * strata: k-means clusters on standardized anonymous features (recovered
+    public groups), or a single global group.
+
+Risk: label_weighted_miss  R = E[cost(true_label) * 1{true_label not in set}],
+audited on the deployment population; target_risk = 0.1084.
+
+Guarantee (RCPS / Learn-then-Test): delta = 0.1366 is the FAILURE PROBABILITY
+of the guarantee, P(R_deployment > UCB) <= delta.  The UCB is a Hoeffding bound
+per stratum, combined with the union (Bonferroni) bound over the full examined
+policy grid x strata (M_EFFECTIVE events), pooled with DEPLOYMENT stratum
+weights (the audited population).  Among feasible candidates (pooled UCB <=
+target_risk) we select the smallest expected deployment set size.
+
+Deployment labels are hidden and never read; no reference/ file is read.
+Conventions for hidden-label outputs:
+  * audit_summary.csv / partition_diagnostics.csv: 'empirical_risk' is the
+    HONEST ESTIMATE of deployment risk = calibration empirical weighted miss
+    risk reweighted with the deployment stratum composition (diagnostic groups).
+  * constraint_audit.csv: 'empirical_risk' is the point estimate,
+    'upper_confidence_risk' (extra column) carries the confidence bound; the
+    BINDING pooled guarantee is the overall row's UCB.  Per-group UCBs use a
+    Bonferroni delta/DG split with grid uniformity and are conservative
+    diagnostics (their sum is not the binding constraint).
+  * policy_parameters.csv / calibration_diagnostics.csv carry per-group and
+    pooled UCBs as extra appended columns (all schema-required columns are
+    present first, in schema order).
+NOTE on figures: matplotlib is declared by the task runtime but is not
+installed in this environment (no network access); the three required PNGs are
+rendered with a self-contained numpy+zlib PNG rasterizer below.
+"""
+import json, os, itertools, zlib, struct
+import numpy as np
+import pandas as pd
+from scipy.cluster.vq import kmeans2
+
+DATA, RESULTS = "data", "results"
+os.makedirs(RESULTS, exist_ok=True)
+meta = json.load(open(f"{DATA}/metadata.json"))
+spec = json.load(open(f"{DATA}/risk_spec.json"))
+LABELS = list(meta["label_columns"]); FEATURES = list(meta["feature_columns"])
+TARGET = float(spec["target_risk"]); DELTA = float(spec["delta"])
+cost = np.array([spec["label_costs"][l] for l in LABELS]); B = float(cost.max())
+
+cal = (pd.read_csv(f"{DATA}/calibration_labels.csv")
+       .merge(pd.read_csv(f"{DATA}/calibration_scores.csv"), on="record_id")
+       .merge(pd.read_csv(f"{DATA}/calibration_features.csv"), on="record_id"))
+dep = (pd.read_csv(f"{DATA}/deployment_scores.csv")
+       .merge(pd.read_csv(f"{DATA}/deployment_features.csv"), on="record_id"))
+assert len(cal) == meta["n_calibration"] and len(dep) == meta["n_deployment"]
+
+S_cal = cal[LABELS].to_numpy(float); S_dep = dep[LABELS].to_numpy(float)
+y_idx = cal["true_label"].map({l: i for i, l in enumerate(LABELS)}).to_numpy()
+y_true = cal["true_label"].to_numpy()
+assert not np.isnan(y_idx).any()
+c_y = cost[y_idx]; s_true = S_cal[np.arange(len(y_idx)), y_idx]
+n_cal, n_dep = len(cal), len(dep)
+
+Xc = cal[FEATURES].to_numpy(float); Xd = dep[FEATURES].to_numpy(float)
+mu_f, sd_f = Xc.mean(0), Xc.std(0)
+Zc, Zd = (Xc - mu_f) / sd_f, (Xd - mu_f) / sd_f
+
+# ---------------------------------------------------------------- clustering
+def best_kmeans(Z, k, restarts=5):
+    best = None
+    for seed in range(restarts):
+        cent, lab = kmeans2(Z, k, minit="++", seed=seed, iter=100)
+        inertia = ((Z - cent[lab]) ** 2).sum()
+        if best is None or inertia < best[0]:
+            best = (inertia, cent, lab)
+    return best[1], best[2]
+
+def assign(Z, cent):
+    return ((Z[:, None, :] - cent[None, :, :]) ** 2).sum(2).argmin(1)
+
+MIN_GROUP_CAL, MIN_GROUP_DEP = 400, 200
+kmeans = {}
+for k in (2, 3):
+    cent, lab = best_kmeans(Zc, k)
+    g_dep = assign(Zd, cent)
+    if all((lab == g).sum() >= MIN_GROUP_CAL and (g_dep == g).sum() >= MIN_GROUP_DEP for g in range(k)):
+        kmeans[k] = (lab, g_dep)
+    else:
+        print(f"[clustering] kmeans_k{k} skipped (group size below minimum)")
+
+GLOBAL_G = (np.zeros(n_cal, int), np.zeros(n_dep, int))
+
+def rule_threshold(S, tau):
+    st = S >= tau
+    st[np.arange(len(S)), S.argmax(1)] = True
+    return st
+
+def rule_cost(S, mu):
+    st = S * cost[None, :] >= mu
+    st[np.arange(len(S)), S.argmax(1)] = True
+    return st
+
+TH_GRID = np.geomspace(3e-4, 0.08, 20)      # tau grid (score threshold)
+MU_GRID = np.geomspace(5e-4, 0.06, 20)      # mu grid (cost-aware threshold)
+
+families = []
+families.append(dict(name="threshold_global", groups=GLOBAL_G, G=1, rule=rule_threshold, grid=TH_GRID))
+families.append(dict(name="cost_global", groups=GLOBAL_G, G=1, rule=rule_cost, grid=MU_GRID))
+for k in (2, 3):
+    if k in kmeans:
+        families.append(dict(name=f"threshold_kmeans_k{k}", groups=kmeans[k], G=k,
+                             rule=rule_threshold, grid=TH_GRID))
+
+def family_curves(fam):
+    g_cal, g_dep = fam["groups"]; Gf = fam["G"]; grid = fam["grid"]; T = len(grid)
+    R = np.zeros((Gf, T)); SZc = np.zeros((Gf, T)); SZd = np.zeros((Gf, T))
+    for g in range(Gf):
+        m, md = g_cal == g, g_dep == g
+        Sc_g, y_g, c_g = S_cal[m], y_idx[m], c_y[m]
+        for t, p in enumerate(grid):
+            sc = fam["rule"](Sc_g, p)
+            miss = ~sc[np.arange(len(y_g)), y_g]
+            R[g, t] = (miss * c_g).mean(); SZc[g, t] = sc.sum(1).mean()
+            SZd[g, t] = fam["rule"](S_dep[md], p).sum(1).mean()
+    return R, SZc, SZd
+
+M_TOTAL = sum(len(f["grid"]) ** f["G"] for f in families)
+M_EFFECTIVE = M_TOTAL * max(f["G"] for f in families)
+
+def hoeff(n, m_events):
+    return B * np.sqrt(np.log(m_events / DELTA) / (2.0 * n))
+
+# ---------------------------------------------------------------- selection
+candidates = []
+for fam in families:
+    Gf = fam["G"]; T = len(fam["grid"])
+    R, SZc, SZd = family_curves(fam)
+    g_cal, g_dep = fam["groups"]
+    w_dep = np.array([(g_dep == g).mean() for g in range(Gf)])
+    w_cal = np.array([(g_cal == g).mean() for g in range(Gf)])
+    n_cal_g = np.array([(g_cal == g).sum() for g in range(Gf)])
+    c_g = np.array([hoeff(n, M_EFFECTIVE) for n in n_cal_g])
+    best = None
+    for tup in itertools.product(range(T), repeat=Gf):
+        t = np.array(tup)
+        ucb = float((w_dep * (R[np.arange(Gf), t] + c_g)).sum())
+        if ucb > TARGET:
+            continue
+        size_dep = float((w_dep * SZd[np.arange(Gf), t]).sum())
+        size_cal = float((w_cal * SZc[np.arange(Gf), t]).sum())
+        key = (size_dep, Gf)
+        if best is None or key < best["key"]:
+            best = dict(key=key, t=t, ucb=ucb, risk=float((w_dep * R[np.arange(Gf), t]).sum()),
+                        size_dep=size_dep, size_cal=size_cal)
+    if best is None:
+        print(f"[selection] {fam['name']}: no feasible candidate (pooled UCB > target)")
+        continue
+    best.update(family=fam["name"], G=Gf, R=R, SZc=SZc, SZd=SZd, w_dep=w_dep, c_g=c_g,
+                g_cal=g_cal, g_dep=g_dep, grid=fam["grid"], rule=fam["rule"])
+    candidates.append(best)
+    print(f"[selection] {fam['name']}: size_dep={best['size_dep']:.3f} size_cal={best['size_cal']:.3f} "
+          f"UCB={best['ucb']:.4f} risk_pooled={best['risk']:.4f} params={fam['grid'][list(best['t'])].round(5)}")
+
+assert candidates, "no feasible policy: target risk unreachable under examined families"
+sel = min(candidates, key=lambda c: (c["size_dep"], c["G"]))
+print(f"[selection] SELECTED {sel['family']} params={sel['grid'][list(sel['t'])].round(5)} "
+      f"UCB={sel['ucb']:.4f} risk_pooled={sel['risk']:.4f} size_dep={sel['size_dep']:.3f}")
+
+G = sel["G"]; params_sel = sel["grid"][list(sel["t"])]
+g_pol_cal, g_pol_dep = sel["g_cal"], sel["g_dep"]
+# build sets with per-record group parameter (works for G == 1 and G > 1)
+def build_sets(S, g_assign):
+    out = np.zeros((len(S), len(LABELS)), bool)
+    for g in range(G):
+        m = g_assign == g
+        out[m] = sel["rule"](S[m], params_sel[g])
+    return out
+sets_cal = build_sets(S_cal, g_pol_cal)
+sets_dep = build_sets(S_dep, g_pol_dep)
+assert sets_dep.sum(1).min() >= 1, "empty prediction set produced"
+
+miss_cal = ~sets_cal[np.arange(n_cal), y_idx]
+risk_cal_groups = np.array([(miss_cal[g_pol_cal == g] * c_y[g_pol_cal == g]).mean() for g in range(G)])
+dep_sizes_g = np.array([sets_dep[g_pol_dep == g].sum(1).mean() for g in range(G)])
+m_pg = np.array([(g_pol_dep == g).sum() for g in range(G)])
+n_pg = np.array([(g_pol_cal == g).sum() for g in range(G)])
+w_pg = m_pg / m_pg.sum()
+dep_sizes_all = sets_dep.sum(1)
+
+# ------------------------------------------------- diagnostic recovered groups
+diag = kmeans.get(3) or kmeans.get(2)
+if diag is not None:
+    d_g_cal, d_g_dep = diag; DG = len(np.unique(d_g_cal))
+else:
+    d_g_cal, d_g_dep, DG = GLOBAL_G[0], GLOBAL_G[1], 1
+rec_ids = ["overall"] if DG == 1 else [f"recovered_group_{g}" for g in range(DG)]
+m_dg = np.array([(d_g_dep == g).sum() for g in range(DG)])
+n_dg = np.array([(d_g_cal == g).sum() for g in range(DG)])
+w_dg = m_dg / m_dg.sum()
+risk_cal_dg = np.array([(miss_cal[d_g_cal == g] * c_y[d_g_cal == g]).mean() for g in range(DG)])
+dep_sizes_dg = np.array([dep_sizes_all[d_g_dep == g].mean() for g in range(DG)])
+c_dg = np.array([hoeff(n, len(TH_GRID) * DG) for n in n_dg])   # delta/DG split, grid-uniform
+risk_dep_hat = float((w_dg * risk_cal_dg).sum())               # honest deployment estimate
+ucb_dep = float(sel["ucb"])                                   # binding pooled policy UCB
+
+# ---------------------------------------------------------------- outputs
+REQUIRED_OUTPUTS = ["analysis.py"] + [p for p in meta["output_files"] if p != "analysis.py"]
+
+pd.DataFrame([{"record_id": rid,
+               "prediction_set": " ".join(l for l, k in zip(LABELS, sets_dep[i]) if k)}
+              for i, rid in enumerate(dep["record_id"])]).to_csv(
+    f"{RESULTS}/prediction_sets.csv", index=False)
+
+pol_ids = ["overall"] if G == 1 else [f"stratum_{g}" for g in range(G)]
+pp = []
+for gi in range(G):
+    for lab in LABELS:
+        pp.append({"proxy_stratum": pol_ids[gi], "label": lab,
+                   "n_calibration": int(n_pg[gi]),
+                   "n_calibration_label": int(((g_pol_cal == gi) & (y_true == lab)).sum()),
+                   "threshold": float(params_sel[gi]),
+                   "group_empirical_weighted_miss_risk": float(risk_cal_groups[gi]),
+                   "group_upper_confidence_risk": float(risk_cal_groups[gi] + sel["c_g"][gi]),
+                   "group_expected_set_size": float(dep_sizes_g[gi]),
+                   "calibration_target_risk": TARGET, "target_risk": TARGET})
+pp.append({"proxy_stratum": "overall", "label": "all", "n_calibration": int(n_pg.sum()),
+           "n_calibration_label": int(n_cal),
+           "threshold": float(np.average(params_sel, weights=m_pg)),
+           "group_empirical_weighted_miss_risk": risk_dep_hat,
+           "group_upper_confidence_risk": ucb_dep,
+           "group_expected_set_size": float(dep_sizes_all.mean()),
+           "calibration_target_risk": TARGET, "target_risk": TARGET})
+pp_df = pd.DataFrame(pp)
+pp_df["delta"] = DELTA
+pp_df["ucb_method"] = (f"Hoeffding+Bonferroni uniform over {M_TOTAL} grid tuples x {G} policy "
+                       "strata; delta = failure probability of P(R_dep > UCB) <= delta")
+pp_df.to_csv(f"{RESULTS}/policy_parameters.csv", index=False)
+
+def audit_rows(empirical_kind):
+    """overall row + one row per recovered public group (diagnostic strata)."""
+    out = []
+    for gi in range(DG + 1):
+        if gi < DG:
+            scope = sid = rec_ids[gi]
+            emp = float(risk_cal_dg[gi] if empirical_kind == "point" else risk_cal_dg[gi] + c_dg[gi])
+            n_rec = int(m_dg[gi]); msz = float(dep_sizes_dg[gi])
+            p90 = float(np.quantile(dep_sizes_all[d_g_dep == gi], 0.9))
+        else:
+            scope, sid = "overall", "all"
+            emp = risk_dep_hat if empirical_kind == "point" else ucb_dep
+            n_rec = int(n_dep); msz = float(dep_sizes_all.mean())
+            p90 = float(np.quantile(dep_sizes_all, 0.9))
+        out.append({"scope": scope, "stratum_id": sid, "n_records": n_rec,
+                    "empirical_risk": emp, "mean_set_size": msz, "p90_set_size": p90,
+                    "target_risk": TARGET, "risk_violation": bool(emp > TARGET)})
+    return out
+
+pd.DataFrame(audit_rows("point")).to_csv(f"{RESULTS}/audit_summary.csv", index=False)
+pd.DataFrame({"record_id": dep["record_id"], "set_size": dep_sizes_all.astype(int),
+              "proxy_stratum": [rec_ids[g] for g in d_g_dep]}).to_csv(
+    f"{RESULTS}/set_size_summary.csv", index=False)
+pd.DataFrame([{"scope": r["scope"], "stratum_id": r["stratum_id"], "n_records": r["n_records"],
+               "empirical_risk": r["empirical_risk"], "mean_set_size": r["mean_set_size"],
+               "p90_set_size": r["p90_set_size"], "target_risk": r["target_risk"],
+               "risk_margin": r["target_risk"] - r["empirical_risk"]}
+              for r in audit_rows("point")]).to_csv(f"{RESULTS}/partition_diagnostics.csv", index=False)
+
+dd = []
+for gi in range(DG):
+    cf_, df_ = n_dg[gi] / n_dg.sum(), m_dg[gi] / m_dg.sum()
+    eps = 1e-9   # stable convention for small calibration fractions
+    dd.append({"proxy_stratum": rec_ids[gi], "calibration_fraction": float(cf_),
+               "deployment_fraction": float(df_),
+               "density_ratio_estimate": float((df_ + eps) / (cf_ + eps)),
+               "absolute_fraction_shift": float(abs(df_ - cf_))})
+if not dd:
+    dd = [{"proxy_stratum": "overall", "calibration_fraction": 1.0, "deployment_fraction": 1.0,
+           "density_ratio_estimate": 1.0, "absolute_fraction_shift": 0.0}]
+pd.DataFrame(dd).to_csv(f"{RESULTS}/distribution_diagnostics.csv", index=False)
+
+# calibration_diagnostics.csv: bins on the true-label-score axis (log-spaced)
+BIN_EDGES = np.array([0.0, 5e-4, 1e-3, 2e-3, 5e-3, 0.01, 0.02, 0.05, 0.1, 0.3, 1.0000001])
+groups_for_bins = ([("overall", np.ones(n_cal, bool))] +
+                   [(rec_ids[gi], d_g_cal == gi) for gi in range(DG)] if DG > 1
+                   else [("overall", np.ones(n_cal, bool))])
+cd = []
+for gname, mask in groups_for_bins:
+    st = s_true[mask]
+    for b in range(len(BIN_EDGES) - 1):
+        bm = (st >= BIN_EDGES[b]) & (st < BIN_EDGES[b + 1])
+        if bm.sum() == 0:
+            continue
+        cd.append({"proxy_stratum": gname, "bin_id": f"b{b:02d}",
+                   "score_left": float(BIN_EDGES[b]), "score_right": float(BIN_EDGES[b + 1]),
+                   "n_records": int(bm.sum()), "mean_true_label_score": float(st[bm].mean())})
+cd_df = pd.DataFrame(cd)
+grp = {("overall" if DG == 1 else rec_ids[gi]):
+       (risk_dep_hat if DG == 1 else float(risk_cal_dg[gi]),
+        ucb_dep if DG == 1 else float(risk_cal_dg[gi] + c_dg[gi])) for gi in range(DG)}
+grp["overall"] = (risk_dep_hat, ucb_dep)
+cd_df["group_empirical_weighted_miss_risk"] = [grp[p][0] for p in cd_df["proxy_stratum"]]
+cd_df["group_upper_confidence_risk"] = [grp[p][1] for p in cd_df["proxy_stratum"]]
+cd_df["pooled_upper_confidence_risk"] = ucb_dep
+cd_df.to_csv(f"{RESULTS}/calibration_diagnostics.csv", index=False)
+
+# constraint_audit.csv: point estimates + binding pooled UCB on the overall row
+ca = []
+for gi in range(DG + 1):
+    if gi < DG:
+        scope = sid = rec_ids[gi]
+        emp = float(risk_cal_dg[gi]); ucb_g = float(risk_cal_dg[gi] + c_dg[gi])
+        sizes = dep_sizes_all[d_g_dep == gi]
+        n_empty = int((sets_dep[d_g_dep == gi].sum(1) == 0).sum())
+    else:
+        scope, sid = "overall", "all"
+        emp, ucb_g = risk_dep_hat, ucb_dep
+        sizes = dep_sizes_all
+        n_empty = int((sets_dep.sum(1) == 0).sum())
+    ca.append({"scope": scope, "stratum_id": sid, "empirical_risk": emp,
+               "target_risk": TARGET, "risk_violation": bool(emp > TARGET),
+               "violates": bool(emp > TARGET),
+               "upper_confidence_risk": ucb_g, "ucb_violates": bool(ucb_g > TARGET),
+               "mean_set_size_dep": float(sizes.mean()), "min_set_size": int(sizes.min()),
+               "max_set_size": int(sizes.max()), "n_empty_sets": n_empty})
+pd.DataFrame(ca)[["scope", "stratum_id", "empirical_risk", "target_risk", "risk_violation",
+                  "violates", "upper_confidence_risk", "ucb_violates", "mean_set_size_dep",
+                  "min_set_size", "max_set_size", "n_empty_sets"]].to_csv(
+    f"{RESULTS}/constraint_audit.csv", index=False)
+
+# ---------------------------------------------------------------- PNG renderer
+FONT = {
+'0':"01110 10001 10011 10101 11001 10001 01110",'1':"00100 01100 00100 00100 00100 00100 01110",
+'2':"01110 10001 00001 00010 00100 01000 11111",'3':"11111 00010 00100 00010 00001 10001 01110",
+'4':"00010 00110 01010 10010 11111 00010 00010",'5':"11111 10000 11110 00001 00001 10001 01110",
+'6':"00110 01000 10000 11110 10001 10001 01110",'7':"11111 00001 00010 00100 01000 01000 01000",
+'8':"01110 10001 10001 01110 10001 10001 01110",'9':"01110 10001 10001 01111 00001 00010 01100",
+'A':"01110 10001 10001 11111 10001 10001 10001",'B':"11110 10001 10001 11110 10001 10001 11110",
+'C':"01110 10001 10000 10000 10000 10001 01110",'D':"11110 10001 10001 10001 10001 10001 11110",
+'E':"11111 10000 10000 11110 10000 10000 11111",'F':"11111 10000 10000 11110 10000 10000 10000",
+'G':"01110 10001 10000 10111 10001 10001 01111",'H':"10001 10001 10001 11111 10001 10001 10001",
+'I':"01110 00100 00100 00100 00100 00100 01110",'J':"00111 00010 00010 00010 00010 10010 01100",
+'K':"10001 10010 10100 11000 10100 10010 10001",'L':"10000 10000 10000 10000 10000 10000 11111",
+'M':"10001 11011 10101 10101 10001 10001 10001",'N':"10001 11001 10101 10011 10001 10001 10001",
+'O':"01110 10001 10001 10001 10001 10001 01110",'P':"11110 10001 10001 11110 10000 10000 10000",
+'Q':"01110 10001 10001 10001 10101 10011 01101",'R':"11110 10001 10001 11110 10100 10010 10001",
+'S':"01111 10000 10000 01110 00001 00001 11110",'T':"11111 00100 00100 00100 00100 00100 00100",
+'U':"10001 10001 10001 10001 10001 10001 01110",'V':"10001 10001 10001 10001 10001 01010 00100",
+'W':"10001 10001 10001 10101 10101 11011 10001",'X':"10001 10001 01010 00100 01010 10001 10001",
+'Y':"10001 10001 01010 00100 00100 00100 00100",'Z':"11111 00001 00010 00100 01000 10000 11111",
+'.':"00000 00000 00000 00000 00000 01100 01100",'-':"00000 00000 00000 01110 00000 00000 00000",
+'/':"00001 00010 00010 00100 01000 01000 10000",'%':"11001 11010 00010 00100 01000 01011 10011",
+'(':"00010 00100 01000 01000 01000 00100 00010",')':"01000 00100 00010 00010 00010 00100 01000",
+'=':"00000 00000 11111 00000 11111 00000 00000",':':"00000 01100 01100 00000 01100 01100 00000",
+',':"00000 00000 00000 00000 01100 00100 01000",' ':"00000 00000 00000 00000 00000 00000 00000"}
+
+def _png_write(path, arr):
+    h, w, _ = arr.shape
+    raw = b"".join(b"\x00" + arr[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(raw, 6)))
+        f.write(chunk(b"IEND", b""))
+
+BLUE, ORANGE, GREEN, RED, PURPLE = (31,119,180), (255,127,14), (44,160,44), (214,39,40), (148,103,189)
+BLACK, GRAY = (20,20,20), (150,150,150)
+
+class Canvas:
+    def __init__(self, w, h, bg=(255,255,255)):
+        self.w, self.h = w, h
+        self.a = np.full((h, w, 3), bg, np.uint8)
+    def rect(self, x0, y0, x1, y1, col):
+        x0, x1 = sorted((int(round(x0)), int(round(x1)))); y0, y1 = sorted((int(round(y0)), int(round(y1))))
+        self.a[max(y0,0):min(y1+1,self.h), max(x0,0):min(x1+1,self.w)] = col
+    def line(self, x0, y0, x1, y1, col, t=1):
+        x0, y0, x1, y1 = int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+        dx, dy = abs(x1-x0), abs(y1-y0)
+        sx = 1 if x0 < x1 else -1; sy = 1 if y0 < y1 else -1
+        err = dx - dy; x, y = x0, y0
+        while True:
+            self.rect(x - t//2, y - t//2, x + t//2, y + t//2, col)
+            if x == x1 and y == y1: break
+            e2 = 2*err
+            if e2 > -dy: err -= dy; x += sx
+            if e2 <  dx: err += dx; y += sy
+    def text(self, x, y, s, col=BLACK, sc=1):
+        for ch in s.upper():
+            bm = FONT.get(ch, FONT[' ']).split()
+            for r, row in enumerate(bm):
+                for c, v in enumerate(row):
+                    if v == '1':
+                        self.rect(x + c*sc, y + r*sc, x + (c+1)*sc - 1, y + (r+1)*sc - 1, col)
+            x += 6*sc
+
+class Plot:
+    def __init__(self, cv, x0, y0, x1, y1, xlim, ylim):
+        self.cv, self.box = cv, (x0, y0, x1, y1)
+        self.xlim, self.ylim = xlim, ylim
+    def xy(self, x, y):
+        x0, y0, x1, y1 = self.box
+        fx = (x - self.xlim[0]) / (self.xlim[1] - self.xlim[0])
+        fy = (y - self.ylim[0]) / (self.ylim[1] - self.ylim[0])
+        return x0 + fx*(x1-x0), y1 - fy*(y1-y0)
+    def frame(self, xticks=5, yticks=5, xfmt="%.3g", yfmt="%.3g", xlabel=None, title=None):
+        x0, y0, x1, y1 = self.box; cv = self.cv
+        cv.line(x0, y0, x1, y0, BLACK); cv.line(x1, y0, x1, y1, BLACK)
+        cv.line(x1, y1, x0, y1, BLACK); cv.line(x0, y1, x0, y0, BLACK)
+        for i in range(xticks + 1):
+            v = self.xlim[0] + (self.xlim[1]-self.xlim[0])*i/xticks
+            px, _ = self.xy(v, self.ylim[0])
+            cv.line(px, y1, px, y1+4, BLACK)
+            cv.text(int(px)-10, y1+7, xfmt % v, BLACK, 1)
+        for i in range(yticks + 1):
+            v = self.ylim[0] + (self.ylim[1]-self.ylim[0])*i/yticks
+            _, py = self.xy(self.xlim[0], v)
+            cv.line(x0-4, py, x0, py, BLACK)
+            cv.text(x0-42, py-3, yfmt % v, BLACK, 1)
+        if xlabel: cv.text((x0+x1)//2 - 5*len(xlabel), y1+22, xlabel, BLACK, 1)
+        if title: cv.text((x0+x1)//2 - 6*len(title), max(y0-20, 4), title, BLACK, 1)
+    def plot_line(self, xs, ys, col, t=2):
+        pts = [self.xy(x, y) for x, y in zip(xs, ys)]
+        for (a, b), (c, d) in zip(pts[:-1], pts[1:]):
+            self.cv.line(a, b, c, d, col, t)
+    def hline(self, y, col, t=1, dash=False):
+        x0, y0, x1, y1 = self.box; _, py = self.xy(self.xlim[0], y)
+        if not dash: self.cv.line(x0, py, x1, py, col, t)
+        else:
+            x = x0
+            while x < x1:
+                self.cv.line(x, py, min(x+8, x1), py, col, t); x += 12
+    def legend(self, entries, x, y):
+        wd = 8*max(len(e[1]) for e in entries) + 14
+        self.cv.rect(x-4, y-4, x+wd, y + 14*len(entries)+4, (245,245,245))
+        for xx, yy, col in [(x-4,y-4,x+wd),(x+wd,y-4,x+wd),(x+wd,y+14*len(entries)+4,x-4),(x-4,y+14*len(entries)+4,x-4)]:
+            self.cv.line(xx, yy, yy if False else xx, yy, GRAY, 1)
+        self.cv.line(x-4, y-4, x+wd, y-4, GRAY); self.cv.line(x+wd, y-4, x+wd, y+14*len(entries)+4, GRAY)
+        self.cv.line(x+wd, y+14*len(entries)+4, x-4, y+14*len(entries)+4, GRAY)
+        self.cv.line(x-4, y+14*len(entries)+4, x-4, y-4, GRAY)
+        for i, (col, lab) in enumerate(entries):
+            self.cv.rect(x, y + 14*i + 2, x+10, y + 14*i + 9, col)
+            self.cv.text(x+16, y + 14*i, lab, BLACK, 1)
+
+def hist_outline(cv, plot, values, edges, col):
+    cnt, _ = np.histogram(values, bins=edges); cnt = cnt / cnt.sum()
+    for i, c in enumerate(cnt):
+        if c <= 0: continue
+        xa, y0b = plot.xy(edges[i], 0); xb, _ = plot.xy(edges[i+1], 0)
+        _, ytop = plot.xy(edges[i], c)
+        cv.line(xa, y0b, xa, ytop, col, 1); cv.line(xa, ytop, xb, ytop, col, 1)
+        cv.line(xb, ytop, xb, y0b, col, 1)
+
+# ---------------- Figure 1: set_size_tradeoff.png
+cv = Canvas(900, 560)
+def global_curve(rule, grid):
+    R, SZ, SZd = np.zeros(len(grid)), np.zeros(len(grid)), np.zeros(len(grid))
+    for t, p in enumerate(grid):
+        sc = rule(S_cal, p); miss = ~sc[np.arange(n_cal), y_idx]
+        R[t] = (miss * c_y).mean(); SZ[t] = sc.sum(1).mean()
+        SZd[t] = rule(S_dep, p).sum(1).mean()
+    o = np.argsort(SZ)
+    return SZ[o], R[o], SZd[np.argsort(SZd)], R[np.argsort(SZd)]
+c_pooled = hoeff(n_cal, M_EFFECTIVE)
+szT, rT, szdT, rTd = global_curve(rule_threshold, TH_GRID)
+szC, rC, szdC, rCd = global_curve(rule_cost, MU_GRID)
+ymax = max((rT + c_pooled).max(), (rC + c_pooled).max(), TARGET) * 1.18
+pl = Plot(cv, 80, 40, 840, 470, (0.8, 9.2), (0, ymax))
+pl.frame(xticks=4, yticks=5, xlabel="MEAN SET SIZE", title="SET-SIZE / RISK TRADEOFF (GLOBAL POLICIES)")
+pl.hline(TARGET, BLACK, 1, dash=True)
+pl.plot_line(szT, rT, BLUE, 2)
+pl.plot_line(szT, np.minimum(rT + c_pooled, 1.0), RED, 1)
+pl.plot_line(szC, rC, PURPLE, 2)
+pl.plot_line(szC, np.minimum(rC + c_pooled, 1.0), (230,159,120), 1)
+sx, sy_ = pl.xy(float(dep_sizes_all.mean()), risk_dep_hat)
+cv.rect(sx-5, sy_-5, sx+5, sy_+5, ORANGE)
+pl.legend([(BLUE, "THRESHOLD: CAL RISK"), (RED, "THRESHOLD: POOLED UCB"),
+           (PURPLE, "COST-AWARE: CAL RISK"), ((230,159,120), "COST-AWARE: POOLED UCB"),
+           (BLACK, "TARGET RISK=%.4g" % TARGET),
+           (ORANGE, "SELECTED (SIZE=%.2f)" % dep_sizes_all.mean())], 520, 55)
+cv.text(80, 505, "DELTA=%.4g: FAILURE PROBABILITY OF P(R_DEPLOYMENT > UCB) <= DELTA" % DELTA, GRAY, 1)
+cv.text(80, 520, "UCB = HOEFFDING + BONFERRONI OVER ALL EXAMINED POLICIES; DEPLOYMENT STRATUM WEIGHTS", GRAY, 1)
+_png_write(f"{RESULTS}/set_size_tradeoff.png", cv.a)
+
+# ---------------- Figure 2: partition_audit.png (recovered diagnostic groups)
+W2 = 1400 if DG > 1 else 900
+cv = Canvas(W2, 470)
+short = [r.replace("recovered_group_", "RG") for r in rec_ids]
+p1 = Plot(cv, 60, 60, 420, 380, (0, max(DG, 1)), (0, 1.0))
+p1.frame(xticks=max(DG-1, 1), yticks=5, xfmt="%d", yfmt="%.1f", title="STRATA COMPOSITION")
+if DG > 1:
+    for gi in range(DG):
+        xa1, _ = p1.xy(gi, 0); xa2, _ = p1.xy(gi + 0.5, 0)
+        cv.rect(xa1+8, p1.xy(gi, n_dg[gi]/n_dg.sum())[1], xa2-4, p1.xy(gi, 0)[1], BLUE)
+        cv.rect(xa2+4, p1.xy(gi, m_dg[gi]/m_dg.sum())[1], p1.xy(gi+1, 0)[0]-8, p1.xy(gi, 0)[1], ORANGE)
+        cv.text(xa1+12, 392, short[gi], BLACK, 1)
+    p1.legend([(BLUE, "CAL FRACTION"), (ORANGE, "DEP FRACTION")], 280, 70)
+else:
+    cv.rect(140, p1.xy(0, 1.0)[1], 380, 380, BLUE)
+    cv.text(220, 392, "ALL RECORDS", BLACK, 1)
+p2 = Plot(cv, 500, 60, 860, 380, (0, max(DG, 1)),
+          (0, max((risk_cal_dg + c_dg).max(), TARGET) * 1.25))
+p2.frame(xticks=max(DG-1, 1), yticks=5, xfmt="%d", yfmt="%.2f", title="RISK VS TARGET (EST + UCB)")
+p2.hline(TARGET, BLACK, 1, dash=True)
+for gi in range(DG):
+    xa, _ = p2.xy(gi, 0)
+    cv.rect(xa+14, p2.xy(gi, risk_cal_dg[gi])[1], xa+66, p2.xy(gi, 0)[1], BLUE)
+    yu = p2.xy(gi, risk_cal_dg[gi] + c_dg[gi])[1]
+    cv.line(xa+40, yu, xa+40, p2.xy(gi, risk_cal_dg[gi])[1], RED, 2)
+    cv.line(xa+30, yu, xa+50, yu, RED, 2)
+    cv.text(xa+30, 392, short[gi], BLACK, 1)
+p3 = Plot(cv, 940, 60, 1300, 380, (0, max(DG, 1)), (0, 9.6))
+p3.frame(xticks=max(DG-1, 1), yticks=5, xfmt="%d", yfmt="%.0f", title="MEAN SET SIZE (DEP)")
+p3.hline(9, GRAY, 1, dash=True)
+for gi in range(DG):
+    xa, _ = p3.xy(gi, 0)
+    cv.rect(xa+20, p3.xy(gi, dep_sizes_dg[gi])[1], xa+60, p3.xy(gi, 0)[1], GREEN)
+    cv.text(xa+34, 392, short[gi], BLACK, 1)
+cv.text(940, 420, "DOTTED: TRIVIAL ALL-LABEL SET (9)", GRAY, 1)
+cv.text(60, 440, "GROUPS RECOVERED BY K-MEANS ON ANONYMOUS FEATURES (PUBLIC; NO DEPLOYMENT LABELS USED)", GRAY, 1)
+_png_write(f"{RESULTS}/partition_audit.png", cv.a)
+
+# ---------------- Figure 3: score_diagnostics.png
+cv = Canvas(1400, 460)
+mx_c, mx_d = S_cal.max(1), S_dep.max(1)
+p1 = Plot(cv, 70, 50, 500, 380, (0, 1.0), (0, np.log10(n_cal) + 0.5))
+p1.frame(xticks=5, yticks=5, xfmt="%.1f", yfmt="%.0f", xlabel="TRUE-LABEL SCORE (CAL)",
+         title="HEAVY LOWER TAIL DRIVES RISK (LOG COUNT)")
+edges = np.linspace(0, 1, 41)
+cnt, _ = np.histogram(s_true, bins=edges); cnt = np.log10(cnt + 1)
+for i, c in enumerate(cnt):
+    xa, _ = p1.xy(edges[i], 0); xb, _ = p1.xy(edges[i+1], 0)
+    _, ytop = p1.xy(edges[i], c)
+    cv.rect(xa+1, ytop, xb-1, p1.xy(edges[i], 0)[1], BLUE)
+cv.text(70, 420, "MOST MISSES OCCUR WHEN THE TRUE LABEL HAS SCORE < ~0.01", GRAY, 1)
+
+p2 = Plot(cv, 570, 50, 1000, 380, (0, 1.0), (0, 5.5))
+p2.frame(xticks=5, yticks=5, xfmt="%.1f", yfmt="%.1f", xlabel="MAX SCORE",
+         title="MAX-SCORE SHIFT CAL VS DEP")
+edges2 = np.linspace(0, 1, 26)
+hist_outline(cv, p2, mx_c, edges2, BLUE)
+hist_outline(cv, p2, mx_d, edges2, ORANGE)
+p2.legend([(BLUE, "CALIBRATION"), (ORANGE, "DEPLOYMENT")], 830, 70)
+
+p3 = Plot(cv, 1070, 50, 1360, 380, (0, 1.0), (0, 1.0))
+p3.frame(xticks=5, yticks=5, xfmt="%.1f", yfmt="%.1f", xlabel="SCORE BIN CENTER",
+         title="MEAN SCORE PER BIN (CAL VS DEP)")
+centers = (edges2[:-1] + edges2[1:]) / 2
+rel_c = [S_cal[(S_cal >= a) & (S_cal < b)].mean() for a, b in zip(edges2[:-1], edges2[1:])]
+rel_d = [S_dep[(S_dep >= a) & (S_dep < b)].mean() for a, b in zip(edges2[:-1], edges2[1:])]
+p3.plot_line(centers, rel_c, BLUE, 2); p3.plot_line(centers, rel_d, ORANGE, 2)
+p3.plot_line([0, 1], [0, 1], GRAY, 1)
+p3.legend([(BLUE, "CALIBRATION"), (ORANGE, "DEPLOYMENT"), (GRAY, "Y=X")], 1140, 70)
+_png_write(f"{RESULTS}/score_diagnostics.png", cv.a)
+
+# ---------------------------------------------------------------- final contract
+print("\n[contract] checks:")
+print(f"  deployment sets: n={n_dep}, empty={int((sets_dep.sum(1) == 0).sum())}, "
+      f"mean size={dep_sizes_all.mean():.3f}, min={dep_sizes_all.min()}, max={dep_sizes_all.max()} "
+      f"(trivial all-label = 9)")
+print(f"  estimated deployment weighted miss risk = {risk_dep_hat:.4f} (point), "
+      f"binding pooled UCB = {ucb_dep:.4f}, target = {TARGET}, delta = {DELTA}")
+print(f"  families examined: {[f['name'] for f in families]}; selected: {sel['family']} "
+      f"params={params_sel.round(5)}")
+missing = [p for p in REQUIRED_OUTPUTS if not (os.path.exists(p) and os.path.getsize(p) > 0)]
+assert not missing, f"missing or empty required outputs: {missing}"
+print(f"  all {len(REQUIRED_OUTPUTS)} required outputs exist and are non-empty")
+print("Done.")

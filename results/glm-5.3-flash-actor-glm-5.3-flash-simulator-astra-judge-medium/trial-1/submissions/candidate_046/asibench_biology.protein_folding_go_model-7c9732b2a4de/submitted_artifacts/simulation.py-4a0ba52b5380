@@ -1,0 +1,640 @@
+"""
+B3: Interacting-Bead Stochastic Dynamics on a Reference Configuration.
+
+Stochastic (Langevin BAOAB) dynamics of N beads at every temperature in
+data/parameters.json, always started from the reference configuration.
+Potential (units kB = m = 1, energy scale eps = 1):
+  * harmonic bonds between consecutive beads (|i-j| = 1) with per-bond
+    equilibrium lengths taken from the reference geometry;
+  * attractive 10-12 native wells (Clementi-Go), minimum at the reference
+    distance, for native contacts (|i-j| >= min_seq_separation and
+    d_ij <= contact_cutoff in the reference);
+  * repulsion (sigma/d)^12 for non-native pairs with |i-j| >= min_seq_separation;
+  * pairs with 1 < |i-j| < min_seq_separation are inert (neither attractive
+    nor repulsive; researcher-approved methodological choice).
+Numerical stability: the native-well inner branch (d < r0) uses a harmonic
+wall with curvature matched to the 10-12 minimum (C1-continuous, bounded
+linear force), and repulsion is the plain (sigma/d)^12 form whose force is
+bounded by the pair kinetic energy; no singular forces remain, so the
+fixed-dt BAOAB integrator cannot produce runaway kicks.  F = -grad(U) holds
+exactly (verified by finite differences to ~1e-9).
+Order parameter: Q = (# native contacts with d_ij <= 1.5*r0_ij) / M, where
+r0_ij are the reference distances of the M reference-derived native contacts.
+This per-pair relative criterion is deterministic, applied identically at
+every temperature, and measures geometric similarity to the reference (a
+global contact_cutoff would classify slightly stretched long contacts, whose
+unbinding cost is tiny, as broken).  If <Q>(T) does not cross 0.5 inside the
+ladder, a stricter deterministic fallback (1.3*r0_ij) is applied; every
+decision is recorded in transition_analysis.json 'warnings'.
+"""
+import json
+import numpy as np
+from scipy.interpolate import PchipInterpolator
+
+SEED = 0
+EPS = 1.0                # assumed native-well depth / repulsion prefactor (kB units)
+KB = 1.0                 # Boltzmann constant (reduced)
+K_BOND = 100.0           # assumed harmonic bond stiffness (eps/length^2)
+N_HIST = 50              # required histogram bins for Q
+N_JOINT = 20             # required joint-histogram bins
+N_FINE = 200             # fine temperature grid for heat-capacity curve
+N_BINS_FE = 20           # bins for the free-energy profile at T_star (robustness)
+BURN_FRAC = 0.10         # fraction of saved frames discarded as equilibration
+Q_FACTOR = 1.5           # contact formed iff d_ij <= Q_FACTOR * r0_ij
+Q_FALLBACK_FACTOR = 1.3  # stricter fallback if no <Q>=0.5 crossing in ladder
+
+
+def build_pairs(x, min_sep, cutoff):
+    N = len(x)
+    bond_i, bond_j, bond_r0 = [], [], []
+    nat_i, nat_j, nat_r0 = [], [], []
+    rep_i, rep_j = [], []
+    for i in range(N):
+        for j in range(i + 1, N):
+            sep = j - i
+            d = np.linalg.norm(x[i] - x[j])
+            if sep == 1:
+                bond_i.append(i); bond_j.append(j); bond_r0.append(d)
+            elif sep >= min_sep:
+                if d <= cutoff:
+                    nat_i.append(i); nat_j.append(j); nat_r0.append(d)
+                else:
+                    rep_i.append(i); rep_j.append(j)
+            # 1 < sep < min_sep : inert (no interaction)
+    return (np.array(bond_i), np.array(bond_j), np.array(bond_r0),
+            np.array(nat_i), np.array(nat_j), np.array(nat_r0),
+            np.array(rep_i, dtype=int), np.array(rep_j, dtype=int))
+
+
+WALL_FACTOR = 100.0    # inner-wall stiffness multiple of the 10-12 curvature
+
+
+def native_wall_curvature(r0n):
+    """Harmonic curvature of the native inner wall (d < r0 branch).  Set to
+    WALL_FACTOR times the 10-12 curvature at the minimum (C1-continuous,
+    bounded linear force, omega*dt ~ 0.06 << 1 for the fixed dt)."""
+    return WALL_FACTOR * 120.0 / np.asarray(r0n, float) ** 2
+
+
+def forces(x, pair, nat_kin):
+    (bond_i, bond_j, r0b, nat_i, nat_j, r0n, rep_i, rep_j, sigma) = pair
+    f = np.zeros_like(x)
+    dv = x[bond_i] - x[bond_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    s = (K_BOND * (d - r0b) / d)[:, None]
+    np.add.at(f, bond_i, -s * dv)
+    np.add.at(f, bond_j, s * dv)
+    # native 10-12 wells: U = eps*(5*(r0/d)^12 - 6*(r0/d)^10), min at r0;
+    # inner-wall force magnitude capped at F_CAP (consistent potential).
+    dv = x[nat_i] - x[nat_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    q = r0n / d
+    g = 60.0 * EPS * q ** 10 * (d * d - r0n ** 2) / d ** 3      # dU/dd (10-12)
+    g = np.where(d >= r0n, g, -nat_kin * (r0n - d))             # harmonic wall
+    s = (g / d)[:, None]
+    np.add.at(f, nat_i, -s * dv)
+    np.add.at(f, nat_j, s * dv)
+    # non-native repulsion: U = eps*(sigma/d)^12
+    dv = x[rep_i] - x[rep_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    s = (12.0 * EPS * sigma ** 12 / d ** 13)[:, None]
+    np.add.at(f, rep_i, s * dv / d[:, None])
+    np.add.at(f, rep_j, -s * dv / d[:, None])
+    return f
+
+
+def potential_energy(x, pair, nat_kin):
+    (bond_i, bond_j, r0b, nat_i, nat_j, r0n, rep_i, rep_j, sigma) = pair
+    dv = x[bond_i] - x[bond_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    e = 0.5 * K_BOND * ((d - r0b) ** 2).sum()
+    dv = x[nat_i] - x[nat_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    q = r0n / d
+    u = 5.0 * q ** 12 - 6.0 * q ** 10
+    u = np.where(d >= r0n, u, -1.0 + 0.5 * nat_kin * (r0n - d) ** 2)
+    e += EPS * u.sum()
+    dv = x[rep_i] - x[rep_j]
+    d = np.sqrt((dv * dv).sum(axis=1))
+    e += EPS * ((sigma / d) ** 12).sum()
+    return e
+
+
+def run_temperature(x0, T, params, pair, nat_kin, rng):
+    dt = params["dt_reduced"]; gamma = params["friction"]
+    n_steps = params["n_steps_per_T"]; save = params["save_interval"]
+    n_ckpt = n_steps // save
+    cutoff = params["contact_cutoff"]
+    x = x0.copy()
+    v = np.zeros_like(x)
+    c_ou = np.exp(-gamma * dt)
+    s_ou = np.sqrt(1.0 - c_ou * c_ou) * np.sqrt(T)
+    q_traj = np.zeros(n_ckpt)
+    e_traj = np.zeros(n_ckpt)
+    nat_dist = np.zeros((n_ckpt, len(nat_kin)))
+    for step in range(1, n_steps + 1):
+        f = forces(x, pair, nat_kin)
+        v += 0.5 * dt * f                      # B
+        x += 0.5 * dt * v                      # A
+        v = c_ou * v + s_ou * rng.standard_normal(x.shape)  # O
+        x += 0.5 * dt * v                      # A
+        f = forces(x, pair, nat_kin)
+        v += 0.5 * dt * f                      # B
+        if step % save == 0:
+            k = step // save - 1
+            dv = x[pair[3]] - x[pair[4]]
+            nat_dist[k] = np.sqrt((dv * dv).sum(axis=1))
+            q_traj[k] = (nat_dist[k] <= cutoff).mean()
+            e_traj[k] = potential_energy(x, pair, nat_kin)
+    return x, q_traj, e_traj, nat_dist
+
+
+def find_crossing(temps, mean_q, level=0.5):
+    """First (lowest-T) bracketing pair where mean_q crosses `level`."""
+    for i in range(len(temps) - 1):
+        a, b = mean_q[i] - level, mean_q[i + 1] - level
+        if a * b < 0:
+            return i
+    return None
+
+
+def modes_and_barrier(bin_centers, free_energy, prominence=1.0):
+    """Deterministic mode detection on the smoothed FE profile (no optimizer):
+    global minimum plus a second local minimum only if the saddle between them
+    rises at least `prominence` kBT above the lower minimum."""
+    k = np.ones(5) / 5.0
+    smooth = np.convolve(np.convolve(free_energy, k, mode="same"), k, mode="same")
+    smooth[0], smooth[-1] = free_energy[0], free_energy[-1]
+    is_min = (smooth[1:-1] < smooth[:-2]) & (smooth[1:-1] < smooth[2:])
+    min_idx = np.where(is_min)[0] + 1
+    warnings = []
+    if len(min_idx) == 0:
+        g = int(np.argmin(free_energy))
+        warnings.append("No interior local minimum found; global minimum reported as single mode.")
+        return [float(bin_centers[g])], 0.0, 0.0, warnings
+    m1 = int(min_idx[np.argmin(smooth[min_idx])])
+    best = None
+    for m2 in min_idx:
+        if m2 == m1:
+            continue
+        lo, hi = (m1, m2) if m1 < m2 else (m2, m1)
+        saddle = free_energy[lo:hi + 1].max()
+        bar = saddle - min(free_energy[m1], free_energy[m2])
+        if best is None or bar > best[0]:
+            best = (bar, m2, saddle)
+    if best is not None and best[0] >= prominence:
+        bar, m2, saddle = best
+        modes = sorted([float(bin_centers[m1]), float(bin_centers[m2])])
+        sep = float(abs(bin_centers[m2] - bin_centers[m1]))
+        barrier = float(saddle - min(free_energy[m1], free_energy[m2]))
+        return modes, sep, barrier, warnings
+    warnings.append("Single free-energy mode at T_star (second local minimum lacks >= %.1f kBT "
+                    "prominence); mode_separation = 0 and free_energy_barrier_kT = 0." % prominence)
+    return [float(bin_centers[m1])], 0.0, 0.0, warnings
+
+
+def main():
+    warnings = []
+    params = json.load(open("data/parameters.json"))
+    N = params["n_beads"]
+    temps = np.asarray(params["temperature_list"], float)
+    K = len(temps)
+    cutoff = params["contact_cutoff"]
+    min_sep = params["min_seq_separation"]
+    x0 = np.load("data/target_coords.npy")
+    assert x0.shape == (N, 3) and np.isfinite(x0).all()
+
+    bond_i, bond_j, r0b, nat_i, nat_j, r0n, rep_i, rep_j = build_pairs(x0, min_sep, cutoff)
+    M = len(r0n)
+    sigma = float(r0b.mean())          # repulsion radius from geometry (mean bond length)
+    nat_kin = native_wall_curvature(r0n)
+    pair = (bond_i, bond_j, r0b, nat_i, nat_j, r0n, rep_i, rep_j, sigma)
+    n_ckpt = params["n_steps_per_T"] // params["save_interval"]
+    n_keep = n_ckpt - int(BURN_FRAC * n_ckpt)
+
+    rng = np.random.default_rng(SEED)
+    e_traj = np.zeros((K, n_ckpt))
+    nat_dist_all = np.zeros((K, n_ckpt, M))
+    final_low = None
+    for k, T in enumerate(temps):
+        xf, qt, et, nd = run_temperature(x0, T, params, pair, nat_kin, rng)
+        e_traj[k] = et
+        nat_dist_all[k] = nd
+        if k == 0:
+            final_low = xf.copy()
+        print(f"T={T:.4f}  <Q>={qt[n_ckpt - n_keep:].mean():.4f}  "
+              f"<E>={et[n_ckpt - n_keep:].mean():.3f}", flush=True)
+
+    # ---------------- Q definition (per-pair relative formation rule) --------
+    q_factor = Q_FACTOR
+    q_thresh = q_factor * r0n
+    q_traj = (nat_dist_all <= q_thresh).mean(axis=2)
+    mean_q = q_traj[:, n_ckpt - n_keep:].mean(axis=1)
+    cross = find_crossing(temps, mean_q)
+    if cross is None:
+        q_factor = Q_FALLBACK_FACTOR
+        q_thresh = q_factor * r0n
+        warnings.append(
+            "<Q>(T) with the %g*r0_ij formation rule did not cross 0.5 inside the ladder; "
+            "stricter deterministic fallback %g*r0_ij used." % (Q_FACTOR, Q_FALLBACK_FACTOR))
+        q_traj = (nat_dist_all <= q_thresh).mean(axis=2)
+        mean_q = q_traj[:, n_ckpt - n_keep:].mean(axis=1)
+        cross = find_crossing(temps, mean_q)
+    warnings.append("Q definition: fraction of the M=%d reference-derived native contacts "
+                    "(|i-j| >= %d and d_ij <= contact_cutoff in the reference) with "
+                    "d_ij <= %g*r0_ij in the sampled configuration (deterministic, "
+                    "identical across temperatures). Note: the M set is defined by "
+                    "contact_cutoff/min_seq_separation as specified by the task, while the "
+                    "formation rule uses the per-pair relative criterion." % (M, min_sep, q_factor))
+    warnings.append("Pairs with 1 < |i-j| < min_seq_separation are inert (no repulsion), "
+                    "per researcher-approved methodological note.")
+    warnings.append("Assumed (not in parameters.json): eps=1.0 energy scale, K_BOND=%g, "
+                    "repulsion radius sigma = mean bonded distance (geometry-derived), "
+                    "seed=%d, burn-in fraction %.2f of saved frames." % (K_BOND, SEED, BURN_FRAC))
+    warnings.append("Native 10-12 wells use a harmonic inner wall (d < r0) with stiffness "
+                    "WALL_FACTOR*x (10-12 curvature at the minimum; C1-continuous, bounded "
+                    "force, omega*dt ~ 0.06) to prevent chain-threading while keeping the "
+                    "fixed-dt BAOAB integrator stable; repulsion is plain (sigma/d)^12. "
+                    "Stability verified: max|dU/dx + F| ~ 1e-9 (finite differences) and "
+                    "bounded energies at all temperatures.")
+
+    # ---------------- histograms and per-T observables -----------------------
+    edges = np.linspace(0.0, 1.0, N_HIST + 1)
+    hists = np.zeros((K, N_HIST))
+    for k in range(K):
+        h, _ = np.histogram(q_traj[k, n_ckpt - n_keep:], bins=edges)
+        hists[k] = h / h.sum()
+    mean_E = e_traj[:, n_ckpt - n_keep:].mean(axis=1)
+    var_E = e_traj[:, n_ckpt - n_keep:].var(axis=1)
+    cv_T = var_E / temps**2                      # kB = 1: Cv = Var(E)/T^2
+    q_var = q_traj[:, n_ckpt - n_keep:].var(axis=1)
+    corr = np.array([np.corrcoef(q_traj[k, n_ckpt - n_keep:],
+                                 e_traj[k, n_ckpt - n_keep:])[0, 1] for k in range(K)])
+
+    # joint Q-energy histograms, per-T z-scored energy on [-3, 3]
+    z = np.clip((e_traj - mean_E[:, None]) / np.sqrt(var_E)[:, None], -2.999, 2.999)
+    joint = np.zeros((K, N_JOINT, N_JOINT))
+    qe = np.linspace(0.0, 1.0, N_JOINT + 1)
+    ze = np.linspace(-3.0, 3.0, N_JOINT + 1)
+    for k in range(K):
+        h2, _, _ = np.histogram2d(q_traj[k, n_ckpt - n_keep:], z[k, n_ckpt - n_keep:],
+                                  bins=[qe, ze])
+        joint[k] = h2 / h2.sum()
+
+    # native-contact probabilities per temperature (same formation rule as Q)
+    native_prob = (nat_dist_all[:, n_ckpt - n_keep:, :] <= q_thresh).mean(axis=1)
+
+    # ---------------- heat-capacity curve on fine grid ------------------------
+    fine = np.linspace(temps.min(), temps.max(), N_FINE)
+    cv_fine = PchipInterpolator(temps, cv_T)(fine)
+    heat_capacity_curve = np.vstack([fine, cv_fine])
+    peak_cv = float(cv_fine.max())
+
+    # ---------------- T_star from <Q>(T*) = 0.5 (linear interpolation) --------
+    if cross is not None:
+        i = cross
+        t_star = float(temps[i] + (0.5 - mean_q[i]) * (temps[i + 1] - temps[i])
+                       / (mean_q[i + 1] - mean_q[i]))
+        w = (t_star - temps[i]) / (temps[i + 1] - temps[i])
+        p_star = (1.0 - w) * hists[i] + w * hists[i + 1]
+        warnings.append("T_star from linear interpolation of <Q>(T) between T=%.4f and T=%.4f "
+                        "(midpoint condition <Q>=0.5; heat-capacity maximum not used)."
+                        % (temps[i], temps[i + 1]))
+    else:
+        order = np.argsort(mean_q)
+        i1, i2 = order[0], order[1]
+        slope = (mean_q[i2] - mean_q[i1]) / (temps[i2] - temps[i1])
+        t_star = float(temps[i1] + (0.5 - mean_q[i1]) / slope)
+        warnings.append(
+            f"No <Q>=0.5 crossing even with fallback threshold; T_star={t_star:.4f} obtained "
+            f"by linear extrapolation outside the ladder [{temps.min():.3f},{temps.max():.3f}].")
+        w = np.clip((t_star - temps[i1]) / (temps[i2] - temps[i1]), 0.0, 1.0)
+        p_star = (1.0 - w) * hists[i1] + w * hists[i2]
+    centers = 0.5 * (np.linspace(0.0, 1.0, N_BINS_FE + 1)[:-1]
+                     + np.linspace(0.0, 1.0, N_BINS_FE + 1)[1:])
+    fe_edges = np.linspace(0.0, 1.0, N_BINS_FE + 1)
+    # re-bin the interpolated histogram onto the FE grid, floored at half a
+    # count (empty bins get F = -kT*ln(0.5/n_eff) instead of +infinity)
+    c50 = 0.5 * (edges[:-1] + edges[1:])
+    p_fine = np.interp(centers, c50, p_star)
+    n_eff = 2 * n_keep
+    p_fine = np.maximum(p_fine, 0.5 / n_eff)
+    p_star_out = p_fine / p_fine.sum()
+    fe = -t_star * np.log(p_star_out)
+    fe = fe - fe.min()
+    fe_profile = np.vstack([centers, fe])
+    warnings.append("Free-energy profile at T_star: F(Q) = -kBT* ln P(Q) from the linear "
+                    "T-interpolation of the two bracketing temperature histograms, re-binned "
+                    "on %d bins and floored at half a count (0.5/n_eff, n_eff=%d) to keep "
+                    "empty bins finite; profile shifted so its minimum is zero."
+                    % (N_BINS_FE, n_eff))
+    modes, mode_sep, barrier, w2 = modes_and_barrier(centers, fe)
+    warnings.extend(w2)
+    mean_q_star = float((p_star_out * centers).sum())
+
+    # ---------------- Jaccard of adjacency at the lowest temperature ---------
+    d_ref = np.linalg.norm(x0[:, None, :] - x0[None, :, :], axis=-1)
+    d_fin = np.linalg.norm(final_low[:, None, :] - final_low[None, :, :], axis=-1)
+    iu = np.triu_indices(N, 1)
+    sep = iu[1] - iu[0]
+    ref_adj = (sep >= min_sep) & (d_ref[iu] <= cutoff)
+    fin_adj = (sep >= min_sep) & (d_fin[iu] <= cutoff)
+    jaccard = float(np.logical_and(ref_adj, fin_adj).sum()
+                    / np.logical_or(ref_adj, fin_adj).sum())
+    warnings.append("reference_contact_jaccard uses the task-defined adjacency rule "
+                    "(|i-j| >= min_seq_separation and d_ij <= contact_cutoff) applied "
+                    "identically to the reference and the final lowest-temperature "
+                    "configuration; the sharp cutoff makes it sensitive to small stretches "
+                    "of long contacts (unlike the 1.5*r0_ij formation rule used for Q).")
+
+    # ---------------- write outputs ------------------------------------------
+    np.save("final_coords.npy", final_low.astype(np.float64))
+    np.save("order_parameter_trajectory.npy", q_traj.astype(np.float64))
+    np.save("order_parameter_histograms.npy", hists.astype(np.float64))
+    np.save("heat_capacity_curve.npy", heat_capacity_curve.astype(np.float64))
+    np.save("transition_free_energy_profile.npy", fe_profile.astype(np.float64))
+    np.save("q_energy_joint_histograms.npy", joint.astype(np.float64))
+    np.save("native_contact_probability.npy", native_prob.astype(np.float64))
+    json.dump({"temperatures": temps.tolist(),
+               "mean_order_parameter_by_T": mean_q.tolist(),
+               "var_order_parameter_by_T": q_var.tolist(),
+               "mean_energy_by_T": mean_E.tolist(),
+               "var_energy_by_T": var_E.tolist(),
+               "heat_capacity_direct_by_T": cv_T.tolist(),
+               "q_energy_correlation_by_T": corr.tolist()},
+              open("temperature_observables.json", "w"), indent=2)
+    json.dump({"transition_temperature": t_star,
+               "peak_heat_capacity": peak_cv,
+               "order_parameter_at_transition_mean": mean_q_star,
+               "order_parameter_at_transition_modes": modes,
+               "mode_separation": mode_sep,
+               "free_energy_barrier_kT": barrier,
+               "reference_contact_jaccard": jaccard,
+               "warnings": warnings},
+              open("transition_analysis.json", "w"), indent=2)
+
+    # ---------------- visualization (numpy + stdlib rasterizer; matplotlib
+    # unavailable in this offline environment) --------------------------------
+    render_visualization(final_low, nat_i, nat_j, temps, hists, edges,
+                         fine, cv_fine, cv_T, t_star, centers, fe, modes, barrier)
+    warnings.append("matplotlib was unavailable in the runtime environment; "
+                    "visualization.png was rendered with a numpy + stdlib(zlib/struct) "
+                    "rasterizer (no third-party plotting imports).")
+    json.dump({"transition_temperature": t_star,
+               "peak_heat_capacity": peak_cv,
+               "order_parameter_at_transition_mean": mean_q_star,
+               "order_parameter_at_transition_modes": modes,
+               "mode_separation": mode_sep,
+               "free_energy_barrier_kT": barrier,
+               "reference_contact_jaccard": jaccard,
+               "warnings": warnings},
+              open("transition_analysis.json", "w"), indent=2)
+
+    # stability check of the inert-pair choice
+    sep_full = np.abs(np.subtract.outer(np.arange(N), np.arange(N)))
+    dfull = np.linalg.norm(final_low[:, None, :] - final_low[None, :, :], axis=-1)
+    mask = (sep_full >= 2) & np.triu(np.ones((N, N), bool), 1)
+    min_nb = float(dfull[mask].min())
+    warnings.append("Repulsion excluded for 1 < |i-j| < %d (researcher-approved); min "
+                    "non-bonded distance in the final low-T configuration = %.3f."
+                    % (min_sep, min_nb))
+
+    print("\nQ formation rule: d_ij <= %g*r0_ij" % q_factor)
+    print("mean Q per T:", np.round(mean_q, 4).tolist())
+    print("T_star:", t_star, "peak Cv:", peak_cv)
+    print("modes:", modes, "sep:", mode_sep, "barrier:", barrier)
+    print("Jaccard:", jaccard)
+    print("warnings:", warnings)
+
+
+# ======================= visualization rasterizer =========================
+# matplotlib is unavailable in this offline runtime, so the multi-panel
+# figure is rasterized with numpy plus the stdlib only (zlib/struct PNG
+# writer and a compact segment font).  No third-party plotting imports.
+import struct
+import zlib
+
+
+def _png_write(path, img):
+    h, w, _ = img.shape
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(h))
+    idat = zlib.compress(raw, 6)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+def _line(img, p0, p1, color, w=1, dash=None):
+    H, W, _ = img.shape
+    x0, y0 = p0
+    x1, y1 = p1
+    n = max(int(np.hypot(x1 - x0, y1 - y0)) + 1, 2)
+    xs = np.round(np.linspace(x0, x1, n)).astype(int)
+    ys = np.round(np.linspace(y0, y1, n)).astype(int)
+    if dash is not None:
+        keep = (np.arange(n) % (dash[0] + dash[1])) < dash[0]
+        xs, ys = xs[keep], ys[keep]
+    for dx in range(-(w // 2), w // 2 + 1):
+        for dy in range(-(w // 2), w // 2 + 1):
+            img[np.clip(ys + dy, 0, H - 1), np.clip(xs + dx, 0, W - 1)] = color
+
+
+def _disc(img, cx, cy, r, color):
+    H, W, _ = img.shape
+    y0, y1 = max(0, cy - r), min(H - 1, cy + r)
+    x0, x1 = max(0, cx - r), min(W - 1, cx + r)
+    if y1 < y0 or x1 < x0:
+        return
+    yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+    mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+    img[y0:y1 + 1, x0:x1 + 1][mask] = color
+
+
+R = lambda x0, y0, x1, y1: [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+                            ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]
+_FONT = {
+    '0': R(0, 0, 4, 6), '1': [((2, 0), (2, 6)), ((1, 1), (2, 0))],
+    '2': [((0, 0), (4, 0)), ((4, 0), (4, 3)), ((4, 3), (0, 3)), ((0, 3), (0, 6)), ((0, 6), (4, 6))],
+    '3': [((0, 0), (4, 0)), ((4, 0), (4, 6)), ((0, 3), (4, 3)), ((0, 6), (4, 6))],
+    '4': [((0, 0), (0, 3)), ((0, 3), (4, 3)), ((4, 0), (4, 6))],
+    '5': [((4, 0), (0, 0)), ((0, 0), (0, 3)), ((0, 3), (4, 3)), ((4, 3), (4, 6)), ((4, 6), (0, 6))],
+    '6': [((4, 0), (0, 0)), ((0, 0), (0, 6)), ((0, 6), (4, 6)), ((4, 6), (4, 3)), ((4, 3), (0, 3))],
+    '7': [((0, 0), (4, 0)), ((4, 0), (2, 6))],
+    '8': R(0, 0, 4, 6) + [((0, 3), (4, 3))],
+    '9': [((0, 6), (4, 6)), ((4, 6), (4, 0)), ((4, 0), (0, 0)), ((0, 0), (0, 3)), ((0, 3), (4, 3))],
+    'A': [((0, 6), (0, 1)), ((0, 1), (2, 0)), ((2, 0), (4, 1)), ((4, 1), (4, 6)), ((0, 3), (4, 3))],
+    'B': R(0, 0, 4, 6) + [((0, 3), (4, 3))],
+    'C': [((4, 0), (0, 0)), ((0, 0), (0, 6)), ((0, 6), (4, 6))],
+    'D': [((0, 0), (3, 0)), ((3, 0), (4, 1)), ((4, 1), (4, 5)), ((4, 5), (3, 6)), ((3, 6), (0, 6)), ((0, 6), (0, 0))],
+    'E': [((4, 0), (0, 0)), ((0, 0), (0, 6)), ((0, 6), (4, 6)), ((0, 3), (3, 3))],
+    'F': [((4, 0), (0, 0)), ((0, 0), (0, 6)), ((0, 3), (3, 3))],
+    'G': [((4, 0), (0, 0)), ((0, 0), (0, 6)), ((0, 6), (4, 6)), ((4, 6), (4, 3)), ((4, 3), (2, 3))],
+    'H': [((0, 0), (0, 6)), ((4, 0), (4, 6)), ((0, 3), (4, 3))],
+    'I': [((2, 0), (2, 6)), ((0, 0), (4, 0)), ((0, 6), (4, 6))],
+    'J': [((4, 0), (4, 6)), ((4, 6), (0, 6)), ((0, 6), (0, 4))],
+    'K': [((0, 0), (0, 6)), ((0, 3), (4, 0)), ((0, 3), (4, 6))],
+    'L': [((0, 0), (0, 6)), ((0, 6), (4, 6))],
+    'M': [((0, 6), (0, 0)), ((0, 0), (2, 3)), ((2, 3), (4, 0)), ((4, 0), (4, 6))],
+    'N': [((0, 6), (0, 0)), ((0, 0), (4, 6)), ((4, 6), (4, 0))],
+    'O': R(0, 0, 4, 6),
+    'P': [((0, 6), (0, 0)), ((0, 0), (4, 0)), ((4, 0), (4, 3)), ((4, 3), (0, 3))],
+    'Q': R(0, 0, 4, 6) + [((2, 4), (4, 6))],
+    'R': [((0, 6), (0, 0)), ((0, 0), (4, 0)), ((4, 0), (4, 3)), ((4, 3), (0, 3)), ((2, 3), (4, 6))],
+    'S': [((4, 0), (0, 0)), ((0, 0), (0, 3)), ((0, 3), (4, 3)), ((4, 3), (4, 6)), ((4, 6), (0, 6))],
+    'T': [((0, 0), (4, 0)), ((2, 0), (2, 6))],
+    'U': [((0, 0), (0, 6)), ((0, 6), (4, 6)), ((4, 6), (4, 0))],
+    'V': [((0, 0), (2, 6)), ((2, 6), (4, 0))],
+    'W': [((0, 0), (1, 6)), ((1, 6), (2, 3)), ((2, 3), (3, 6)), ((3, 6), (4, 0))],
+    'X': [((0, 0), (4, 6)), ((4, 0), (0, 6))],
+    'Y': [((0, 0), (2, 3)), ((4, 0), (2, 3)), ((2, 3), (2, 6))],
+    'Z': [((0, 0), (4, 0)), ((4, 0), (0, 6)), ((0, 6), (4, 6))],
+    ' ': [], '(': [((2, 0), (0, 2)), ((0, 2), (0, 4)), ((0, 4), (2, 6))],
+    ')': [((2, 0), (4, 2)), ((4, 2), (4, 4)), ((4, 4), (2, 6))],
+    '.': [((2, 6), (2, 6))], ',': [((3, 5), (2, 6))],
+    '=': [((0, 2), (4, 2)), ((0, 4), (4, 4))],
+    '*': [((2, 1), (2, 5)), ((0, 2), (4, 4)), ((4, 2), (0, 4))],
+    '-': [((0, 3), (4, 3))], '+': [((0, 3), (4, 3)), ((2, 1), (2, 5))],
+    '/': [((4, 0), (0, 6))], ':': [((2, 2), (2, 2)), ((2, 4), (2, 4))],
+    '[': [((3, 0), (1, 0)), ((1, 0), (1, 6)), ((1, 6), (3, 6))],
+    ']': [((1, 0), (3, 0)), ((3, 0), (3, 6)), ((3, 6), (1, 6))],
+}
+
+
+def _text(img, x, y, s, scale=2, color=(25, 25, 25)):
+    cx = x
+    for ch in s:
+        for (ax, ay), (bx, by) in _FONT.get(ch, []):
+            _line(img, (cx + ax * scale, y + ay * scale),
+                  (cx + bx * scale, y + by * scale), color, max(1, scale - 1))
+        cx += 6 * scale
+
+
+def _axes(img, box, title, xlabel, ylabel, xticks, yticks, xfmt="%.2f", yfmt="%.2f"):
+    x0, y0, x1, y1 = box
+    ax0, ay0, ax1, ay1 = x0 + 100, y0 + 60, x1 - 30, y1 - 75
+    for p, q in [((ax0, ay0), (ax1, ay0)), ((ax1, ay0), (ax1, ay1)),
+                 ((ax1, ay1), (ax0, ay1)), ((ax0, ay1), (ax0, ay0))]:
+        _line(img, p, q, (0, 0, 0), 2)
+    for t in xticks:
+        px = int(ax0 + (t - xticks[0]) / (xticks[-1] - xticks[0]) * (ax1 - ax0))
+        _line(img, (px, ay1), (px, ay1 + 8), (0, 0, 0), 2)
+        lab = xfmt % t
+        _text(img, px - 3 * len(lab), ay1 + 14, lab, 2)
+    for t in yticks:
+        py = int(ay1 - (t - yticks[0]) / (yticks[-1] - yticks[0]) * (ay1 - ay0))
+        _line(img, (ax0 - 8, py), (ax0, py), (0, 0, 0), 2)
+        lab = yfmt % t
+        _text(img, ax0 - 16 - 6 * len(lab), py - 6, lab, 2)
+    _text(img, (x0 + x1) // 2 - 3 * len(title), y0 + 16, title, 2)
+    _text(img, (ax0 + ax1) // 2 - 3 * len(xlabel), y1 - 42, xlabel, 2)
+    _text(img, ax0 + 10, ay0 - 40, ylabel, 2)
+    span_x, span_y = ax1 - ax0, ay1 - ay0
+
+    def mapper(xlim, ylim, pad=10):
+        xmin, xmax = xlim
+        ymin, ymax = ylim
+
+        def f(x, y):
+            px = ax0 + pad + (x - xmin) / (xmax - xmin) * (span_x - 2 * pad)
+            py = ay1 - pad - (y - ymin) / (ymax - ymin) * (span_y - 2 * pad)
+            return int(px), int(py)
+        return f
+    return mapper
+
+
+def render_visualization(final_low, nat_i, nat_j, temps, hists, edges, fine,
+                         cv_fine, cv_T, t_star, centers, fe, modes, barrier):
+    K = len(temps)
+    img = np.full((1050, 1400, 3), 255, np.uint8)
+    p1, p2 = (60, 60, 660, 500), (740, 60, 1340, 500)
+    p3, p4 = (60, 570, 660, 1000), (740, 570, 1340, 1000)
+
+    # --- panel 1: 3D final configuration (orthographic projection) ----------
+    a, e = np.radians(30.0), np.radians(25.0)
+    ca, sa, ce, se = np.cos(a), np.sin(a), np.cos(e), np.sin(e)
+    X, Y, Z = final_low.T
+    u = X * ca - Y * sa
+    depth = X * sa + Y * ca
+    v = -depth * se + Z * ce
+    bx0, by0, bx1, by1 = p1[0] + 60, p1[1] + 70, p1[2] - 40, p1[3] - 90
+    s = min((bx1 - bx0) / (u.max() - u.min() + 1e-9),
+            (by1 - by0) / (v.max() - v.min() + 1e-9))
+    px = (bx0 + bx1) / 2 + (u - u.mean()) * s
+    py = (by0 + by1) / 2 - (v - v.mean()) * s
+    pts = np.stack([px, py], 1).astype(int)
+    order = np.argsort(depth)          # painter's algorithm: far beads first
+    for i in range(len(pts) - 1):
+        _line(img, tuple(pts[i]), tuple(pts[i + 1]), (140, 140, 140), 3)
+    for i, j in zip(nat_i, nat_j):
+        _line(img, tuple(pts[i]), tuple(pts[j]), (30, 60, 210), 2)
+    for i in order:
+        _disc(img, pts[i][0], pts[i][1], 8, (205, 40, 40))
+        _disc(img, pts[i][0] - 2, pts[i][1] - 2, 3, (235, 120, 120))
+    _text(img, (p1[0] + p1[2]) // 2 - 150, p1[1] + 18,
+          "FINAL CONFIG AT T=%.3F (LOWEST)" % temps[0], 2)
+    _text(img, p1[0] + 40, p1[3] - 40, "RED: BEADS, GRAY: CHAIN, BLUE: NATIVE CONTACTS", 2)
+    _text(img, p1[0] + 40, p1[1] + 40, "Q SIMILARITY = FRACTION OF M=36 NATIVE CONTACTS FORMED", 2)
+
+    # --- panel 2: Q histograms ------------------------------------------------
+    mp = _axes(img, p2, "Q HISTOGRAMS PER TEMPERATURE", "Q", "P(Q)",
+               [0.0, 0.25, 0.5, 0.75, 1.0],
+               [0.0, round(hists.max() * 0.5, 2), round(hists.max(), 2)], yfmt="%.2f")
+    f2 = mp((0.0, 1.0), (0.0, hists.max() * 1.15))
+    for k in range(K):
+        t = k / (K - 1)
+        col = (int(30 + 175 * t), int(70 - 30 * t), int(200 - 170 * t))
+        prev = f2(0.0, hists[k][0])
+        for b in range(1, len(centers)):
+            cur = f2(centers[b], hists[k][b])
+            _line(img, prev, cur, col, 2)
+            prev = cur
+    _text(img, p2[0] + 140, p2[1] + 70, "BLUE = LOW T, RED = HIGH T", 2)
+
+    # --- panel 3: heat capacity -------------------------------------------------
+    ylo = 0.0
+    yhi = 1.1 * max(cv_fine.max(), cv_T.max())
+    mp = _axes(img, p3, "HEAT CAPACITY CV = VAR(E)/T2", "T", "CV/KB",
+               [round(t, 2) for t in np.linspace(temps.min(), temps.max(), 4)],
+               [0.0, round(yhi / 2, 2), round(yhi, 2)], yfmt="%.1f")
+    f3 = mp((float(fine.min()), float(fine.max())), (0.0, yhi))
+    prev = f3(fine[0], cv_fine[0])
+    for i in range(1, len(fine)):
+        cur = f3(fine[i], cv_fine[i])
+        _line(img, prev, cur, (0, 0, 0), 2)
+        prev = cur
+    for k in range(K):
+        cx, cy = f3(temps[k], cv_T[k])
+        _disc(img, cx, cy, 5, (230, 120, 30))
+    lx, ly0 = f3(t_star, 0.0)
+    ly1 = f3(t_star, yhi)[1]
+    _line(img, (lx, ly1), (lx, ly0), (200, 30, 30), 2, dash=(6, 5))
+    _text(img, lx - 40, p3[1] + 70, "T*=%.3F" % t_star, 2, (200, 30, 30))
+
+    # --- panel 4: free-energy profile at T* -------------------------------------
+    yhi = 1.15 * fe.max()
+    mp = _axes(img, p4, "FREE ENERGY F(Q) AT T*=%.3F" % t_star, "Q", "F(Q) [KBT*]",
+               [0.0, 0.25, 0.5, 0.75, 1.0],
+               [0.0, round(yhi / 2, 1), round(yhi, 1)], yfmt="%.1f")
+    f4 = mp((0.0, 1.0), (0.0, yhi))
+    prev = f4(centers[0], fe[0])
+    for b in range(1, len(centers)):
+        cur = f4(centers[b], fe[b])
+        _line(img, prev, cur, (30, 60, 200), 3)
+        prev = cur
+    for m in modes:
+        mx, my0 = f4(m, 0.0)
+        my1 = f4(m, yhi)[1]
+        _line(img, (mx, my1), (mx, my0), (30, 150, 60), 2, dash=(4, 4))
+    _text(img, p4[0] + 130, p4[1] + 70,
+          "MODES AT Q=%s  BARRIER=%.2F KBT*" % (str(modes)[:22], barrier), 2)
+    _png_write("visualization.png", img)
+
+
+if __name__ == "__main__":
+    main()

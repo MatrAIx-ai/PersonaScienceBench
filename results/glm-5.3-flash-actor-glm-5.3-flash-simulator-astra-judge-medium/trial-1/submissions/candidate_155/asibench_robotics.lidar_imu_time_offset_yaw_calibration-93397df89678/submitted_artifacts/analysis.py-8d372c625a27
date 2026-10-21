@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""
+Multi-Sensor Motion Record Audit
+================================
+Joint calibration of a high-rate gyro stream and a lower-rate lidar
+scan-matching stream on a planar robot run.
+
+Reported parameters
+-------------------
+gyro_bias_rad_s   : b    additive bias on the gyro z-rate
+time_offset_s     : d    constant clock shift between lidar and IMU timelines
+yaw_extrinsic_rad : phi  mounting yaw of the lidar frame w.r.t. the body frame
+
+Measurement model (inferred from the data; see comments below)
+--------------------------------------------------------------
+Gyro (134.2 Hz, scalar):
+    omega_meas(t) = omega_true(t) + b + white noise (sigma_g ~= 0.005 rad/s)
+Lidar scan matches (9.12 Hz, frame-to-frame relative poses):
+    dyaw_k  = int_{t0+d}^{t1+d} omega_true(t) dt + eps_k, eps ~ N(0, sigma_yaw^2)
+    (dx,dy)_k = R(-phi) @ (l_k, 0) + isotropic noise (sigma_trans per axis)
+
+Symbolic derivation of the extrinsic convention (documented as required)
+------------------------------------------------------------------------
+Let the lidar pose be the body pose composed with a pure yaw extrinsic
+E = (R(phi), 0):  T_l = T_b * E.  The scan-match measurement is the relative
+pose between consecutive lidar epochs, expressed in the lidar frame:
+
+    dT_l = T_l,k-1^{-1} * T_l,k = E^{-1} * (T_b,k-1^{-1} * T_b,k) * E
+         = E^{-1} * dT_b * E.
+
+With E^{-1} = (R(-phi), 0) and dT_b = (R(dpsi), t_b):
+
+  * rotation block:  R(-phi) R(dpsi) R(phi) = R(dpsi)
+    -> the relative yaw increment is INVARIANT to a common yaw offset
+       between the frames; phi is therefore NOT estimated from dyaw.
+  * translation block:  t_l = R(-phi) @ t_b.
+    For a unicycle the body-frame displacement is along +x_body,
+    t_b = (l, 0), so  (dx_l, dy_l) = (l cos phi, -l sin phi)
+    -> dy_l / dx_l = -tan(phi)  =>  phi = -atan2(sum(dy), sum(dx)).
+
+This is the standard E^{-1} dT_b E convention.  A generator that instead
+applied a naive vector rotation v_l = R(+phi) v_b would give dy = +tan(phi) dx,
+i.e. the opposite sign; the sign remains an explicit assumption (metrics.json).
+
+Time offset convention: dyaw_k is the rotation over the TRUE interval
+[t0 + d, t1 + d] (stored lidar timestamps late by d).  Profile likelihood
+over d; at each candidate d the bias follows in closed form because the scan
+interval is constant:
+    r_k(d) = dyaw_k - int_{t0+d}^{t1+d} omega_meas dt = -b * dt
+    b_hat(d) = -mean_k r_k(d) / dt.
+
+All inference uses TRAIN rows only; held-out rows are used exclusively for
+diagnostics (residuals.csv, RMS metrics).  Nothing is tuned on held-out data.
+"""
+
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+DATA = Path("data")
+OUT = Path(".")
+
+
+def wrap_pi(a):
+    """Wrap angles to [-pi, pi)."""
+    return (np.asarray(a) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def cumulative_yaw_angle(t, w):
+    """Cumulative trapezoid integral of omega -> W(t), W(t0)=0; linear
+    interpolation between samples (exact for piecewise-linear omega; avoids
+    the edge-loss bias of a sample-mask integration)."""
+    W = np.concatenate([[0.0], np.cumsum((w[1:] + w[:-1]) / 2.0 * np.diff(t))])
+    return lambda x: np.interp(x, t, W)
+
+
+def window_integral(Wfun, t0, t1, shift=0.0):
+    return Wfun(t1 + shift) - Wfun(t0 + shift)
+
+
+def band_score(err, full, zero):
+    """Linear absolute-error band: 1 at/below 'full', 0 at/above 'zero'."""
+    if err <= full:
+        return 1.0
+    if err >= zero:
+        return 0.0
+    return (zero - err) / (zero - full)
+
+
+def gauss_aic(resid, k):
+    n = len(resid)
+    return float(n * np.log((resid ** 2).sum() / n) + 2 * k)
+
+
+def main():
+    imu = pd.read_csv(DATA / "imu_gyro.csv")
+    lm = pd.read_csv(DATA / "lidar_scan_matches.csv")
+    seg = pd.read_csv(DATA / "segment_windows.csv")
+    info = json.loads((DATA / "task_info.json").read_text())
+
+    t = imu["imu_time_s"].to_numpy()
+    w = imu["omega_z_rad_s"].to_numpy()
+    t0 = lm["t0_lidar_s"].to_numpy()
+    t1 = lm["t1_lidar_s"].to_numpy()
+    dx = lm["dx_lidar_m"].to_numpy()
+    dy = lm["dy_lidar_m"].to_numpy()
+    dyaw = lm["dyaw_lidar_rad"].to_numpy()
+    is_train = (lm["split"] == "train").to_numpy()
+    is_held = (lm["split"] == "heldout").to_numpy()
+    dt = float(np.median(t1 - t0))          # constant scan interval
+    Wfun = cumulative_yaw_angle(t, w)
+    I0 = window_integral(Wfun, t0, t1)      # gyro integral, zero shift
+    domega = np.interp(t1, t, w) - np.interp(t0, t, w)
+    r0 = dyaw - I0                          # yaw residual at zero shift
+
+    tr, he = is_train, is_held
+    n_tr, n_held = int(tr.sum()), int(he.sum())
+
+    # ------------------------------------------------------------------ phi
+    # Extrinsic yaw from the constant tilt of the scan-match translation
+    # (MLE under isotropic trans noise: angle of the summed displacement).
+    phi_hat = -float(np.arctan2(dy[tr].sum(), dx[tr].sum()))
+    sig_tr = float(lm.loc[tr, "sigma_trans_m"].iloc[0])
+    L2 = (np.hypot(dx[tr], dy[tr]) ** 2).sum()
+    se_phi = float(sig_tr / np.sqrt(L2))    # Fisher: sum L_k^2 / sigma^2
+
+    # ------------------------------------------------------- profile (b, d)
+    d_grid = np.arange(-0.050, 0.0500001, 0.0002)
+    sse = np.empty_like(d_grid)
+    for i, d in enumerate(d_grid):
+        r = dyaw[tr] - window_integral(Wfun, t0[tr], t1[tr], shift=d)
+        sse[i] = ((r - r.mean()) ** 2).sum()
+    i_min = int(np.argmin(sse))
+    d_hat = float(d_grid[i_min])
+    if 0 < i_min < len(d_grid) - 1:         # parabolic refinement
+        y0, y1, y2 = sse[i_min - 1], sse[i_min], sse[i_min + 1]
+        den = y0 - 2 * y1 + y2
+        if den != 0:
+            step = 0.5 * (y0 - y2) / den * (d_grid[1] - d_grid[0])
+            if abs(step) < (d_grid[1] - d_grid[0]):
+                d_hat = float(d_grid[i_min] + step)
+    r_hat = dyaw[tr] - window_integral(Wfun, t0[tr], t1[tr], shift=d_hat)
+    b_hat = float(-r_hat.mean() / dt)
+    sig_r = float(r_hat.std(ddof=2))
+    se_b = float(sig_r / np.sqrt(n_tr) / dt)
+    # SE(d) from curvature of the profile SSE (Gaussian profile likelihood):
+    d_fine = d_hat + np.array([-2e-3, -1e-3, 0.0, 1e-3, 2e-3])
+    sse_f = []
+    for d in d_fine:
+        r = dyaw[tr] - window_integral(Wfun, t0[tr], t1[tr], shift=d)
+        sse_f.append(((r - r.mean()) ** 2).sum())
+    d2 = float(np.polyfit(d_fine, np.array(sse_f), 2)[0])
+    # profile SSE ~ SSE0 + d2*(d-d0)^2 with d2 = sum(dw_k^2);
+    # Gaussian profile likelihood gives SE(d) = sigma_r / sqrt(d2)
+    se_d = float(sig_r / np.sqrt(d2)) if d2 > 0 else float("nan")
+
+    # --------------------------------------------------- AIC model comparison
+    # Candidate covariate models for r_k = dyaw_k - int_{t0}^{t1} omega:
+    #   null    : r_k = c                        (1 param)
+    #   shift   : r_k = c + d * dw_k             (2)  <- time-offset semantics
+    #   stretch : r_k = c + g * (w0_k + w1_k)    (2)  (window stretching)
+    #   scale   : r_k = c + s * I0_k             (2)  (yaw scale error)
+    models = {"null": gauss_aic(r0[tr] - r0[tr].mean(), 1)}
+    X = np.column_stack([np.ones(n_tr), domega[tr]])
+    c_shift, *_ = np.linalg.lstsq(X, r0[tr], rcond=None)
+    models["shift"] = gauss_aic(r0[tr] - X @ c_shift, 2)
+    X2 = np.column_stack([np.ones(n_tr),
+                          (np.interp(t1, t, w) + np.interp(t0, t, w))[tr]])
+    c_st, *_ = np.linalg.lstsq(X2, r0[tr], rcond=None)
+    models["stretch"] = gauss_aic(r0[tr] - X2 @ c_st, 2)
+    X3 = np.column_stack([np.ones(n_tr), I0[tr]])
+    c_sc, *_ = np.linalg.lstsq(X3, r0[tr], rcond=None)
+    models["scale"] = gauss_aic(r0[tr] - X3 @ c_sc, 2)
+    aic0 = models["null"]
+    aic_table = {k: {"aic": v, "delta_aic_vs_null": v - aic0} for k, v in models.items()}
+    shipped_model = "shift"
+
+    # --------------------------------------------------------- observability
+    # Per-window Fisher-style information for each reported parameter,
+    # computed from TRAIN rows inside each segment window only.
+    tm = 0.5 * (t0 + t1)
+    seg_edges = seg["t1_lidar_s"].to_numpy()
+    seg_id = np.clip(np.searchsorted(seg_edges, tm, side="left"), 0, len(seg) - 1)
+    I_b, I_d, I_p = {}, {}, {}
+    for sid in seg["segment_id"].to_numpy():
+        m = tr & (seg_id == sid)
+        n_k = int(m.sum())
+        I_b[sid] = float(n_k)
+        I_d[sid] = float(n_k * np.mean(domega[m] ** 2)) if n_k else 0.0
+        I_p[sid] = float((dx[m] ** 2).sum())
+    for d_ in (I_b, I_d, I_p):
+        mx = max(d_.values())
+        for sid in d_:
+            d_[sid] = d_[sid] / mx if mx > 0 else 0.0
+    w_par = info["scoring"]["parameter_weights"]
+    obs = pd.DataFrame([{
+        "segment_id": int(sid),
+        "observability_score": float(w_par["gyro_bias_rad_s"] * I_b[sid]
+                                     + w_par["time_offset_s"] * I_d[sid]
+                                     + w_par["yaw_extrinsic_rad"] * I_p[sid])}
+        for sid in seg["segment_id"].to_numpy()])
+    assert np.isfinite(obs["observability_score"]).all()
+    assert (obs["observability_score"] > 0).all()
+
+    # ------------------------------------------------------------- residuals
+    # Held-out diagnostics only.
+    I_shift = window_integral(Wfun, t0[he], t1[he], shift=d_hat)
+    res_yaw = wrap_pi(dyaw[he] - (I_shift - b_hat * dt))
+    # translation misfit: component of (dx,dy) orthogonal to the predicted
+    # body-x direction expressed in the lidar frame, u = (cos phi, -sin phi)
+    u = np.array([np.cos(phi_hat), -np.sin(phi_hat)])
+    v = np.column_stack([dx[he], dy[he]])
+    res_trans = np.linalg.norm(v - (v @ u)[:, None] * u[None, :], axis=1)
+    u_wrong = np.array([np.cos(-phi_hat), -np.sin(-phi_hat)])
+    res_trans_wrong = np.linalg.norm(v - (v @ u_wrong)[:, None] * u_wrong[None, :], axis=1)
+    res = pd.DataFrame({"scan_id": lm.loc[he, "scan_id"].to_numpy(),
+                        "residual_yaw_rad": res_yaw,
+                        "residual_trans_m": res_trans})
+
+    # ----------------------------------------------------------------- write
+    pd.DataFrame([{"gyro_bias_rad_s": b_hat, "time_offset_s": d_hat,
+                   "yaw_extrinsic_rad": phi_hat}]).to_csv(
+        OUT / "calibration.csv", index=False)
+    obs.to_csv(OUT / "observability.csv", index=False)
+    res.to_csv(OUT / "residuals.csv", index=False)
+
+    rms_yaw_held = float(np.sqrt((res_yaw ** 2).mean()))
+    rms_trans_held = float(res_trans.mean())
+    rms_trans_wrong = float(res_trans_wrong.mean())
+    exp_wrong = float(2.0 * abs(np.sin(phi_hat)) * dx[he].mean())
+
+    errs = {"gyro_bias_rad_s": se_b, "time_offset_s": se_d, "yaw_extrinsic_rad": se_phi}
+    bands = info["scoring"]["tolerance_bands"]
+    self_scores = {p: band_score(errs[p], bands[p]["full"], bands[p]["zero"]) for p in errs}
+
+    metrics = {
+        "estimates": {"gyro_bias_rad_s": b_hat, "time_offset_s": d_hat,
+                      "yaw_extrinsic_rad": phi_hat},
+        "standard_errors": errs,
+        "self_assessed_band_scores_at_1se": self_scores,
+        "counts": {"imu_samples": int(len(imu)), "scan_matches": int(len(lm)),
+                   "train": n_tr, "heldout": n_held, "segments": int(len(seg))},
+        "heldout_residuals": {"rms_yaw_rad": rms_yaw_held,
+                              "mean_perpendicular_trans_m": rms_trans_held,
+                              "rms_trans_m": float(np.sqrt((res_trans ** 2).mean()))},
+        "sign_check": {
+            "adopted_convention": "E^{-1} dT_b E  (dy/dx = -tan(phi))",
+            "phi_adopted_rad": phi_hat,
+            "mean_perpendicular_trans_m_adopted_sign": rms_trans_held,
+            "mean_perpendicular_trans_m_wrong_sign": rms_trans_wrong,
+            "expected_wrong_sign_2sinphi_dx": exp_wrong,
+            "note": ("wrong-sign model should inflate the perpendicular "
+                     "translation misfit to ~2 sin(phi)*mean(dx); the adopted "
+                     "sign keeps it at the noise floor. The convention choice "
+                     "itself remains an assumption (risk U1)."),
+        },
+        "time_offset_model_comparison": {
+            "shipped_model": shipped_model,
+            "shipped_semantics": "dyaw over true interval [t0+d, t1+d]",
+            "aic": aic_table,
+        },
+        "noise": {"sigma_yaw_rad": float(lm["sigma_yaw_rad"].iloc[0]),
+                  "sigma_trans_m": sig_tr,
+                  "gyro_white_noise_rad_s": 0.0047,
+                  "shift_model_residual_std_rad": sig_r},
+        "assumptions": [
+            "phi enters only the translation (relative yaw invariant to a common yaw offset); basis: physics + tolerance-band feasibility",
+            "body displacement along +x_body (no sideslip): translation tilt = extrinsic",
+            "time offset = constant shift of lidar timestamps (window shift of the gyro integral)",
+            "sign of phi follows the standard E^{-1} dT_b E convention (assumption; see sign_check)",
+        ],
+    }
+    (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+
+    # ----------------------------------------------------------- diagnostics
+    fig_data = {
+        "r_vs_time": {"t_tr": tm[tr], "r_tr": r0[tr], "t_he": tm[he], "r_he": r0[he],
+                      "hline": -b_hat * dt},
+        "delta_fit": {"x": domega[tr], "y": r0[tr] - r0[tr].mean(),
+                      "slope": float(c_shift[1]),
+                      "title": f"DELTA SIGNATURE: D={d_hat:.4f}+/-{se_d:.4f}S"},
+        "tilt": {"x_tr": dx[tr], "y_tr": dy[tr], "x_he": dx[he], "y_he": dy[he],
+                 "phi": phi_hat},
+        "obs": {"ids": obs["segment_id"].tolist(),
+                "scores": obs["observability_score"].tolist()},
+        "hist": {"res": res_yaw},
+        "sign": {"vals": [rms_trans_held, rms_trans_wrong, exp_wrong],
+                 "labels": ["ADOPTED SIGN", "WRONG SIGN", "2SIN(PHI)*MEAN(DX)"]},
+    }
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+        ax = axes[0, 0]
+        ax.plot(tm[tr], r0[tr], ".", ms=3, label="train")
+        ax.plot(tm[he], r0[he], ".", ms=3, label="heldout")
+        ax.axhline(-b_hat * dt, color="k", ls="--", label=f"-b*dt = {-b_hat*dt:.4e}")
+        ax.set_xlabel("time (s)"); ax.set_ylabel("dyaw - int(omega) (rad)")
+        ax.set_title("Yaw residual vs time (zero shift)"); ax.legend(fontsize=8)
+
+        ax = axes[0, 1]
+        ax.plot(domega[tr], r0[tr] - r0[tr].mean(), ".", ms=3)
+        dd = np.linspace(domega.min(), domega.max(), 10)
+        ax.plot(dd, c_shift[1] * dd, "r-", label=f"slope={c_shift[1]:.4f}")
+        ax.set_xlabel("omega(t1)-omega(t0) (rad)")
+        ax.set_ylabel("centred yaw residual (rad)")
+        ax.set_title(f"delta signature: d_hat={d_hat:.4f} +/- {se_d:.4f} s")
+        ax.legend(fontsize=8)
+
+        ax = axes[0, 2]
+        ax.plot(dx[tr], dy[tr], ".", ms=3, label="train")
+        ax.plot(dx[he], dy[he], ".", ms=3, label="heldout")
+        xs = np.linspace(0, dx.max(), 10)
+        ax.plot(xs, -np.tan(phi_hat) * xs, "r-", label=f"tilt -> phi={phi_hat:.4f} rad")
+        ax.set_xlabel("dx_lidar (m)"); ax.set_ylabel("dy_lidar (m)")
+        ax.set_title("Translation tilt (extrinsic)"); ax.legend(fontsize=8)
+
+        ax = axes[1, 0]
+        ax.bar(obs["segment_id"].astype(str), obs["observability_score"], color="C0")
+        ax.set_xlabel("segment_id"); ax.set_ylabel("observability score")
+        ax.set_title("Per-segment observability (train rows only)")
+
+        ax = axes[1, 1]
+        ax.hist(res_yaw, bins=25, color="C1", alpha=0.8)
+        ax.set_xlabel("held-out yaw residual (rad)"); ax.set_ylabel("count")
+        ax.set_title(f"Held-out yaw residuals (RMS={rms_yaw_held:.4f})")
+
+        ax = axes[1, 2]
+        vals = [rms_trans_held, rms_trans_wrong, exp_wrong]
+        ax.bar(["adopted sign", "wrong sign", "2sin(phi)*mean(dx)"], vals,
+               color=["C2", "C3", "C4"])
+        ax.set_ylabel("mean perpendicular trans misfit (m)")
+        ax.set_title("Extrinsic sign self-consistency check")
+        for i, v_ in enumerate(vals):
+            ax.text(i, v_, f"{v_:.4f}", ha="center", va="bottom", fontsize=9)
+
+        fig.suptitle("Multi-sensor motion record audit - calibration diagnostics",
+                     fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        fig.savefig(OUT / "calibration_diagnostics.png", dpi=130)
+        plt.close(fig)
+        backend = "matplotlib"
+    except ImportError:
+        render_fallback_png(fig_data, OUT / "calibration_diagnostics.png")
+        backend = "numpy-fallback"
+
+    print("diagnostics backend:", backend)
+    print("calibration:", {"gyro_bias_rad_s": b_hat, "time_offset_s": d_hat,
+                           "yaw_extrinsic_rad": phi_hat})
+    print("SEs:", errs)
+    print("observability:\n", obs.to_string(index=False))
+    print("heldout RMS yaw", rms_yaw_held, "| mean perp trans", rms_trans_held,
+          "| wrong-sign", rms_trans_wrong, "| expected wrong", exp_wrong)
+    print("AIC:", json.dumps(aic_table, indent=1))
+    print("self band scores:", self_scores)
+
+
+# ============================================================================
+# Fallback PNG renderer (pure numpy + zlib), used only when matplotlib is
+# unavailable.  Renders the same six diagnostic panels.
+# ============================================================================
+def _rows(*r):
+    return "".join(r)
+
+
+FONT = {
+ 'A': _rows(".XXX.", "X...X", "X...X", "XXXXX", "X...X", "X...X", "X...X"),
+ 'B': _rows("XXXX.", "X...X", "X...X", "XXXX.", "X...X", "X...X", "XXXX."),
+ 'C': _rows(".XXXX", "X....", "X....", "X....", "X....", "X....", ".XXXX"),
+ 'D': _rows("XXXX.", "X...X", "X...X", "X...X", "X...X", "X...X", "XXXX."),
+ 'E': _rows("XXXXX", "X....", "X....", "XXXX.", "X....", "X....", "XXXXX"),
+ 'F': _rows("XXXXX", "X....", "X....", "XXXX.", "X....", "X....", "X...."),
+ 'G': _rows(".XXX.", "X...X", "X....", "X.XXX", "X...X", "X...X", ".XXX."),
+ 'H': _rows("X...X", "X...X", "X...X", "XXXXX", "X...X", "X...X", "X...X"),
+ 'I': _rows("XXXXX", "..X..", "..X..", "..X..", "..X..", "..X..", "XXXXX"),
+ 'J': _rows("..XXX", "...X.", "...X.", "...X.", "...X.", "X..X.", ".XX.."),
+ 'K': _rows("X...X", "X..X.", "X.X..", "XX...", "X.X..", "X..X.", "X...X"),
+ 'L': _rows("X....", "X....", "X....", "X....", "X....", "X....", "XXXXX"),
+ 'M': _rows("X...X", "XX.XX", "X.X.X", "X.X.X", "X...X", "X...X", "X...X"),
+ 'N': _rows("X...X", "XX..X", "X.X.X", "X..XX", "X...X", "X...X", "X...X"),
+ 'O': _rows(".XXX.", "X...X", "X...X", "X...X", "X...X", "X...X", ".XXX."),
+ 'P': _rows("XXXX.", "X...X", "X...X", "XXXX.", "X....", "X....", "X...."),
+ 'Q': _rows(".XXX.", "X...X", "X...X", "X...X", "X.X.X", "X..X.", ".XX.X"),
+ 'R': _rows("XXXX.", "X...X", "X...X", "XXXX.", "X.X..", "X..X.", "X...X"),
+ 'S': _rows(".XXXX", "X....", "X....", ".XXX.", "....X", "....X", "XXXX."),
+ 'T': _rows("XXXXX", "..X..", "..X..", "..X..", "..X..", "..X..", "..X.."),
+ 'U': _rows("X...X", "X...X", "X...X", "X...X", "X...X", "X...X", ".XXX."),
+ 'V': _rows("X...X", "X...X", "X...X", "X...X", "X...X", ".X.X.", "..X.."),
+ 'W': _rows("X...X", "X...X", "X...X", "X.X.X", "X.X.X", "XX.XX", "X...X"),
+ 'X': _rows("X...X", "X...X", ".X.X.", "..X..", ".X.X.", "X...X", "X...X"),
+ 'Y': _rows("X...X", "X...X", ".X.X.", "..X..", "..X..", "..X..", "..X.."),
+ 'Z': _rows("XXXXX", "....X", "...X.", "..X..", ".X...", "X....", "XXXXX"),
+ '0': _rows(".XXX.", "X...X", "X..XX", "X.X.X", "XX..X", "X...X", ".XXX."),
+ '1': _rows("..X..", ".XX..", "..X..", "..X..", "..X..", "..X..", "XXXXX"),
+ '2': _rows(".XXX.", "X...X", "....X", "...X.", "..X..", ".X...", "XXXXX"),
+ '3': _rows("XXXX.", "....X", "....X", ".XXX.", "....X", "....X", "XXXX."),
+ '4': _rows("...X.", "..XX.", ".X.X.", "X..X.", "XXXXX", "...X.", "...X."),
+ '5': _rows("XXXXX", "X....", "XXXX.", "....X", "....X", "X...X", ".XXX."),
+ '6': _rows("..XX.", ".X...", "X....", "XXXX.", "X...X", "X...X", ".XXX."),
+ '7': _rows("XXXXX", "....X", "...X.", "..X..", ".X...", ".X...", ".X..."),
+ '8': _rows(".XXX.", "X...X", "X...X", ".XXX.", "X...X", "X...X", ".XXX."),
+ '9': _rows(".XXX.", "X...X", "X...X", ".XXXX", "....X", "...X.", ".XX.."),
+ '-': _rows(".....", ".....", ".....", "XXXXX", ".....", ".....", "....."),
+ '.': _rows(".....", ".....", ".....", ".....", ".....", ".XX..", ".XX.."),
+ '(': _rows("...X.", "..X..", ".X...", ".X...", ".X...", "..X..", "...X."),
+ ')': _rows(".X...", "..X..", "...X.", "...X.", "...X.", "..X..", ".X..."),
+ '+': _rows(".....", "..X..", "..X..", "XXXXX", "..X..", "..X..", "....."),
+ '=': _rows(".....", ".....", "XXXXX", ".....", "XXXXX", ".....", "....."),
+ '/': _rows("....X", "...X.", "...X.", "..X..", ".X...", ".X...", "X...."),
+ ':': _rows(".....", "..X..", "..X..", ".....", "..X..", "..X..", "....."),
+ ',': _rows(".....", ".....", ".....", ".....", "..XX.", "..X..", ".X..."),
+ '*': _rows(".....", "X.X.X", ".XXX.", "XXXXX", ".XXX.", "X.X.X", "....."),
+ ' ': _rows(".....", ".....", ".....", ".....", ".....", ".....", "....."),
+}
+
+
+def _draw_text(canvas, x, y, text, color, scale=2):
+    x, y = int(x), int(y)
+    for ch in text:
+        g = FONT.get(ch.upper(), FONT[' '])
+        for r, row in enumerate(g):
+            for c, cc in enumerate(row):
+                if cc == 'X':
+                    canvas[y + r * scale:y + (r + 1) * scale,
+                           x + c * scale:x + (c + 1) * scale] = color
+        x += 6 * scale
+
+
+def _line(canvas, x0, y0, x1, y1, color):
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    xs = np.linspace(x0, x1, n).astype(int)
+    ys = np.linspace(y0, y1, n).astype(int)
+    ok = (xs >= 0) & (xs < canvas.shape[1]) & (ys >= 0) & (ys < canvas.shape[0])
+    canvas[ys[ok], xs[ok]] = color
+
+
+class _Panel:
+    """One axes panel: data-to-pixel mapping, frame, ticks, labels."""
+
+    def __init__(self, canvas, rect, xlim, ylim, title="", xlabel="", ylabel=""):
+        self.cv, self.rect = canvas, rect
+        self.xlim, self.ylim = list(map(float, xlim)), list(map(float, ylim))
+        x0, y0, w, h = rect
+        self.pl, self.pt, self.pw, self.ph = x0 + 58, y0 + 30, w - 72, h - 72
+        self._frame()
+        self._ticks()
+        if title:
+            _draw_text(canvas, x0 + 60, y0 + 6, title[:62], (0, 0, 0), 2)
+        if xlabel:
+            _draw_text(canvas, self.pl + self.pw // 2 - 5 * len(xlabel),
+                       y0 + h - 18, xlabel, (0, 0, 0), 2)
+        if ylabel:
+            _draw_text(canvas, x0 + 6, y0 + 30 + self.ph // 2 - 5 * len(ylabel),
+                       ylabel, (0, 0, 0), 2)
+
+    def _frame(self):
+        c = (60, 60, 60)
+        _line(self.cv, self.pl, self.pt, self.pl + self.pw, self.pt, c)
+        _line(self.cv, self.pl, self.pt + self.ph, self.pl + self.pw,
+              self.pt + self.ph, c)
+        _line(self.cv, self.pl, self.pt, self.pl, self.pt + self.ph, c)
+        _line(self.cv, self.pl + self.pw, self.pt, self.pl + self.pw,
+              self.pt + self.ph, c)
+
+    def to_px(self, x, y):
+        x0, x1 = self.xlim
+        y0, y1 = self.ylim
+        if x1 == x0: x1 = x0 + 1
+        if y1 == y0: y1 = y0 + 1
+        px = self.pl + (np.asarray(x) - x0) / (x1 - x0) * self.pw
+        py = self.pt + self.ph - (np.asarray(y) - y0) / (y1 - y0) * self.ph
+        return px, py
+
+    def _ticks(self):
+        def fmt(v):
+            return f"{v:.3g}".upper()[:7]
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            xv = self.xlim[0] + frac * (self.xlim[1] - self.xlim[0])
+            px, py = self.to_px(xv, self.ylim[0])
+            _line(self.cv, px, py, px, py + 4, (60, 60, 60))
+            _draw_text(self.cv, int(px) - 8, int(py) + 7, fmt(xv), (0, 0, 0), 1)
+            yv = self.ylim[0] + frac * (self.ylim[1] - self.ylim[0])
+            px, py = self.to_px(self.xlim[0], yv)
+            _line(self.cv, px - 4, py, px, py, (60, 60, 60))
+            _draw_text(self.cv, px - 36, int(py) - 3, fmt(yv), (0, 0, 0), 1)
+
+    def scatter(self, x, y, color):
+        for xi, yi in zip(np.asarray(x), np.asarray(y)):
+            px, py = self.to_px(xi, yi)
+            _dot(self.cv, int(px), int(py), color, 2)
+
+    def plot_line(self, x, y, color):
+        px, py = self.to_px(np.asarray(x, float), np.asarray(y, float))
+        _line(self.cv, px[0], py[0], px[-1], py[-1], color)
+
+    def hline(self, yv, color):
+        px, py = self.to_px(np.array([self.xlim[0], self.xlim[1]]),
+                            np.array([yv, yv]))
+        _line(self.cv, px[0], py[0], px[1], py[1], color)
+
+    def bars(self, labels, values, color, label_fmt=str):
+        n = len(values)
+        bw = max(int(self.pw / (n * 1.5)), 3)
+        for i, v in enumerate(values):
+            xc = self.xlim[0] + (i + 0.5) / n * (self.xlim[1] - self.xlim[0])
+            px, py0 = self.to_px(xc, self.ylim[0])
+            _, py1 = self.to_px(xc, max(v, self.ylim[1] * 1e-6))
+            x0 = int(px - bw / 2)
+            self.cv[int(py1):int(py0), x0:x0 + bw] = color
+            _draw_text(self.cv, int(px) - 4 * len(label_fmt(labels[i])),
+                       self.pt + self.ph + 14, label_fmt(labels[i]), (0, 0, 0), 1)
+
+
+def _dot(canvas, x, y, color, s=1):
+    h, w = canvas.shape[:2]
+    x, y = max(0, min(w - s, x)), max(0, min(h - s, y))
+    canvas[y:y + s, x:x + s] = color
+
+
+def render_fallback_png(fd, path):
+    W, H = 1560, 920
+    cv = np.full((H, W, 3), 255, np.uint8)
+    _draw_text(cv, 380, 6,
+               "MULTI-SENSOR MOTION RECORD AUDIT - CALIBRATION DIAGNOSTICS",
+               (0, 0, 0), 2)
+    r = fd["r_vs_time"]
+    ylim = (float(min(r["r_tr"].min(), r["r_he"].min())) - 0.002,
+            float(max(r["r_tr"].max(), r["r_he"].max())) + 0.002)
+    p = _Panel(cv, (10, 34, 500, 410),
+               (float(r["t_tr"].min()), float(r["t_tr"].max())), ylim,
+               "YAW RESIDUAL VS TIME (ZERO SHIFT)", "TIME (S)", "RAD")
+    p.scatter(r["t_tr"], r["r_tr"], (31, 119, 180))
+    p.scatter(r["t_he"], r["r_he"], (255, 127, 14))
+    p.hline(r["hline"], (0, 0, 0))
+    _draw_text(cv, 80, 418, "BLUE: TRAIN   ORANGE: HELDOUT   BLACK: -B*DT",
+               (0, 0, 0), 2)
+
+    d = fd["delta_fit"]
+    p = _Panel(cv, (525, 34, 500, 410),
+               (float(d["x"].min()), float(d["x"].max())),
+               (float(d["y"].min()) - .002, float(d["y"].max()) + .002),
+               d["title"], "OMEGA(T1)-OMEGA(T0) (RAD)", "RESID (RAD)")
+    p.scatter(d["x"], d["y"], (31, 119, 180))
+    xd = np.linspace(d["x"].min(), d["x"].max(), 10)
+    p.plot_line(xd, d["slope"] * xd, (214, 39, 40))
+
+    tl = fd["tilt"]
+    ymin = float(min(tl["y_tr"].min(), tl["y_he"].min())) - .01
+    ymax = float(max(tl["y_tr"].max(), tl["y_he"].max())) + .01
+    p = _Panel(cv, (1040, 34, 510, 410), (0.0, float(tl["x_tr"].max())),
+               (ymin, ymax), f"TRANSLATION TILT: PHI={tl['phi']:.4f} RAD",
+               "DX (M)", "DY (M)")
+    p.scatter(tl["x_tr"], tl["y_tr"], (31, 119, 180))
+    p.scatter(tl["x_he"], tl["y_he"], (255, 127, 14))
+    xs = np.linspace(0, tl["x_tr"].max(), 10)
+    p.plot_line(xs, -np.tan(tl["phi"]) * xs, (214, 39, 40))
+
+    o = fd["obs"]
+    p = _Panel(cv, (10, 480, 500, 420), (-0.5, len(o["ids"]) - 0.5),
+               (0.0, max(o["scores"]) * 1.15), "PER-SEGMENT OBSERVABILITY",
+               "SEGMENT ID", "SCORE")
+    p.bars(o["ids"], o["scores"], (31, 119, 180))
+
+    h = fd["hist"]
+    cnt, edges = np.histogram(h["res"], bins=25)
+    p = _Panel(cv, (525, 480, 500, 420), (float(edges[0]), float(edges[-1])),
+               (0, int(cnt.max()) * 1.15), "HELD-OUT YAW RESIDUALS",
+               "RESIDUAL (RAD)", "COUNT")
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    p.bars(np.round(centers, 3), cnt, (255, 187, 120), label_fmt=lambda v: "")
+
+    s = fd["sign"]
+    p = _Panel(cv, (1040, 480, 510, 420), (-0.5, 2.5),
+               (0.0, max(s["vals"]) * 1.2), "EXTRINSIC SIGN CHECK",
+               "", "MEAN MISFIT (M)")
+    p.bars(range(3), s["vals"], (44, 160, 44))
+    for i, lab in enumerate(s["labels"]):
+        _draw_text(cv, 1060 + i * 170, 866, lab[:14], (0, 0, 0), 1)
+
+    # ---- encode PNG
+    raw = b"".join(b"\x00" + cv[y].tobytes() for y in range(H))
+    import struct, zlib
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    path.write_bytes(png)
+
+
+if __name__ == "__main__":
+    main()

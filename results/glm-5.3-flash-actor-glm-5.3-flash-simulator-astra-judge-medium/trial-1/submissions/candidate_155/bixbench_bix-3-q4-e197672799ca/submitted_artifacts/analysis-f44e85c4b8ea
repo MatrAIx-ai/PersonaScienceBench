@@ -1,0 +1,227 @@
+"""
+run_analysis.py -- DESeq2-equivalent differential expression analysis
+(Paroxetine 2017 RNA-seq, BixBench bix-3-q4).
+
+NOTE: R/DESeq2 is unavailable in this environment (no R, no pydeseq2, no
+network); this script re-implements the DESeq2 algorithm in Python
+(deseq2_core.py). Equivalent implementation, NOT the original R package.
+
+Stages (each runnable within the runner's per-command time limit):
+  --stage prep    load Excel, de-normalize NormCount -> pseudo-raw counts
+  --stage main    design ~ animal + tissue, 3 tissue contrasts (MAIN)
+  --stage sens1   design ~ tissue              (sensitivity)
+  --stage sens2   design ~ response + tissue   (sensitivity)
+  --stage valid   ~ response on final-blood subset vs paper's block 7
+  --stage summary intersection across comparisons + all CSV outputs check
+Significance: padj < 0.05 (BH + independent filtering, alpha=0.05), no LFC cutoff.
+Answer = |intersection of the 3 DEG sets| from the MAIN design.
+"""
+import json, sys, time, os
+import numpy as np
+import pandas as pd
+import deseq2_core as dc
+
+T0 = time.time()
+XL = 'data/Data_deposition_RNAseq_Paroxetine_2017.xlsx'
+OUT = 'results'
+os.makedirs(OUT, exist_ok=True)
+LOG = open(f'{OUT}/run_log.txt', 'a')
+def log(*a):
+    msg = f'[{time.time()-T0:7.1f}s] ' + ' '.join(str(x) for x in a)
+    print(msg, flush=True); LOG.write(msg+'\n'); LOG.flush()
+
+def load_norm():
+    nc = pd.read_excel(XL, sheet_name='NormCount', header=3)
+    ms = pd.read_excel(XL, sheet_name='Mapping_statistics')
+    genes = nc['GeneID'].astype(str).to_numpy()
+    cols = list(nc.columns[2:92])
+    norm = nc[cols].to_numpy(float)
+    meta = ms.sort_values('Index_DESeq').reset_index(drop=True)
+    assert list(meta['Code']) == cols, 'Code/Index_DESeq alignment failed'
+    return genes, norm, meta
+
+def stage_prep():
+    genes, norm, meta = load_norm()
+    sf_prime = dc.median_ratio_size_factors(norm)     # ~ 1/sf (const-free)
+    raw = np.rint(norm * sf_prime[None, :]).astype(np.int64)
+    sf2 = dc.median_ratio_size_factors(raw)
+    norm_check = raw / sf2[None, :]
+    nz = norm > 0
+    rel_err = float(np.median(np.abs(norm_check[nz]/norm[nz] - 1.0)))
+    log(f'pseudo-raw reconstruction: median rel. deviation re-normalized vs NormCount = {rel_err:.4g}')
+    animal = meta['Sample ID'].str.extract(r'um_mueller_2017_02_\d+_(\d+)_')[0].astype(str).to_numpy()
+    np.savez_compressed(f'{OUT}/prep.npz', raw=raw, genes=genes,
+                        tissue=meta['Tissue'].to_numpy(),
+                        response=meta['Response'].to_numpy(), animal=animal,
+                        rel_err=rel_err)
+    log(f'prep done: raw {raw.shape}, nonzero genes {int((raw.mean(1)>0).sum())}')
+
+def design(cols_spec, tissue, response, animal):
+    Xs = [np.ones(len(tissue))]; names = ['Intercept']
+    mapping = {'tissue': tissue, 'response': response, 'animal': animal}
+    for c in cols_spec:
+        for l in sorted(set(mapping[c]))[1:]:
+            Xs.append((mapping[c] == l).astype(float)); names.append(f'{c}_{l}')
+    return np.column_stack(Xs), names
+
+def tissue_contrasts(names):
+    iDG = names.index('tissue_dentate_gyrus'); iFI = names.index('tissue_final_blood')
+    def vec(): return np.zeros(len(names))
+    cDG = vec(); cDG[iDG] = 1
+    cFI = vec(); cFI[iFI] = 1
+    cDF = vec(); cDF[iDG] = 1; cDF[iFI] = -1
+    return [('dentate_gyrus_vs_baseline_blood', cDG),
+            ('final_blood_vs_baseline_blood', cFI),
+            ('dentate_gyrus_vs_final_blood', cDF)]
+
+def run_pipeline(raw, X, contrasts, label, tag, minmu_check=True):
+    Y = raw
+    keep = Y.mean(axis=1) > 0
+    Yk = Y[keep]
+    log(f'[{label}] fitting {Yk.shape[0]} genes, P={X.shape[1]}, n={X.shape[0]}')
+    sf = dc.median_ratio_size_factors(Yk)
+    filt = (Yk / sf[None, :]).mean(axis=1)
+    beta1, mu1, c1, it1 = dc.nb_fit_mean(Yk, X, np.ones(len(Yk)))
+    log(f'[{label}] initial fit: {it1} iters, converged {int(c1.sum())}/{len(c1)}')
+    a_hat = dc.gene_wise_dispersion_cr(Yk, mu1, X)
+    bm = mu1.mean(axis=1)
+    trend, param_ok, abc = dc.fit_disp_trend(a_hat, bm)
+    log(f'[{label}] dispersion trend parametric={param_ok} a0,a1={tuple(np.round(abc,5))}')
+    a_final = dc.map_dispersion_cr(Yk, mu1, X, a_hat, trend)
+    beta, mu, c2, it2 = dc.nb_fit_mean(Yk, X, a_final)
+    log(f'[{label}] final fit: {it2} iters, converged {int(c2.sum())}/{len(c2)}')
+    XtWX = np.einsum('gs,sp,sq->gpq', mu/(1.0 + a_final[:,None]*mu), X, X, optimize=True)
+    XtWX_inv = dc._solve_batch(XtWX + 1e-10*np.eye(X.shape[1]),
+                               np.broadcast_to(np.eye(X.shape[1]), XtWX.shape))
+    from scipy.stats import f as fdist
+    df_res = X.shape[0] - X.shape[1]
+    cutoff = fdist.ppf(0.99, 1, df_res)   # DESeq2: 99% quantile of F(1, n-p)
+    cooks = dc.cooks_distance(Yk, mu, a_final, XtWX_inv, X)
+    flagged = (cooks > cutoff).any(axis=1)
+    log(f"[{label}] Cook's cutoff={cutoff:.4g} (F(1,{df_res}) q99): {int(flagged.sum())} genes flagged")
+    cooks_max = cooks.max(axis=1)
+    res = {}
+    for cname, cvec in contrasts:
+        lfc, se, stat, pval = dc.wald_test(beta, XtWX_inv, cvec)
+        padj, theta, nrej = dc.independent_filter(pval, filt, alpha=0.05)
+        res[cname] = pd.DataFrame({
+            'GeneID': GENES[keep], 'baseMean': bm,
+            'log2FoldChange': lfc, 'lfcSE': se, 'stat': stat,
+            'pvalue': pval, 'padj': padj, 'dispGeneEst': a_hat,
+            'dispTrend': trend, 'dispMAP': a_final})
+        n = int((res[cname]['padj'] < 0.05).sum())
+        log(f'[{label}] {cname}: padj<0.05 = {n} (filter theta={theta:.4g}, kept {int((filt>=theta).sum())})')
+    np.savez_compressed(f'{OUT}/diag_{tag}.npz', a_hat=a_hat, trend=trend,
+                        a_final=a_final, flagged=flagged, keep=keep,
+                        filt=filt, sf=sf, conv1=c1, conv2=c2, cooks_max=cooks_max,
+                        cutoff=cutoff)
+    for cname, r in res.items():
+        r.to_csv(f'{OUT}/results_{tag}__{cname}.csv', index=False)
+    return res
+
+def stage_main():
+    global GENES
+    d = np.load(f'{OUT}/prep.npz', allow_pickle=True)
+    GENES = d['genes']; raw = d['raw']
+    X, names = design(['animal', 'tissue'], d['tissue'], d['response'], d['animal'])
+    res = run_pipeline(raw, X, tissue_contrasts(names), 'main ~animal+tissue', 'main')
+    sig = {c: sorted(set(r['GeneID'][r['padj'] < 0.05])) for c, r in res.items()}
+    json.dump(sig, open(f'{OUT}/sig_sets_main.json', 'w'))
+    log('main stage done')
+
+def stage_sens(which):
+    d = np.load(f'{OUT}/prep.npz', allow_pickle=True)
+    global GENES
+    GENES = d['genes']; raw = d['raw']
+    if which == 1:
+        X, names = design(['tissue'], d['tissue'], d['response'], d['animal'])
+        run_pipeline(raw, X, tissue_contrasts(names), 'sens ~tissue', 'sens_tissue')
+    else:
+        X, names = design(['response', 'tissue'], d['tissue'], d['response'], d['animal'])
+        run_pipeline(raw, X, tissue_contrasts(names), 'sens ~response+tissue', 'sens_rt')
+    log(f'sens{which} stage done')
+
+def stage_valid():
+    d = np.load(f'{OUT}/prep.npz', allow_pickle=True)
+    global GENES
+    GENES = d['genes']; raw = d['raw']; tissue = d['tissue']; response = d['response']
+    sub = np.where(tissue == 'final_blood')[0]
+    Xv = np.column_stack([np.ones(len(sub)),
+                          (response[sub] == 'good_responder').astype(float),
+                          (response[sub] == 'bad_responder').astype(float)])
+    cv = np.zeros(3); cv[1] = 1
+    res = run_pipeline(raw[:, sub], Xv, [('good_vs_control_final_blood', cv)],
+                       'validation final_blood ~response', 'valid')
+    # compare against the paper's published block 7 (final blood: control vs good)
+    nc = pd.read_excel(XL, sheet_name='NormCount', header=3)
+    pub = nc.iloc[:, 98 + 6*9: 98 + 7*9].copy()
+    pub.columns = ['baseMean','baseMeanA','baseMeanB','foldChange','log2FoldChange',
+                   'pval','padj','DEG_max','DEG_median']
+    pub.index = nc['GeneID'].astype(str).to_numpy()
+    v = res['good_vs_control_final_blood'].set_index('GeneID')
+    common = v.index.intersection(pub.index)
+    o = v.loc[common,'log2FoldChange']; p = pub.loc[common,'log2FoldChange']
+    ok = np.isfinite(o) & np.isfinite(p)
+    rcorr = float(np.corrcoef(o[ok], p[ok])[0,1])
+    spear = float(pd.Series(o[ok]).corr(pd.Series(p[ok]), method='spearman'))
+    sign_agree = float((np.sign(o[ok]) == np.sign(p[ok])).mean())
+    ours = set(v.index[v['padj'] < 0.05]); paper = set(pub.index[pub['padj'] < 0.05])
+    ud = pub['DEG_max'].isin(['U','D'])
+    shared_ud = ours & set(pub.index[ud])
+    dir_agree = float(np.mean([ (v.loc[g,'log2FoldChange'] > 0) == (pub.loc[g,'DEG_max'] == 'U')
+                                for g in shared_ud ])) if shared_ud else float('nan')
+    log(f'[validation] log2FC Pearson r={rcorr:.4f}, Spearman={spear:.4f}, sign agreement={sign_agree:.3f}')
+    log(f'[validation] our padj<0.05={len(ours)}, paper padj<0.05={len(paper)}, overlap={len(ours & paper)}')
+    log(f"[validation] paper U/D calls={int(ud.sum())}, our sig among them={len(shared_ud)}, direction agreement={dir_agree:.3f}")
+    json.dump({'log2fc_pearson_block7': rcorr, 'log2fc_spearman_block7': spear,
+               'sign_agreement': sign_agree, 'n_sig_ours': len(ours),
+               'n_sig_paper': len(paper), 'overlap': len(ours & paper),
+               'paper_UD_calls': int(ud.sum()), 'UD_in_our_sig': len(shared_ud),
+               'UD_direction_agreement': dir_agree},
+              open(f'{OUT}/validation.json','w'), indent=2)
+    log('validation stage done')
+
+def stage_summary():
+    sig = json.load(open(f'{OUT}/sig_sets_main.json'))
+    lfc = {}
+    for c in sig:
+        t = pd.read_csv(f'{OUT}/results_main__{c}.csv').set_index('GeneID')
+        lfc[c] = t['log2FoldChange']
+    inter = set(sig['dentate_gyrus_vs_baseline_blood']) & \
+            set(sig['final_blood_vs_baseline_blood']) & \
+            set(sig['dentate_gyrus_vs_final_blood'])
+    # concordant = the three pairwise LFCs share the same sign
+    # (equivalent to a strict ordering DG > FI > BL or DG < FI < BL)
+    def sgn(g, c):
+        v = lfc[c][g]
+        return 1 if v > 0 else (-1 if v < 0 else 0)
+    conc = [g for g in inter if len({sgn(g,'dentate_gyrus_vs_baseline_blood'),
+                                     sgn(g,'final_blood_vs_baseline_blood'),
+                                     sgn(g,'dentate_gyrus_vs_final_blood')}) == 1]
+    summary = {'design_main': '~ animal + tissue (30 animals x 3 tissues, paired)',
+               'threshold': 'padj < 0.05 (BH + independent filtering alpha=0.05), no LFC cutoff',
+               'DEG_per_comparison_main': {c: len(s) for c, s in sig.items()},
+               'intersection_all_three': len(inter),
+               'intersection_concordant_sign': len(conc)}
+    for tag in ['sens_tissue', 'sens_rt']:
+        s = {}
+        for c in ['dentate_gyrus_vs_baseline_blood','final_blood_vs_baseline_blood','dentate_gyrus_vs_final_blood']:
+            t = pd.read_csv(f'{OUT}/results_{tag}__{c}.csv')
+            s[c] = int((t['padj'] < 0.05).sum())
+        summary[f'DEG_per_comparison_{tag}'] = s
+        sets = []
+        for c in s:
+            t = pd.read_csv(f'{OUT}/results_{tag}__{c}.csv')
+            sets.append(set(t['GeneID'][t['padj'] < 0.05]))
+        summary[f'intersection_{tag}'] = len(set.intersection(*sets))
+    summary['validation_vs_paper'] = json.load(open(f'{OUT}/validation.json'))
+    json.dump(summary, open(f'{OUT}/summary.json','w'), indent=2)
+    pd.Series(sorted(inter), name='GeneID').to_csv(f'{OUT}/intersection_genes.csv', index=False)
+    pd.Series(conc, name='GeneID').to_csv(f'{OUT}/intersection_concordant.csv', index=False)
+    log('SUMMARY: ' + json.dumps(summary, indent=2))
+
+if __name__ == '__main__':
+    stage = sys.argv[sys.argv.index('--stage')+1]
+    dict(prep=stage_prep, main=stage_main, sens1=lambda: stage_sens(1),
+         sens2=lambda: stage_sens(2), valid=stage_valid, summary=stage_summary)[stage]()
+    log(f'stage {stage} finished')

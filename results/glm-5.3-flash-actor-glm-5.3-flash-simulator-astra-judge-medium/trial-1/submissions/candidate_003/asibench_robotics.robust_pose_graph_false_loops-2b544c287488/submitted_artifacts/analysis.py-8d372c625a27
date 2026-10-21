@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+Robust SE(2) pose-graph optimization with outlier-aware loop-closure scoring.
+
+Inputs  (data/): poses_initial.npy, odometry_edges.csv, loop_candidates.csv
+Outputs (root ): poses.npy, loop_closure_scores.csv, metrics.json, map_diagnostics.png
+
+Conventions (data/task_info.json):
+  * pose row = [x_m, y_m, theta_rad], theta wrapped to (-pi, pi]
+  * edge = relative measurement from pose i to pose j in the LOCAL frame of i:
+    z = (dx, dy, dtheta)  =>  p_j - p_i = R(theta_i) z_t
+  * pose 0 is the world-frame anchor (fixed; output frame identical to input)
+
+Method:
+  1. Anchored sparse Gauss-Newton/LM. Odometry edges at fixed diagonal
+     information from the provided sigmas (never downweighted); loop edges
+     reweighted by a graduated Cauchy/DCS-style robust kernel.
+  2. Two-component EM mixture on whitened loop residuals (inlier: chi2(3);
+     outlier: scaled chi2(3), scale estimated) -> posterior false_probability.
+  3. Classification / clean re-solve iterated to a fixed point: accepted loops
+     (p_false < 0.5) re-enter the solve at full weight; final scores are
+     residuals of ALL candidates measured against the final trajectory.
+"""
+import csv, json
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy.optimize import minimize_scalar
+from scipy.stats import chi2 as chi2dist
+# matplotlib is unavailable in this runtime (no network); the diagnostics
+# plot is rendered with matplotlib when present, otherwise via Pillow.
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+DATA = "data"
+N = 544
+
+def wrap(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+# --------------------------------------------------------------- data loading
+P0 = np.load(f"{DATA}/poses_initial.npy")
+assert P0.shape == (N, 3)
+with open(f"{DATA}/odometry_edges.csv") as f:
+    odom_rows = list(csv.DictReader(f))
+with open(f"{DATA}/loop_candidates.csv") as f:
+    loop_rows = list(csv.DictReader(f))
+odom_edges = [(int(r["from"]), int(r["to"]),
+               np.array([float(r["dx"]), float(r["dy"]), float(r["dtheta"])]))
+              for r in odom_rows]
+loop_edges = [(int(r["from"]), int(r["to"]),
+               np.array([float(r["dx"]), float(r["dy"]), float(r["dtheta"])]))
+              for r in loop_rows]
+loop_ids = [int(r["loop_id"]) for r in loop_rows]
+st_o, sr_o = float(odom_rows[0]["sigma_trans"]), float(odom_rows[0]["sigma_rot"])
+st_l, sr_l = float(loop_rows[0]["sigma_trans"]), float(loop_rows[0]["sigma_rot"])
+assert len(odom_edges) == N - 1 and len(loop_edges) == len(loop_ids) == 55
+NV = 3 * (N - 1)  # pose 0 fixed -> 1629 free variables
+
+# ------------------------------------------------------- residual / Jacobian
+def block(P, i, j, z, st, sr):
+    """Normalized residual (3,) and sparse Jacobian (3, NV) for one edge.
+    e = [ R(th_i)^T (p_j - p_i) - z_t ; wrap(th_j - th_i - z_th) ] / sigma
+    d e_t / d p_i = -st * R^T ;  d e_t / d p_j = +st * R^T
+    d e_t / d th_i = st * (dR^T/dth) (p_j - p_i) ;  d e_rot / d th_i = -sr ; d e_rot / d th_j = sr
+    """
+    c, s = np.cos(P[i, 2]), np.sin(P[i, 2])
+    d = P[j, :2] - P[i, :2]
+    it_, ir_ = 1.0 / st, 1.0 / sr          # whitening = DIVIDE by sigma
+    e = np.array([(c * d[0] + s * d[1] - z[0]) * it_,
+                  (-s * d[0] + c * d[1] - z[1]) * it_,
+                  wrap(P[j, 2] - P[i, 2] - z[2]) * ir_])
+    rows, cols, vals = [], [], []
+    if i != 0:
+        # d e_t / d p_i = -(1/st) * R^T
+        negRT = np.array([[-it_ * c, -it_ * s], [it_ * s, -it_ * c]])
+        for row_ in range(2):
+            for cc in range(2):
+                rows.append(row_); cols.append(3 * (i - 1) + cc)
+                vals.append(negRT[row_, cc])
+        dRtd = np.array([[-s, c], [-c, -s]]) @ d
+        for row_ in range(2):
+            rows.append(row_); cols.append(3 * (i - 1) + 2); vals.append(it_ * dRtd[row_])
+        rows.append(2); cols.append(3 * (i - 1) + 2); vals.append(-ir_)
+    if j != 0:
+        # d e_t / d p_j = +(1/st) * R^T
+        posRT = np.array([[it_ * c, it_ * s], [-it_ * s, it_ * c]])
+        for row_ in range(2):
+            for cc in range(2):
+                rows.append(row_); cols.append(3 * (j - 1) + cc)
+                vals.append(posRT[row_, cc])
+        rows.append(2); cols.append(3 * (j - 1) + 2); vals.append(ir_)
+    J = sp.csr_matrix((vals, (rows, cols)), shape=(3, NV))
+    return e, J
+
+def build(P, edges_all, sigs):
+    e_list, J_list = [], []
+    for (i, j, z), (st, sr) in zip(edges_all, sigs):
+        e, J = block(P, i, j, z, st, sr)
+        e_list.append(e); J_list.append(J)
+    return np.concatenate(e_list), sp.vstack(J_list).tocsr()
+
+def solve(P, edges_all, sigs, w_row, iters=60, lm=1e-4):
+    cost_prev = np.inf
+    converged = False
+    it_used = 0
+    for it in range(iters):
+        it_used = it + 1
+        e, J = build(P, edges_all, sigs)
+        W = w_row
+        g = J.T @ (W * e)
+        H = (J.multiply(W[:, None])).T @ J
+        d = H.diagonal().copy(); d[d <= 1e-12] = 1e-12
+        accepted = False
+        for _ in range(8):
+            Hreg = (H + lm * sp.diags(d) + 1e-9 * sp.identity(NV)).tocsc()
+            dx = spla.spsolve(Hreg, -g)
+            Pn = P.copy()
+            Pn[1:, :2] += dx.reshape(N - 1, 3)[:, :2]
+            Pn[1:, 2] = wrap(Pn[1:, 2] + dx.reshape(N - 1, 3)[:, 2])
+            e2, _ = build(Pn, edges_all, sigs)
+            cost = 0.5 * float(np.sum(W * e2 ** 2))
+            if cost <= cost_prev or cost_prev == np.inf:
+                P, accepted = Pn, True
+                break
+            lm *= 5.0
+        if not accepted:
+            converged = True
+            break
+        if abs(cost_prev - cost) < 1e-9 * max(1.0, cost):
+            converged = True
+            cost_prev = cost
+            break
+        cost_prev, lm = cost, max(lm * 0.3, 1e-8)
+    e_fin, _ = build(P, edges_all, sigs)
+    return P, 0.5 * float(np.sum(w_row * e_fin ** 2)), converged, it_used
+
+def chi2_per_edge(P, edges, st, sr):
+    out = []
+    for (i, j, z) in edges:
+        e, _ = block(P, i, j, z, st, sr)
+        out.append(float(np.sum(e ** 2)))
+    return np.array(out)
+
+# ------------------------------------------------------------ EM mixture model
+def em_mixture(chi2_vals, max_iter=300, tol=1e-12):
+    """inlier ~ chi2(df=3); outlier ~ scaled chi2(df=3): x/lam ~ chi2(3).
+    Returns (p_false per point, pi_outlier, lam)."""
+    x = np.asarray(chi2_vals, float)
+    f_in = chi2dist.pdf(x, 3)
+    pi_out = 0.4
+    lam = max(float(np.median(x)), 10.0)
+    for _ in range(max_iter):
+        f_out = chi2dist.pdf(x / lam, 3) / lam
+        num = (1 - pi_out) * f_in
+        r_in = num / np.maximum(num + pi_out * f_out, 1e-300)
+        pi_new = 1.0 - float(np.mean(r_in))
+
+        def nll(loglam):
+            l = np.exp(loglam)
+            return -float(np.sum((1 - r_in) * (chi2dist.logpdf(x / l, 3) - np.log(l))))
+        res = minimize_scalar(nll, bounds=(np.log(1e-3), np.log(1e6)), method="bounded")
+        lam_new = float(np.exp(res.x))
+        if abs(pi_new - pi_out) < tol and abs(lam_new - lam) < tol * max(1.0, lam):
+            pi_out, lam = pi_new, lam_new
+            break
+        pi_out, lam = pi_new, lam_new
+    f_out = chi2dist.pdf(x / lam, 3) / lam
+    num = (1 - pi_out) * f_in
+    p_false = 1.0 - num / np.maximum(num + pi_out * f_out, 1e-300)
+    return np.clip(p_false, 0.0, 1.0), float(pi_out), float(lam)
+
+# ------------------------------------------------------------- robust pipeline
+odom_sigs = [(st_o, sr_o)] * len(odom_edges)
+loop_sig1 = (st_l, sr_l)
+
+P = P0.copy()
+w_loops = np.ones(len(loop_edges))
+history = []
+for c2 in [50.0, 20.0, 9.0, 4.0, 2.5, 1.5, 1.0]:   # graduated Cauchy scale^2
+    edges_all = odom_edges + loop_edges
+    sigs = odom_sigs + [loop_sig1] * len(loop_edges)
+    w_row = np.concatenate([np.ones(3 * len(odom_edges)), np.repeat(w_loops, 3)])
+    P, cost, conv, it = solve(P, edges_all, sigs, w_row)
+    chi2 = chi2_per_edge(P, loop_edges, st_l, sr_l)
+    w_loops = 1.0 / (1.0 + chi2 / c2)   # Cauchy/DCS-style weight on whitened chi2
+    history.append(dict(kernel_c2=c2, cost=round(cost, 4), iters=int(it),
+                        max_loop_chi2=round(float(chi2.max()), 3)))
+
+# ---- EM classification + clean re-solve, iterated to a fixed point
+chi2_all = chi2
+for round_ in range(10):
+    p_false, pi_out, lam = em_mixture(chi2_all)
+    keep = p_false < 0.5
+    edges_all = odom_edges + [le for le, k in zip(loop_edges, keep) if k]
+    sigs = odom_sigs + [loop_sig1] * int(keep.sum())
+    w_row = np.concatenate([np.ones(3 * len(odom_edges)), np.ones(3 * int(keep.sum()))])
+    P, cost_final, conv_final, it_final = solve(P, edges_all, sigs, w_row)
+    chi2_new = chi2_per_edge(P, loop_edges, st_l, sr_l)
+    p_new, pi_out, lam = em_mixture(chi2_new)
+    if np.array_equal(p_new < 0.5, keep):        # classification stable
+        chi2_all, p_false = chi2_new, p_new
+        break
+    chi2_all = chi2_new
+# final EM on final-trajectory residuals + one last consistent solve
+p_false, pi_out, lam = em_mixture(chi2_all)
+keep = p_false < 0.5
+edges_all = odom_edges + [le for le, k in zip(loop_edges, keep) if k]
+sigs = odom_sigs + [loop_sig1] * int(keep.sum())
+w_row = np.concatenate([np.ones(3 * len(odom_edges)), np.ones(3 * int(keep.sum()))])
+P, cost_final, conv_final, it_final = solve(P, edges_all, sigs, w_row)
+chi2_all = chi2_per_edge(P, loop_edges, st_l, sr_l)
+p_false, pi_out, lam = em_mixture(chi2_all)
+keep = p_false < 0.5
+
+# ------------------------------------------------------------- final artifacts
+P_out = P.copy()
+P_out[:, 2] = wrap(P_out[:, 2])
+assert np.allclose(P_out[0], P0[0]), "anchor pose 0 moved"
+np.save("poses.npy", P_out.astype(np.float64))
+
+with open("loop_closure_scores.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["loop_id", "false_probability"])
+    for lid, pf in zip(loop_ids, p_false):
+        w.writerow([f"{lid}", f"{pf:.6f}"])
+
+odom_chi2 = chi2_per_edge(P, odom_edges, st_o, sr_o)
+accepted = [int(lid) for lid, k in zip(loop_ids, keep) if k]
+rejected = [int(lid) for lid, k in zip(loop_ids, keep) if not k]
+borderline = [int(lid) for lid, pf in zip(loop_ids, p_false) if 0.05 < pf < 0.95]
+
+metrics = {
+    "num_poses": N,
+    "num_odometry_edges": len(odom_edges),
+    "num_loop_candidates": len(loop_edges),
+    "optimizer": {
+        "method": ("anchored sparse Gauss-Newton with Levenberg-Marquardt damping; "
+                   "graduated Cauchy/DCS IRLS on loop edges, then EM-classified "
+                   "clean re-solve iterated to a classification fixed point"),
+        "converged": bool(conv_final),
+        "graduated_stages": len(history),
+        "final_solve_iterations": int(it_final),
+        "final_cost": round(float(cost_final), 6),
+    },
+    "residuals": {
+        "odometry_whitened_chi2_3dof": {
+            "mean": round(float(odom_chi2.mean()), 4),
+            "median": round(float(np.median(odom_chi2)), 4),
+            "max": round(float(odom_chi2.max()), 4),
+            "argmax_edge_id": int(np.argmax(odom_chi2)),
+            "num_edges_chi2_gt_20": int((odom_chi2 > 20).sum()),
+            "note": ("odometry edges were never downweighted; a large whitened "
+                     "chi2 here would flag an odometry outlier"),
+        },
+        "loop_whitened_chi2_3dof": {
+            "accepted_mean": round(float(chi2_all[keep].mean()), 4) if keep.any() else None,
+            "accepted_max": round(float(chi2_all[keep].max()), 4) if keep.any() else None,
+            "rejected_min": round(float(chi2_all[~keep].min()), 4) if (~keep).any() else None,
+            "rejected_max": round(float(chi2_all[~keep].max()), 4) if (~keep).any() else None,
+        },
+    },
+    "loop_classification": {
+        "false_probability_formula": (
+            "p_false = 1 - (1-pi_out)*f(chi2;3) / ((1-pi_out)*f(chi2;3) + "
+            "pi_out*f(chi2/lam;3)/lam), where chi2 is the whitened 3-dof "
+            "residual e'*Omega*e of the loop edge measured against the final "
+            "optimized trajectory (Omega = diag(1/sigma_trans^2, 1/sigma_trans^2, "
+            "1/sigma_rot^2) with sigmas from loop_candidates.csv), f(x;3) is the "
+            "chi-square density with 3 dof (inlier component), the outlier "
+            "component is a scaled chi2 (chi2/lam ~ chi2(3)) with lam estimated "
+            "by EM, and pi_out is the EM-estimated outlier mixing weight"),
+        "em_outlier_mixing_weight_pi_out": round(float(pi_out), 6),
+        "em_outlier_scale_lambda": round(float(lam), 4),
+        "decision_threshold_p_false": 0.5,
+        "num_accepted_loops": int(keep.sum()),
+        "num_rejected_loops": int((~keep).sum()),
+        "accepted_loop_ids": accepted,
+        "rejected_loop_ids": rejected,
+        "borderline_loop_ids_0.05_lt_p_lt_0.95": borderline,
+        "borderline_details": [
+            {"loop_id": int(lid), "false_probability": round(float(pf), 6),
+             "whitened_chi2": round(float(c), 3)}
+            for lid, pf, c in zip(loop_ids, p_false, chi2_all) if 0.05 < pf < 0.95],
+        "per_loop": [
+            {"loop_id": int(lid), "false_probability": round(float(pf), 6),
+             "whitened_chi2": round(float(c), 3),
+             "from": int(loop_rows[k]["from"]), "to": int(loop_rows[k]["to"])}
+            for k, (lid, pf, c) in enumerate(zip(loop_ids, p_false, chi2_all))],
+    },
+    "trajectory": {
+        "pose0_fixed_at_input_value": True,
+        "theta_wrapped_minus_pi_pi": True,
+        "max_abs_translation_change_from_initial_m": round(
+            float(np.max(np.linalg.norm(P[:, :2] - P0[:, :2], axis=1))), 4),
+    },
+    "robust_schedule": history,
+}
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+
+# ------------------------------------------------------------- diagnostics plot
+# matplotlib is unavailable in this offline runtime (Pillow's C extension is
+# also broken), so the diagnostic figure is rendered as PostScript and
+# converted to PNG with ghostscript. If matplotlib IS importable it is used.
+PLOT_BACKEND = None
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    PLOT_BACKEND = "matplotlib"
+except Exception:
+    PLOT_BACKEND = None
+
+GREEN, RED, ORANGE = (0.0, 0.6, 0.0), (0.8, 0.15, 0.15), (0.9, 0.55, 0.0)
+GRAYC, BLUEC, BLACK = (0.65, 0.65, 0.65), (0.1, 0.35, 0.8), (0, 0, 0)
+
+if PLOT_BACKEND == "matplotlib":
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
+    ax = axes[0]
+    ax.plot(P0[:, 0], P0[:, 1], "-", color="0.6", lw=1.0, label="initial (dead-reckoned)")
+    ax.plot(P_out[:, 0], P_out[:, 1], "-", color="tab:blue", lw=1.2, label="optimized")
+    for k, (i, j, _) in enumerate(loop_edges):
+        pf = p_false[k]
+        col = "tab:green" if pf < 0.5 else ("tab:orange" if 0.05 < pf < 0.95 else "tab:red")
+        ax.plot([P0[i, 0], P0[j, 0]], [P0[i, 1], P0[j, 1]], "-", color=col, lw=0.6, alpha=0.3)
+        ax.plot([P_out[i, 0], P_out[j, 0]], [P_out[i, 1], P_out[j, 1]], "-", color=col, lw=1.0, alpha=0.9)
+    ax.plot(P0[0, 0], P0[0, 1], "ks", ms=7, label="anchor pose 0")
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.set_title(f"Trajectory: {int(keep.sum())} accepted / {int((~keep).sum())} rejected loops\n"
+                 "loop edges colored by false_probability (green<0.5<=red, orange=borderline)")
+    ax.legend(fontsize=8); ax.set_aspect("equal", adjustable="datalim")
+    ax = axes[1]
+    lo = max(float(chi2_all.min()), 1e-3)
+    bins = np.logspace(np.log10(lo), np.log10(float(chi2_all.max()) * 1.3), 25)
+    ax.hist(chi2_all[keep], bins=bins, color="tab:green", alpha=0.75, label="accepted (p_false<0.5)")
+    ax.hist(chi2_all[~keep], bins=bins, color="tab:red", alpha=0.75, label="rejected (p_false>=0.5)")
+    if keep.any():
+        ax.axvline(float(chi2_all[keep].max()), color="k", ls="--", lw=1, label="max accepted chi2")
+    ax.set_xscale("log"); ax.set_xlabel("whitened loop residual chi2 (3 dof)")
+    ax.set_ylabel("count"); ax.set_title("Loop-candidate residual separation")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig("map_diagnostics.png", dpi=150)
+else:
+    import subprocess, os
+
+    def esc(s):
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    ops = []
+
+    def col(c):
+        ops.append(f"{c[0]:.3f} {c[1]:.3f} {c[2]:.3f} setrgbcolor")
+
+    def txt(x, y, s, size=12, c=BLACK, align="left"):
+        col(c)
+        if align != "left":  # approximate centering via char width ~0.5*size
+            wpx = 0.5 * size * len(s)
+            x = x - wpx / 2 if align == "center" else x - wpx
+        ops.append(f"/Helvetica findfont {size} scalefont setfont")
+        ops.append(f"{x:.2f} {y:.2f} moveto ({esc(s)}) show")
+
+    def line(x1, y1, x2, y2, c, wdt=1.0):
+        col(c)
+        ops.append(f"{wdt:.1f} setlinewidth {x1:.2f} {y1:.2f} moveto {x2:.2f} {y2:.2f} lineto stroke")
+
+    def poly(pts, c, wdt=1.0):
+        if len(pts) < 2:
+            return
+        col(c); ops.append(f"{wdt:.1f} setlinewidth")
+        ops.append(f"{pts[0][0]:.2f} {pts[0][1]:.2f} moveto")
+        for p in pts[1:]:
+            ops.append(f"{p[0]:.2f} {p[1]:.2f} lineto")
+        ops.append("stroke")
+
+    def rect(x, y, w, h, c):
+        col(c)
+        ops.append(f"{x:.2f} {y:.2f} moveto {w:.2f} 0 rlineto 0 {h:.2f} rlineto "
+                   f"{-w:.2f} 0 rlineto closepath fill")
+
+    PW, PH = 1500.0, 720.0
+    # ================= left panel: trajectory + loop edges =================
+    px0, py0, pw, ph = 60.0, 70.0, 740.0, 540.0
+    allxy = np.vstack([P0[:, :2], P_out[:, :2]])
+    xmin, ymin = allxy.min(0); xmax, ymax = allxy.max(0)
+    pad = 0.05 * max(xmax - xmin, ymax - ymin, 1.0)
+    xmin -= pad; xmax += pad; ymin -= pad; ymax += pad
+    sc = min(pw / (xmax - xmin), ph / (ymax - ymin))
+
+    def m2p(xy):
+        return (px0 + (xy[0] - xmin) * sc, py0 + (xy[1] - ymin) * sc)
+
+    def loop_col(pf):
+        return GREEN if pf < 0.5 else (ORANGE if 0.05 < pf < 0.95 else RED)
+
+    for k, (i, j, _) in enumerate(loop_edges):          # initial-frame loops (faint)
+        a, b = m2p(P0[i, :2]), m2p(P0[j, :2])
+        line(a[0], a[1], b[0], b[1], loop_col(p_false[k]), 0.8)
+    poly([m2p(p) for p in P0[:, :2]], GRAYC, 1.5)       # dead-reckoned path
+    poly([m2p(p) for p in P_out[:, :2]], BLUEC, 1.8)    # optimized path
+    for k, (i, j, _) in enumerate(loop_edges):          # final-frame loops
+        a, b = m2p(P_out[i, :2]), m2p(P_out[j, :2])
+        line(a[0], a[1], b[0], b[1], loop_col(p_false[k]), 1.6)
+    ax_, ay_ = m2p(P0[0, :2])
+    rect(ax_ - 5, ay_ - 5, 10, 10, BLACK)
+    txt(px0, py0 + ph + 130, f"Trajectory: {int(keep.sum())} accepted / "
+        f"{int((~keep).sum())} rejected loops  (plot backend: ghostscript)", 13)
+    txt(px0, py0 + ph + 105, "gray = initial dead-reckoned path   blue = optimized trajectory", 11)
+    txt(px0, py0 + ph + 85, "loop edges colored by false_probability: green < 0.5 (accepted), "
+        "red >= 0.5 (rejected), orange = borderline", 11)
+    txt(px0, py0 + ph + 65, "faint = loop drawn on initial poses, solid = on final poses; "
+        "black square = anchor pose 0", 11)
+    txt(px0 + pw / 2, 30, f"x range [{xmin:.1f}, {xmax:.1f}] m", 11, align="center")
+    ops.append("gsave")
+    txt(px0 - 40, py0 + ph / 2, "y [m]", 11, align="center")
+
+    # ================= right panel: chi2 histogram (log bins) ================
+    hx0, hy0, hw, hh = 880.0, 110.0, 560.0, 480.0
+    lo = max(float(chi2_all.min()), 1e-3)
+    hi = float(chi2_all.max()) * 1.3
+    nb = 25
+    binedges = np.logspace(np.log10(lo), np.log10(hi), nb + 1)
+    cnt_a = np.histogram(chi2_all[keep], bins=binedges)[0] if keep.any() else np.zeros(nb)
+    cnt_r = np.histogram(chi2_all[~keep], bins=binedges)[0] if (~keep).any() else np.zeros(nb)
+    hmax = max(float((cnt_a + cnt_r).max()), 1.0)
+
+    def x_of(chi2v):
+        t = (np.log10(chi2v) - np.log10(lo)) / (np.log10(hi) - np.log10(lo))
+        return hx0 + t * hw
+    bw = hw / nb
+    for b in range(nb):
+        xa = hx0 + b * bw
+        ha = cnt_a[b] / hmax * (hh - 10)
+        hr = cnt_r[b] / hmax * (hh - 10)
+        if hr > 0:
+            rect(xa, hy0, bw * 0.48, hr, RED)
+        if ha > 0:
+            rect(xa + bw * 0.5, hy0, bw * 0.48, ha, GREEN)
+    line(hx0, hy0, hx0 + hw, hy0, BLACK, 1.5)
+    line(hx0, hy0, hx0, hy0 + hh, BLACK, 1.5)
+    dec = [d for d in range(int(np.floor(np.log10(lo))), int(np.ceil(np.log10(hi))) + 1)
+           if lo <= 10 ** d <= hi]
+    for d in dec:
+        xt = x_of(10 ** d)
+        line(xt, hy0, xt, hy0 - 6, BLACK, 1.0)
+        txt(xt, hy0 - 24, f"1e{d}", 10, align="center")
+    txt(hx0 + hw / 2, hy0 - 50, "whitened loop residual chi2 (3 dof), log axis", 12, align="center")
+    if keep.any() and (~keep).any():
+        txt(hx0, hy0 + hh + 45, f"green = accepted (max chi2 {chi2_all[keep].max():.2f})    "
+            f"red = rejected (min chi2 {chi2_all[~keep].min():.2f})", 11)
+    else:
+        txt(hx0, hy0 + hh + 45, "green = accepted   red = rejected", 11)
+    txt(hx0, hy0 + hh + 25, f"EM mixture: outlier weight pi_out = {pi_out:.3f}, "
+        f"outlier scale lambda = {lam:.1f}", 11)
+    txt(hx0, hy0 + hh + 70, "Loop-candidate residual separation", 13)
+    ops.append("grestore")
+
+    import tempfile, shutil
+    # ghostscript is sandboxed away from the workspace in this runtime, so the
+    # PS is rendered and converted inside a temp dir, then copied back.
+    with tempfile.TemporaryDirectory() as td:
+        ps_path = os.path.join(td, "map_diagnostics.ps")
+        png_path = os.path.join(td, "map_diagnostics.png")
+        with open(ps_path, "w") as f:
+            f.write("%!PS\n%%BoundingBox: 0 0 1500 720\n")
+            f.write(f"%%PageBoundingBox: 0 0 {PW:.0f} {PH:.0f}\n1 1 1 setrgbcolor "
+                    f"0 0 {PW:.0f} {PH:.0f} rectfill\n")
+            f.write("\n".join(ops) + "\nshowpage\n")
+        r = subprocess.run(
+            ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m", "-r72",
+             "-dDEVICEWIDTHPOINTS=1500", "-dDEVICEHEIGHTPOINTS=720",
+             "-sOutputFile=" + png_path, ps_path],
+            capture_output=True, text=True, cwd=td)
+        if r.returncode != 0:
+            raise RuntimeError(f"ghostscript failed: {r.stderr[-500:]}")
+        shutil.copy(png_path, "map_diagnostics.png")
+    PLOT_BACKEND = "ghostscript(ps->png)"
+
+metrics["plot_backend"] = PLOT_BACKEND
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print("PLOT_BACKEND:", PLOT_BACKEND)
+print("converged:", conv_final, "| final cost:", round(cost_final, 4))
+print("accepted:", int(keep.sum()), "rejected:", int((~keep).sum()),
+      "| pi_out:", round(pi_out, 3), "| lam:", round(lam, 1))
+print("odom chi2: max", round(float(odom_chi2.max()), 3),
+      "mean", round(float(odom_chi2.mean()), 3))
+if keep.any() and (~keep).any():
+    print("accepted chi2 max:", round(float(chi2_all[keep].max()), 3),
+          "| rejected chi2 min:", round(float(chi2_all[~keep].min()), 3))
+print("p_false per loop:", np.round(p_false, 3).tolist())

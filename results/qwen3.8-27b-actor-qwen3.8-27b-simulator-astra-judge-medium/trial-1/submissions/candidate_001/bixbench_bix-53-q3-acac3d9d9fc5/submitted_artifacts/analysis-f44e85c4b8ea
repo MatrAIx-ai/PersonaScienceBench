@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+DE analysis (DESeq2-style NB GLM + LFC shrinkage) on data/count.csv,
+then attempt gseapy KEGG_2019_Mouse enrichment of the DGE set.
+
+Pipeline (mirrors DESeq2):
+  1. Load genes x samples count matrix.
+  2. Size factors via median-of-ratios.
+  3. Per-gene dispersion (method-of-moments) shrunk toward a mean-dispersion trend.
+  4. NB GLM (log2 link) fitted by IRLS for condition effect KD(KL) vs control(WL)
+     -> MLE log2FC + Wald p-value.
+  5. LFC shrinkage: DESeq2 'normal' prior (shrinkage of log2FC towards 0).
+  6. DGE filter: p<0.05 (raw Wald p), |shrunk log2FC|>1, baseMean>10.
+  7. gseapy enrichr with KEGG_2019_Mouse on the DGE Ensembl set (blocked: no net/lib).
+"""
+import csv, math, sys, json, os
+import numpy as np
+from scipy import stats
+
+RNG = np.random.default_rng(0)
+LN2 = math.log(2.0)
+
+# ---------- 1. load ----------
+def load_counts(path):
+    with open(path) as f:
+        r = csv.reader(f)
+        header = next(r)
+        rows = list(r)
+    ids = [row[0] for row in rows]
+    sample_cols = header[1:]
+    K = np.array([[int(v) for v in row[1:]] for row in rows], dtype=float)
+    return ids, sample_cols, K
+
+ids, sample_cols, K = load_counts('data/count.csv')
+n, m = K.shape
+KL = [c for c in sample_cols if c.startswith('KL')]
+WL = [c for c in sample_cols if c.startswith('WL')]
+idx_KL = [sample_cols.index(c) for c in KL]
+idx_WL = [sample_cols.index(c) for c in WL]
+x = np.zeros(m); x[idx_KL] = 1.0   # 1 = KD(KL), 0 = control(WL)
+print(f"Loaded {n} genes x {m} samples. KD(KL)={KL} control(WL)={WL}")
+
+# ---------- 2. size factors (median of ratios) ----------
+logK = np.log(np.where(K>0, K, np.nan))
+geo = np.exp(np.nanmean(logK, axis=1))  # per-gene geo mean (raw)
+# guard zeros
+geo = np.where(np.isfinite(geo) & (geo>0), geo, 1.0)
+ratio = K / geo[:, None]
+med = np.median(ratio, axis=0)
+size = np.where(med>0, med, 1.0)
+size = size / np.median(size)  # scale so median=1
+
+# baseMean: DESeq2 results 'baseMean' = mean of normalized counts (raw/sizefactor)
+norm = K / size[None, :]
+baseMean = norm.mean(axis=1)
+
+# ---------- 3-4. dispersion + NB GLM per gene ----------
+# trend fit inputs: baseMean vs initial method-of-moments dispersion
+def init_disp(K):
+    mu = K.mean(axis=1)
+    v = K.var(axis=1, ddof=1)
+    a = np.zeros(n)
+    pos = mu>0
+    a[pos] = (v[pos]-mu[pos])/ (mu[pos]**2)
+    a = np.clip(a, 0.0, 1.0)
+    return a, mu
+
+a_init, _ = init_disp(K)
+# fit log2(alpha) ~ log2(baseMean) trend via lowess (skip zero alpha)
+try:
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    pos = a_init>0
+    xb = np.log2(np.where(baseMean>0, baseMean, 0.5))
+    yb = np.log2(a_init[pos])
+    trend = lowess(yb, xb[pos], frac=0.3, return_sorted=False)
+    trend_map = {0:[]}; # fallback
+    def trend_at(bm):
+        xv = np.log2(max(bm,0.5))
+        return float(np.interp(xv, np.sort(xb[pos]),
+                               np.interp(np.sort(xb[pos]), xb[pos], yb)))
+except Exception as e:
+    print("lowess failed:", e, " -> using global median trend")
+    gm = np.median(a_init[a_init>0]) if (a_init>0).any() else 0.05
+    def trend_at(bm): return gm
+
+def shrunk_disp(a_i, bm):
+    tr = trend_at(bm)
+    if a_i<=0 and tr<=0:
+        return 0.05
+    if a_i<=0:
+        return tr
+    se_a = a_i*math.sqrt(2.0/n)          # approx SE of dispersion estimate
+    w_i = 1.0/(se_a**2)
+    w_t = 1.0
+    la = (w_i*math.log(a_i) + w_t*math.log(max(tr,1e-6)))/(w_i+w_t)
+    return float(np.exp(la))
+
+from scipy.optimize import minimize as _minimize
+
+def _nll_grad(beta, y, X, offset, alpha):
+    """Negative NB log-likelihood (beta-dependent part) and its gradient.
+    Var = mu + alpha*mu^2 ; mu = 2^eta ; r = 1/alpha ; p = 1/(1+alpha*mu)."""
+    r = 1.0/alpha
+    eta = np.clip(X@beta + offset, -30.0, 30.0)
+    mu = 2.0**eta
+    omu = 1.0 + alpha*mu
+    p = 1.0/omu               # p = 1/(1+alpha*mu)
+    one_minus_p = 1.0 - p     # = alpha*mu/(1+alpha*mu)
+    f = np.sum((r + y)*np.log(omu) - y*np.log(mu))
+    # grad_k = ln2 * sum_i X_ik [ r*(1-p_i) - y_i*p_i ]
+    grad = LN2 * (X.T @ (r*one_minus_p - y*p))
+    return f, grad
+
+LFC_BOUND = 15.0   # cap on |log2FC| MLE (zero-group genes have LFC->inf; bound is a stable surrogate)
+
+def nb_glm_fit(y, X, offset, alpha, beta0):
+    """Maximize NB log-likelihood (BFGS, LFC coefficient bounded at +-LFC_BOUND).
+    SE from the EXPECTED Fisher information I = X' W X, W_ii = ln2^2*mu/(1+alpha*mu),
+    which is stable even for zero-group boundary genes. Returns (beta, VCV) or None."""
+    def f(beta): return _nll_grad(beta, y, X, offset, alpha)[0]
+    def g(beta): return _nll_grad(beta, y, X, offset, alpha)[1]
+    res = _minimize(f, beta0, jac=g, method='L-BFGS-B',
+                    bounds=[(-np.inf, np.inf), (-LFC_BOUND, LFC_BOUND)],
+                    options={'maxiter': 300, 'gtol': 1e-12})
+    if not np.all(np.isfinite(res.x)):
+        return None
+    beta = res.x
+    eta = np.clip(X@beta + offset, -30.0, 30.0)
+    mu = 2.0**eta
+    W = (LN2**2) * (mu / (1.0 + alpha*mu))     # expected information weights
+    Xw = X*np.sqrt(W)[:,None]
+    I = Xw.T @ Xw                              # expected Fisher information
+    try:
+        VCV = np.linalg.inv(I + 1e-10*np.eye(2))
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(VCV)):
+        return None
+    return beta, VCV
+
+X = np.column_stack([np.ones(m), x])
+mean_x = x.mean()
+lfc_mle = np.zeros(n); pval = np.full(n, np.nan); se = np.full(n, np.nan); alpha_hat=np.zeros(n)
+nonconv=0
+for i in range(n):
+    y = K[i]
+    if y.sum()==0:
+        continue
+    a = shrunk_disp(a_init[i], baseMean[i])
+    alpha_hat[i]=a
+    off = np.log(size)/LN2   # offset on log2 scale: log2(size)
+    # good initial guess from group means (log2 scale)
+    mkl = y[idx_KL].sum(); mwl = y[idx_WL].sum()
+    if mkl>0 and mwl>0:
+        b1 = math.log2(mkl/mwl)
+    else:
+        b1 = 0.0
+    b0 = math.log2(max(y.mean(), 0.5)) - b1*mean_x - off.mean()
+    out = nb_glm_fit(y, X, off, a, np.array([b0, b1]))
+    if out is None:
+        nonconv+=1; continue
+    beta, VCV = out
+    lfc_mle[i]=beta[1]
+    se[i]=math.sqrt(max(VCV[1,1],1e-12))
+    zstat = beta[1]/se[i]
+    pval[i] = 2.0*(1.0-stats.norm.cdf(abs(zstat)))
+
+print(f"Non-converged genes: {nonconv}")
+
+# ---------- 5. LFC shrinkage (DESeq2 'normal' prior) ----------
+valid = ~np.isnan(se) & (se>0)
+# robust common-LFC variance estimate (DESeq2 'normal' prior):
+#   use var(lfc_mle) - mean(se^2), but guard against a handful of low-count genes
+#   whose SEs blow up (tiny expected info). Cap the per-gene se2 contribution at
+#   the 99th percentile so one outlier cannot dominate the mean.
+se2_all = se[valid]**2
+cap99 = np.percentile(se2_all, 99)
+se2 = np.minimum(se2_all, cap99)
+prior_var = max(np.var(lfc_mle[valid]) - np.mean(se2), 0.1)
+print(f"[diag] var(lfc_mle)={np.var(lfc_mle[valid]):.4f} mean(se2_capped@99)={np.mean(se2):.4f} "
+      f"n_at_cap(|lfc|>=14.9)={int((np.abs(lfc_mle[valid])>=14.9).sum())} se2_p99={cap99:.3f}")
+lfc_shrunk = lfc_mle.copy()
+lfc_shrunk[valid] = lfc_mle[valid]*se2/(se2+prior_var)
+print(f"prior_var (normal LFC shrinkage) = {prior_var:.4f}")
+
+# ---------- 6. DGE filter ----------
+def dge_set(pcol, use_adj=False):
+    f = (pcol<0.05) & (np.abs(lfc_shrunk)>1.0) & (baseMean>10.0)
+    up = f & (lfc_shrunk>0); dn = f & (lfc_shrunk<0)
+    return f, up, dn
+
+f_raw, up_raw, dn_raw = dge_set(pval)
+# BH-adjusted p for sensitivity
+p_for_bh = np.where(np.isnan(pval), 1.0, pval)
+adj = stats.false_discovery_control(p_for_bh)  # scipy BH
+f_adj, up_adj, dn_adj = dge_set(adj)
+
+def idset(mask): return set(ids[i] for i in np.where(mask)[0])
+dges_raw = idset(f_raw); dges_adj = idset(f_adj)
+
+# save full DE results table (evidence)
+import pandas as pd
+res = pd.DataFrame({
+  "geneID": ids,
+  "baseMean": baseMean,
+  "log2FC_MLE": lfc_mle,
+  "log2FC_shrunk": lfc_shrunk,
+  "SE": se,
+  "pvalue_raw": pval,
+  "padj_BH": adj,
+})
+res.to_csv("de_results.csv", index=False)
+res.loc[f_raw, ["geneID","baseMean","log2FC_MLE","log2FC_shrunk","pvalue_raw"]].to_csv(
+    "dgeseq_raw_table.csv", index=False)
+print("Wrote de_results.csv, dgeseq_raw_table.csv")
+
+# ---- prior_var sensitivity (normal-prior shrinkage is sensitive to prior_var) ----
+sens = {}
+_se2f = np.where(np.isnan(se), 1.0, se**2)   # full-length SE^2
+for _pv in [0.1, 0.2, 0.3, 0.5]:
+    _sh = lfc_mle*_se2f/(_se2f+_pv)
+    _f = (pval<0.05) & (np.abs(_sh)>1.0) & (baseMean>10.0)
+    sens[_pv] = int(_f.sum())
+# zero-group (boundary) genes with baseMean>10
+_zKL = K[:, idx_KL].sum(axis=1)==0; _zWL = K[:, idx_WL].sum(axis=1)==0
+_n_boundary_bm10 = int(((_zKL|_zWL)&(baseMean>10.0)).sum())
+
+print("\n===== DGE SUMMARY =====")
+print(f"Total genes: {n}")
+print(f"baseMean>10 genes: {int((baseMean>10).sum())}")
+print(f"RAW p<0.05 & |shrunkLFC|>1 & baseMean>10 : {int(f_raw.sum())}  (up={int(up_raw.sum())}, down={int(dn_raw.sum())})")
+print(f"ADJ p<0.05 (BH) & |shrunkLFC|>1 & baseMean>10 : {int(f_adj.sum())}  (up={int(up_adj.sum())}, down={int(dn_adj.sum())})")
+print(f"[sensitivity] RAW-p DGE count by prior_var: {sens}  (primary prior_var={prior_var:.3f})")
+print(f"[note] zero-group (boundary) genes with baseMean>10: {_n_boundary_bm10} (excluded; degenerate SE at LFC boundary)")
+
+# save DGE sets
+np.savetxt('dgeseq_raw.txt', np.array(sorted(dges_raw)), fmt='%s')
+np.savetxt('dgeseq_adj.txt', np.array(sorted(dges_adj)), fmt='%s')
+
+# ---------- 7. gseapy enrichment (expected to be blocked) ----------
+enrich_result = None; blocker = None
+try:
+    import gseapy as gp
+    # KEGG_2019_Mouse is keyed by Entrez IDs -> Ensembl->Entrez mapping required (no offline source)
+    enr = gp.enrichr(gene_list=sorted(dges_raw), gene_sets='KEGG_2019_Mouse',
+                     outdir=None, no_plot=True, verbose=False)
+    enr_df = enr.results
+    glut = enr_df[enr_df['Term'].str.contains('Glutathione metabolism', case=False, na=False)]
+    enrich_result = glut.to_dict('records')
+except ModuleNotFoundError as e:
+    blocker = ("gseapy NOT installed and cannot be installed (no network / no DNS in this "
+              "environment). Additionally the KEGG_2019_Mouse reference library is not cached "
+              "locally (gseapy downloads it on demand, requiring internet) and no Ensembl->Entrez "
+              "mapping source is available offline (biopython/KEGG REST unavailable). Therefore the "
+              "KEGG_2019_Mouse 'glutathione metabolism' enrichment/overlap cannot be executed here. "
+              f"Import error: {e}")
+except Exception as e:
+    blocker = f"gseapy enrichment failed: {type(e).__name__}: {e}"
+
+print("\n===== ENRICHMENT (gseapy / KEGG_2019_Mouse) =====")
+if enrich_result is not None:
+    print("GSEAPY RESULT:")
+    print(json.dumps(enrich_result, indent=2, default=str))
+else:
+    print("BLOCKED:", blocker)
+
+# persist summary
+summary = {
+  "n_genes": int(n),
+  "n_samples": int(m),
+  "KL": KL, "WL": WL,
+  "baseMean_gt10": int((baseMean>10).sum()),
+  "DGE_raw_p": {"total": int(f_raw.sum()), "up": int(up_raw.sum()), "down": int(dn_raw.sum())},
+  "DGE_adj_p": {"total": int(f_adj.sum()), "up": int(up_adj.sum()), "down": int(dn_adj.sum())},
+  "prior_var": float(prior_var),
+  "prior_var_sensitivity_rawp": {str(k): v for k,v in sens.items()},
+  "boundary_genes_basemean_gt10": _n_boundary_bm10,
+  "enrichment": enrich_result,
+  "blocker": blocker,
+}
+with open('summary.json','w') as f: json.dump(summary,f,indent=2,default=str)
+print("\nWrote summary.json, dgeseq_raw.txt, dgeseq_adj.txt")

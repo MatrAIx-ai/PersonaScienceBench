@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-5-q1 — ASXL1 fibroblasts: DE disease vs control + honest GO-BP status.
+Path B (researcher-approved): no GO annotations available offline -> GO BP ORA NOT computable.
+Pipeline: raw counts -> filter -> median-of-ratios size factors -> NB-GLM (statsmodels)
+primary ~condition, sensitivity ~sex+condition -> BH FDR -> (labeled, non-GO) gene_type ORA.
+"""
+import glob, os, sys
+import numpy as np, pandas as pd
+import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import hypergeom, spearmanr
+
+RNG = np.random.default_rng(0)
+OUT = "/workspace/results"
+os.makedirs(OUT, exist_ok=True)
+log = lambda *a: print(*a, flush=True)
+
+# ---------------- 0. Runtime re-check for GO annotation sources ----------------
+go_candidates = []
+for pat in ("*.obo", "*.gaf", "*.gpa", "goa_human*", "*gene2go*", "*.owl", "**/*.obo", "**/*.gaf"):
+    go_candidates += glob.glob(f"/workspace/{pat}", recursive=True) + glob.glob(f"/data/{pat}", recursive=True)
+GO_AVAILABLE = bool(go_candidates)
+log(f"[GO check] annotation files found at runtime: {go_candidates if GO_AVAILABLE else 'NONE'}")
+
+# ---------------- 1. Load inputs ----------------
+counts = pd.read_csv("data/Issy_ASXL1_fibro_featureCounts_GeneTable_final.txt", sep=r"\s+", index_col=0)
+coldata = pd.read_excel("data/Issy_ASXL1_fibro_coldata_gender.xlsx", sheet_name="Sheet1")
+gencode = pd.read_csv("data/gencode.v31.primary_assembly.genes.csv", dtype=str, low_memory=False)
+hgnc = pd.read_csv("data/HGNC_05-09-19.txt", sep="\t", dtype=str, low_memory=False)
+
+log(f"[load] counts {counts.shape}, coldata {coldata.shape}, gencode {gencode.shape}, hgnc {hgnc.shape}")
+
+# sample sync: drop counts columns without metadata
+missing_meta = [s for s in counts.columns if s not in set(coldata["sample"])]
+log(f"[sync] count-table samples without metadata (dropped): {missing_meta}")
+counts = counts[[s for s in counts.columns if s in set(coldata["sample"])]]
+coldata = coldata.set_index("sample").loc[counts.columns]
+assert coldata["condition"].notna().all() and coldata["sex"].notna().all()
+log(f"[design] n={len(coldata)}, condition={coldata['condition'].value_counts().to_dict()}, sex={coldata['sex'].value_counts().to_dict()}")
+
+# ID -> symbol mapping (hgnc_id -> Approved symbol, fallback gene_name)
+hg = hgnc.set_index("HGNC ID")["Approved symbol"]
+gencode = gencode.set_index("gene_id")
+sym = gencode["hgnc_id"].map(hg).fillna(gencode["gene_name"])
+gtype = gencode["gene_type"]
+
+# ---------------- 2. Filtering ----------------
+keep = (counts >= 10).sum(axis=1) >= 7          # >=10 reads in >= min group size samples
+keep &= counts.sum(axis=1) > 0
+counts_f = counts.loc[keep]
+log(f"[filter] genes total={counts.shape[0]}, all-zero={int((counts.sum(axis=1)==0).sum())}, "
+    f"tested after filter={counts_f.shape[0]}")
+
+# ---------------- 3. Size factors (median-of-ratios, poscounts fallback) ----------------
+Y = counts_f.values.astype(float)
+pos = Y > 0
+logY = np.where(pos, np.log(Y), np.nan)
+geo = np.exp(np.nanmean(logY, axis=1))
+valid = np.isfinite(geo) & (geo > 0)
+sf = np.median(Y[valid] / geo[valid][:, None], axis=0)
+sf = sf / np.exp(np.mean(np.log(sf)))
+offset = np.log(sf)
+log(f"[size factors] {np.round(sf,4).tolist()}")
+
+# ---------------- 4. Dispersion: MoM toward fitted trend (DESeq2-like) ----------------
+Yn = Y / sf                                     # normalized counts
+def nb_glm(y, X, off, alpha):
+    fam = sm.families.NegativeBinomial(alpha=alpha)
+    return sm.GLM(y, X, family=fam, offset=off).fit(maxiter=100, tol=1e-8)
+
+X1 = np.column_stack([np.ones(Y.shape[1]), (coldata["condition"] == "disease").astype(float).values])
+X2 = np.column_stack([X1, (coldata["sex"] == "M").astype(float).values])
+
+# null model (intercept) at near-Poisson alpha for MoM dispersion
+mu0 = np.empty_like(Y)
+for g in range(Y.shape[0]):
+    r = nb_glm(Y[g], np.ones((Y.shape[1], 1)), offset, 1e-6)
+    mu0[g] = r.fittedvalues
+var_res = Y - mu0
+alpha_mom = (var_res**2 - mu0).sum(1) / np.maximum(mu0**2, 1e-12).sum(1)
+
+# trend: binned median alpha vs mean expression, monotone interp in log-log space
+mb = np.log10(np.maximum(mu0.mean(1), 1e-3))
+bins = np.quantile(mb, np.linspace(0, 1, 41)); bins[0] -= 1e-9
+tb = np.clip(mb, bins[0], bins[-1])
+idx = np.digitize(tb, bins) - 1
+trend_bin, centers = [], []
+for b in sorted(set(idx)):
+    a = alpha_mom[idx == b]
+    a = a[a > 1e-8]
+    if len(a) >= 30:
+        trend_bin.append(np.median(a)); centers.append(np.log10(np.maximum(mu0[idx == b].mean(1).mean(), 1e-3)))
+centers, trend_bin = np.array(centers), np.array(trend_bin)
+alpha_trend = np.interp(mb, centers, np.log10(trend_bin)); alpha_trend = 10**alpha_trend
+# shrink MoM toward trend (log-space, weight w=5, n_eff=12), final = max(trend, shrunk), floor 1e-8
+w, n_eff = 5.0, 12.0
+with np.errstate(divide="ignore"):
+    alpha_trend = np.clip(alpha_trend, 1e-8, None)
+    la = np.where(alpha_mom > 1e-8, np.log(np.clip(alpha_mom,1e-12,None)), np.log(alpha_trend))
+shrunk = np.exp((w * np.log(alpha_trend) + n_eff * la) / (w + n_eff))
+alpha_final = np.maximum(alpha_trend, shrunk)
+alpha_final = np.clip(alpha_final, 1e-8, 50.0)
+log(f"[dispersion] trend medians (min/med/max): {np.min(trend_bin):.3g}/{np.median(trend_bin):.3g}/{np.max(trend_bin):.3g}; "
+    f"final alpha med={np.median(alpha_final):.3g}")
+
+# ---------------- 5. NB-GLM Wald tests, both models ----------------
+def run_model(X, tag):
+    res = []
+    for g in range(Y.shape[0]):
+        y = Y[g]
+        try:
+            f = nb_glm(y, X, offset, alpha_final[g])
+            b = f.params[1]; se = np.sqrt(f.cov_params()[1, 1])  # condition is column 1 in both designs
+            if not np.isfinite(b) or not np.isfinite(se) or se <= 0: raise ValueError
+            res.append((b, b / se, 2 * __import__("scipy").stats.norm.sf(abs(b / se))))
+        except Exception:
+            res.append((np.nan, np.nan, np.nan))
+    r = pd.DataFrame(res, columns=["log2FC", "z", "pval"], index=counts_f.index)
+    r["log2FC"] *= np.log2(np.e)  # GLM coefficient on log-e counts -> log2
+    ok = r["pval"].notna().values
+    if r["pval"].notna().any():
+        r.loc[r["pval"].notna(), "padj"] = multipletests(r["pval"].dropna().values, method="fdr_bh")[1]
+    log(f"[model {tag}] genes fitted ok={ok.sum()}, failed={(~ok).sum()}")
+    return r
+
+res1 = run_model(X1, "~condition (primary)")
+res2 = run_model(X2, "~sex+condition (sensitivity)")
+
+for name, r in (("primary", res1), ("sensitivity", res2)):
+    r.to_csv(f"{OUT}/de_{name}.csv")
+    for thr in (0.05, 0.1):
+        up = int(((r.padj < thr) & (r.log2FC > 0)).sum()); dn = int(((r.padj < thr) & (r.log2FC < 0)).sum())
+        log(f"[{name}] padj<{thr}: up={up}, down={dn}")
+    top = r.dropna().sort_values("pval").head(15)
+    log(f"[{name}] top genes:\n" + pd.DataFrame({
+        "symbol": top.index.map(sym), "log2FC": top.log2FC.round(3),
+        "padj": top.padj.apply(lambda v: f"{v:.3g}")}).to_string())
+
+# primary vs sensitivity comparison
+both = res1.dropna().join(res2.dropna(), lsuffix="_1", rsuffix="_2", how="inner")
+shared05 = int(((both.padj_1 < .05) & (both.padj_2 < .05)).sum())
+r1only = int(((both.padj_1 < .05) & (both.padj_2 >= .05)).sum())
+sp = spearmanr(both.log2FC_1, both.log2FC_2)[0]
+log(f"[compare] shared padj<0.05: {shared05}; primary-only: {r1only}; "
+    f"sensitivity-only: {int(((both.padj_2<.05)&(both.padj_1>=.05)).sum())}; "
+    f"Spearman log2FC rho={sp:.3f}")
+
+# ---------------- 6. ORA ----------------
+if GO_AVAILABLE:
+    log("[ORA] GO annotation files detected -> would run canonical GO BP ORA here")
+else:
+    log("[ORA] GO enrichment NOT computable from supplied inputs (no *.obo/*.gaf anywhere, "
+        "HGNC file has no GO columns, no network egress). NOT fabricating GO terms.")
+    # sanity-check ORA on gencode gene_type — explicitly NOT GO BP
+    q = res1[(res1.padj < 0.05) & (res1.log2FC > 0)].index
+    bg = res1.dropna().index
+    q_ids, bg_ids = set(q), set(bg)
+    N, K = len(bg_ids), len(q_ids & bg_ids)
+    gt_of_bg = gtype.loc[list(bg)]
+    rows = []
+    for gt in gt_of_bg.value_counts().index:
+        s = set(gt_of_bg.index[gt_of_bg == gt])
+        k = len(q_ids & s)
+        rows.append({"gene_type": gt, "query_hits": k, "set_size": len(s),
+                     "fold": (k / K) / (len(s) / N) if k else np.nan,
+                     "pval": hypergeom.sf(k - 1, N, len(s), K)})
+    ora = pd.DataFrame(rows)
+    ora["padj"] = multipletests(ora["pval"].fillna(1), method="fdr_bh")[1]
+    ora.sort_values("pval").to_csv(f"{OUT}/ora_gene_type_NOT_GO_BP.csv", index=False)
+    log("[ORA gene_type — *** NOT GO BP, sanity check only ***]\n" +
+        ora.sort_values("pval").head(8).to_string(index=False))
+    log(f"[ORA gene_type] query set: up-in-disease padj<0.05, n={K} genes; background n={N} tested genes")
+    qc = res1.join(pd.DataFrame({"sym": sym, "gt": gtype}), how="left").dropna(subset=["padj"])
+    log("[top up-in-disease genes]:\n" + qc[qc.padj<0.05].sort_values("log2FC",ascending=False)[["sym","log2FC","padj"]].head(20).to_string())
+
+# supporting evidence: ASXL1 itself
+asl = res1[res1.index.str.startswith("ENSG00000162041")]
+if len(asl): log(f"[support] ASXL1 ({asl.index[0]} -> {sym[asl.index[0]]}): log2FC={asl.log2FC.iloc[0]:.3f}, padj={asl.padj.iloc[0]:.3g}")
+log("[DONE]")

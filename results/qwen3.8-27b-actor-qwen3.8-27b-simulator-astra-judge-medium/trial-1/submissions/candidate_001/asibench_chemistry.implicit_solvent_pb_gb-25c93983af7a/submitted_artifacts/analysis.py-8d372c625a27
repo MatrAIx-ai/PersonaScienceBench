@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""
+Continuum-electrostatics binding-response analysis (8-case suite).
+
+Primary metric  : finite-volume Poisson-Boltzmann reaction-field response.
+  - Per entity (assembly / part_a / part_b) on the case grid:
+      * voxel masks from sites.csv atom radii; SAS = r+probe;
+        SES = (dilate(SAS,probe) & ~VDW) | VDW; SDF = edt(outside)-edt(inside).
+      * dielectric eps = eps_in + (eps_out-eps_in)*sf, sf from SDF
+        (sharp outside-of-SES indicator, or tanh transition with manifest window).
+      * 7-point finite-volume operator, harmonic face-averaged dielectric,
+        screening kappa^2*sf; interior unknowns, zero Dirichlet boundary.
+      * RHS = 4*pi*332.06371 * CIC charge (trilinear cloud-in-cell / s^3).
+      * linearized regime: linear solve; nonlinear regime:
+        L phi - kappa^2*sf*sinh(phi/(R*T)) = RHS, damped Newton w/ continuation.
+      * vacuum subtraction: same grid, uniform eps_in, sf=0, kappa=0.
+      * E_entity = 0.5 * sum_i q_i * (phi_medium - phi_vacuum)(r_i), trilinear.
+  - metric_primary = E_assembly - E_part_a - E_part_b (manifest binding expr).
+
+Secondary metric: compact Born cross term between part_a and part_b sites,
+  a_i = max(radius_i, |SDF_component| at site),
+  f_ij = sqrt(r_ij^2 + a_i a_j exp(-r_ij^2/(4 a_i a_j))),
+  secondary = -332.06371 * sum_{i in a, j in b} q_i q_j
+              * ((1/eps_in) - exp(-kappa f_ij)/eps_out) / f_ij,
+  with a 6.5 A nearest-site gate on part_a sites.
+"""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from scipy import ndimage
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import cg, splu
+
+R_GAS = 1.9872042586   # kcal/(mol K)
+COULOMB = 332.06371    # kcal A / (mol e^2)
+GATE = 6.5             # Angstrom, secondary cross-term cutoff
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(BASE, "data")
+OUT = os.path.join(BASE, "results")
+os.makedirs(OUT, exist_ok=True)
+
+NEIGHBORS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+
+
+def node_coords(center, spacing, n):
+    return np.array(center) + (np.arange(n) - (n - 1) / 2.0) * spacing
+
+
+def build_vdw_sas(sites, probe, xs, ys, zs, s):
+    """sites: (m,4) x,y,z,r.  Returns voxel masks (VDW, SAS)."""
+    nx, ny, nz = len(xs), len(ys), len(zs)
+    vdw = np.zeros((nx, ny, nz), bool)
+    sas = np.zeros((nx, ny, nz), bool) if probe > 0 else vdw
+    for x, y, z, r in sites:
+        if r <= 0:
+            continue
+        for mask, rad in ((vdw, r), (sas, r + probe)):
+            i0 = max(0, int(np.floor((x - rad) / s)))
+            i1 = min(nx - 1, int(np.ceil((x + rad) / s)))
+            j0 = max(0, int(np.floor((y - rad) / s)))
+            j1 = min(ny - 1, int(np.ceil((y + rad) / s)))
+            k0 = max(0, int(np.floor((z - rad) / s)))
+            k1 = min(nz - 1, int(np.ceil((z + rad) / s)))
+            if i0 > i1 or j0 > j1 or k0 > k1:
+                continue
+            d2 = ((xs[i0:i1 + 1, None, None] - x) ** 2
+                  + (ys[None, j0:j1 + 1, None] - y) ** 2
+                  + (zs[None, None, k0:k1 + 1] - z) ** 2)
+            mask[i0:i1 + 1, j0:j1 + 1, k0:k1 + 1] |= d2 <= rad * rad
+    return vdw, sas
+
+
+def sdf_from_mask(mask, s):
+    d_out = ndimage.distance_transform_edt(~mask) * s
+    d_in = ndimage.distance_transform_edt(mask) * s
+    return d_out - d_in
+
+
+def entity_sdf(sites, probe, xs, ys, zs, s):
+    vdw, sas = build_vdw_sas(sites, probe, xs, ys, zs, s)
+    if probe > 0:
+        d_sas = ndimage.distance_transform_edt(~sas) * s
+        ses = (d_sas <= probe) & ~vdw
+        ses |= vdw
+    else:
+        ses = vdw
+    return sdf_from_mask(ses, s)
+
+
+def deposit_cic(coords, charges, origin, s, n):
+    """Trilinear cloud-in-cell deposition of point charges onto the grid."""
+    Q = np.zeros((n, n, n), float)
+    u = (np.asarray(coords, float) - np.asarray(origin, float)) / s
+    i0 = np.floor(u).astype(int)
+    fr = u - i0
+    q = np.asarray(charges, float)
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                ix = np.clip(i0[:, 0] + dx, 0, n - 1)
+                iy = np.clip(i0[:, 1] + dy, 0, n - 1)
+                iz = np.clip(i0[:, 2] + dz, 0, n - 1)
+                w = (np.where(dx == 1, fr[:, 0], 1 - fr[:, 0])
+                     * np.where(dy == 1, fr[:, 1], 1 - fr[:, 1])
+                     * np.where(dz == 1, fr[:, 2], 1 - fr[:, 2]))
+                np.add.at(Q, (ix, iy, iz), q * w)
+    return Q
+
+
+def trilinear(G, pts, origin, s):
+    """Trilinear interpolation of grid G at absolute coordinate points."""
+    n = G.shape[0]
+    u = (np.asarray(pts, float) - np.asarray(origin, float)) / s
+    i0 = np.floor(u).astype(int)
+    fr = u - i0
+    out = np.zeros(len(pts))
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                ix = np.clip(i0[:, 0] + dx, 0, n - 1)
+                iy = np.clip(i0[:, 1] + dy, 0, n - 1)
+                iz = np.clip(i0[:, 2] + dz, 0, n - 1)
+                w = (np.where(dx == 1, fr[:, 0], 1 - fr[:, 0])
+                     * np.where(dy == 1, fr[:, 1], 1 - fr[:, 1])
+                     * np.where(dz == 1, fr[:, 2], 1 - fr[:, 2]))
+                out += w * G[ix, iy, iz]
+    return out
+
+
+# ----------------------------------------------------------------------
+# Poisson-Boltzmann operator / solves
+# ----------------------------------------------------------------------
+def build_operator(eps, sf, kappa, s):
+    """7-point finite-volume operator on interior nodes, zero Dirichlet boundary.
+    Returns A (ni^3 x ni^3) over C-order flattened interior."""
+    n = eps.shape[0]
+    ni = n - 2
+    rows, cols, vals = [], [], []
+    for i in range(1, n - 1):
+        for j in range(1, n - 1):
+            for k in range(1, n - 1):
+                p = ((i - 1) * ni + (j - 1)) * ni + (k - 1)
+                diag = 0.0
+                for di, dj, dk in NEIGHBORS:
+                    ni_, nj, nk = i + di, j + dj, k + dk
+                    e1 = eps[i, j, k]
+                    e2 = eps[ni_, nj, nk]
+                    w = s * (2.0 / (1.0 / e1 + 1.0 / e2))
+                    diag += w
+                    if 1 <= ni_ <= n - 2 and 1 <= nj <= n - 2 and 1 <= nk <= n - 2:
+                        q = ((ni_ - 1) * ni + (nj - 1)) * ni + (nk - 1)
+                        rows.append(p); cols.append(q); vals.append(-w)
+                diag -= (kappa ** 2) * sf[i, j, k] * s ** 3
+                rows.append(p); cols.append(p); vals.append(diag)
+    return coo_matrix((vals, (rows, cols)), shape=(ni ** 3, ni ** 3)).tocsr()
+
+
+def solve_linear(A, b):
+    # conjugate gradients (SPD operator) with direct-solve fallback
+    x, info = cg(A, b, rtol=1e-12, maxiter=5000)
+    if info != 0:
+        x = splu(A.tocsc()).solve(b)
+    return x
+
+
+def solve_nonlinear(A, sf_int, kappa, s, b, phiB, phi0):
+    """Damped Newton with kappa-continuation for
+    A phi - kappa^2 s^3 sf sinh(phi/phiB) = b.  Returns (phi, method)."""
+    nsteps = 6
+    phi = phi0.copy()
+    for m in range(1, nsteps + 1):
+        kap = kappa * m / nsteps
+        c = kap ** 2 * s ** 3
+        res = np.inf
+        for it in range(60):
+            F = A @ phi - c * sf_int * np.sinh(phi / phiB) - b
+            res = np.max(np.abs(F))
+            if res < 1e-8 * max(1.0, np.max(np.abs(b))):
+                break
+            J = (A - diags(c * sf_int * np.cosh(phi / phiB) / phiB)).tocsr()
+            d = splu(J.tocsc()).solve(-F)
+            alpha = 1.0
+            F0 = res
+            for _ in range(40):
+                trial = phi + alpha * d
+                Ft = A @ trial - c * sf_int * np.sinh(trial / phiB) - b
+                if np.max(np.abs(Ft)) < F0:
+                    phi, res, F0 = trial, np.max(np.abs(Ft)), np.max(np.abs(Ft))
+                    break
+                alpha *= 0.5
+        if m == nsteps and res < 1e-8 * max(1.0, np.max(np.abs(b))):
+            return phi, "newton"
+    # fallback: damped fixed point at full kappa
+    c = kappa ** 2 * s ** 3
+    fac = splu(A.tocsc())
+    for _ in range(5000):
+        phi_new = fac.solve(b + c * sf_int * np.sinh(phi / phiB))
+        phi_next = 0.5 * phi + 0.5 * phi_new
+        if np.max(np.abs(phi_next - phi)) < 1e-9:
+            return phi_next, "damped_fixed_point"
+        phi = phi_next
+    return phi, "damped_fixed_point(maxit)"
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+def main():
+    manifest = json.load(open(os.path.join(DATA, "manifest.json")))
+    plane_spec = json.load(open(os.path.join(DATA, "plane_spec.json")))
+    planes = {p["case_id"]: p for p in plane_spec["planes"]}
+    sites_df = pd.read_csv(os.path.join(DATA, "sites.csv"))
+    vol_a = np.load(os.path.join(DATA, "volume_a.npy"))
+    vol_b = np.load(os.path.join(DATA, "volume_b.npy"))
+    queries = np.load(os.path.join(DATA, "queries.npy"))
+
+    order = manifest["case_order"]
+    n_cases = len(order)
+    field_samples = np.zeros((n_cases, 24), float)
+    field_slice = np.zeros((n_cases, 35, 35), float)
+    rows = []
+    solver_log = []
+
+    for ci, case in enumerate(manifest["cases"]):
+        cid = case["case_id"]
+        g = case["grid"]
+        rp = case["response_parameters"]
+        sp = case["surface_parameters"]
+        n = g["shape"][0]
+        s = g["spacing_angstrom"]
+        origin = np.array(g["box_center_angstrom"]) - (n - 1) / 2.0 * s
+        xs = origin[0] + np.arange(n) * s
+        ys = origin[1] + np.arange(n) * s
+        zs = origin[2] + np.arange(n) * s
+        probe = sp["probe_radius_angstrom"]
+        window = sp["smoothing_window_angstrom"]
+        eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+        kappa = rp["screening_kappa_per_angstrom"]
+        regime = rp["response_regime"]
+        phiB = R_GAS * rp["temperature_kelvin"]
+
+        sub = sites_df[sites_df["case_id"] == cid]
+        ent_sites, ent_charge, ent_sdf = {}, {}, {}
+        for ent in ("assembly", "part_a", "part_b"):
+            st = sub[sub["entity_id"] == ent]
+            ent_sites[ent] = st[["x_angstrom", "y_angstrom", "z_angstrom",
+                                 "radius_angstrom"]].to_numpy(float)
+            ent_charge[ent] = st["charge_e"].to_numpy(float)
+
+        # authoritative assembly surface from provided tensors (matches the
+        # case surface settings: probe>0 or smol -> volume_b, else volume_a)
+        ent_sdf["assembly"] = (vol_b[ci] if (probe > 0 or sp["surface_model"] == "smol")
+                               else vol_a[ci]).astype(float)
+        for ent in ("part_a", "part_b"):
+            ent_sdf[ent] = entity_sdf(ent_sites[ent], probe, xs, ys, zs, s)
+
+        energies = {}
+        for ent in ("assembly", "part_a", "part_b"):
+            sdf = ent_sdf[ent]
+            sf = (0.5 * (1.0 + np.tanh(sdf / window)) if window > 0
+                  else (sdf > 0).astype(float))
+            eps = eps_in + (eps_out - eps_in) * sf
+            Q = deposit_cic(ent_sites[ent][:, :3], ent_charge[ent], origin, s, n)
+            b = 4.0 * np.pi * COULOMB * Q[1:n - 1, 1:n - 1, 1:n - 1].ravel()
+
+            A = build_operator(eps, sf, kappa, s)
+            sf_int = sf[1:n - 1, 1:n - 1, 1:n - 1].ravel()
+            phi_lin = solve_linear(A, b)
+            if regime == "linearized_screening":
+                phi_med, method = phi_lin, "linear"
+            else:
+                phi_med, method = solve_nonlinear(A, sf_int, kappa, s, b, phiB,
+                                                  phi_lin)
+            # vacuum solve: uniform eps_in, sf=0, kappa=0, same charges
+            A_vac = build_operator(np.full_like(eps, eps_in),
+                                   np.zeros_like(sf), 0.0, s)
+            phi_vac = solve_linear(A_vac, b)
+
+            phi_r = np.zeros((n, n, n))
+            ni = n - 2
+            phi_r[1:n - 1, 1:n - 1, 1:n - 1] = (phi_med - phi_vac).reshape(ni, ni, ni)
+
+            E = 0.5 * float(np.sum(ent_charge[ent]
+                                   * trilinear(phi_r, ent_sites[ent][:, :3],
+                                               origin, s)))
+            energies[ent] = E
+            solver_log.append((cid, ent, regime, method))
+            if ent == "assembly":
+                field_samples[ci] = trilinear(phi_r, queries[ci], origin, s)
+                p = planes[cid]
+                if p["axis"] == "z":
+                    field_slice[ci] = phi_r[:, :, p["plane_index"]]
+                else:  # "y"
+                    field_slice[ci] = phi_r[:, p["plane_index"], :]
+
+        primary = energies["assembly"] - energies["part_a"] - energies["part_b"]
+
+        # ---------------- secondary Born cross term ----------------
+        A_s, B_s = ent_sites["part_a"], ent_sites["part_b"]
+        qA, qB = ent_charge["part_a"], ent_charge["part_b"]
+        dA = np.abs(trilinear(ent_sdf["part_a"], A_s[:, :3], origin, s))
+        dB = np.abs(trilinear(ent_sdf["part_b"], B_s[:, :3], origin, s))
+        aA = np.maximum(A_s[:, 3], dA)
+        aB = np.maximum(B_s[:, 3], dB)
+        D = np.linalg.norm(A_s[:, None, :3] - B_s[None, :, :3], axis=2)
+        keep = D.min(axis=1) <= GATE
+        total = 0.0
+        for i in np.where(keep)[0]:
+            r_ij = D[i]
+            f = np.sqrt(r_ij ** 2 + aA[i] * aB * np.exp(-r_ij ** 2 / (4 * aA[i] * aB)))
+            total += qA[i] * np.sum(qB * ((1 / eps_in) - np.exp(-kappa * f) / eps_out) / f)
+        secondary = -COULOMB * total
+
+        rows.append({"case_id": cid,
+                     "metric_primary_kcal_mol": primary,
+                     "metric_secondary_kcal_mol": secondary,
+                     "metric_gap_kcal_mol": primary - secondary})
+        print(f"{cid}: primary={primary:.6f} secondary={secondary:.6f} "
+              f"gap={primary - secondary:.6f}  "
+              f"E(asmb,a,b)=({energies['assembly']:.4f},{energies['part_a']:.4f},"
+              f"{energies['part_b']:.4f})")
+
+    # ---------------- outputs ----------------
+    df = pd.DataFrame(rows, columns=["case_id", "metric_primary_kcal_mol",
+                                     "metric_secondary_kcal_mol",
+                                     "metric_gap_kcal_mol"])
+    assert list(df["case_id"]) == order
+    np.testing.assert_allclose(df["metric_gap_kcal_mol"],
+                               df["metric_primary_kcal_mol"]
+                               - df["metric_secondary_kcal_mol"], rtol=0, atol=0)
+    df.to_csv(os.path.join(OUT, "summary_metrics.csv"), index=False)
+    np.save(os.path.join(OUT, "field_samples.npy"), field_samples.astype(np.float32))
+    np.save(os.path.join(OUT, "field_slice.npy"), field_slice.astype(np.float32))
+
+    # ---------------- overview figure ----------------
+    make_overview(field_slice, df, order, os.path.join(OUT, "overview.png"))
+
+    print("\nSolver methods:")
+    for entry in solver_log:
+        print("  ", entry)
+    print("\nfield_samples:", field_samples.shape, field_samples.dtype)
+    print("field_slice:", field_slice.shape, field_slice.dtype)
+    print("\nsummary_metrics.csv:")
+    print(df.to_string(index=False))
+
+
+# ----------------------------------------------------------------------
+# overview figure: matplotlib when available, pure-python PNG otherwise
+# ----------------------------------------------------------------------
+_FONT = {
+ "A": (14,17,17,31,17,17,17), "B": (30,17,30,17,17,17,30), "C": (14,17,16,16,16,17,14),
+ "D": (28,18,17,17,17,18,28), "E": (31,16,30,16,16,16,31), "F": (31,16,30,16,16,16,16),
+ "G": (14,17,16,23,17,17,15), "H": (17,17,31,17,17,17,17), "I": (14,4,4,4,4,4,14),
+ "J": (7,2,2,2,2,18,12), "K": (17,18,20,24,20,18,17), "L": (16,16,16,16,16,16,31),
+ "M": (17,27,21,21,17,17,17), "N": (17,25,21,19,17,17,17), "O": (14,17,17,17,17,17,14),
+ "P": (30,17,17,30,16,16,16), "Q": (14,17,17,17,21,18,13), "R": (30,17,17,30,20,18,17),
+ "S": (15,16,16,14,1,1,30), "T": (31,4,4,4,4,4,4), "U": (17,17,17,17,17,17,14),
+ "V": (17,17,17,17,17,10,4), "W": (17,17,17,21,21,27,17), "X": (17,17,10,4,10,17,17),
+ "Y": (17,17,10,4,4,4,4), "Z": (31,1,2,4,8,16,31),
+ "0": (14,17,19,21,25,17,14), "1": (4,12,4,4,4,4,14), "2": (14,17,1,2,4,8,31),
+ "3": (14,17,1,6,1,17,14), "4": (2,6,10,18,31,2,2), "5": (31,16,30,1,1,17,14),
+ "6": (6,8,16,30,17,17,14), "7": (31,1,2,4,8,8,8), "8": (14,17,17,14,17,17,14),
+ "9": (14,17,17,15,1,2,12),
+ "_": (0,0,0,0,0,0,31), "-": (0,0,0,31,0,0,0), ".": (0,0,0,0,0,0,4),
+ "(": (2,4,8,8,8,4,2), ")": (8,4,2,2,2,4,8), "/": (1,2,2,4,8,8,16),
+ ":": (0,4,0,0,4,0,0), " ": (0,0,0,0,0,0,0),
+}
+
+
+def _draw_text(rgb, x, y, text, scale, color):
+    cx = x
+    for ch in text.upper():
+        g = _FONT.get(ch, (0,) * 7)
+        for r in range(7):
+            bits = g[r]
+            for c in range(5):
+                if bits & (16 >> c):
+                    rgb[y + r * scale: y + (r + 1) * scale,
+                        cx + c * scale: cx + (c + 1) * scale] = color
+        cx += 6 * scale
+
+
+def _diverging_rgb(t):
+    """t in [-1,1] -> (H,W,3) uint8, blue(-) white(0) red(+) diverging map."""
+    t = np.clip(np.asarray(t, float), -1.0, 1.0)
+    a = np.abs(t)
+    r = np.where(t > 0, 255 - t * 77, 255 - a * 222)
+    g = np.where(t > 0, 255 - t * 231, 255 - a * 153)
+    b = np.where(t > 0, 255 - t * 212, 255)
+    return np.stack([r, g, b], axis=-1).clip(0, 255).astype(np.uint8)
+
+
+def _write_png(path, rgb):
+    import zlib, struct
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    h, w = rgb.shape[:2]
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def _overview_pure(field_slice, df, order, path):
+    W, H = 1900, 860
+    rgb = np.full((H, W, 3), 255, np.uint8)
+    lim = np.percentile(np.abs(field_slice), 99.5)
+    _draw_text(rgb, W // 2 - 330, 12,
+               "PB BINDING RESPONSE: REACTION-FIELD SLICES AND METRICS", 2, (0, 0, 0))
+    # top row: 8 field slices + shared colorbar
+    pw, ph = 200, 200
+    x0, y0, gap = 25, 60, 25
+    for i in range(len(order)):
+        x = x0 + i * (pw + gap)
+        z = field_slice[i] / lim
+        img = _diverging_rgb(z)
+        up = np.repeat(np.repeat(img, 6, axis=0), 6, axis=1)[:ph, :pw]
+        rgb[y0:y0 + ph, x:x + pw] = up
+        _draw_text(rgb, x + pw // 2 - 24, y0 + ph + 8, order[i], 1, (0, 0, 0))
+    cbx = x0 + 8 * (pw + gap) + 5
+    for r in range(ph):
+        t = 1 - 2 * r / (ph - 1)
+        rgb[y0 + r:y0 + r + 1, cbx:cbx + 18] = _diverging_rgb(np.array([t]))[0]
+    for val, yy in ((lim, y0), (0, y0 + ph // 2), (-lim, y0 + ph - 1)):
+        rgb[yy, cbx - 4:cbx] = (0, 0, 0)
+        lab = ("+%d" % int(round(val))) if val > 0 else ("%d" % int(round(val)))
+        _draw_text(rgb, cbx + 22, yy - 3, lab, 1, (0, 0, 0))
+    # bottom row: grouped bars
+    prim = df["metric_primary_kcal_mol"].to_numpy()
+    sec = df["metric_secondary_kcal_mol"].to_numpy()
+    gapv = df["metric_gap_kcal_mol"].to_numpy()
+    ax_l, ax_r, ax_b, ax_t = 70, W - 40, 800, 430
+    vmax = max(np.abs(prim).max(), np.abs(sec).max(), np.abs(gapv).max()) * 1.15
+    yz = int(ax_t + (ax_b - ax_t) / 2)
+    rgb[yz, ax_l:ax_r] = (80, 80, 80)
+    for val in (vmax, -vmax):
+        yy = int(ax_t + (ax_b - ax_t) * (1 - (val + vmax) / (2 * vmax)))
+        rgb[yy, ax_l:ax_r] = (220, 220, 220)
+        _draw_text(rgb, 8, yy - 3, ("%d" % int(round(val))), 1, (60, 60, 60))
+    _draw_text(rgb, ax_l, ax_t - 22, "KCAL/MOL", 1, (60, 60, 60))
+    gw = (ax_r - ax_l) / len(order)
+    bw = gw * 0.24
+    colors = ((31, 119, 180), (255, 127, 14), (44, 160, 44))
+    for i in range(len(order)):
+        cx = ax_l + gw * i + gw / 2
+        for k, (val, col) in enumerate(zip((prim[i], sec[i], gapv[i]), colors)):
+            xx = cx + (k - 1) * bw - bw / 2
+            yy = int(ax_t + (ax_b - ax_t) * (1 - (val + vmax) / (2 * vmax)))
+            top, bot = (min(yy, yz), max(yy, yz))
+            if bot - top < 1:
+                bot = top + 1
+            rgb[top:bot, int(xx):int(xx + bw)] = col
+        _draw_text(rgb, int(cx) - 24, ax_b + 8, order[i], 1, (0, 0, 0))
+    # legend
+    lx = ax_l + 20
+    for k, (lab, col) in enumerate((("PRIMARY (PB)", colors[0]),
+                                    ("SECONDARY (BORN CROSS-TERM)", colors[1]),
+                                    ("GAP (PRIMARY - SECONDARY)", colors[2]))):
+        yy = 396 + k * 18
+        rgb[yy:yy + 12, lx:lx + 12] = col
+        _draw_text(rgb, lx + 18, yy, lab, 1, (0, 0, 0))
+        lx += 18 + len(lab) * 6 + 40
+    _write_png(path, rgb)
+
+
+def make_overview(field_slice, df, order, path):
+    """2-row overview figure: 8 reaction-field slices + metric bars."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        lim = np.percentile(np.abs(field_slice), 99.5)
+        fig = plt.figure(figsize=(18, 8.5))
+        gs = fig.add_gridspec(2, 8, height_ratios=[1.25, 1.0],
+                              left=0.04, right=0.97, top=0.90, bottom=0.10,
+                              hspace=0.42, wspace=0.45)
+        for i in range(len(order)):
+            ax = fig.add_subplot(gs[0, i])
+            im = ax.imshow(field_slice[i], origin="lower", aspect="equal",
+                           cmap="RdBu_r", vmin=-lim, vmax=lim)
+            ax.set_title(order[i], fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            cb = fig.colorbar(im, ax=ax, fraction=0.35, pad=0.02)
+            cb.ax.tick_params(labelsize=6)
+        axb = fig.add_subplot(gs[1, :])
+        prim = df["metric_primary_kcal_mol"].to_numpy()
+        sec = df["metric_secondary_kcal_mol"].to_numpy()
+        gapv = df["metric_gap_kcal_mol"].to_numpy()
+        x = np.arange(len(order))
+        w = 0.26
+        axb.bar(x - w, prim, width=w, label="primary (PB)", color="#1f77b4")
+        axb.bar(x, sec, width=w, label="secondary (Born cross-term)", color="#ff7f0e")
+        axb.bar(x + w, gapv, width=w, label="gap (primary - secondary)", color="#2ca02c")
+        axb.axhline(0, color="k", lw=0.6)
+        axb.set_xticks(x)
+        axb.set_xticklabels(order, fontsize=8)
+        axb.set_ylabel("kcal/mol")
+        axb.set_title("Binding-response metrics per case", fontsize=10)
+        axb.legend(fontsize=8, loc="best")
+        axb.grid(axis="y", alpha=0.3)
+        fig.suptitle("Implicit-solvent PB binding response: reaction-field slices and metrics",
+                     fontsize=12)
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+    except Exception:
+        _overview_pure(field_slice, df, order, path)
+
+
+if __name__ == "__main__":
+    main()

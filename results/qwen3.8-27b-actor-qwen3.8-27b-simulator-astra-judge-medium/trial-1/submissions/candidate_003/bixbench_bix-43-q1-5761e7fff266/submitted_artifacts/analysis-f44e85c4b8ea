@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BixBench bix-43-q1 main analysis.
+Question: CBD/cisplatin combination (group 9: Cisplatin_IC50_CBD_IC50) vs DMSO
+control (group 3: DMSO) -> cellular process with the LOWEST adjusted p-value in a
+gseapy enrichment analysis using the GO_Biological_Process_2021 gene-set library.
+
+Pipeline:
+ 1. Load raw counts (ENSG x 30 samples), map ENSG -> gene_name (1:1 file).
+ 2. DESeq2-style median-of-ratios size-factor normalization.
+ 3. Primary DEA: per-gene NB GLM (log link, group effect), global dispersion,
+    vectorized IRLS, Wald test, BH FDR.
+    Sensitivity DEA: Welch t-test on log2(size-factor-normalized counts + 1).
+ 4. DE table: |log2FC| >= 1 and BH-adjusted p < 0.05 (reporting only; prerank
+    uses the FULL ranked list, as required).
+ 5. Enrichment PRIMARY PATH: gseapy.prerank(rnk, lib_name='GO_Biological_Process_2021',
+    min_size=15, max_size=500, permutation_num=1000, seed=42). gseapy is
+    auto-installed via pip if missing (runner expected to have network; the
+    library file ships inside the package, so prerank then runs offline).
+    DOCUMENTED FALLBACK (only if gseapy truly cannot be installed): local exact
+    re-implementation of the fgsea algorithm (rank-weighted ES, 1000 label
+    permutations, BH) with parameters identical to gseapy.prerank defaults;
+    needs a local GO_Biological_Process_2021 library file. Flagged as a
+    deviation from the 'using the gseapy package' requirement if used.
+ 6. Sensitivity enrichments: ranking by -log10(adj p) and by t-test log2FC.
+"""
+import json, os, subprocess, sys, warnings
+import numpy as np
+import pandas as pd
+from scipy.stats import norm, t as tdist
+
+warnings.filterwarnings("ignore")
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(BASE, "data")
+OUT = os.path.join(BASE, "results")
+os.makedirs(OUT, exist_ok=True)
+
+TREAT = "Cisplatin_IC50_CBD_IC50"   # group 9 (9_1..9_3)
+CTRL = "DMSO"                        # group 3 (3_1..3_3)
+LIB = "GO_Biological_Process_2021"
+
+# ---------------------------------------------------------------- data loading
+counts = pd.read_csv(os.path.join(DATA, "counts_raw_unfiltered.csv"), index_col=0)
+counts.index = counts.index.astype(str)
+layout = pd.read_csv(os.path.join(DATA, "sample_layout.csv"))
+layout["col"] = layout["SampleID"].str.replace("-", "_", regex=False)
+assert set(layout["col"]) <= set(counts.columns), "layout/counts column mismatch"
+mapping = pd.read_csv(os.path.join(DATA, "ensg_to_gene_name.tsv"), sep="\t", dtype=str)
+ensg2gene = dict(zip(mapping["ENSG"], mapping["gene_name"]))
+
+idx = [e for e in counts.index if e in ensg2gene]
+mat = counts.loc[idx].astype(float)
+mat.index = [ensg2gene[e] for e in idx]
+print(f"[data] genes with name: {mat.shape[0]} / {counts.shape[0]}")
+
+def samples_of(group):
+    cols = layout.loc[layout["Group"] == group, "col"].tolist()
+    assert len(cols) == 3, f"expected 3 replicates for {group}, got {cols}"
+    return cols
+
+def size_factors(m):
+    col_med = m.median(axis=1).replace(0, np.nan)
+    return m.div(col_med, axis=0).median(axis=0).fillna(1.0)
+
+# --------------------------------------------- NB GLM (NB2: Var = mu + phi*mu^2)
+def estimate_dispersion(y, mu):
+    """Per-gene NB2 dispersion (method of moments) + log-log trend (edgeR-style)."""
+    n_obs = y.shape[1]
+    r2 = (y - mu) ** 2 / np.maximum(mu, 1e-6) ** 2
+    inv_mu = 1.0 / np.maximum(mu, 1e-6)
+    phi2_g = (r2.sum(1) - inv_mu.sum(1)) / n_obs
+    phi2_g = np.clip(phi2_g, 1e-6, 10.0)
+    mean_g = np.maximum(mu.mean(1), 1e-6)
+    sel = (phi2_g > 1e-6) & (phi2_g < 1.0)
+    if sel.sum() >= 20:
+        x = np.log(mean_g[sel]); z = np.log(phi2_g[sel])
+        A = np.vstack([np.ones(x.size), x]).T
+        coef, *_ = np.linalg.lstsq(A, z, rcond=None)
+        trend = np.exp(coef[0] + coef[1] * np.log(mean_g))
+    else:
+        trend = np.full_like(mean_g, np.median(phi2_g))
+    return np.clip(trend, 1e-6, 10.0), phi2_g
+
+def nb_glm(m, treat_cols, ctrl_cols, max_iter=50, tol=1e-8):
+    y = m[treat_cols + ctrl_cols].to_numpy(dtype=float) + 0.5  # pseudocount
+    T = np.array([1.0] * len(treat_cols) + [0.0] * len(ctrl_cols))
+    G = y.shape[0]
+    # Poisson MLE (closed form): mu_t = mean treat, mu_c = mean ctrl
+    mt = y[:, :len(treat_cols)].mean(1); mc = y[:, len(treat_cols):].mean(1)
+    b0 = np.log(mc); b1 = np.log(np.maximum(mt, 1e-6) / np.maximum(mc, 1e-6))
+    mu = np.exp(b0[:, None] + b1[:, None] * T[None, :])
+    phi2, phi2_mom = estimate_dispersion(y, mu)   # trended, per gene (G,)
+
+    for it in range(max_iter):
+        g1 = 1.0 + 2.0 * phi2[:, None] * mu
+        g2 = 2.0 * phi2[:, None]
+        mu_safe = np.maximum(mu, 1e-8)
+        t1 = (y - mu) / g1
+        t2 = np.where(y > 0, (1.0 - y / mu_safe) * g2 / (2.0 * g1), 0.0)
+        eta = b0[:, None] + b1[:, None] * T[None, :]
+        z = eta + t1 + t2
+        w = 1.0 / g1
+        Sw = w.sum(1); SwT = (w * T).sum(1)
+        Swz = (w * z).sum(1); SwTz = (w * T * z).sum(1)
+        det = Sw * SwT - SwT * SwT
+        ok = det > 1e-12
+        nb1 = np.where(ok, (Sw * SwTz - SwT * Swz) / np.where(ok, det, 1.0), b1)
+        nb0 = np.where(ok, (Swz - nb1 * SwT) / np.where(Sw > 0, Sw, 1.0), b0)
+        if np.max(np.abs(nb1 - b1)) < tol:
+            b1, b0 = nb1, nb0
+            break
+        b1, b0 = nb1, nb0
+    mu = np.exp(b0[:, None] + b1[:, None] * T[None, :])
+    wc = mu / (1.0 + phi2[:, None] * mu)          # Fisher weight mu^2/V
+    Sw = wc.sum(1); SwT = (wc * T).sum(1)
+    det = Sw * SwT - SwT * SwT
+    ok = det > 1e-12
+    se1 = np.sqrt(np.where(ok, Sw / np.where(ok, det, 1.0), np.nan))
+    zstat = np.where(ok & ~np.isnan(se1), b1 / se1, 0.0)
+    p = 2.0 * norm.sf(np.abs(zstat))
+    return b1, p, phi2, phi2_mom
+
+def bh(p):
+    p = np.asarray(p, dtype=float)
+    n = p.size
+    order = np.argsort(p)
+    ranked = p[order]
+    adj = ranked * n / np.arange(1, n + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    out = np.empty(n)
+    out[order] = np.clip(adj, 0, 1)
+    return out
+
+def welch(m, treat_cols, ctrl_cols):
+    la = np.log2(m[treat_cols].to_numpy() + 1.0)
+    lb = np.log2(m[ctrl_cols].to_numpy() + 1.0)
+    a, b = la.mean(1), lb.mean(1)
+    va, vb = la.var(1, ddof=1), lb.var(1, ddof=1)
+    se2 = va / 3 + vb / 3
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tstat = (a - b) / np.sqrt(np.where(se2 > 0, se2, np.nan))
+        df = np.where(se2 > 0, se2 ** 2 / ((va / 3) ** 2 / 2 + (vb / 3) ** 2 / 2), np.nan)
+    p = 2.0 * tdist.sf(np.abs(tstat), df)
+    p = np.where(np.isnan(p) & (a == b), 1.0, p)
+    p = np.where(np.isnan(p), 0.0, p)
+    return a - b, p
+
+# -------------------------------- local fgsea re-implementation (FALLBACK ONLY)
+def fgsea_es(order, hit):
+    # hit is boolean, aligned positionally to `order` (rank order)
+    n = len(order); k = int(hit.sum())
+    if k == 0 or k == n:
+        return 0.0
+    rw = np.arange(1, n + 1, dtype=float)
+    k_hit = rw[hit].sum(); k_miss = rw[~hit].sum()
+    if k_hit == 0 or k_miss == 0:
+        return 0.0
+    rs = np.cumsum(rw * hit) / k_hit - np.cumsum(rw * (1 - hit)) / k_miss
+    i = int(np.argmax(np.abs(rs)))
+    return float(rs[i])
+
+def fgsea_prerank(rnk, gene_sets, n_perm=1000, seed=42, min_size=15, max_size=500):
+    rnk = rnk.sort_values(ascending=False)
+    order = rnk.index.to_numpy()
+    rows = []
+    rng = np.random.default_rng(seed)
+    for term, genes in gene_sets.items():
+        hit = np.isin(order, list(genes))
+        k = int(hit.sum())
+        if not (min_size <= k <= max_size):
+            continue
+        es = fgsea_es(order, hit)
+        es_perms = np.empty(n_perm)
+        for j in range(n_perm):
+            es_perms[j] = fgsea_es(order, rng.permutation(hit))
+        same = es_perms[np.sign(es_perms) == np.sign(es)] if es != 0 else es_perms
+        nes = es / same.mean() if same.size and same.mean() != 0 else 0.0
+        pval = ((np.sum(es_perms >= es) + 1) / (n_perm + 1)) if es >= 0 else \
+               ((np.sum(es_perms <= es) + 1) / (n_perm + 1))
+        rows.append((term, es, pval, nes, k))
+    df = pd.DataFrame(rows, columns=["Term", "ES", "pvalue", "NES", "size"])
+    if df.empty:
+        return df
+    df["adj.Pvalue"] = bh(df["pvalue"].to_numpy())
+    return df.sort_values("adj.Pvalue")
+
+# ------------------------------------------------------------ gseapy handling
+def ensure_gseapy():
+    try:
+        import gseapy
+        return gseapy
+    except ImportError:
+        pass
+    cmds = [[sys.executable, "-m", "pip", "install", "--quiet", "gseapy"],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--user", "gseapy"],
+            [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "gseapy"]]
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            r = None
+        if r is not None and r.returncode == 0:
+            try:
+                import gseapy
+                return gseapy
+            except ImportError:
+                pass
+        tail = (r.stderr[-300:] if r is not None else "timeout")
+        print(f"[gseapy] {' '.join(cmd[2:])} failed: {tail}")
+    return None
+
+def run_gseapy_prerank(gp, rnk, tag):
+    outdir = os.path.join(OUT, f"gsea_{tag}")
+    os.makedirs(outdir, exist_ok=True)
+    nproc = min(8, os.cpu_count() or 1)
+    try:
+        res = gp.prerank(rnk, lib_name=LIB, min_size=15, max_size=500, out_fdr=1.0,
+                         permutation_num=1000, seed=42, processes=nproc,
+                         outdir=outdir, no_plot=True)
+    except TypeError:
+        res = gp.prerank(rnk, lib_name=LIB, min_size=15, max_size=500, out_fdr=1.0,
+                         n_permutations=1000, seed=42, processes=nproc,
+                         outdir=outdir, no_plot=True)
+    d = res.res2d.copy()
+    d.columns = [str(c) for c in d.columns]
+    print(f"[GSEA:{tag}] res2d columns: {list(d.columns)}")
+    adj_col = next(c for c in d.columns if "adj" in c.lower() and "p" in c.lower())
+    # gseapy res2d may carry duplicated 'NES'/'pvalue' columns; keep the last (final) ones
+    d = d.loc[:, ~d.columns.duplicated(keep="last")]
+    if "NES" not in d.columns and "ES" in d.columns:
+        d = d.rename(columns={"ES": "NES"})
+    keep = [c for c in ["Term", "NES", "pvalue", adj_col] if c in d.columns]
+    d = d[keep].drop_duplicates(subset=["Term"]).sort_values(adj_col)
+    d.to_csv(os.path.join(OUT, f"enrichment_{tag}.csv"), index=False)
+    return d
+
+def find_local_library():
+    cands = [os.environ.get("GO_LIB_PATH", ""),
+             os.path.join(OUT, "GO_Biological_Process_2021.tsv"),
+             os.path.join(DATA, "GO_Biological_Process_2021.tsv")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            lib = {}
+            with open(c) as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 2:
+                        lib[parts[0]] = parts[1].split("|")
+            return lib, c
+    return None, None
+
+# =================================================================== MAIN
+def main():
+    summary = {"question_groups": {"treatment": TREAT, "control": CTRL}, "library": LIB}
+    sf = size_factors(mat)
+    nmat = mat.div(sf, axis=1)
+    summary["size_factors"] = {k: round(float(v), 4) for k, v in sf.items()}
+
+    b1, p, phi2, phi2_mom = nb_glm(mat, samples_of(TREAT), samples_of(CTRL))
+    adjp = bh(p)
+    fc_tt, p_tt = welch(mat, samples_of(TREAT), samples_of(CTRL))
+    adjp_tt = bh(p_tt)
+    de = pd.DataFrame({"log2FC": b1, "pvalue": p, "adj.pvalue": adjp,
+                       "log2FC_ttest": fc_tt, "pvalue_ttest": p_tt,
+                       "adj.pvalue_ttest": adjp_tt}, index=mat.index)
+    de.index.name = "gene"
+    de = de.sort_values("log2FC", ascending=False)
+    de.to_csv(os.path.join(OUT, "de_table.csv"))
+    summary["nb2_trended_dispersion"] = {"median": float(np.median(phi2)),
+                                          "min": float(np.min(phi2)), "max": float(np.max(phi2))}
+
+    def de_count(fc, ap):
+        return int(((fc.abs() >= 1.0) & (ap < 0.05)).sum())
+    summary["DE_table"] = {
+        "primary_NBGlm_|log2FC|>=1_BH<0.05": de_count(de["log2FC"], de["adj.pvalue"]),
+        "sensitivity_ttest_|log2FC|>=1_BH<0.05": de_count(de["log2FC_ttest"], de["adj.pvalue_ttest"]),
+    }
+    print("[DE] primary NB-GLM DE genes:", summary["DE_table"]["primary_NBGlm_|log2FC|>=1_BH<0.05"])
+    print("[DE] t-test sensitivity DE genes:", summary["DE_table"]["sensitivity_ttest_|log2FC|>=1_BH<0.05"])
+
+    rnk_main = pd.Series(de["log2FC"].to_numpy(), index=de.index, name="log2FC")
+    rnk_fdr = pd.Series(-np.log10(np.clip(de["adj.pvalue"].to_numpy(), 1e-300, 1.0)),
+                        index=de.index, name="neglog10adjp")
+    rnk_tt = pd.Series(de["log2FC_ttest"].to_numpy(), index=de.index, name="log2FC_ttest")
+    for name, s in [("main_log2FC", rnk_main), ("sens_neglog10adjp", rnk_fdr), ("sens_log2FC_ttest", rnk_tt)]:
+        s.sort_values(ascending=False).to_csv(os.path.join(OUT, f"ranked_{name}.tsv"),
+                                              sep="\t", header=["score"])
+
+    gp = ensure_gseapy()
+    summary["gseapy_available"] = bool(gp)
+    results = {}
+    if gp is not None:
+        summary["gseapy_version"] = getattr(gp, "__version__", "?")
+        for tag, s in [("main", rnk_main), ("sens_neglog10adjp", rnk_fdr), ("sens_log2FC_ttest", rnk_tt)]:
+            d = run_gseapy_prerank(gp, s, tag)
+            adj_col = [c for c in d.columns if "adj" in c.lower()][0]
+            top5 = d.head(5)
+            results[tag] = top5.to_dict("records")
+            best = d.iloc[0]
+            print(f"[GSEA:{tag}] top term (lowest adj.Pvalue): {best['Term']}  "
+                  f"adj.Pvalue={best[adj_col]:.3e}  NES={best['NES']:.2f}")
+        summary["top5_main"] = results["main"]
+        summary["answer_term"] = results["main"][0]["Term"]
+    else:
+        lib, libpath = find_local_library()
+        if lib is not None:
+            print("[FALLBACK] gseapy unavailable -> local fgsea re-implementation "
+                  f"(documented deviation from 'using the gseapy package'). Library: {libpath}")
+            summary["fallback"] = "fgsea re-implementation (deviation documented)"
+            for tag, s in [("main", rnk_main), ("sens_neglog10adjp", rnk_fdr), ("sens_log2FC_ttest", rnk_tt)]:
+                d = fgsea_prerank(s, lib)
+                d.to_csv(os.path.join(OUT, f"enrichment_{tag}_fallback.csv"), index=False)
+                results[tag] = d.head(5).to_dict("records")
+            summary["top5_main"] = results["main"]
+            summary["answer_term"] = results["main"][0]["Term"]
+        else:
+            summary["status"] = ("ENRICHMENT NOT RUN: gseapy could not be installed "
+                                 "(sandbox has no network) and no local "
+                                 "GO_Biological_Process_2021 library file was found. "
+                                 "Re-run in the runner environment where pip install gseapy works.")
+            print("[ENRICHMENT] " + summary["status"])
+
+    with open(os.path.join(OUT, "summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2, default=str)
+    print("=" * 70)
+    print("FINAL REPORT")
+    print(f"  comparison : {TREAT} (9_1..9_3) vs {CTRL} (3_1..3_3)")
+    print(f"  DE table   : {summary['DE_table']}")
+    if "answer_term" in summary:
+        print(f"  ANSWER     : {summary['answer_term']}")
+        for t in results["main"]:
+            print("   term:", t)
+    else:
+        print("  ANSWER     : NOT AVAILABLE (enrichment not run, see status)")
+        print("  status   :", summary["status"])
+    print("[done] summary written to", os.path.join(OUT, "summary.json"))
+    return 0 if "answer_term" in summary else 2
+
+if __name__ == "__main__":
+    sys.exit(main())

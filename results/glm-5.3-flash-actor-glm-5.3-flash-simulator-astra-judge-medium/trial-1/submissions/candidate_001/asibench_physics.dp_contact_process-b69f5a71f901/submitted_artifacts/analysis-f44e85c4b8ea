@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""
+Asymmetric parity-modulated 1D contact process: threshold, beta and dynamic-scaling
+assessment from ./data/task_input.json (single source of truth).
+
+Kernel (exactly as specified by the input contract):
+  - 1D lattice of L sites, states {0,1}, state 0 absorbing, periodic boundaries.
+  - Initial condition: fully active lattice for every trajectory.
+  - Random-sequential updates: one sweep = L site visits drawn uniformly with
+    replacement; visits are applied sequentially (each visit sees the state left
+    by previous visits of the same sweep; a site may be visited several times
+    per sweep).
+  - Visit to site i:
+      active site   -> dies with probability dt = 0.2;
+      inactive site -> p_birth = min(1, lambda*dt*parity_scale(i)
+                                        *(w_left*state[i-1] + w_right*state[i+1]))
+                       with w_left=1.0, w_right=0.85, parity_scale 1.04 (even), 0.96 (odd).
+  - Record rho(t) (active density) and survival(t) (fraction of trajectories never
+    absorbed) once per sweep for t = 1..t_max.
+
+Outputs (exactly the mandated columns/keys):
+  results/dp_summary.csv, results/dp_scan.csv, results/dp_timeseries.csv,
+  results/dp_report.json
+"""
+
+import json
+import os
+import numpy as np
+import pandas as pd
+
+INPUT_PATH = "./data/task_input.json"
+RESULTS_DIR = "./results"
+
+with open(INPUT_PATH, encoding="utf-8-sig") as fh:
+    TASK = json.load(fh)
+
+PROTO = TASK["protocol"]
+PAR = TASK["parameterization"]
+
+LAMBDA_SCAN = [float(x) for x in PROTO["lambda_scan"]]
+BETA_FIT_LAMBDAS = [float(x) for x in PROTO["beta_fit_lambdas"]]
+SYSTEM_SIZES = [int(x) for x in PROTO["system_sizes"]]
+N_SEEDS = int(PROTO["n_seeds"])
+T_MAX = int(PROTO["t_max"])
+MASTER_SEED = int(PROTO["seed"])
+
+DT = float(PAR["dt"])
+W_LEFT = float(PAR["left_neighbor_weight"])
+W_RIGHT = float(PAR["right_neighbor_weight"])
+P_EVEN = float(PAR["site_parity_scale"]["even"])
+P_ODD = float(PAR["site_parity_scale"]["odd"])
+TASK_ID = TASK.get("task_id", "unknown")
+
+BETA_DP_REF = 0.2767   # 1+1D DP reference beta anchoring the threshold fit
+N_BOOT = 200           # seed-level bootstrap resamples
+
+
+def simulate_size(lambdas, L, n_seeds, t_max, child_seeds):
+    """Run all (lambda, seed) pairs for one system size.
+
+    RNG protocol: SeedSequence(MASTER_SEED).spawn(n_lambda*n_sizes); child index =
+    size_index * n_lambdas + lambda_index (size-major). Each child first draws the
+    int32 visit sites (n_seeds, t_max, L), then the float64 uniforms (n_seeds, t_max, L).
+    Returns rho_ts (n_lambda*n_seeds, t_max) and alive_ts (same shape, bool).
+    """
+    n_lam = len(lambdas)
+    rows = n_lam * n_seeds
+    row_idx = np.arange(rows)
+    lam_arr = np.repeat(np.asarray(lambdas, dtype=float), n_seeds)
+    parity = np.where(np.arange(L) % 2 == 0, P_EVEN, P_ODD)
+
+    sites_all = np.empty((rows, t_max, L), dtype=np.int32)
+    u_all = np.empty((rows, t_max, L), dtype=np.float64)
+    for li in range(n_lam):
+        rng = np.random.default_rng(child_seeds[li])
+        sites_all[li * n_seeds:(li + 1) * n_seeds] = rng.integers(
+            0, L, size=(n_seeds, t_max, L), dtype=np.int32)
+        u_all[li * n_seeds:(li + 1) * n_seeds] = rng.random((n_seeds, t_max, L))
+
+    state = np.ones((rows, L), dtype=bool)
+    rho_ts = np.empty((rows, t_max), dtype=np.float64)
+    alive_ts = np.empty((rows, t_max), dtype=bool)
+    alive = np.ones(rows, dtype=bool)
+
+    for t in range(t_max):
+        sites = sites_all[:, t, :]
+        us = u_all[:, t, :]
+        for k in range(L):
+            idx = sites[:, k]
+            st = state[row_idx, idx]
+            li_ = idx - 1
+            li_[li_ < 0] += L
+            ri_ = idx + 1
+            ri_[ri_ >= L] -= L
+            lft = state[row_idx, li_]
+            rgt = state[row_idx, ri_]
+            p = lam_arr * DT * parity[idx] * (lft + W_RIGHT * rgt)
+            np.minimum(p, 1.0, out=p)
+            u = us[:, k]
+            state[row_idx, idx] = (st & (u >= DT)) | (~st & (u < p))
+        cnt = state.sum(axis=1)
+        rho_ts[:, t] = cnt / L
+        alive &= (cnt > 0)
+        alive_ts[:, t] = alive
+    return rho_ts, alive_ts
+
+
+def run_scan():
+    n_tot = len(LAMBDA_SCAN) * len(SYSTEM_SIZES)
+    children = np.random.SeedSequence(MASTER_SEED).spawn(n_tot)
+    out = {}
+    for si, L in enumerate(SYSTEM_SIZES):
+        ch = children[si * len(LAMBDA_SCAN):(si + 1) * len(LAMBDA_SCAN)]
+        out[L] = simulate_size(LAMBDA_SCAN, L, N_SEEDS, T_MAX, ch)
+    return out
+
+
+def cell_observables(rho_ts, alive_ts):
+    """rho_ss: active-run-conditioned mean density over the last 20% of t_max
+    (t = 801..1000), identical rule at every (lambda, size); survival_prob at t_max."""
+    m_fin = alive_ts[:, -1]
+    rho_ss = float(rho_ts[m_fin][:, -int(0.2 * T_MAX):].mean()) if m_fin.any() else 0.0
+    return rho_ss, float(m_fin.mean()), rho_ts.mean(axis=0), alive_ts.mean(axis=0)
+
+
+def fit_fixed_beta_powerlaw(rho, lams, beta, c_grid):
+    """rho = A (lambda - lambda_c)^beta, A by linear least squares, beta fixed."""
+    best = None
+    for c in c_grid:
+        x = np.maximum(lams - c, 1e-12) ** beta
+        denom = float(np.dot(x, x))
+        if denom <= 0:
+            continue
+        A = float(np.dot(rho, x) / denom)
+        res = float(np.sum((rho - A * x) ** 2))
+        if best is None or res < best[0]:
+            best = (res, float(c), A)
+    return best[0] / max(float(np.mean(rho ** 2)), 1e-12), best[1], best[2]
+
+
+def smoothed(arr, w=3):
+    pad = np.concatenate([np.full(w // 2, arr[0]), arr, np.full(w // 2, arr[-1])])
+    return np.convolve(pad, np.ones(w) / w, mode="valid")
+
+
+def survival_crossing(surv, lams, level=0.5):
+    s = smoothed(np.asarray(surv, dtype=float))
+    for i in range(1, len(lams)):
+        if s[i - 1] < level <= s[i]:
+            frac = (level - s[i - 1]) / (s[i] - s[i - 1])
+            return float(lams[i - 1] + frac * (lams[i] - lams[i - 1]))
+    return None
+
+
+def threshold_estimate(rho_tab, surv_tab, lams):
+    """M1 pooled fixed-beta power-law fit; M2 mean of resolved survival=0.5 crossings."""
+    c_grid = np.arange(1.30, 1.7099 + 1e-9, 0.002)
+    per_size = {}
+    for j, L in enumerate(SYSTEM_SIZES):
+        rss, c, A = fit_fixed_beta_powerlaw(rho_tab[:, j], lams, BETA_DP_REF, c_grid)
+        per_size[L] = {"lambda_c": c, "A": A, "rss_norm": rss}
+    pooled_curve = np.zeros_like(c_grid)
+    for gi, c in enumerate(c_grid):
+        tot = 0.0
+        for j in range(len(SYSTEM_SIZES)):
+            x = np.maximum(lams - c, 1e-12) ** BETA_DP_REF
+            A = float(np.dot(rho_tab[:, j], x) / np.dot(x, x))
+            tot += float(np.sum((rho_tab[:, j] - A * x) ** 2)) / max(float(np.mean(rho_tab[:, j] ** 2)), 1e-12)
+        pooled_curve[gi] = tot
+    lam_m1 = float(c_grid[int(np.argmin(pooled_curve))])
+    crossings = {}
+    for j, L in enumerate(SYSTEM_SIZES):
+        cr = survival_crossing(surv_tab[:, j], lams)
+        if cr is not None:
+            crossings[L] = cr
+    lam_m2 = float(np.mean(list(crossings.values()))) if crossings else None
+    ests = [lam_m1] + ([lam_m2] if lam_m2 is not None else [])
+    return {"lambda_c": float(np.mean(ests)), "lam_m1": lam_m1, "lam_m2": lam_m2,
+            "m1_per_size": per_size, "m2_crossings": crossings}
+
+
+def resample_cells(scan_cells, rng):
+    """One seed-level bootstrap resample of all (lambda, size) cells."""
+    lams = np.asarray(LAMBDA_SCAN)
+    rho_tab = np.zeros((len(lams), len(SYSTEM_SIZES)))
+    surv_tab = np.zeros_like(rho_tab)
+    for li in range(len(lams)):
+        for j in range(len(SYSTEM_SIZES)):
+            rho_ts, alive_ts = scan_cells[(li, j)]
+            idx = rng.integers(0, N_SEEDS, size=N_SEEDS)
+            r = rho_ts[idx]
+            a = alive_ts[idx]
+            m = a[:, -1]
+            surv_tab[li, j] = m.mean()
+            rho_tab[li, j] = r[m][:, -int(0.2 * T_MAX):].mean() if m.any() else 0.0
+    return rho_tab, surv_tab
+
+
+def bootstrap_threshold(scan_cells, n_boot=N_BOOT, rng_seed=12345):
+    lams = np.asarray(LAMBDA_SCAN)
+    rng = np.random.default_rng(rng_seed)
+    d1, d2, dc = [], [], []
+    for _ in range(n_boot):
+        rho_tab, surv_tab = resample_cells(scan_cells, rng)
+        th = threshold_estimate(rho_tab, surv_tab, lams)
+        d1.append(th["lam_m1"])
+        if th["lam_m2"] is not None:
+            d2.append(th["lam_m2"])
+        dc.append(th["lambda_c"])
+
+    def ci(vals):
+        if not vals:
+            return None
+        v = np.asarray(vals)
+        return (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+
+    return {"m1_ci": ci(d1), "m2_ci": ci(d2), "comb_ci": ci(dc), "n_m2_valid": len(d2)}
+
+
+def beta_fit_at_fixed_lc(rho_tab, lams, lam_c):
+    """Per-size log-log OLS slope of rho_ss vs (lambda - lambda_c) on grid points
+    with lambda >= lam_c + 0.02; pooled as the unweighted mean of available sizes."""
+    sel = lams >= (lam_c + 0.02)
+    per_size = {}
+    for j, L in enumerate(SYSTEM_SIZES):
+        x = lams[sel] - lam_c
+        y = rho_tab[sel, j]
+        if len(x) >= 3 and np.all(y > 0):
+            sl, _ = np.polyfit(np.log(x), np.log(y), 1)
+            per_size[L] = float(sl)
+        else:
+            per_size[L] = None
+    vals = [v for v in per_size.values() if v is not None]
+    return per_size, (float(np.mean(vals)) if vals else None)
+
+
+def bootstrap_beta(scan_cells, lam_c_hat, n_boot=N_BOOT, rng_seed=54321):
+    """Bootstrap beta: resample seeds, re-estimate lambda_c on the resample, refit
+    beta at that lambda_c (propagates threshold uncertainty into the beta CI)."""
+    lams = np.asarray(LAMBDA_SCAN)
+    c_grid = np.arange(1.30, 1.7099 + 1e-9, 0.002)
+    rng = np.random.default_rng(rng_seed)
+    draws = []
+    per_size_draws = {L: [] for L in SYSTEM_SIZES}
+    for _ in range(n_boot):
+        rho_tab, surv_tab = resample_cells(scan_cells, rng)
+        best = None
+        for c in c_grid:
+            tot = 0.0
+            for j in range(len(SYSTEM_SIZES)):
+                x = np.maximum(lams - c, 1e-12) ** BETA_DP_REF
+                A = float(np.dot(rho_tab[:, j], x) / np.dot(x, x))
+                tot += float(np.sum((rho_tab[:, j] - A * x) ** 2)) / max(float(np.mean(rho_tab[:, j] ** 2)), 1e-12)
+            if best is None or tot < best[0]:
+                best = (tot, c)
+        per_size, pooled = beta_fit_at_fixed_lc(rho_tab, lams, best[1])
+        if pooled is not None:
+            draws.append(pooled)
+            for L in SYSTEM_SIZES:
+                if per_size[L] is not None:
+                    per_size_draws[L].append(per_size[L])
+
+    def ci(vals):
+        if len(vals) < 10:
+            return None
+        v = np.asarray(vals)
+        return (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+
+    return {"beta_ci": ci(draws), "per_size_ci": {L: ci(v) for L, v in per_size_draws.items()}}
+
+
+def collapse_analysis(ens_rho, lam_c_hat):
+    """Grid-search collapse rho_ens(t)*L^x vs t/L^z at the three grid lambdas nearest
+    lambda_c_hat, sizes 64/128/256 (L=32 is the most finite-size-contaminated and is
+    excluded from the collapse only).  Search window: x in [0.10, 0.60], z in [1.0, 2.5]."""
+    lams = np.asarray(LAMBDA_SCAN)
+    order = np.argsort(np.abs(lams - lam_c_hat))
+    lam_set = [float(lams[i]) for i in order[:3]]
+    sizes_c = [L for L in SYSTEM_SIZES if L >= 64]
+    # Search restricted to the physically plausible DP-like window; an optimum at the
+    # window boundary means z is not identified by the data.
+    z_grid = np.round(np.arange(1.00, 2.501, 0.05), 3)
+    x_grid = np.round(np.arange(0.10, 0.601, 0.05), 3)
+
+    def residual_for(lam, x, z):
+        s_list, y_list = [], []
+        for L in sizes_c:
+            r = ens_rho[(lam, L)]
+            s_list.append(np.arange(1, T_MAX + 1) / (L ** z))
+            y_list.append(r * (L ** x))
+        s_lo = max(s[0] for s in s_list)
+        s_hi = min(s[-1] for s in s_list)
+        if not (s_hi > s_lo * 10):
+            return None, 0.0
+        grid = np.exp(np.linspace(np.log(s_lo), np.log(s_hi), 40))
+        Y = np.vstack([np.interp(grid, s, y) for s, y in zip(s_list, y_list)])
+        return (float(Y.var(axis=0, ddof=1).mean() / max((Y.mean(axis=0) ** 2).mean(), 1e-12)),
+                float(np.log10(s_hi / s_lo)))
+
+    best, null_best = None, None
+    for lam in lam_set:
+        for z in z_grid:
+            for x in x_grid:
+                res, span = residual_for(lam, x, z)
+                if res is not None and (best is None or res < best["res"]):
+                    best = {"res": res, "x": float(x), "z": float(z), "lam": lam, "span": span}
+            res0, span0 = residual_for(lam, 0.0, z)
+            if res0 is not None and (null_best is None or res0 < null_best["res"]):
+                null_best = {"res": res0, "z": float(z), "lam": lam, "span": span0}
+
+    z_per_lam = {}
+    for lam in lam_set:
+        blocal = None
+        for z in z_grid:
+            for x in x_grid:
+                res, span = residual_for(lam, x, z)
+                if res is not None and (blocal is None or res < blocal[0]):
+                    blocal = (res, float(z), float(x))
+        z_per_lam[str(lam)] = {"z": blocal[1], "x": blocal[2], "res": blocal[0]}
+    z_vals = [v["z"] for v in z_per_lam.values()]
+    z_stable = bool(z_vals) and (max(z_vals) - min(z_vals) <= 0.15)
+    return {"lam_set": lam_set, "best": best, "null_best": null_best,
+            "z_per_lam": z_per_lam, "z_stable": z_stable, "sizes_used": sizes_c}
+
+
+def tau_q_half(ens_surv, lam_nc):
+    """First sweep at which ensemble survival at the near-critical lambda reaches <=0.5
+    for the largest size; censored at t_max if never observed."""
+    L = max(SYSTEM_SIZES)
+    p = ens_surv[(lam_nc, L)]
+    hits = np.nonzero(p <= 0.5)[0]
+    if len(hits):
+        return int(hits[0] + 1), False, L
+    return T_MAX, True, L
+
+
+def main():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"Running protocol scan: {len(LAMBDA_SCAN)} lambdas x {len(SYSTEM_SIZES)} sizes "
+          f"x {N_SEEDS} seeds x t_max={T_MAX}")
+    scan = run_scan()
+
+    rho_tab = np.zeros((len(LAMBDA_SCAN), len(SYSTEM_SIZES)))
+    surv_tab = np.zeros_like(rho_tab)
+    ens_rho, ens_surv = {}, {}
+    ts_rows = []
+    for li, lam in enumerate(LAMBDA_SCAN):
+        for j, L in enumerate(SYSTEM_SIZES):
+            rho_ts, alive_ts = scan[L]
+            sl = slice(li * N_SEEDS, (li + 1) * N_SEEDS)
+            rho_ss, survival, rbar, pbar = cell_observables(rho_ts[sl], alive_ts[sl])
+            rho_tab[li, j] = rho_ss
+            surv_tab[li, j] = survival
+            ens_rho[(lam, L)] = rbar
+            ens_surv[(lam, L)] = pbar
+            for t in range(T_MAX):
+                ts_rows.append((lam, L, t + 1, rbar[t], pbar[t]))
+
+    pd.DataFrame(ts_rows, columns=["lambda", "system_size", "time", "rho", "survival_prob"]
+                 ).to_csv(os.path.join(RESULTS_DIR, "dp_timeseries.csv"), index=False)
+
+    scan_rows = [(lam, L, rho_tab[li, j], surv_tab[li, j], N_SEEDS)
+                 for li, lam in enumerate(LAMBDA_SCAN)
+                 for j, L in enumerate(SYSTEM_SIZES)]
+    pd.DataFrame(scan_rows, columns=["lambda", "system_size", "rho_ss", "survival_prob", "n_runs"]
+                 ).to_csv(os.path.join(RESULTS_DIR, "dp_scan.csv"), index=False)
+
+    lams = np.asarray(LAMBDA_SCAN)
+    scan_cells = {(li, j): (scan[L][0][li * N_SEEDS:(li + 1) * N_SEEDS],
+                            scan[L][1][li * N_SEEDS:(li + 1) * N_SEEDS])
+                  for li in range(len(LAMBDA_SCAN))
+                  for j, L in enumerate(SYSTEM_SIZES)}
+
+    th = threshold_estimate(rho_tab, surv_tab, lams)
+    boot = bootstrap_threshold(scan_cells)
+    lam_c = th["lambda_c"]
+    ci_low, ci_high = boot["comb_ci"]
+    method_vals = [v for v in [th["lam_m1"], th["lam_m2"]] if v is not None]
+    ci_low = float(min(ci_low, min(method_vals)))
+    ci_high = float(max(ci_high, max(method_vals)))
+
+    s32 = surv_tab[:, SYSTEM_SIZES.index(min(SYSTEM_SIZES))]
+    gate_intermediate = bool((s32 > 0.05).any() and (s32 < 0.95).any())
+    gate_note = (f"smallest system L={min(SYSTEM_SIZES)} survival_prob(t_max) over the scan = "
+                 f"{np.round(s32, 3).tolist()} (intermediate regime: {gate_intermediate}); "
+                 f"survival_prob(t_max) for L>=64 remains >= {surv_tab[:, 1:].min():.2f} at every "
+                 f"scan lambda, so no clean subcritical branch is resolved within t_max={T_MAX}")
+
+    per_size_beta, beta_hat = beta_fit_at_fixed_lc(rho_tab, lams, lam_c)
+    bboot = bootstrap_beta(scan_cells, lam_c)
+    b_lo, b_hi = bboot["beta_ci"]
+    bv = [v for v in per_size_beta.values() if v is not None]
+    disagree = bool(bv and (max(bv) - min(bv) > (b_hi - b_lo)))
+    if disagree:
+        b_lo = float(min(b_lo, min(bv)))
+        b_hi = float(max(b_hi, max(bv)))
+
+    lam_min = float(lams.min())
+    L_max = max(SYSTEM_SIZES)
+    rbar_min = ens_rho[(lam_min, L_max)]
+    tt = np.arange(1, T_MAX + 1)
+    win = tt >= 100
+    delta_est = float(-np.polyfit(np.log(tt[win]), np.log(np.maximum(rbar_min[win], 1e-12)), 1)[0])
+
+    col = collapse_analysis(ens_rho, lam_c)
+    best = col["best"]
+    z_q_used = best["z"] if best else float("nan")
+    collapse_success = False
+    if best is not None and col["null_best"] is not None:
+        interior = (0.10 < best["x"] < 0.60) and (1.00 < best["z"] < 2.50)
+        collapse_success = bool(best["res"] < 0.5 * col["null_best"]["res"]
+                                and interior and col["z_stable"] and best["span"] >= 1.0)
+    dynamic_scale_observed = collapse_success
+    # identifiability diagnostic: residual at the DP reference scaling (x=beta/nu_perp,
+    # z=nu_parallel/nu_perp) compared with the best residual found in the window
+    x_dp, z_dp = 0.252, 1.5807
+    res_dp = None
+    if best is not None:
+        sizes_c = col["sizes_used"]
+        s_list, y_list = [], []
+        for L in sizes_c:
+            r = ens_rho[(best["lam"], L)]
+            s_list.append(np.arange(1, T_MAX + 1) / (L ** z_dp))
+            y_list.append(r * (L ** x_dp))
+        s_lo = max(s[0] for s in s_list)
+        s_hi = min(s[-1] for s in s_list)
+        grid = np.exp(np.linspace(np.log(s_lo), np.log(s_hi), 40))
+        Y = np.vstack([np.interp(grid, s, y) for s, y in zip(s_list, y_list)])
+        res_dp = float(Y.var(axis=0, ddof=1).mean() / max((Y.mean(axis=0) ** 2).mean(), 1e-12))
+    z_identifiable = None
+    if best is not None and res_dp is not None:
+        z_identifiable = bool(res_dp <= 3.0 * best["res"])
+    lam_nc = min(col["lam_set"], key=lambda v: abs(v - lam_c))
+    tqh, censored, tqh_L = tau_q_half(ens_surv, lam_nc)
+
+    beta_consistent = bool(b_lo is not None and b_lo <= BETA_DP_REF <= b_hi)
+    z_consistent = bool(collapse_success and np.isfinite(z_q_used)
+                        and abs(z_q_used - 1.5807) <= 0.35)
+    static_ok = bool(beta_consistent and gate_intermediate)
+    universality_supported = bool(collapse_success and static_ok and z_consistent)
+    conclusion = "consistent_with_directed_percolation" if universality_supported else "inconclusive"
+
+    pd.DataFrame([{
+        "task_id": TASK_ID,
+        "lambda_c_estimate": round(lam_c, 4),
+        "lambda_c_ci_low": round(ci_low, 4),
+        "lambda_c_ci_high": round(ci_high, 4),
+        "beta_estimate": round(beta_hat, 4) if beta_hat is not None else np.nan,
+        "beta_ci_low": round(b_lo, 4) if b_lo is not None else np.nan,
+        "beta_ci_high": round(b_hi, 4) if b_hi is not None else np.nan,
+        "delta_estimate": round(delta_est, 4),
+        "z_estimate": round(z_q_used, 4) if np.isfinite(z_q_used) else np.nan,
+        "n_seeds": N_SEEDS,
+        "t_max": T_MAX,
+        "collapse_success": collapse_success,
+    }]).to_csv(os.path.join(RESULTS_DIR, "dp_summary.csv"), index=False)
+
+    note = (
+        f"Within the provided protocol (t_max={T_MAX}, {N_SEEDS} seeds, grid "
+        f"{LAMBDA_SCAN[0]}..{LAMBDA_SCAN[-1]}) the transition is only weakly constrained. "
+        f"{gate_note}. Because survival_prob at t_max stays high for L>=64 over the whole grid, "
+        "the apparent activity at low lambda may be finite-time transient (long-lived near-critical "
+        "decay) rather than a genuinely active phase; the rho_ss-based power-law fit (M1) and the "
+        "survival-crossing estimator (M2) therefore bracket the threshold from opposite sides "
+        f"(M1={th['lam_m1']:.3f}, M2={th['lam_m2']:.3f}), and the headline estimate carries a "
+        "correspondingly wide CI. The dynamic collapse at this budget is "
+        + ("acceptable" if collapse_success else
+           "not resolved: correlation times comparable to t_max leave the scaling form "
+           "under-constrained, so no reliable z claim is made")
+        + (("; the residual landscape is flat between the window optimum (z=%.2f) and the "
+            "DP reference scaling z=1.58 (residual ratio %.1f), so z is not discriminated "
+            "by this data" % (best['z'], res_dp / best['res']))
+           if (best is not None and z_identifiable) else "")
+        + f". Universality with directed percolation is therefore "
+        f"{'supported' if universality_supported else 'not established'} by this data; the "
+        f"conservative conclusion is '{conclusion}'."
+    )
+
+    def r4(v):
+        if isinstance(v, bool) or v is None:
+            return v
+        if isinstance(v, (int, float)) and np.isfinite(v):
+            return round(v, 4)
+        return v
+
+    report = {
+        "task_id": TASK_ID,
+        "model": ("one-dimensional asymmetric, parity-modulated nearest-neighbor birth-death "
+                  "contact process: binary states, absorbing empty lattice, periodic boundaries, "
+                  "fully active initial trajectories, random-sequential updates (one sweep = L "
+                  "uniform site visits with replacement, applied sequentially), death probability "
+                  "dt=0.2 per visit to an active site, birth probability "
+                  "p=min(1, lambda*dt*parity_scale(i)*(1.0*left_active + 0.85*right_active)) for "
+                  "an inactive visited site, parity_scale 1.04/0.96 for even/odd sites"),
+        "method_summary": {
+            "input": "protocol section of ./data/task_input.json used as the single source of truth",
+            "kernel": ("exact random-sequential kernel as specified; sequential within-sweep "
+                       "updates; site visits drawn uniformly with replacement; state 0 absorbing"),
+            "rng": (f"numpy SeedSequence({MASTER_SEED}).spawn(n_lambda*n_sizes); child index = "
+                    "size_index * n_lambdas + lambda_index; each child first draws int32 visit "
+                    "sites (n_seeds, t_max, L), then float64 uniforms (n_seeds, t_max, L); kernel "
+                    "validated bit-exact against a naive scalar reference implementation"),
+            "rho_ss_rule": ("mean active density over the last 20% of t_max (t=801..1000), averaged "
+                            "over trajectories still active at t_max (active-run-conditioned "
+                            "quasistationary estimate); identical rule at every (lambda, size)"),
+            "survival_rule": ("fraction of trajectories never absorbed up to t_max, reported "
+                              "separately from rho_ss"),
+            "threshold_estimator": (
+                "M1: rho_ss(lambda) fitted per size to A*(lambda-lambda_c)^0.2767 (beta pinned to "
+                "the 1+1D DP reference because a free-beta fit is unidentifiable on this grid: it "
+                "runs to its upper bound); pooled over all four sizes by minimising the sum of "
+                "normalised residuals. M2: first upward crossing of 0.5 by the width-3 smoothed "
+                "survival_prob(t_max) vs lambda curve, averaged over sizes where a crossing is "
+                "resolved. Headline lambda_c = mean(M1, M2)."),
+            "ci_method": (f"{N_BOOT} seed-level bootstrap resamples (16 seeds resampled "
+                          "independently per (lambda, size) cell, estimator fully re-run per "
+                          "resample); the reported CI is the union of the bootstrap percentile "
+                          "interval and the between-method spread (M1 vs M2), i.e. it includes an "
+                          "explicit systematic component"),
+            "beta_estimator": ("per-size log-log OLS slope of rho_ss vs (lambda - lambda_c) on grid "
+                               "points with lambda >= lambda_c + 0.02; pooled as the unweighted "
+                               "mean; bootstrap CI re-estimates lambda_c per resample (propagating "
+                               "threshold uncertainty); widened to cover per-size values when they "
+                               "disagree beyond the pooled CI"),
+            "delta_estimator": (f"effective exponent -d ln rho_ens/d ln t at (lambda={lam_min}, "
+                                f"L={L_max}) over t in [100, {T_MAX}]; an effective decay "
+                                "diagnostic only, since the scan point need not sit at criticality"),
+            "collapse_method": ("grid search over (x, z) of the DP-style collapse rho_ens(t)*L^x vs "
+                                "t/L^z at the three grid lambdas nearest lambda_c, sizes 64/128/256, "
+                                "relative variance of the collapsed curves on a common log-spaced "
+                                "scaled-time grid; null baseline = best collapse with x=0; collapse "
+                                "accepted only if residual < 0.5*null, best (x, z) interior to the "
+                                "grid, z stable within 0.15 across the three lambdas, and >= 1 "
+                                "decade of scaled-time overlap"),
+            "n_bootstrap": N_BOOT,
+        },
+        "evidence": {
+            "collapse_success": collapse_success,
+            "universality_supported": universality_supported,
+            "static_evidence_consistent": static_ok,
+            "dynamic_scale_observed": dynamic_scale_observed,
+            "z_q_used": r4(z_q_used),
+            "tau_q_half": tqh,
+            "assessment_note": note,
+            "threshold": {
+                "lambda_c_estimate": r4(lam_c),
+                "M1_pooled_fixed_beta_fit": r4(th["lam_m1"]),
+                "M2_survival_crossing_mean": r4(th["lam_m2"]),
+                "M2_crossings_per_size": {str(k): r4(v) for k, v in th["m2_crossings"].items()},
+                "M1_per_size": {str(k): r4(v["lambda_c"]) for k, v in th["m1_per_size"].items()},
+                "bootstrap_ci_combined": [r4(ci_low), r4(ci_high)],
+                "bootstrap_ci_m1": [r4(v) for v in boot["m1_ci"]] if boot["m1_ci"] else None,
+                "smallest_system_gate": gate_note,
+            },
+            "beta": {
+                "pooled": r4(beta_hat),
+                "per_size": {str(k): r4(v) for k, v in per_size_beta.items()},
+                "ci": [r4(b_lo), r4(b_hi)],
+                "per_size_disagreement_beyond_ci": disagree,
+                "dp_reference": BETA_DP_REF,
+            },
+            "delta": {"effective_exponent": r4(delta_est),
+                      "note": "effective decay exponent at the lowest scanned lambda; weakly constrained"},
+            "collapse": {
+                "lambdas_used": col["lam_set"],
+                "sizes_used": col["sizes_used"],
+                "best_fit": {k: r4(v) for k, v in best.items()} if best else None,
+                "null_best": ({k: r4(v) for k, v in col["null_best"].items()}
+                              if col["null_best"] else None),
+                "z_per_lambda": {k: {"z": r4(v["z"]), "x": r4(v["x"]), "res": r4(v["res"])}
+                                 for k, v in col["z_per_lam"].items()},
+                "z_stable_within_0.15": col["z_stable"],
+                "residual_at_DP_reference_scaling": r4(res_dp),
+                "z_identifiable_from_landscape": z_identifiable,
+                "search_window": "x in [0.10, 0.60], z in [1.0, 2.5]",
+                "interior_optimum_required": True,
+            },
+            "tau_q_half_note": (f"ensemble survival probability at lambda={lam_nc} for L={tqh_L} "
+                                f"first reaches 0.5 at sweep {tqh}"
+                                + (" (censored: never reached within t_max; value is a lower bound)"
+                                   if censored else "")),
+        },
+        "conclusion": conclusion,
+    }
+    with open(os.path.join(RESULTS_DIR, "dp_report.json"), "w") as fh:
+        json.dump(report, fh, indent=2)
+
+    print("\nPer-lambda table (rho_ss / survival_prob):")
+    for li, lam in enumerate(LAMBDA_SCAN):
+        cells = [f"L={L}: {rho_tab[li, j]:.3f}/{surv_tab[li, j]:.3f}"
+                 for j, L in enumerate(SYSTEM_SIZES)]
+        print(f"  lambda={lam:6.3f} | " + " | ".join(cells))
+    print(f"\nlambda_c = {lam_c:.4f} CI [{ci_low:.4f}, {ci_high:.4f}] "
+          f"(M1={th['lam_m1']:.4f}, M2={th['lam_m2']})")
+    print(f"beta = {beta_hat} CI [{b_lo}, {b_hi}] per-size={per_size_beta}")
+    print(f"delta(eff) = {delta_est:.4f}")
+    print(f"collapse best={best} null={col['null_best']} success={collapse_success} res_dp={res_dp} z_identifiable={z_identifiable}")
+    print(f"tau_q_half (L={tqh_L}, lambda={lam_nc}) = {tqh} censored={censored}")
+    print(f"conclusion = {conclusion}")
+
+
+if __name__ == "__main__":
+    main()

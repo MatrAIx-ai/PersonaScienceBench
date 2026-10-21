@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+analysis.py — implicit-solvent continuum-electrostatics binding-response benchmark
+(contract v6.8, case pack "v6_8_continuum_response_hidden_suite").
+
+Primary route : finite-volume Poisson-Boltzmann on the disclosed 35^3 node-centered
+                grid, per-entity (assembly / part_a / part_b) medium and vacuum
+                solves with zero-Dirichlet exterior, harmonic face dielectrics,
+                trilinear cloud-in-cell charge deposition, trilinear reaction-field
+                interpolation at site positions, manifest binding expression
+                assembly - part_a - part_b.
+Secondary route: compact generalized-Born cross-term surrogate (part_a x part_b
+                only) with Born radii from the reconstructed component SES.
+
+All quantities follow the disclosed data only; no external solver software.
+"""
+import json
+import os
+import numpy as np
+import pandas as pd
+from scipy import ndimage, sparse
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
+try:                                   # matplotlib is listed in the runtime
+    import matplotlib                  # policy; fall back to a pure-numpy
+    matplotlib.use("Agg")              # PNG renderer if unavailable
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+# ----------------------- labeled contract constants ------------------------ #
+K_COULOMB = 332.06371                  # kcal mol^-1 e^-2 Angstrom
+RHS_PREFAC = 4.0 * np.pi * K_COULOMB   # interior RHS prefactor, kcal/mol/e
+SINH_ARG_CLIP = 700.0                  # nonlinear: clip |sinh| argument
+NEWTON_MAX_ITER = 40
+NEWTON_REL_TOL = 1e-9                  # relative residual tolerance (inf norm)
+NEWTON_TRUST_CAP = 10.0                # cap on max |dphi| per Newton step
+CROSS_TERM_MAX_NEAREST = 6.5           # Angstrom; skip part_a sites beyond this
+N_GRID = 35
+_PERMC = "MMD_AT_PLUS_A"          # fast ordering for the symmetric pattern
+
+with open("data/manifest.json") as fh:
+    MANIFEST = json.load(fh)
+with open("data/plane_spec.json") as fh:
+    PLANE_SPEC = json.load(fh)
+SITES = pd.read_csv("data/sites.csv")
+VOL_A = np.load("data/volume_a.npy")   # (8,35,35,35) assembly SES signed distance
+VOL_B = np.load("data/volume_b.npy")   # (8,35,35,35) assembly SAS signed distance
+QUERIES = np.load("data/queries.npy")  # (8,24,3) Angstrom
+
+CASES = MANIFEST["cases"]
+assert [c["case_id"] for c in CASES] == MANIFEST["case_order"]
+assert VOL_A.shape == VOL_B.shape == (8, N_GRID, N_GRID, N_GRID)
+assert QUERIES.shape == (8, 24, 3)
+
+
+def axes_of(case):
+    """Node-centered axis coordinate vectors (Angstrom)."""
+    g = case["grid"]
+    h = g["spacing_angstrom"]
+    ctr = np.asarray(g["box_center_angstrom"], dtype=float)
+    off = (np.arange(N_GRID) - (N_GRID - 1) / 2.0) * h
+    return ctr[0] + off, ctr[1] + off, ctr[2] + off, h, ctr
+
+
+def grid_points(X, Y, Z):
+    return np.stack(np.meshgrid(X, Y, Z, indexing="ij"), -1).reshape(-1, 3)
+
+
+def sdf_from_mask(mask, h):
+    """Signed distance: EDT(outside) - EDT(inside), sampled in Angstrom."""
+    outside = ndimage.distance_transform_edt(~mask, sampling=h)
+    inside = ndimage.distance_transform_edt(mask, sampling=h)
+    return outside - inside
+
+
+def component_surfaces(xyz, rad, gp_flat, h, probe):
+    """
+    Component SES/SAS per the contract: VDW mask from atom radii (radius-0
+    atoms contribute no volume), SAS = radius + probe, SES = probe-radius
+    dilation followed by probe-radius erosion of the VDW mask, union VDW;
+    signed distances from Euclidean distance transforms (outside - inside).
+    Dilation/erosion are grid EDT operations with sampling = spacing.
+    """
+    tree = cKDTree(xyz)
+    d, nn = tree.query(gp_flat, workers=-1)
+    d = d.reshape(N_GRID, N_GRID, N_GRID)
+    r_nn = rad[nn].reshape(N_GRID, N_GRID, N_GRID)
+    vdw = d <= r_nn
+    sas = d <= r_nn + probe
+    dilated = ndimage.distance_transform_edt(~vdw, sampling=h) <= probe
+    eroded = ndimage.distance_transform_edt(dilated, sampling=h) > probe
+    ses = eroded | vdw
+    return sdf_from_mask(ses, h), sdf_from_mask(sas, h)
+
+
+def solvent_fraction(sdf, surface_model, window):
+    """Sharp mol: outside-of-SES indicator. smol: tanh transition on SES SDF."""
+    if surface_model == "smol" and window > 0:
+        return 0.5 * (1.0 + np.tanh(sdf / window))
+    return (sdf >= 0.0).astype(float)
+
+
+def cic_deposits(pos, q, ctr, h):
+    """Trilinear cloud-in-cell charge density on nodes, divided by spacing**3."""
+    u = (pos - ctr) / h + (N_GRID - 1) / 2.0     # fractional node index
+    i0 = np.floor(u).astype(int)
+    w = u - i0
+    rho = np.zeros((N_GRID, N_GRID, N_GRID))
+    for dz in (0, 1):
+        wz = w[:, 2] if dz else 1.0 - w[:, 2]
+        iz = np.clip(i0[:, 2] + dz, 0, N_GRID - 1)
+        for dy in (0, 1):
+            wy = w[:, 1] if dy else 1.0 - w[:, 1]
+            iy = np.clip(i0[:, 1] + dy, 0, N_GRID - 1)
+            for dx in (0, 1):
+                wx = w[:, 0] if dx else 1.0 - w[:, 0]
+                ix = np.clip(i0[:, 0] + dx, 0, N_GRID - 1)
+                np.add.at(rho, (ix, iy, iz), q * wx * wy * wz)
+    return rho / h ** 3
+
+
+def build_operator(eps, frac, kappa, h):
+    """
+    7-point finite-volume operator for
+        -div(eps grad phi) + kappa^2 * frac * phi = RHS
+    with harmonic face-averaged dielectric coefficients. Interior unknowns
+    only; the zero-Dirichlet boundary folds boundary-face fluxes into the
+    diagonal. Returns (matrix, interior_flat_ids, screen_vector).
+    """
+    n = N_GRID
+    # per-axis harmonic face dielectric between node and its +axis neighbor
+    harm = [2.0 * eps[:-1] * eps[1:] / (eps[:-1] + eps[1:]),
+            2.0 * eps[:, :-1] * eps[:, 1:] / (eps[:, :-1] + eps[:, 1:]),
+            2.0 * eps[:, :, :-1] * eps[:, :, 1:] / (eps[:, :, :-1] + eps[:, :, 1:])]
+
+    ii = np.arange(1, n - 1)
+    III = np.stack(np.meshgrid(ii, ii, ii, indexing="ij"), -1).reshape(-1, 3)
+    M = III.shape[0]
+    flat = (III[:, 0] * n + III[:, 1]) * n + III[:, 2]
+    iid = np.full(n ** 3, -1, dtype=np.int64)
+    iid[flat] = np.arange(M)
+
+    rows, cols, vals = [], [], []
+    diag = np.zeros(M)
+    arangeM = np.arange(M)
+
+    for axis in range(3):
+        o1, o2 = [a for a in range(3) if a != axis]
+        cf = h * harm[axis].take(III[:, axis], axis=axis)   # face coef per axis
+        cp = cf[(III[:, axis], III[:, o1], III[:, o2])]          # +1 face
+        cm = cf[(III[:, axis] - 1, III[:, o1], III[:, o2])]      # -1 face
+        for sign, c in ((+1, cp), (-1, cm)):
+            nb = III.copy()
+            nb[:, axis] += sign
+            nb_flat = (nb[:, 0] * n + nb[:, 1]) * n + nb[:, 2]
+            nb_int = iid[nb_flat]
+            interior = nb_int >= 0
+            diag += c                                    # every face -> diagonal
+            rows.append(arangeM[interior])               # interior pairs -> off-diag
+            cols.append(nb_int[interior])
+            vals.append(-c[interior])
+
+    screen = (kappa ** 2) * frac[III[:, 0], III[:, 1], III[:, 2]] * h ** 3
+    diag = diag + screen
+    rows.append(arangeM); cols.append(arangeM); vals.append(diag)
+
+    A = sparse.coo_matrix(
+        (np.concatenate(vals),
+         (np.concatenate(rows), np.concatenate(cols))), shape=(M, M)).tocsr()
+    return A, flat, screen
+
+
+def _newton_solve(A_lin, screen, b):
+    """Damped Newton for -div(eps grad phi) + screen*sinh(phi) = b (native units)."""
+    base = (A_lin - sparse.diags(screen)).tocsc()   # dielectric part only
+    phi = spsolve((base + sparse.diags(screen)).tocsc(), b, permc_spec=_PERMC)  # linearized guess
+
+    def residual(p):
+        sh = np.sinh(np.clip(p, -SINH_ARG_CLIP, SINH_ARG_CLIP))
+        return base @ p + screen * sh - b
+
+    bnorm = max(np.max(np.abs(b)), 1e-300)
+    F = residual(phi)
+    rel = np.max(np.abs(F)) / bnorm
+    it = 0
+    while rel > NEWTON_REL_TOL and it < NEWTON_MAX_ITER:
+        it += 1
+        ch = np.cosh(np.clip(phi, -SINH_ARG_CLIP, SINH_ARG_CLIP))
+        d = spsolve((base + sparse.diags(screen * ch)).tocsc(), -F, permc_spec=_PERMC)
+        step = np.max(np.abs(d))
+        if step > NEWTON_TRUST_CAP:
+            d *= NEWTON_TRUST_CAP / step
+        alpha, F0 = 1.0, np.max(np.abs(F))
+        while alpha > 1.0 / 64.0:
+            if np.max(np.abs(residual(phi + alpha * d))) < F0:
+                break
+            alpha *= 0.5
+        phi = phi + alpha * d
+        F = residual(phi)
+        rel = np.max(np.abs(F)) / bnorm
+    status = "newton-converged" if rel <= NEWTON_REL_TOL else "newton-maxiter"
+    return phi, status, it, float(rel)
+
+
+def solve_pb(case, entity_rows, ses_sdf, diag_list, entity_id):
+    """Medium + vacuum PB solves for one entity; returns reaction field (35^3)."""
+    rp, sp = case["response_parameters"], case["surface_parameters"]
+    eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+    kappa, regime = rp["screening_kappa_per_angstrom"], rp["response_regime"]
+    X, Y, Z, h, ctr = axes_of(case)
+
+    frac = solvent_fraction(ses_sdf, sp["surface_model"], sp["smoothing_window_angstrom"])
+    eps = eps_in + (eps_out - eps_in) * frac
+    rho = cic_deposits(
+        entity_rows[["x_angstrom", "y_angstrom", "z_angstrom"]].values,
+        entity_rows["charge_e"].values, ctr, h)
+
+    ii = np.arange(1, N_GRID - 1)
+    III = np.stack(np.meshgrid(ii, ii, ii, indexing="ij"), -1).reshape(-1, 3)
+    b = (h ** 3) * RHS_PREFAC * rho[III[:, 0], III[:, 1], III[:, 2]]
+
+    A_med, flat, screen = build_operator(eps, frac, kappa, h)
+    if regime == "linearized_screening":
+        phi_med = spsolve(A_med.tocsc(), b, permc_spec=_PERMC)
+        status, iters = "direct-linear", 1
+        resid = float(np.max(np.abs(A_med @ phi_med - b)) / max(np.max(np.abs(b)), 1e-300))
+    else:
+        phi_med, status, iters, resid = _newton_solve(A_med, screen, b)
+
+    # Vacuum: identical code path, uniform inner dielectric, f=0, kappa=0.
+    A_vac, _, _ = build_operator(np.full_like(eps, eps_in),
+                                 np.zeros_like(frac), 0.0, h)
+    phi_vac = spsolve(A_vac.tocsc(), b, permc_spec=_PERMC)
+    resid_v = float(np.max(np.abs(A_vac @ phi_vac - b)) / max(np.max(np.abs(b)), 1e-300))
+
+    phi_m = np.zeros(N_GRID ** 3); phi_m[flat] = phi_med
+    phi_v = np.zeros(N_GRID ** 3); phi_v[flat] = phi_vac
+    rf = (phi_m - phi_v).reshape(N_GRID, N_GRID, N_GRID)
+
+    diag_list.append(dict(case=case["case_id"], entity=entity_id, solve="medium",
+                          method=status, iterations=iters, rel_residual=resid,
+                          max_abs_phi=float(np.max(np.abs(phi_med)))))
+    diag_list.append(dict(case=case["case_id"], entity=entity_id, solve="vacuum",
+                          method="direct-linear", iterations=1, rel_residual=resid_v,
+                          max_abs_phi=float(np.max(np.abs(phi_vac)))))
+    return rf
+
+
+def trilinear(vol, pts, ctr, h):
+    coords = ((pts[:, 0] - ctr[0]) / h + (N_GRID - 1) / 2.0,
+              (pts[:, 1] - ctr[1]) / h + (N_GRID - 1) / 2.0,
+              (pts[:, 2] - ctr[2]) / h + (N_GRID - 1) / 2.0)
+    return ndimage.map_coordinates(vol, np.asarray(coords), order=1, mode="nearest")
+
+
+def response_energy(rf, rows, ctr, h):
+    rf_at = trilinear(rf, rows[["x_angstrom", "y_angstrom", "z_angstrom"]].values, ctr, h)
+    return 0.5 * float(np.sum(rows["charge_e"].values * rf_at))
+
+
+def secondary_cross_term(rows_a, rows_b, sdf_a, sdf_b, ctr, h, rp):
+    """
+    Compact GB cross-term surrogate: part_a x part_b pairs only.
+    Born radius a_i = max(atom radius, |component SES SDF| at the site).
+    Skip a part_a site when its nearest part_b site is farther than
+    CROSS_TERM_MAX_NEAREST Angstrom; otherwise sum it against all part_b sites.
+    """
+    eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+    kappa = rp["screening_kappa_per_angstrom"]
+    a = born_radii(rows_a, sdf_a, ctr, h)
+    bb = born_radii(rows_b, sdf_b, ctr, h)
+    PA = rows_a[["x_angstrom", "y_angstrom", "z_angstrom"]].values
+    PB = rows_b[["x_angstrom", "y_angstrom", "z_angstrom"]].values
+    qA = rows_a["charge_e"].values
+    qB = rows_b["charge_e"].values
+    dmin, _ = cKDTree(PB).query(PA, workers=-1)
+    keep = dmin <= CROSS_TERM_MAX_NEAREST
+    total = 0.0
+    if keep.any():
+        PAk, qAk, ak = PA[keep], qA[keep], a[keep]
+        dr = PAk[:, None, :] - PB[None, :, :]
+        rij2 = (dr ** 2).sum(-1)
+        prod = ak[:, None] * bb[None, :]
+        fij = np.sqrt(rij2 + prod * np.exp(-rij2 / (4.0 * prod)))
+        fij = np.maximum(fij, 1e-12)          # guard against coincident sites
+        pairs = -K_COULOMB * qAk[:, None] * qB[None, :] * \
+            ((1.0 / eps_in) - np.exp(-kappa * fij) / eps_out) / fij
+        total = float(pairs.sum())
+    return total, int(keep.sum())
+
+
+def born_radii(rows, ses_sdf, ctr, h):
+    r_atom = rows["radius_angstrom"].values
+    d_bnd = np.abs(trilinear(ses_sdf,
+                             rows[["x_angstrom", "y_angstrom", "z_angstrom"]].values,
+                             ctr, h))
+    return np.maximum(r_atom, d_bnd)
+
+
+def plane_slice(vol, axis, plane_index, storage_order):
+    """Nodal slice laid out literally per plane_spec storage_order."""
+    ax = {"x": 0, "y": 1, "z": 2}[axis]
+    sl = np.take(vol, plane_index, axis=ax)
+    remaining = [a for a in range(3) if a != ax]
+    want = [{"x_index": 0, "y_index": 1, "z_index": 2}[s] for s in storage_order]
+    perm = [remaining.index(w) for w in want]
+    return np.transpose(sl, perm)
+
+
+def verify_vacuum_special_case(case):
+    """Requirement (b): vacuum operator == same builder with uniform eps_in,
+    f=0, kappa=0; check against the analytic uniform-grid expectation."""
+    X, Y, Z, h, ctr = axes_of(case)
+    eps_in = case["response_parameters"]["inner_dielectric"]
+    A, flat, screen = build_operator(np.full((N_GRID,) * 3, eps_in),
+                                     np.zeros((N_GRID,) * 3), 0.0, h)
+    A = A.tocsr()
+    ok_screen = np.all(screen == 0.0)
+    d = A.diagonal()
+    ok_diag = np.allclose(d, 6.0 * h * eps_in, rtol=0, atol=1e-9)
+    ok_sym = (A - A.T).nnz == 0
+    # central interior node row: exactly 6 interior neighbors
+    c = (N_GRID // 2)
+    center_row = ((c * N_GRID) + c) * N_GRID + c
+    row = A.getrow(np.searchsorted(flat, center_row))
+    off_vals = row.data[np.abs(row.data + h * eps_in) > 1e-9]
+    ok_off = (row.nnz == 7 and len(off_vals) == 1 and
+              abs(off_vals[0] - 6.0 * h * eps_in) < 1e-9)
+    # row sum == h*eps_in * (number of Dirichlet boundary faces of that node):
+    # interior faces cancel (diag + off-diag), boundary faces leave their flux.
+    ii2 = np.arange(1, N_GRID - 1)
+    III2 = np.stack(np.meshgrid(ii2, ii2, ii2, indexing="ij"), -1).reshape(-1, 3)
+    n_bnd = np.zeros(len(III2))
+    for ax in range(3):
+        n_bnd += (III2[:, ax] == 1) + (III2[:, ax] == N_GRID - 2)
+    expected = h * eps_in * n_bnd
+    rowsum = np.asarray(A.sum(axis=1)).ravel()
+    ok_cons = bool(np.allclose(rowsum, expected, rtol=0, atol=1e-9))
+    return dict(case=case["case_id"], screen_zero=bool(ok_screen),
+                diag_uniform=bool(ok_diag), symmetric=bool(ok_sym),
+                offdiag_uniform=bool(ok_off), boundary_flux_consistent=ok_cons)
+
+
+def main():
+    os.makedirs("results", exist_ok=True)
+    diag_list = []
+    vac_checks = []
+    rows_out = []
+    samples = np.zeros((8, 24), dtype=np.float64)
+    slices = np.zeros((8, N_GRID, N_GRID), dtype=np.float64)
+    per_case_extra = []
+
+    for ci, case in enumerate(CASES):
+        cid = case["case_id"]
+        rp, sp = case["response_parameters"], case["surface_parameters"]
+        X, Y, Z, h, ctr = axes_of(case)
+        gp = grid_points(X, Y, Z)
+        vac_checks.append(verify_vacuum_special_case(case))
+
+        ent_rows = {e["entity_id"]: SITES[(SITES.case_id == cid) &
+                                             (SITES.entity_id == e["entity_id"])]
+                    for e in case["entities"]}
+
+        # geometry: assembly = supplied SES tensor (authoritative); components
+        # reconstructed from their own sites.csv rows
+        sdf = {"assembly": VOL_A[ci].astype(np.float64)}
+        for eid in ("part_a", "part_b"):
+            r = ent_rows[eid]
+            ses_sdf, _ = component_surfaces(
+                r[["x_angstrom", "y_angstrom", "z_angstrom"]].values,
+                r["radius_angstrom"].values, gp, h, sp["probe_radius_angstrom"])
+            sdf[eid] = ses_sdf
+
+        energies = {}
+        for ent in case["entities"]:
+            eid = ent["entity_id"]
+            rf = solve_pb(case, ent_rows[eid], sdf[eid], diag_list, eid)
+            energies[eid] = response_energy(rf, ent_rows[eid], ctr, h)
+            if eid == case["field_entity_id"]:
+                field_rf = rf
+
+        primary = energies["assembly"] - energies["part_a"] - energies["part_b"]
+        secondary, n_pairs = secondary_cross_term(
+            ent_rows["part_a"], ent_rows["part_b"], sdf["part_a"], sdf["part_b"],
+            ctr, h, rp)
+
+        ps = [p for p in PLANE_SPEC["planes"] if p["case_id"] == cid][0]
+        sl = plane_slice(field_rf, ps["axis"], ps["plane_index"], ps["storage_order"])
+        samples[ci] = trilinear(field_rf, QUERIES[ci].astype(np.float64), ctr, h)
+        slices[ci] = sl
+
+        rows_out.append(dict(case_id=cid,
+                             metric_primary_kcal_mol=primary,
+                             metric_secondary_kcal_mol=secondary,
+                             metric_gap_kcal_mol=primary - secondary))
+        per_case_extra.append(dict(case_id=cid, n_cross_pairs=n_pairs,
+                                   E_assembly=energies["assembly"],
+                                   E_part_a=energies["part_a"],
+                                   E_part_b=energies["part_b"]))
+        print(f"[{cid}] primary={primary:.6f} secondary={secondary:.6f} "
+              f"gap={primary - secondary:.6f} (cross pairs={n_pairs})", flush=True)
+
+    # ---------------------------- deliverables ----------------------------- #
+    samples32 = samples.astype(np.float32)
+    slices32 = slices.astype(np.float32)
+    assert samples32.shape == (8, 24) and samples32.dtype == np.float32
+    assert slices32.shape == (8, N_GRID, N_GRID) and slices32.dtype == np.float32
+    assert np.all(np.isfinite(samples32)) and np.all(np.isfinite(slices32))
+
+    df_out = pd.DataFrame(rows_out)[
+        ["case_id", "metric_primary_kcal_mol", "metric_secondary_kcal_mol",
+         "metric_gap_kcal_mol"]]
+    assert np.allclose(df_out.metric_gap_kcal_mol,
+                       df_out.metric_primary_kcal_mol - df_out.metric_secondary_kcal_mol)
+    df_out.to_csv("results/summary_metrics.csv", index=False)
+
+    np.save("results/field_samples.npy", samples32)
+    np.save("results/field_slice.npy", slices32)
+
+    pd.DataFrame(diag_list).to_csv("results/solve_diagnostics.csv", index=False)
+    pd.DataFrame(vac_checks).to_csv("results/vacuum_operator_check.csv", index=False)
+    pd.DataFrame(per_case_extra).to_csv("results/per_case_detail.csv", index=False)
+
+    make_overview(df_out)
+    print(df_out.to_string(index=False))
+
+
+
+# --------------------------------------------------------------------------- #
+# Pure-numpy PNG fallback renderer (used only when matplotlib is unavailable)
+# --------------------------------------------------------------------------- #
+_GLYPHS = {
+ 'A':"01110 10001 10001 11111 10001 10001 10001",'B':"11110 10001 10001 11110 10001 10001 11110",
+ 'C':"01110 10001 10000 10000 10000 10001 01110",'D':"11110 10001 10001 10001 10001 10001 11110",
+ 'E':"11111 10000 10000 11110 10000 10000 11111",'F':"11111 10000 10000 11110 10000 10000 10000",
+ 'G':"01110 10001 10000 10111 10001 10001 01111",'H':"10001 10001 10001 11111 10001 10001 10001",
+ 'I':"01110 00100 00100 00100 00100 00100 01110",'J':"00111 00010 00010 00010 00010 10010 01100",
+ 'K':"10001 10010 10100 11000 10100 10010 10001",'L':"10000 10000 10000 10000 10000 10000 11111",
+ 'M':"10001 11011 10101 10101 10001 10001 10001",'N':"10001 11001 10101 10011 10001 10001 10001",
+ 'O':"01110 10001 10001 10001 10001 10001 01110",'P':"11110 10001 10001 11110 10000 10000 10000",
+ 'Q':"01110 10001 10001 10001 10101 10010 01101",'R':"11110 10001 10001 11110 10100 10010 10001",
+ 'S':"01111 10000 10000 01110 00001 00001 11110",'T':"11111 00100 00100 00100 00100 00100 00100",
+ 'U':"10001 10001 10001 10001 10001 10001 01110",'V':"10001 10001 10001 10001 10001 01010 00100",
+ 'W':"10001 10001 10001 10101 10101 11011 10001",'X':"10001 10001 01010 00100 01010 10001 10001",
+ 'Y':"10001 10001 01010 00100 00100 00100 00100",'Z':"11111 00001 00010 00100 01000 10000 11111",
+ '0':"01110 10001 10011 10101 11001 10001 01110",'1':"00100 01100 00100 00100 00100 00100 01110",
+ '2':"01110 10001 00001 00110 01000 10000 11111",'3':"11110 00001 00001 01110 00001 00001 11110",
+ '4':"00010 00110 01010 10010 11111 00010 00010",'5':"11111 10000 11110 00001 00001 10001 01110",
+ '6':"00110 01000 10000 11110 10001 10001 01110",'7':"11111 00001 00010 00100 01000 01000 01000",
+ '8':"01110 10001 10001 01110 10001 10001 01110",'9':"01110 10001 10001 01111 00001 00010 01100",
+ ' ':"00000 00000 00000 00000 00000 00000 00000",'-':"00000 00000 00000 01110 00000 00000 00000",
+ '.':"00000 00000 00000 00000 00000 00110 00110",'_':"00000 00000 00000 00000 00000 00000 11111",
+ '(':"00010 00100 01000 01000 01000 00100 00010",')':"01000 00100 00010 00010 00010 00100 01000",
+ '/':"00001 00010 00010 00100 01000 01000 10000",':':"00000 00110 00110 00000 00110 00110 00000",
+ '+':"00000 00100 00100 11111 00100 00100 00000",'=':"00000 00000 11111 00000 11111 00000 00000",
+ ',':"00000 00000 00000 00000 00110 00100 01000",'[':"01110 01000 01000 01000 01000 01000 01110",
+ ']':"01110 00010 00010 00010 00010 00010 01110",'%':"01001 01010 00100 00100 01010 01010 00000"}
+
+
+def _draw_text(img, x0, y0, text, scale=2, color=(0, 0, 0)):
+    for ch in text.upper():
+        g = _GLYPHS.get(ch, _GLYPHS[' '])
+        rows = g.split()
+        for ry, rowbits in enumerate(rows):
+            for rx, bit in enumerate(rowbits):
+                if bit == '1':
+                    y = y0 + ry * scale
+                    x = x0 + rx * scale
+                    img[y:y + scale, x:x + scale] = color
+        x0 += 6 * scale
+
+
+def _diverging(v, vmax):
+    c = np.clip(v / max(vmax, 1e-300), -1.0, 1.0)
+    r = np.where(c >= 0, 255.0, 255.0 * (1.0 + c))
+    g = np.where(c >= 0, 255.0 * (1.0 - c), 255.0 * (1.0 + c))
+    b = np.where(c >= 0, 255.0 * (1.0 - c), 255.0)
+    return np.stack([r, g, b], -1).astype(np.uint8)
+
+
+def _write_png(path, img):
+    import zlib, struct
+    h, w, _ = img.shape
+    raw = b''.join(b'\x00' + img[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        return (struct.pack('>I', len(data)) + tag + data +
+                struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+    png = (b'\x89PNG\r\n\x1a\n'
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+           + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+    open(path, 'wb').write(png)
+
+
+def _imshow_panel(img, ox, oy, field, vmax, scale, label, unit):
+    small = _diverging(field, vmax)
+    big = np.repeat(np.repeat(small, scale, 0), scale, 1)
+    img[oy:oy + big.shape[0], ox:ox + big.shape[1]] = big
+    _draw_text(img, ox, oy + big.shape[0] + 6, label, 2, (0, 0, 0))
+    _draw_text(img, ox + big.shape[1] - 14 * 12, oy - 18, unit, 2, (0, 0, 0))
+
+
+def _bar_panel(img, ox, oy, w, h, primary, secondary):
+    img[oy:oy + h, ox:ox + w] = (255, 255, 255)
+    base = oy + h - 30
+    img[base:base + 2, ox:ox + w] = (0, 0, 0)          # x axis
+    img[oy:base, ox:ox + 2] = (0, 0, 0)                # y axis
+    hi = max(abs(primary), abs(secondary), 1e-9)
+    usable = (base - oy) - 44
+    for k, (val, col, name) in enumerate([(primary, (70, 116, 193), 'primary (PB)'),
+                                          (secondary, (221, 132, 43), 'secondary (GB)')]):
+        bh = int(round(abs(val) / hi * usable))
+        x = ox + 60 + k * (w // 2)
+        if val >= 0:
+            img[base - bh:base, x:x + 46] = col
+        else:
+            img[base:min(base + bh, oy + h), x:x + 46] = col
+        _draw_text(img, x - 12, (base + 10) if val >= 0 else (base + bh + 10),
+                   '%+.3f' % val, 2, (0, 0, 0))
+        _draw_text(img, ox + 24, oy + 6, name, 2, (0, 0, 0))
+
+
+def _overview_fallback(df_out):
+    scale, pad = 8, 18
+    pw = N_GRID * scale                      # 280
+    W = pad + 3 * (pw + 60) + pad
+    H = 90 + 8 * (pw + 60) + 40
+    img = np.full((H, W, 3), 255, np.uint8)
+    _draw_text(img, pad, 20, 'IMPLICIT-SOLVENT BINDING RESPONSE: PB PRIMARY VS GB-CROSS SECONDARY',
+               2, (0, 0, 0))
+    heads = ['SES SDF (PRESCRIBED PLANE)', 'REACTION FIELD (KCAL/MOL/E)', 'RESPONSE METRICS (KCAL/MOL)']
+    for k, hd in enumerate(heads):
+        _draw_text(img, pad + k * (pw + 60), 52, hd, 2, (0, 0, 0))
+    for ci, case in enumerate(CASES):
+        cid = case['case_id']
+        ps = [p for p in PLANE_SPEC['planes'] if p['case_id'] == cid][0]
+        geo = plane_slice(VOL_A[ci], ps['axis'], ps['plane_index'], ps['storage_order'])
+        fld = np.load('results/field_slice.npy')[ci]
+        y0 = 90 + ci * (pw + 60)
+        _imshow_panel(img, pad, y0, geo, 3.0, scale,
+                      '%s %s-plane SDF' % (cid, ps['axis']), 'SDF')
+        _imshow_panel(img, pad + pw + 60, y0, fld, np.max(np.abs(fld)) or 1.0, scale,
+                      '%s field' % cid, 'KCAL/MOL/E')
+        _bar_panel(img, pad + 2 * (pw + 60), y0, pw + 60, pw,
+                   df_out.metric_primary_kcal_mol[ci], df_out.metric_secondary_kcal_mol[ci])
+        _draw_text(img, pad + 2 * (pw + 60), y0 + pw + 6, cid, 2, (0, 0, 0))
+    _write_png('results/overview.png', img)
+
+
+def make_overview(df_out):
+    if HAVE_MPL:
+        fig, axes = plt.subplots(8, 3, figsize=(15, 30))
+        for ci, case in enumerate(CASES):
+            cid = case['case_id']
+            ps = [p for p in PLANE_SPEC['planes'] if p['case_id'] == cid][0]
+            geo = plane_slice(VOL_A[ci], ps['axis'], ps['plane_index'], ps['storage_order'])
+            fld = np.load('results/field_slice.npy')[ci]
+            ax = axes[ci, 0]
+            im = ax.imshow(geo, origin='lower', cmap='bwr_r', vmin=-3, vmax=3)
+            ax.set_title(f"{cid} SES SDF [{ps['axis']}-plane]")
+            plt.colorbar(im, ax=ax, fraction=0.046)
+            ax = axes[ci, 1]
+            vm = np.nanmax(np.abs(fld))
+            im = ax.imshow(fld, origin='lower', cmap='bwr', vmin=-vm, vmax=vm)
+            ax.set_title(f'{cid} reaction field (kcal/mol/e)')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+            ax = axes[ci, 2]
+            ax.bar([-0.15, 0.15],
+                   [df_out.metric_primary_kcal_mol[ci], df_out.metric_secondary_kcal_mol[ci]],
+                   0.3, color=['#4a74c1', '#dd842b'])
+            ax.set_xticks([-0.15, 0.15])
+            ax.set_xticklabels(['primary (PB)', 'secondary (GB cross)'], fontsize=8)
+            ax.set_ylabel('kcal/mol')
+            ax.set_title(f'{cid} response metrics')
+        fig.suptitle('Implicit-solvent binding response: PB primary vs GB-cross secondary '
+                     '(geometry slice = prescribed plane, SES signed distance)', y=0.995)
+        fig.tight_layout(rect=[0, 0, 1, 0.99])
+        fig.savefig('results/overview.png', dpi=110)
+        plt.close(fig)
+    else:
+        _overview_fallback(df_out)
+
+
+if __name__ == "__main__":
+    main()

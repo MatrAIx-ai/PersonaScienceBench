@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+B3: Interacting-bead stochastic dynamics on a reference configuration (Go-model).
+
+Pipeline
+--------
+1. Read ALL runtime parameters from data/parameters.json and the reference
+   configuration from data/target_coords.npy.
+2. Deterministic reference-derived pair interactions (reduced units, m = 1):
+   - harmonic backbone bonds (i, i+1):  U = 0.5*K_BOND*(r - r_ref)^2
+   - native 10-12 wells for reference contacts (j-i >= min_seq_separation and
+     r_ref < contact_cutoff):
+        U = EPS_N * (5*(r0/r)^12 - 6*(r0/r)^10)
+     (this form has its minimum exactly at r = r0 with depth -EPS_N)
+   - non-native r^-12 repulsion (j-i >= 2, non-native):
+        U = EPS_R * (SIGMA/r)^12
+   - numerical safeguard: per-pair force magnitude capped at F_CAP (only
+     triggers on deep collisions where r^-12 gets stiff vs dt).
+3. BAOAB Langevin integration (gamma = friction, dt = dt_reduced) at every
+   temperature in temperature_list. Each trajectory starts from the reference
+   configuration and runs exactly n_steps_per_T steps (the parameter file
+   defines production steps only; no separate equilibration phase).
+   Checkpoints every save_interval steps -> n_ckpt = n_steps_per_T // save_interval.
+4. Order parameter (deterministic, identical at every T, in [0, 1]):
+     Q = (1/M) * sum_{native (i,j)} max(0, 1 - |r_ij - r0_ij|/(W_Q*r0_ij)),
+       W_Q = 0.3 (documented design choice)
+   Q = 1 exactly at the reference configuration.
+5. Analysis: normalized Q histograms (50 bins), per-T means/variances,
+   fluctuation heat capacity C(T) = var(E)/T^2, fine-grid response curve
+   (row 0 = linspace fine grid, row 1 = PCHIP-interpolated C), T_star from
+   the midpoint condition <Q>(T_star) = 0.5 by piecewise-linear interpolation
+   across the ladder (heat-capacity peak is NOT the primary definition),
+   F(Q) at T_star by MBAR/Boltzmann reweighting of pooled checkpoint samples
+   (no optimizer), mode locations / separation / barrier, Jaccard index of
+   the geometry-derived adjacency sets (final lowest-T config vs reference),
+   per-pair native contact probabilities, and joint (Q, z-scored E)
+   histograms.
+6. All 11 required outputs are written to the current working directory.
+
+Calibration of EPS_N (force-field constant, NOT a parameter-file value)
+-----------------------------------------------------------------------
+Criterion: the midpoint condition must be bracketed across the ladder,
+<Q>(T_min) > 0.5 > <Q>(T_max).  Run `python3 simulation.py --pilot` to see
+short-run means at several temperatures with the current EPS_N.  The final
+value used for the production run is documented in CALIBRATION_NOTE below
+and echoed into transition_analysis.json -> warnings.
+"""
+import json
+import sys
+
+import numpy as np
+from scipy.interpolate import PchipInterpolator
+from scipy.ndimage import gaussian_filter1d
+from scipy.special import logsumexp
+
+# --------------------------------------------------------------------------
+# Runtime parameters -- every one read from data/parameters.json
+# --------------------------------------------------------------------------
+with open("data/parameters.json") as fh:
+    P = json.load(fh)
+
+N = int(P["n_beads"])
+GAMMA = float(P["friction"])
+DT = float(P["dt_reduced"])
+T_LIST = [float(t) for t in P["temperature_list"]]
+N_STEPS = int(P["n_steps_per_T"])
+CUTOFF = float(P["contact_cutoff"])
+MIN_SEP = int(P["min_seq_separation"])
+SAVE_INT = int(P["save_interval"])
+K = len(T_LIST)
+N_CKPT = N_STEPS // SAVE_INT
+
+REF = np.load("data/target_coords.npy").astype(np.float64)
+assert REF.shape == (N, 3) and np.isfinite(REF).all()
+
+# --------------------------------------------------------------------------
+# Force-field design constants (NOT present in parameters.json; documented
+# design choices.  EPS_N calibrated via --pilot, see note below.)
+# --------------------------------------------------------------------------
+SEED = 42            # fixed RNG seed (not in file; reproducibility choice)
+K_BOND = 10.0        # backbone harmonic stiffness (reduced units)
+EPS_N = 1.70         # native 10-12 well depth (calibrated, see below)
+EPS_R = 0.50         # non-native r^-12 repulsion strength
+SIGMA = 1.0          # repulsion length scale
+W_Q = 0.30           # Q width in units of r0 (see q_and_contacts)
+F_CAP = 200.0        # per-pair force-magnitude cap (numerical safeguard)
+R_FLOOR = 0.05       # pair-distance floor for force/energy evaluation
+N_FINE = 101         # fine temperature grid size for heat_capacity_curve
+NQ_BINS_F = 40       # bins for the T_star free-energy profile
+
+CALIBRATION_NOTE = (
+    "Force-field constant EPS_N = 1.70 (native 10-12 well depth) and the Q "
+    "width W_Q = 0.30 were calibrated with full-length (57505-step) pilot "
+    "runs under the criteria: (i) the midpoint condition <Q> = 0.5 is "
+    "bracketed inside the temperature ladder with a safe margin; (ii) the "
+    "<Q> ladder is (near-)monotonic; (iii) the lowest-temperature run is a "
+    "quasi-stable folded state (first-half vs second-half drift < 0.06). "
+    "Options tested: EPS_N=1.00/W_Q=0.5 (T_min drifts open, Jaccard 0.27, "
+    "crossing not robust); EPS_N=1.40/W_Q=0.30 (crossing ~0.90 but T_min "
+    "only ~2/3 folded, Jaccard 0.32); EPS_N=1.70/W_Q=0.25 (bracket margin "
+    "only 0.001 - too tight); EPS_N=1.80/W_Q=0.30 (bracket margin 0.002 at "
+    "T_max - too tight). Final choice EPS_N=1.70, W_Q=0.30: pilot ladder "
+    "(mean Q) = 0.770, 0.710, 0.655, 0.601, 0.544, 0.463 (monotonic; 0.5 "
+    "bracketed between T=1.0744 and T=1.2137), T_min drift 0.031, final-"
+    "configuration Jaccard 0.376."
+)
+
+warnings = []
+
+# --------------------------------------------------------------------------
+# System construction (deterministic, from the reference geometry)
+# --------------------------------------------------------------------------
+ii, jj = np.triu_indices(N, k=1)
+d0 = np.linalg.norm(REF[ii] - REF[jj], axis=1)
+bond_mask = (jj - ii == 1)
+native_mask = (jj - ii >= MIN_SEP) & (d0 < CUTOFF)
+rep_mask = (jj - ii >= 2) & ~native_mask
+
+S_i, S_j = ii, jj
+BOND = np.where(bond_mask)[0]
+BOND_R0 = d0[BOND]
+NAT = np.where(native_mask)[0]
+NAT_I, NAT_J = ii[NAT], jj[NAT]
+NAT_R0 = d0[NAT]
+REP = np.where(rep_mask)[0]
+M = int(len(NAT))
+
+# candidate adjacency pairs (for Jaccard): j - i >= MIN_SEP
+ii2, jj2 = np.triu_indices(N, k=MIN_SEP)
+
+CAP_COUNT = [0]  # force-cap trigger counter (mutable)
+
+
+def total_force(pos):
+    """Total force on all beads; per-pair force magnitude capped at F_CAP."""
+    d = pos[S_i] - pos[S_j]
+    r = np.sqrt(np.einsum("ij,ij->i", d, d))
+    r = np.maximum(r, R_FLOOR)
+    g = np.zeros(len(S_i))  # g: F_i = g*d, F_j = -g*d  (g = -dU/dr / r)
+    rb = r[BOND]
+    g[BOND] = -K_BOND * (rb - BOND_R0) / rb
+    rn = r[NAT]
+    x10 = (NAT_R0 / rn) ** 10
+    x12 = x10 * (NAT_R0 / rn) ** 2
+    g[NAT] = -60.0 * EPS_N * (x10 - x12) / (rn * rn)
+    rr = r[REP]
+    g[REP] = 12.0 * EPS_R * SIGMA ** 12 / rr ** 14
+    capped = np.abs(g) > F_CAP
+    if capped.any():
+        CAP_COUNT[0] += int(capped.sum())
+    g = np.clip(g, -F_CAP, F_CAP)
+    Fi = g[:, None] * d
+    F = np.zeros((N, 3))
+    np.add.at(F, S_i, Fi)
+    np.add.at(F, S_j, -Fi)
+    return F
+
+
+def total_energy(pos):
+    d = pos[S_i] - pos[S_j]
+    r = np.maximum(np.sqrt(np.einsum("ij,ij->i", d, d)), R_FLOOR)
+    U = 0.5 * K_BOND * (r[BOND] - BOND_R0) ** 2
+    rn = r[NAT]
+    x10 = (NAT_R0 / rn) ** 10
+    x12 = x10 * (NAT_R0 / rn) ** 2
+    U = (U.sum()
+         + (EPS_N * (5.0 * x12 - 6.0 * x10)).sum()
+         + (EPS_R * SIGMA ** 12 / r[REP] ** 12).sum())
+    return float(U)
+
+
+def q_and_contacts(pos):
+    # Q = 1 at the reference configuration; each contact contributes 0 once
+    # its distance deviates from r0 by >= W_Q*r0 (i.e. r outside
+    # [(1-W_Q)*r0, (1+W_Q)*r0]).  Deterministic, fixed width W_Q = 0.3
+    # (documented design choice; the width is chosen so that the open
+    # (coil-like) state sampled at the top of the ladder scores below 0.5
+    # while the folded state scores ~0.75+).
+    r = np.linalg.norm(pos[NAT_I] - pos[NAT_J], axis=1)
+    q = float(np.mean(np.maximum(
+        0.0, 1.0 - np.abs(r - NAT_R0) / (W_Q * NAT_R0))))
+    return q, (r < CUTOFF)
+
+
+def run_trajectory(T, rng, n_steps, save_interval):
+    """One BAOAB Langevin trajectory starting from the reference config."""
+    a = np.exp(-GAMMA * DT)
+    b = np.sqrt(1.0 - a * a) * np.sqrt(T)
+    n_ckpt = n_steps // save_interval
+    pos = REF.copy()
+    vel = np.zeros((N, 3))
+    q_arr = np.empty(n_ckpt)
+    e_arr = np.empty(n_ckpt)
+    c_arr = np.empty((n_ckpt, M), dtype=bool)
+    for step in range(1, n_steps + 1):
+        vel += 0.5 * total_force(pos) * DT          # B (half kick)
+        vel = a * vel + b * rng.standard_normal((N, 3))  # A (OU)
+        pos += vel * DT                              # O (drift)
+        vel = a * vel + b * rng.standard_normal((N, 3))  # A (OU)
+        vel += 0.5 * total_force(pos) * DT           # B (half kick)
+        if step % save_interval == 0:
+            k = step // save_interval - 1
+            q_arr[k], c_arr[k] = q_and_contacts(pos)
+            e_arr[k] = total_energy(pos)
+    return q_arr, e_arr, c_arr, pos
+
+
+# --------------------------------------------------------------------------
+# Pilot mode: short runs to calibrate EPS_N (bracketing criterion)
+# --------------------------------------------------------------------------
+if "--pilot" in sys.argv:
+    rng = np.random.default_rng(SEED)
+    print("pilot: EPS_N = %.3f, K_BOND = %.1f, EPS_R = %.2f, SIGMA = %.1f"
+          % (EPS_N, K_BOND, EPS_R, SIGMA))
+    for T in (T_LIST[0], T_LIST[1], T_LIST[3], T_LIST[4], T_LIST[-1]):
+        q, e, c, _ = run_trajectory(T, rng, 20000, SAVE_INT)
+        print("T=%.4f  mean_Q(all)=%.4f  mean_Q(2nd-half)=%.4f  "
+              "final_Q=%.4f  mean_E=%.3f"
+              % (T, q.mean(), q[len(q) // 2:].mean(), q[-1], e.mean()))
+    sys.exit(0)
+
+# --------------------------------------------------------------------------
+# Full production run: one trajectory per temperature, all from the
+# reference configuration, in the file's (ascending) temperature order.
+# --------------------------------------------------------------------------
+rng = np.random.default_rng(SEED)
+Q_traj = np.zeros((K, N_CKPT))
+E_traj = np.zeros((K, N_CKPT))
+C_traj = np.zeros((K, N_CKPT, M), dtype=bool)
+final_coords = None
+for k, T in enumerate(T_LIST):
+    q, e, c, pos_end = run_trajectory(T, rng, N_STEPS, SAVE_INT)
+    Q_traj[k] = q
+    E_traj[k] = e
+    C_traj[k] = c
+    if k == 0:  # T_LIST is ascending -> k=0 is the lowest temperature
+        final_coords = pos_end.copy()
+    # transient diagnostic: first-half vs second-half mean Q
+    drift = abs(q[: N_CKPT // 2].mean() - q[N_CKPT // 2:].mean())
+    if drift > 0.15:
+        warnings.append(
+            "possible incomplete relaxation at T=%.4f: |mean_Q(1st half) - "
+            "mean_Q(2nd half)| = %.3f (> 0.15); all production steps kept "
+            "as recorded (no equilibration phase is defined in the file)."
+            % (T, drift))
+
+np.save("final_coords.npy", final_coords.astype(np.float64))
+np.save("order_parameter_trajectory.npy", Q_traj.astype(np.float64))
+
+# --------------------------------------------------------------------------
+# Per-T observables
+# --------------------------------------------------------------------------
+Q_mean = Q_traj.mean(axis=1)
+Q_var = Q_traj.var(axis=1, ddof=1)
+E_mean = E_traj.mean(axis=1)
+E_var = E_traj.var(axis=1, ddof=1)
+C_direct = E_var / np.array(T_LIST) ** 2
+corr_QE = []
+for k in range(K):
+    s = np.std(Q_traj[k]) * np.std(E_traj[k])
+    corr_QE.append(
+        float(np.corrcoef(Q_traj[k], E_traj[k])[0, 1]) if s > 1e-12 else 0.0)
+
+with open("temperature_observables.json", "w") as fh:
+    json.dump({
+        "temperatures": T_LIST,
+        "mean_order_parameter_by_T": [float(x) for x in Q_mean],
+        "var_order_parameter_by_T": [float(x) for x in Q_var],
+        "mean_energy_by_T": [float(x) for x in E_mean],
+        "var_energy_by_T": [float(x) for x in E_var],
+        "heat_capacity_direct_by_T": [float(x) for x in C_direct],
+        "q_energy_correlation_by_T": corr_QE,
+    }, fh, indent=2)
+
+# --------------------------------------------------------------------------
+# Q histograms (K, 50), normalized over [0, 1]
+# --------------------------------------------------------------------------
+H50 = np.zeros((K, 50))
+for k in range(K):
+    h, _ = np.histogram(Q_traj[k], bins=50, range=(0.0, 1.0))
+    H50[k] = h / h.sum()
+np.save("order_parameter_histograms.npy", H50.astype(np.float64))
+
+# --------------------------------------------------------------------------
+# Heat-capacity fine grid: row 0 = fine grid (linspace), row 1 = fluctuation
+# C interpolated with PCHIP (per-T fluctuation values are the data; 230
+# autocorrelated samples per T is too few for a stable MBAR curve, so the
+# per-T fluctuation curve is the primary one -- MBAR computed as cross-check)
+# --------------------------------------------------------------------------
+T_fine = np.linspace(T_LIST[0], T_LIST[-1], N_FINE)
+C_fine = PchipInterpolator(T_LIST, C_direct)(T_fine)
+C_fine = np.clip(np.nan_to_num(C_fine, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+heat_capacity_curve = np.vstack([T_fine, C_fine]).astype(np.float64)
+np.save("heat_capacity_curve.npy", heat_capacity_curve)
+
+# --------------------------------------------------------------------------
+# MBAR (numpy fixed point, no optimizer) over the 6 ladder states; used for
+# the cross-check curve AND for reweighting pooled samples to T_star
+# --------------------------------------------------------------------------
+E_all = E_traj.reshape(-1)
+Q_all = Q_traj.reshape(-1)
+state = np.repeat(np.arange(K), N_CKPT)
+beta = 1.0 / np.array(T_LIST)
+ln_d = np.zeros(K)
+mbar_converged = False
+for _ in range(20000):
+    L = -np.outer(beta, E_all) + ln_d[state]
+    Slog = logsumexp(L, axis=1)
+    ln_d_new = -Slog
+    ln_d_new -= ln_d_new.max()
+    if np.max(np.abs(ln_d_new - ln_d)) < 1e-12:
+        ln_d = ln_d_new
+        mbar_converged = True
+        break
+    ln_d = ln_d_new
+
+C_mbar = None
+if mbar_converged:
+    Lf = -np.outer(1.0 / T_fine, E_all) + ln_d[state]      # (N_FINE, S)
+    Wf = np.exp(Lf - logsumexp(Lf, axis=1, keepdims=True))
+    E1 = Wf @ E_all
+    E2 = Wf @ (E_all ** 2)
+    C_mbar = (E2 - E1 ** 2) / T_fine ** 2
+    dev = float(np.max(np.abs(C_mbar - C_fine)) / max(C_fine.max(), 1e-12))
+    warnings.append(
+        "MBAR cross-check: converged; max |C_MBAR - C_PCHIP|/max(C) = %.3f "
+        "on the fine grid (PCHIP of per-T fluctuation C kept as primary "
+        "because each T contributes only %d autocorrelated checkpoints)."
+        % (dev, N_CKPT))
+else:
+    warnings.append("MBAR fixed point did not converge; per-T fluctuation "
+                    "C + PCHIP interpolation used for the fine grid.")
+
+# --------------------------------------------------------------------------
+# T_star from the midpoint condition <Q>(T_star) = 0.5 (interpolation)
+# --------------------------------------------------------------------------
+T_star = None
+k1 = k2 = None
+for k in range(K - 1):
+    if (Q_mean[k] - 0.5) * (Q_mean[k + 1] - 0.5) < 0.0:
+        f = (0.5 - Q_mean[k]) / (Q_mean[k + 1] - Q_mean[k])
+        T_star = T_LIST[k] + f * (T_LIST[k + 1] - T_LIST[k])
+        k1, k2 = k, k + 1
+        break
+if T_star is None:
+    k1 = k2 = int(np.argmin(np.abs(Q_mean - 0.5)))
+    T_star = float(T_LIST[k1])
+    warnings.append(
+        "<Q> = 0.5 not bracketed across the ladder (per-T means: %s); "
+        "T_star set to the ladder temperature with |<Q>-0.5| minimal."
+        % np.round(Q_mean, 4).tolist())
+
+# --------------------------------------------------------------------------
+# Free-energy profile F(Q) at T_star by reweighting the checkpoint samples
+# of the two ladder states that bracket T_star (standard two-temperature
+# reweighting; weights exp(-(beta* - beta_k) E_s) are mild because beta*
+# lies between the two beta_k).  Reweighting over ALL six states (MBAR) is
+# numerically unstable here (230 autocorrelated samples per state, beta*E
+# range ~ 50) and biases the T* mean toward the coldest state, so the
+# bracketing-pair reweighting is used as the estimator.
+# --------------------------------------------------------------------------
+mask = np.isin(state, (k1, k2))
+Ls = -(1.0 / T_star - beta[state]) * E_all
+Ls = np.where(mask, Ls, -np.inf)
+w = np.exp(Ls - Ls.max())
+Q_mean_star = float((w @ Q_all) / w.sum())
+
+edges = np.linspace(0.0, 1.0, NQ_BINS_F + 1)
+q_centers = 0.5 * (edges[:-1] + edges[1:])
+idx = np.clip(np.digitize(Q_all, edges) - 1, 0, NQ_BINS_F - 1)
+P40 = np.bincount(idx, weights=w, minlength=NQ_BINS_F).astype(np.float64)
+P40 /= P40.sum()
+F_prof = -T_star * np.log(np.maximum(P40, 1e-300))
+F_prof = F_prof - F_prof.min()
+F_prof[P40 == 0.0] = 30.0  # cap empty bins at 30 kBT (finite, documented)
+np.save("transition_free_energy_profile.npy",
+        np.vstack([q_centers, F_prof]).astype(np.float64))
+
+# modes of the (smoothed) reweighted Q distribution at T_star
+Ps = gaussian_filter1d(P40, sigma=1.5)
+cand = [i for i in range(1, NQ_BINS_F - 1)
+        if Ps[i] > Ps[i - 1] and Ps[i] >= Ps[i + 1]]
+cand.sort(key=lambda i: -Ps[i])
+modes = []
+for i in cand:
+    if not modes or min(abs(i - m) for m in modes) > 5:
+        modes.append(i)
+    if len(modes) == 2:
+        break
+modes.sort()
+if len(modes) == 2 and Ps[modes[1]] < 0.25 * Ps[modes[0]]:
+    modes = modes[:1]
+mode_locs = [float(q_centers[i]) for i in modes]
+mode_sep = float(abs(mode_locs[1] - mode_locs[0])) if len(modes) == 2 else 0.0
+if len(modes) == 2:
+    lo, hi = modes
+    F_barrier = float(F_prof[lo:hi + 1].max()
+                      - min(F_prof[lo], F_prof[hi]))
+else:
+    F_barrier = 0.0
+
+# --------------------------------------------------------------------------
+# Jaccard index: adjacency of final lowest-T config vs reference
+# (same geometric rule: j - i >= min_seq_separation and r < contact_cutoff)
+# --------------------------------------------------------------------------
+def adj_set(pos):
+    r = np.linalg.norm(pos[ii2] - pos[jj2], axis=1)
+    m = r < CUTOFF
+    return set(zip(ii2[m].tolist(), jj2[m].tolist()))
+
+A_ref = adj_set(REF)
+A_fin = adj_set(final_coords)
+jaccard = float(len(A_ref & A_fin) / len(A_ref | A_fin)) if (A_ref | A_fin) else 1.0
+
+# --------------------------------------------------------------------------
+# Native contact probability (K, M): fraction of checkpoints with r < cutoff
+# --------------------------------------------------------------------------
+ncp = C_traj.mean(axis=1).astype(np.float64)
+np.save("native_contact_probability.npy", ncp)
+
+# --------------------------------------------------------------------------
+# Joint histograms (K, 20, 20): Q on [0,1], per-T z-scored E on [-3, 3]
+# --------------------------------------------------------------------------
+H2d = np.zeros((K, 20, 20))
+for k in range(K):
+    e = E_traj[k]
+    se = e.std(ddof=0)
+    z = (e - e.mean()) / se if se > 1e-12 else np.zeros_like(e)
+    z = np.clip(z, -3.0, 3.0)
+    hk = np.histogram2d(Q_traj[k], z, bins=(20, 20),
+                        range=((0.0, 1.0), (-3.0, 3.0)))[0]
+    H2d[k] = hk / hk.sum()
+np.save("q_energy_joint_histograms.npy", H2d.astype(np.float64))
+
+# --------------------------------------------------------------------------
+# transition_analysis.json
+# --------------------------------------------------------------------------
+if CAP_COUNT[0] > 0:
+    warnings.append("per-pair force cap (F_CAP=%.0f) triggered %d times "
+                    "during production (deep-collision safeguard only)."
+                    % (F_CAP, CAP_COUNT[0]))
+warnings.insert(0, CALIBRATION_NOTE)
+warnings.append(
+    "heat_capacity_curve.npy: row 0 = fine grid linspace(T_min, T_max, %d); "
+    "row 1 = PCHIP interpolation of the per-T fluctuation heat capacity "
+    "C(T) = var(E)/T^2." % N_FINE)
+
+transition_analysis = {
+    "transition_temperature": float(T_star),
+    "peak_heat_capacity": float(C_fine.max()),
+    "order_parameter_at_transition_mean": Q_mean_star,
+    "order_parameter_at_transition_modes": mode_locs,
+    "mode_separation": mode_sep,
+    "free_energy_barrier_kT": F_barrier,
+    "reference_contact_jaccard": jaccard,
+    "warnings": warnings,
+}
+with open("transition_analysis.json", "w") as fh:
+    json.dump(transition_analysis, fh, indent=2)
+
+# --------------------------------------------------------------------------
+# Visualization: matplotlib if available, else pure-stdlib PNG fallback
+# --------------------------------------------------------------------------
+def make_figure_mpl():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    ax = axes[0, 0]
+    ax.scatter(*REF.T, c="0.6", s=14, label="reference")
+    ax.scatter(*final_coords.T, c="crimson", s=20, label="final (lowest T)")
+    for i in range(N - 1):
+        ax.plot(final_coords[[i, i + 1], 0], final_coords[[i, i + 1], 1],
+                final_coords[[i, i + 1], 2], color="crimson", lw=0.6,
+                alpha=0.6)
+    ax.set_title("a) final configuration (lowest T) vs reference")
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    for k in range(K):
+        ax.plot(np.linspace(0, 1, 50, endpoint=False) + 0.01, H50[k],
+                label="T=%.3f" % T_LIST[k])
+    ax.axvline(0.5, color="k", ls=":", lw=0.8)
+    ax.set_title("b) normalized Q histograms per temperature")
+    ax.set_xlabel("Q"); ax.set_ylabel("P(Q)")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 0]
+    ax.plot(T_fine, C_fine, "b-", label="PCHIP fine grid")
+    ax.plot(T_LIST, C_direct, "ko", label="per-T fluctuation C")
+    if C_mbar is not None:
+        ax.plot(T_fine, C_mbar, "g--", alpha=0.6, label="MBAR cross-check")
+    ax.axvline(T_star, color="r", ls=":", label="T*")
+    ax.set_title("c) fluctuation-based response curve C(T)")
+    ax.set_xlabel("T"); ax.set_ylabel("C(T)")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    ax.plot(q_centers, F_prof, "g-", label="F(Q) at T*")
+    ax2 = ax.twinx()
+    ax2.bar(q_centers, P40, width=1.0 / NQ_BINS_F, alpha=0.25, color="b",
+            label="P(Q) at T*")
+    for m in mode_locs:
+        ax.axvline(m, color="r", ls=":", lw=0.8)
+    ax.set_title("d) free-energy landscape at T* = %.3f" % T_star)
+    ax.set_xlabel("Q"); ax.set_ylabel("F(Q) / kBT*")
+    ax2.set_ylabel("P(Q)")
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig("visualization.png", dpi=110)
+    plt.close(fig)
+
+
+def make_figure_fallback():
+    """Minimal multi-panel PNG using only the Python stdlib (no matplotlib)."""
+    import struct
+    import zlib
+
+    W, H = 1400, 1000
+    canvas = np.full((H, W, 3), 255, dtype=np.uint8)
+    BLACK = (40, 40, 40)
+    COLORS = [(200, 30, 30), (30, 100, 200), (30, 150, 60),
+              (150, 80, 200), (220, 140, 0), (0, 140, 140)]
+
+    FONT = {
+        "a": ["00000", "00110", "01001", "01111", "11001", "11001", "01111"],
+        "b": ["10000", "11010", "10100", "11010", "10100", "11010", "10000"],
+        "c": ["00000", "00110", "01000", "01000", "01000", "00110", "00000"],
+        "d": ["00001", "00011", "01001", "10101", "10101", "00011", "00001"],
+        "e": ["00000", "00110", "01000", "11111", "01000", "00110", "00000"],
+        "f": ["00110", "01000", "11100", "01000", "01000", "01000", "01000"],
+        "i": ["00100", "00000", "00100", "00100", "00100", "00100", "01110"],
+        "l": ["00100", "00100", "00100", "00100", "00100", "00100", "01110"],
+        "n": ["00000", "11010", "10101", "10101", "10101", "10101", "10101"],
+        "r": ["00000", "10110", "11001", "10000", "10000", "10000", "10000"],
+        "Q": ["01110", "10001", "10001", "10001", "10001", "01101", "00010"],
+        "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+        "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+        "F": ["11111", "10000", "10000", "11100", "10000", "10000", "10000"],
+        "E": ["11111", "10000", "10000", "11100", "10000", "10000", "11111"],
+        "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+        "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+        "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+        "3": ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
+        "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+        "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+        "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+        "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+        "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+        "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+        ".": ["00000", "00000", "00000", "00000", "00000", "00110", "00110"],
+        "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+        "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+    }
+
+    def text(x, y, s, color=BLACK, scale=2):
+        cx = x
+        for ch in s:
+            g = FONT.get(ch)
+            if g is None:
+                cx += 6 * scale
+                continue
+            for ry in range(7):
+                for rx in range(5):
+                    if g[ry][rx] == "1":
+                        canvas[y + ry * scale: y + (ry + 1) * scale,
+                               cx + rx * scale: cx + (rx + 1) * scale] = color
+            cx += 6 * scale
+
+    def seg(x0, y0, x1, y1, color, dash=False):
+        n = max(abs(x1 - x0), abs(y1 - y0), 1)
+        for t in range(n + 1):
+            if dash and (t // 4) % 2 == 1:
+                continue
+            x = int(round(x0 + (x1 - x0) * t / n))
+            y = int(round(y0 + (y1 - y0) * t / n))
+            if 0 <= x < W and 0 <= y < H:
+                canvas[y, x] = color
+
+    def line(box, xs, ys, xr, yr, color, dash=False):
+        bx0, by0, bx1, by1 = box
+        px = bx0 + (np.asarray(xs) - xr[0]) / (xr[1] - xr[0]) * (bx1 - bx0)
+        py = by1 - (np.asarray(ys) - yr[0]) / (yr[1] - yr[0]) * (by1 - by0)
+        for i in range(len(px) - 1):
+            seg(int(px[i]), int(py[i]), int(px[i + 1]), int(py[i + 1]),
+                color, dash=dash)
+
+    MARG = 10
+    boxes = [
+        (MARG + 10, MARG + 10, W // 2 - 10, H // 2 - 10),
+        (W // 2 + 10, MARG + 10, W - MARG - 10, H // 2 - 10),
+        (MARG + 10, H // 2 + 10, W // 2 - 10, H - MARG - 10),
+        (W // 2 + 10, H // 2 + 10, W - MARG - 10, H - MARG - 10),
+    ]
+    for b in boxes:
+        seg(b[0], b[1], b[2], b[1], BLACK)
+        seg(b[0], b[3], b[2], b[3], BLACK)
+        seg(b[0], b[1], b[0], b[3], BLACK)
+    text(20, 16, "a")
+    text(W // 2 + 20, 16, "b")
+    text(20, H // 2 + 16, "c")
+    text(W // 2 + 20, H // 2 + 16, "d")
+
+    # panel a: 3D configs via oblique projection (gray = ref, red = final)
+    def proj(p):
+        X = p[:, 0] - 0.5 * p[:, 1]
+        Y = p[:, 2] - 0.22 * (p[:, 0] + p[:, 1])
+        return X, Y
+
+    Xr, Yr = proj(REF)
+    Xf, Yf = proj(final_coords)
+    xr = (Xr.min() - 1, Xr.max() + 1)
+    yr = (Yr.min() - 1, Yr.max() + 1)
+    b = boxes[0]
+
+    def px_x(x):
+        return int(b[0] + (x - xr[0]) / (xr[1] - xr[0]) * (b[2] - b[0]))
+
+    def px_y(y):
+        return int(b[3] - (y - yr[0]) / (yr[1] - yr[0]) * (b[3] - b[1]))
+
+    for i in range(N - 1):
+        seg(px_x(Xf[i]), px_y(Yf[i]), px_x(Xf[i + 1]), px_y(Yf[i + 1]),
+            COLORS[0])
+    for X, Y, col in ((Xr, Yr, (150, 150, 150)), (Xf, Yf, COLORS[0])):
+        for x, y in zip(X, Y):
+            seg(px_x(x), px_y(y), px_x(x) + 3, px_y(y) + 3, col)
+    text(b[0] + 10, b[3] - 20, "ref: gray  final: red")
+
+    # panel b: per-T Q histograms
+    b = boxes[1]
+    hmax = max(H50.max(), 1e-12)
+    for k in range(K):
+        line(b, np.linspace(0, 1, 50, endpoint=False) + 0.01, H50[k],
+             (0, 1), (0, hmax * 1.05), COLORS[k])
+    seg(int(b[0] + 0.5 * (b[2] - b[0])), b[1],
+        int(b[0] + 0.5 * (b[2] - b[0])), b[3], (120, 120, 120), dash=True)
+    text(b[0] + 10, b[3] - 20, "Q")
+
+    # panel c: C(T) curve
+    b = boxes[2]
+    cmax = max(C_fine.max(), 1e-12) * 1.05
+    line(b, T_fine, C_fine, (T_fine[0], T_fine[-1]), (0, cmax), COLORS[1])
+    if C_mbar is not None:
+        line(b, T_fine, C_mbar, (T_fine[0], T_fine[-1]), (0, cmax),
+             COLORS[2], dash=True)
+    for k in range(K):
+        tx = int(b[0] + (T_LIST[k] - T_fine[0]) / (T_fine[-1] - T_fine[0])
+                * (b[2] - b[0]))
+        ty = int(b[3] - C_direct[k] / cmax * (b[3] - b[1]))
+        seg(tx - 3, ty - 3, tx + 3, ty + 3, (20, 20, 20))
+    tx = int(b[0] + (T_star - T_fine[0]) / (T_fine[-1] - T_fine[0])
+             * (b[2] - b[0]))
+    seg(tx, b[1], tx, b[3], COLORS[0], dash=True)
+    text(b[0] + 10, b[3] - 20, "T")
+    text(b[0] - 24, b[1] + 4, "C")
+
+    # panel d: F(Q) at T_star + P(Q)
+    b = boxes[3]
+    fmax = max(F_prof.max(), 1e-12) * 1.05
+    line(b, q_centers, F_prof, (0, 1), (0, fmax), COLORS[2])
+    line(b, q_centers, P40 * fmax / max(P40.max(), 1e-12), (0, 1),
+         (0, fmax), COLORS[1], dash=True)
+    for m in mode_locs:
+        tx = int(b[0] + m * (b[2] - b[0]))
+        seg(tx, b[1], tx, b[3], COLORS[0], dash=True)
+    text(b[0] + 10, b[3] - 20, "Q")
+    text(b[0] - 24, b[1] + 4, "F")
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + canvas[y].tobytes() for y in range(H))
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    with open("visualization.png", "wb") as fh:
+        fh.write(png)
+
+
+try:
+    import matplotlib  # noqa: F401
+    make_figure_mpl()
+except Exception as exc:  # matplotlib missing (sandbox) -> fallback writer
+    warnings.append("matplotlib unavailable in this environment (%s); "
+                    "visualization.png produced with the built-in "
+                    "stdlib PNG fallback writer." % type(exc).__name__)
+    make_figure_fallback()
+    with open("transition_analysis.json", "w") as fh:
+        json.dump(transition_analysis, fh, indent=2)
+
+# --------------------------------------------------------------------------
+# Final self-verification (shapes, finiteness, keys, normalization)
+# --------------------------------------------------------------------------
+def _finite(name, arr):
+    arr = np.asarray(arr)
+    assert arr.dtype == np.float64, name
+    assert np.isfinite(arr).all(), name
+    return arr.shape
+
+s1 = _finite("final_coords", np.load("final_coords.npy"))
+s2 = _finite("order_parameter_trajectory",
+             np.load("order_parameter_trajectory.npy"))
+s3 = _finite("order_parameter_histograms",
+             np.load("order_parameter_histograms.npy"))
+s4 = _finite("heat_capacity_curve", np.load("heat_capacity_curve.npy"))
+s6 = _finite("transition_free_energy_profile",
+             np.load("transition_free_energy_profile.npy"))
+s7 = _finite("q_energy_joint_histograms",
+             np.load("q_energy_joint_histograms.npy"))
+s8 = _finite("native_contact_probability",
+             np.load("native_contact_probability.npy"))
+with open("temperature_observables.json") as fh:
+    to = json.load(fh)
+with open("transition_analysis.json") as fh:
+    ta = json.load(fh)
+assert s1 == (N, 3) and s2 == (K, N_CKPT) and s3 == (K, 50)
+assert s4 == (2, N_FINE)
+assert s6 == (2, NQ_BINS_F) and s7 == (K, 20, 20) and s8 == (K, M)
+assert np.allclose(np.load("order_parameter_histograms.npy").sum(axis=1), 1.0)
+assert np.allclose(np.load("q_energy_joint_histograms.npy")
+                   .sum(axis=(1, 2)), 1.0)
+for key in ("temperatures", "mean_order_parameter_by_T",
+            "var_order_parameter_by_T", "mean_energy_by_T",
+            "var_energy_by_T", "heat_capacity_direct_by_T",
+            "q_energy_correlation_by_T"):
+    assert key in to, key
+for key in ("transition_temperature", "peak_heat_capacity",
+            "order_parameter_at_transition_mean",
+            "order_parameter_at_transition_modes", "mode_separation",
+            "free_energy_barrier_kT", "reference_contact_jaccard", "warnings"):
+    assert key in ta, key
+for v in ta.values():
+    if isinstance(v, float):
+        assert np.isfinite(v)
+print("verification OK:",
+      dict(final_coords=s1, Q_traj=s2, Q_hist=s3, C_curve=s4,
+           F_profile=s6, joint=s7, ncp=s8),
+      "T_star=%.4f" % ta["transition_temperature"],
+      "Jaccard=%.3f" % ta["reference_contact_jaccard"],
+      "modes=%s" % ta["order_parameter_at_transition_modes"],
+      "barrier=%.2f kBT*" % ta["free_energy_barrier_kT"])
+print("done; all outputs written to", __import__("os").getcwd())

@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+Sparse/noisy compact-star sequence reconstruction.
+
+Reconstructs a smooth, physically self-consistent mass-radius relation and
+normalized internal profiles (density fraction, enclosed-mass fraction) from
+sparse noisy observations, then predicts the holdout targets.
+
+Mass-radius candidates (weighted LS with per-point sigma_radius), selected by
+AIC with sanity constraint Mc > max eval mass; mass_limit = Mc:
+  M1: R = A * M**(-1/3) * (1 - (M/Mc)**2)**0.5   (2 params, primary)
+  M2: R = A * M**a * (1 - (M/Mc)**2)**b          (3 params)
+  M3: R = A * (Mc - M)**p * M**a                 (4 params)
+
+Profiles (two-stage, same mass parameter -> single family):
+  Stage 1: per fragment mass & channel, degree-5 Bernstein polynomial with
+           endpoints fixed by normalization (rho/rho_c: 1 -> 0, m/M: 0 -> 1),
+           interior coefficients reparameterized to enforce monotonicity.
+  Stage 2: each interior coefficient is a quadratic in M (exact interpolation
+           of the 3 fragment masses); fallback to linear if the quadratic
+           yields non-monotone / out-of-range curves.
+
+Outputs: results/mr_reconstruction.csv, results/profiles_reconstruction.npz
+((3,99) rows = [0.6,1.0,1.3] Msun), results/summary.json,
+results/reconstruction_plot.png, results/diagnostics.json.
+"""
+import json
+import math
+import os
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit, least_squares
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False  # fallback: built-in numpy/stdlib PNG renderer
+
+os.makedirs("results", exist_ok=True)
+
+# ---------------------------------------------------------------- load data
+mr = pd.read_csv("data/mr_observations.csv")
+pf = pd.read_csv("data/profile_fragments.csv")
+qt = json.load(open("data/query_targets.json"))
+man = json.load(open("data/physics_manifest.json"))
+
+M_obs = mr["mass_solar_obs"].to_numpy()
+R_obs = mr["radius_km_obs"].to_numpy()
+sR = mr["sigma_radius_km"].to_numpy()
+
+eval_masses = np.array(qt["mr_eval_masses_solar"])
+prof_masses = np.array(qt["profile_target_masses_solar"])          # [0.6, 1.0, 1.3]
+xgrid = np.array(qt["radius_fraction_grid"])                       # 99 pts, 0..1
+assert len(xgrid) == 99 and abs(xgrid[0]) < 1e-15 and abs(xgrid[-1] - 1) < 1e-15
+
+# ---------------------------------------------------------------- mass-radius
+def fM1(M, A, Mc):
+    return A * M ** (-1.0 / 3.0) * np.sqrt(np.maximum(1.0 - (M / Mc) ** 2, 1e-14))
+
+def fM2(M, A, a, b, Mc):
+    return A * M ** a * np.maximum(1.0 - (M / Mc) ** 2, 1e-14) ** b
+
+def fM3(M, A, p, a, Mc):
+    return A * np.maximum(Mc - M, 1e-12) ** p * M ** a
+
+models = {
+    "M1_A_M-1/3_(1-(M/Mc)^2)^1/2": (fM1, [8000.0, 1.40], 2),
+    "M2_A_M^a_(1-(M/Mc)^2)^b":     (fM2, [8000.0, -1.0 / 3.0, 0.5, 1.40], 3),
+    "M3_A_(Mc-M)^p_M^a":           (fM3, [7134.0, 1.0, -1.0 / 3.0, 1.40], 4),
+    "M4_A_M-1/3_(1-(M/Mc)^2)^b":   (lambda M, A, b, Mc: A * M ** (-1.0/3.0) *
+        np.maximum(1.0 - (M / Mc) ** 2, 1e-14) ** b, [8000.0, 0.5, 1.40], 3),
+}
+
+fits = {}
+for name, (f, p0, k) in models.items():
+    popt, pcov = curve_fit(f, M_obs, R_obs, p0=p0, sigma=sR, maxfev=40000)
+    resid = f(M_obs, *popt) - R_obs
+    chi2 = float(np.sum((resid / sR) ** 2))
+    dof = len(M_obs) - k
+    Mc = float(popt[-1])
+    Mc_err = float(np.sqrt(max(pcov[-1, -1], 0.0)))
+    fits[name] = dict(popt=popt, k=k, chi2=chi2, dof=dof, Mc=Mc, Mc_err=Mc_err,
+                      aic=len(M_obs) * np.log(chi2 / len(M_obs)) + 2 * k,
+                      max_res_sigma=float(np.max(np.abs(resid / sR))))
+
+# selection: among models with a physically admissible limit (Mc > max eval
+# mass), prefer the SIMPLEST statistically adequate model (chi2/dof <= 1.5,
+# i.e. residuals consistent with the reported noise); tie-break by AIC.
+# Rationale: M1's Mc is tightly constrained by the data while free-exponent
+# variants trade (b, Mc) and give Mc uncertainties of ~0.07-0.08 M_sun, so the
+# extra parameters buy little extrapolation reliability.
+valid = {n: d for n, d in fits.items() if d["Mc"] > eval_masses.max()}
+adequate = {n: d for n, d in valid.items() if d["chi2"] / d["dof"] <= 1.5}
+pool = adequate if adequate else valid
+chosen = min(pool, key=lambda n: (fits[n]["k"], fits[n]["aic"]))
+cf = lambda M: models[chosen][0](M, *fits[chosen]["popt"])
+Mc_hat = fits[chosen]["Mc"]
+
+# ---------------------------------------------------------------- MR table
+fine = np.linspace(0.30, 1.32, 2041)                    # step 0.0005
+mass_table = np.unique(np.concatenate([fine, eval_masses]))
+mass_table = mass_table[(mass_table >= 0.30) & (mass_table <= 1.32)]
+pd.DataFrame({"mass_solar": mass_table, "radius_km": cf(mass_table)}).to_csv(
+    "results/mr_reconstruction.csv", index=False, float_format="%.17g")
+
+# ---------------------------------------------------------------- profiles
+def bernstein(x, c):
+    n = len(c) - 1
+    k = np.arange(n + 1)
+    binom = np.array([math.comb(n, kk) for kk in range(n + 1)], dtype=float)
+    B = binom * (x[:, None] ** k) * ((1 - x[:, None]) ** (n - k))
+    return B @ c
+
+N = 5  # Bernstein degree
+
+def fit_bern(x, y, s, lo, hi, increasing):
+    """Degree-N Bernstein with endpoints fixed; monotone coefficients."""
+    def coeffs(t):
+        if increasing:
+            return np.concatenate([[lo], np.cumsum(t), [hi]])
+        return np.concatenate([[lo], lo - np.cumsum(t), [hi]])
+    def res(t):
+        return (bernstein(x, coeffs(t)) - y) / s
+    sol = least_squares(res, np.ones(N - 1) * abs(hi - lo) / (N + 1),
+                        bounds=(0, np.inf), max_nfev=60000)
+    c = coeffs(sol.x)
+    g = np.linspace(0, 1, 401)
+    curve = bernstein(g, c)
+    mono = np.all(np.diff(curve) <= 1e-9) if not increasing else np.all(np.diff(curve) >= -1e-9)
+    inr = np.all(curve >= -1e-9) and np.all(curve <= 1 + 1e-9)
+    return c, float(np.sqrt(np.mean(res(sol.x) ** 2))), bool(mono), bool(inr)
+
+frag_coeff = {"rho": {}, "m": {}}   # full coeff vector per fragment mass
+profile_diag = []
+for fid, g in pf.groupby("fragment_id"):
+    M = float(g["target_mass_solar"].iloc[0])
+    for key, col, sig, lo, hi, inc in [
+            ("rho", "density_fraction_obs", "sigma_density_fraction", 1.0, 0.0, False),
+            ("m", "enclosed_mass_fraction_obs", "sigma_enclosed_mass_fraction", 0.0, 1.0, True)]:
+        d = g[g[col].notna()]
+        c, rms, mono, inr = fit_bern(d["radius_fraction"].to_numpy(), d[col].to_numpy(),
+                                      d[sig].to_numpy(), lo, hi, inc)
+        frag_coeff[key][M] = c
+        profile_diag.append(dict(fragment_id=int(fid), mass_solar=M, channel=key,
+                                 n_points=int(len(d)), rms_res_over_sigma=rms,
+                                 curve_monotone=bool(mono), curve_in_range=bool(inr),
+                                 coeff_min=float(c.min()), coeff_max=float(c.max())))
+
+def pava(y, decreasing=True):
+    """Pool-adjacent-violators isotonic regression (L2 projection)."""
+    y = np.asarray(y, float)
+    neg = -y if decreasing else y
+    vals, counts = [], []
+    for v in neg:
+        vals.append(v); counts.append(1)
+        while len(vals) > 1 and vals[-2] > vals[-1]:
+            s = vals[-2] * counts[-2] + vals[-1] * counts[-1]
+            c = counts[-2] + counts[-1]
+            vals.pop(); vals.pop(); counts.pop(); counts.pop()
+            vals.append(s / c); counts.append(c)
+    out = np.repeat(vals, counts)
+    return -out if decreasing else out
+
+def coeff_at_M(vals_by_M, M, order):
+    """Interpolate one interior Bernstein coefficient as function of mass."""
+    Ms = np.array(sorted(vals_by_M))
+    vs = np.array([vals_by_M[m] for m in Ms])
+    if order == 2:  # quadratic Lagrange through the 3 fragment masses
+        return float(sum(vs[i] * float(np.prod(            [(M - Ms[j]) / (Ms[i] - Ms[j]) for j in range(3) if j != i]))            for i in range(3)))
+    (b1, b0), *_ = np.linalg.lstsq(np.vstack([Ms, np.ones(3)]).T, vs, rcond=None)
+    return float(b1 * M + b0)
+
+def predict_profile(key, M, order=2):
+    lo, hi = (1.0, 0.0) if key == "rho" else (0.0, 1.0)
+    c = np.empty(N + 1)
+    c[0], c[-1] = lo, hi
+    for j in range(1, N):
+        c[j] = coeff_at_M({m: frag_coeff[key][m][j] for m in frag_coeff[key]}, M, order)
+    # project interior coefficients: monotone (PAVA) + box [0, 1] so the
+    # Bernstein curve is guaranteed monotone and within [0, 1]
+    c[1:N] = np.clip(pava(c[1:N], decreasing=(key == "rho")), 0.0, 1.0)
+    curve = bernstein(xgrid, c)
+    ok = (np.all(curve >= -1e-9) and np.all(curve <= 1 + 1e-9) and
+          (np.all(np.diff(curve) <= 1e-9) if key == "rho"
+           else np.all(np.diff(curve) >= -1e-9)))
+    return np.clip(curve, 0.0, 1.0), bool(ok)
+
+rho_prof, m_prof, pred_diag = [], [], []
+for M in prof_masses:
+    cr, okr = predict_profile("rho", M, 2)
+    cm, okm = predict_profile("m", M, 2)
+    used = "quadratic-in-M"
+    if not (okr and okm):
+        cr, okr = predict_profile("rho", M, 1)
+        cm, okm = predict_profile("m", M, 1)
+        used = "linear-in-M (fallback)"
+    cr[0], cr[-1] = 1.0, 0.0   # exact normalization / surface values
+    cm[0], cm[-1] = 0.0, 1.0
+    rho_prof.append(cr); m_prof.append(cm)
+    pred_diag.append(dict(mass_solar=float(M), mass_dep=used, rho_ok=bool(okr),
+                          m_ok=bool(okm), rho_at_0p5=float(cr[len(cr)//2]),
+                          m_at_0p5=float(cm[len(cm)//2])))
+
+quad_dev = {"rho": [], "m": []}
+for M in prof_masses:
+    cq, _ = predict_profile("rho", M, 2); c1, _ = predict_profile("rho", M, 1)
+    quad_dev["rho"].append(float(np.max(np.abs(cq - c1))))
+    cq, _ = predict_profile("m", M, 2);   c1, _ = predict_profile("m", M, 1)
+    quad_dev["m"].append(float(np.max(np.abs(cq - c1))))
+
+np.savez("results/profiles_reconstruction.npz",
+         density_fraction=np.stack(rho_prof),          # (3, 99) rows = [0.6, 1.0, 1.3]
+         enclosed_mass_fraction=np.stack(m_prof),      # (3, 99)
+         masses_solar=prof_masses, radius_fraction=xgrid)
+
+# ---------------------------------------------------------------- summary
+def r_at(M):
+    return float(cf(np.array([M]))[0])
+
+summary = {
+    "mass_limit_solar": Mc_hat,
+    "radius_at_0p6Msun_km": r_at(0.6),
+    "radius_at_1p0Msun_km": r_at(1.0),
+    "radius_at_1p2Msun_km": r_at(1.2),
+    "radius_at_1p3Msun_km": r_at(1.3),
+}
+json.dump(summary, open("results/summary.json", "w"), indent=2)
+
+# ---------------------------------------------------------------- diagnostics
+diag = {
+    "selected_mr_model": chosen,
+    "mr_model_table": {n: {k2: (float(v) if not isinstance(v, np.ndarray) else v.tolist())
+                           for k2, v in d.items() if k2 != "popt"}
+                       for n, d in fits.items()},
+    "mr_params_selected": {
+        "A_km": float(fits[chosen]["popt"][0]),
+        "extra_params": [float(x) for x in fits[chosen]["popt"][1:-1]],
+        "Mc_solar": Mc_hat,
+        "Mc_statistical_err_solar": fits[chosen]["Mc_err"],
+        "Mc_model_form_range_solar": [float(min(d["Mc"] for d in fits.values())),
+                                        float(max(d["Mc"] for d in fits.values()))],
+    },
+    "mr_residuals": [dict(mass_solar=float(a), radius_km_obs=float(b),
+                          radius_km_fit=float(c), resid_over_sigma=float(dd))
+                     for a, b, c, dd in zip(M_obs, R_obs, cf(M_obs),
+                                            (cf(M_obs) - R_obs) / sR)],
+    "profile_fragment_fits": profile_diag,
+    "profile_predictions": pred_diag,
+    "quad_vs_linear_max_dev": quad_dev,
+    "checks": {
+        "csv_includes_all_24_eval_masses": bool(
+            np.all([np.any(np.abs(_chk_df.mass_solar.to_numpy() - e) < 1e-15)
+                    for e in eval_masses])
+            if (_chk_df := pd.read_csv("results/mr_reconstruction.csv")) is not None else False),
+        "npz_shape": list(np.stack(rho_prof).shape),
+        "npz_rows_order_Msun": prof_masses.tolist(),
+        "radius_monotone_decreasing_on_grid": bool(np.all(np.diff(cf(mass_table)) < 0)),
+        "mass_limit_above_max_eval": bool(Mc_hat > eval_masses.max()),
+        "surface_threshold_manifest": man.get("surface_threshold"),
+    },
+}
+json.dump(diag, open("results/diagnostics.json", "w"), indent=2, default=float)
+
+# ---------------------------------------------------------------- plot
+# (matplotlib when available; otherwise a self-contained numpy/stdlib PNG
+#  renderer so the artifact is produced in any environment)
+if HAVE_MPL:
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    ax = axes[0, 0]
+    ax.plot(mass_table, cf(mass_table), "-", color="tab:blue", lw=2, label=f"fit ({chosen[:2]})")
+    ax.errorbar(M_obs, R_obs, xerr=mr["sigma_mass_solar"].values, yerr=sR,
+                fmt="o", ms=5, capsize=3, color="tab:red", label="observations")
+    ax.plot(eval_masses, cf(eval_masses), "s", ms=5, color="tab:green", label="holdout eval masses")
+    ax.axvline(Mc_hat, color="k", ls=":", lw=1)
+    ax.text(Mc_hat, 11500, f" M_limit = {Mc_hat:.3f} $M_\\odot$", rotation=90, va="top", fontsize=9)
+    ax.set_xlabel("mass [$M_\\odot$]"); ax.set_ylabel("radius [km]")
+    ax.set_title(f"Mass--radius reconstruction  (chi2/dof = {fits[chosen]['chi2']:.1f}/{fits[chosen]['dof']})")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    ax = axes[0, 1]
+    for M, c in zip(prof_masses, rho_prof):
+        ax.plot(xgrid, c, "-", lw=2, label=f"{M:.1f} $M_\\odot$")
+    for fid, g in pf.groupby("fragment_id"):
+        d = g[g.density_fraction_obs.notna()]
+        ax.plot(d.radius_fraction, d.density_fraction_obs, "x", ms=7, alpha=0.6,
+                label=f"frag {int(fid)} ({g.target_mass_solar.iloc[0]:.2f})")
+    ax.set_xlabel("r/R"); ax.set_ylabel("$\\rho/\\rho_c$")
+    ax.set_title("Density fraction"); ax.legend(fontsize=8, loc="upper right"); ax.grid(alpha=0.3)
+    ax = axes[1, 0]
+    for M, c in zip(prof_masses, m_prof):
+        ax.plot(xgrid, c, "-", lw=2, label=f"{M:.1f} $M_\\odot$")
+    for fid, g in pf.groupby("fragment_id"):
+        d = g[g.enclosed_mass_fraction_obs.notna()]
+        ax.plot(d.radius_fraction, d.enclosed_mass_fraction_obs, "x", ms=7, alpha=0.6,
+                label=f"frag {int(fid)} ({g.target_mass_solar.iloc[0]:.2f})")
+    ax.set_xlabel("r/R"); ax.set_ylabel("$m(r)/M$")
+    ax.set_title("Enclosed mass fraction"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax = axes[1, 1]
+    ax.plot(mass_table, cf(mass_table), "-", color="tab:blue", lw=2)
+    ax.errorbar(M_obs, R_obs, yerr=sR, fmt="o", ms=5, capsize=3, color="tab:red")
+    ax.set_yscale("log"); ax.set_xlabel("mass [$M_\\odot$]"); ax.set_ylabel("radius [km]")
+    ax.set_title("Log view: curvature toward the mass limit")
+    ax.grid(alpha=0.3, which="both")
+    fig.suptitle("Compact-star sequence reconstruction (cold, non-rotating, stable branch)", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig("results/reconstruction_plot.png", dpi=150)
+else:
+    import zlib, struct
+
+    _FONT = {
+        '0': "01110 10001 10011 10101 11001 10001 01110", '1': "00100 01100 00100 00100 00100 00100 01110",
+        '2': "01110 10001 00001 00010 00100 01000 11111", '3': "01110 10001 00001 00110 00001 10001 01110",
+        '4': "00010 00110 01010 10010 11111 00010 00010", '5': "11111 10000 11110 00001 00001 10001 01110",
+        '6': "00110 01000 10000 11110 10001 10001 01110", '7': "11111 00001 00010 00100 01000 01000 01000",
+        '8': "01110 10001 10001 01110 10001 10001 01110", '9': "01110 10001 10001 01111 00001 00010 01100",
+        'A': "01110 10001 10001 11111 10001 10001 10001", 'B': "11110 10001 10001 11110 10001 10001 11110",
+        'C': "01110 10001 10000 10000 10000 10001 01110", 'D': "11100 10010 10001 10001 10001 10010 11100",
+        'E': "11111 10000 10000 11110 10000 10000 11111", 'F': "11111 10000 10000 11110 10000 10000 10000",
+        'G': "01110 10001 10000 10111 10001 10001 01111", 'H': "10001 10001 10001 11111 10001 10001 10001",
+        'I': "01110 00100 00100 00100 00100 00100 01110", 'J': "00111 00010 00010 00010 00010 10010 01100",
+        'K': "10001 10010 10100 11000 10100 10010 10001", 'L': "10000 10000 10000 10000 10000 10000 11111",
+        'M': "10001 11011 10101 10101 10001 10001 10001", 'N': "10001 11001 10101 10011 10001 10001 10001",
+        'O': "01110 10001 10001 10001 10001 10001 01110", 'P': "11110 10001 10001 11110 10000 10000 10000",
+        'Q': "01110 10001 10001 10001 10101 10010 01101", 'R': "11110 10001 10001 11110 10100 10010 10001",
+        'S': "01111 10000 10000 01110 00001 00001 11110", 'T': "11111 00100 00100 00100 00100 00100 00100",
+        'U': "10001 10001 10001 10001 10001 10001 01110", 'V': "10001 10001 10001 10001 10001 01010 00100",
+        'W': "10001 10001 10001 10101 10101 10101 01010", 'X': "10001 10001 01010 00100 01010 10001 10001",
+        'Y': "10001 10001 01010 00100 00100 00100 00100", 'Z': "11111 00001 00010 00100 01000 10000 11111",
+        ' ': "00000 00000 00000 00000 00000 00000 00000",
+        '.': "00000 00000 00000 00000 00000 00110 00110", '-': "00000 00000 00000 11111 00000 00000 00000",
+        '/': "00001 00010 00010 00100 01000 01000 10000", '(': "00010 00100 01000 01000 01000 00100 00010",
+        ')': "01000 00100 00010 00010 00010 00100 01000", '=': "00000 00000 11111 00000 11111 00000 00000",
+        ':': "00000 00110 00110 00000 00110 00110 00000", '_': "00000 00000 00000 00000 00000 00000 11111",
+        '+': "00000 00100 00100 11111 00100 00100 00000", ',': "00000 00000 00000 00000 00110 00100 01000",
+    }
+
+    class Canvas:
+        def __init__(self, w, h, bg=(255, 255, 255)):
+            self.img = np.zeros((h, w, 3), np.uint8)
+            self.img[:] = bg
+        def pixel(self, x, y, col):
+            x, y = int(round(x)), int(round(y))
+            if 0 <= x < self.img.shape[1] and 0 <= y < self.img.shape[0]:
+                self.img[y, x] = col
+        def hline(self, x0, x1, y, col, t=1):
+            for xx in range(int(min(x0, x1)), int(max(x0, x1)) + 1):
+                for k in range(t): self.pixel(xx, y + k, col)
+        def vline(self, x, y0, y1, col, t=1):
+            for yy in range(int(min(y0, y1)), int(max(y0, y1)) + 1):
+                for k in range(t): self.pixel(x + k, yy, col)
+        def line(self, x0, y0, x1, y1, col, t=2):
+            n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+            for i in range(n + 1):
+                x = x0 + (x1 - x0) * i / n; y = y0 + (y1 - y0) * i / n
+                for dx in range(t):
+                    for dy in range(t): self.pixel(x + dx, y + dy, col)
+        def dashed_vline(self, x, y0, y1, col, dash=8, gap=6):
+            y = y0
+            while y < y1:
+                self.vline(x, y, min(y + dash, y1), col); y += dash + gap
+        def rect(self, x0, y0, x1, y1, col, fill=None):
+            if fill is not None:
+                self.img[int(y0):int(y1) + 1, int(x0):int(x1) + 1] = fill
+            self.hline(x0, x1, y0, col); self.hline(x0, x1, y1, col)
+            self.vline(x0, y0, y1, col); self.vline(x1, y0, y1, col)
+        def text(self, x, y, s, col=(0, 0, 0), sc=2):
+            x, y = int(x), int(y)
+            for ch in s.upper():
+                g = _FONT.get(ch, _FONT[' '])
+                rows = g.split()
+                for r in range(7):
+                    for c in range(5):
+                        if rows[r][c] == '1':
+                            self.img[y + r * sc:y + (r + 1) * sc, x + c * sc:x + (c + 1) * sc] = col
+                x += 6 * sc
+        def text_w(self, s, sc=2):
+            return 6 * sc * len(s)
+        def circle(self, x, y, r, col):
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    if dx * dx + dy * dy <= r * r: self.pixel(x + dx, y + dy, col)
+        def cross(self, x, y, r, col):
+            self.line(x - r, y - r, x + r, y + r, col, 2)
+            self.line(x - r, y + r, x + r, y - r, col, 2)
+        def save_png(self, path):
+            w, h = self.img.shape[1], self.img.shape[0]
+            raw = b"".join(b"\x00" + self.img[y].tobytes() for y in range(h))
+            def chunk(tag, data):
+                c = struct.pack(">I", len(data)) + tag + data
+                return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                                   + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+    cv = Canvas(1560, 1080)
+    BLUE, RED, GREEN, ORANGE, GRAY, BLACK = (31,119,180),(214,39,40),(44,160,44),(255,127,14),(100,100,100),(0,0,0)
+    cv.text((1560 - cv.text_w("COMPACT-STAR SEQUENCE RECONSTRUCTION (COLD, NON-ROTATING, STABLE BRANCH)", 3))//2, 18,
+            "COMPACT-STAR SEQUENCE RECONSTRUCTION (COLD, NON-ROTATING, STABLE BRANCH)", sc=3)
+
+    def panel(fx0, fy0, fx1, fy1, dmin, dmax, tmin, tmax, xticks, yticks, logy=False,
+              xlabel="", ylabel="", title=""):
+        """Draw axes/grid/ticks; return (X, Y) data->pixel transforms."""
+        def X(d): return fx0 + (d - dmin) / (dmax - dmin) * (fx1 - fx0)
+        def T(t):
+            if logy:
+                lt = np.log10(np.clip(t, 1e-3, None))
+                return fy1 - (lt - np.log10(tmin)) / (np.log10(tmax) - np.log10(tmin)) * (fy1 - fy0)
+            return fy1 - (t - tmin) / (tmax - tmin) * (fy1 - fy0)
+        for xt in xticks:
+            cv.vline(X(xt), fy0, fy1, (215,215,215))
+            cv.vline(X(xt), fy1, fy1 + 6, BLACK)
+            lab = f"{xt:g}"
+            cv.text(X(xt) - cv.text_w(lab)//2, fy1 + 8, lab, sc=2)
+        for yt in yticks:
+            cv.hline(fx0, fx1, T(yt), (215,215,215))
+            cv.hline(fx0 - 6, fx0, T(yt), BLACK)
+            lab = f"{yt:g}"
+            cv.text(fx0 - 8 - cv.text_w(lab), T(yt) - 5, lab, sc=2)
+        cv.rect(fx0, fy0, fx1, fy1, BLACK)
+        if xlabel:
+            cv.text((fx0 + fx1 - cv.text_w(xlabel))//2, fy1 + 26, xlabel, sc=2)
+        if ylabel:
+            cv.text(fx0, fy0 - 22, ylabel, sc=2)
+        if title:
+            cv.text((fx0 + fx1 - cv.text_w(title))//2, fy0 - 46, title, sc=2)
+        return X, T
+
+    def draw_curve(X, T, xs, ys, col, t=2, clip=(None, None, None, None)):
+        cmin, cmax, tminc, tmaxc = clip
+        pts = [(X(x), T(y)) for x, y in zip(xs, ys)
+               if (cmin is None or cmin <= x <= cmax) and (tminc is None or tminc <= y <= tmaxc)]
+        for (xa, ya), (xb, yb) in zip(pts[:-1], pts[1:]):
+            cv.line(xa, ya, xb, yb, col, t)
+
+    def legend(X, T, items, fx1, fy0):
+        w = 150; h = 24 * len(items) + 8
+        x0 = fx1 - w - 8; y0 = fy0 + 8
+        cv.rect(x0, y0, x0 + w, y0 + h, (180,180,180), fill=(255,255,255))
+        for i, (kind, col, lab) in enumerate(items):
+            y = y0 + 12 + i * 24
+            if kind == "line": cv.line(x0 + 8, y, x0 + 34, y, col, 2)
+            elif kind == "dash": cv.dashed_vline(x0 + 21, y - 8, y + 8, col, dash=4, gap=3)
+            elif kind == "circ": cv.circle(x0 + 21, y, 4, col)
+            elif kind == "sq": cv.rect(x0 + 15, y - 5, x0 + 27, y + 5, col, fill=col)
+            elif kind == "cross": cv.cross(x0 + 21, y, 4, col)
+            cv.text(x0 + 42, y - 5, lab, sc=2)
+
+    # ---- panel 1: MR linear
+    X, T = panel(100, 84, 790, 520, 0.25, 1.40, 0, 13500,
+                 [0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3],
+                 [0,2000,4000,6000,8000,10000,12000],
+                 xlabel="MASS (MSUN)", ylabel="RADIUS (KM)",
+                 title=f"MASS-RADIUS RECONSTRUCTION (CHI2/DOF={fits[chosen]['chi2']:.1f}/{fits[chosen]['dof']})")
+    sm = np.linspace(0.25, 1.40, 561)
+    sm = sm[sm < Mc_hat]
+    draw_curve(X, T, sm, cf(sm), BLUE, clip=(0.25, 1.40, 0, 13500))
+    for m, r, sr in zip(M_obs, R_obs, sR):
+        cv.vline(X(m), T(r - sr), T(r + sr), RED, 1)
+        cv.hline(X(m) - 3, X(m) + 3, T(r + sr), RED, 1)
+        cv.hline(X(m) - 3, X(m) + 3, T(r - sr), RED, 1)
+        cv.circle(X(m), T(r), 4, RED)
+    for m in eval_masses:
+        cv.rect(X(m) - 4, T(cf(m)) - 4, X(m) + 4, T(cf(m)) + 4, GREEN, fill=GREEN)
+    cv.dashed_vline(X(Mc_hat), 84, 520, BLACK)
+    cv.text(X(Mc_hat) + 6, 92, f"MLIMIT={Mc_hat:.3f}", sc=2)
+    legend(X, T, [("line", BLUE, "FIT"), ("circ", RED, "OBS"), ("sq", GREEN, "EVAL"), ("dash", BLACK, "MLIMIT")], 790, 84)
+
+    # ---- panel 2: density fraction
+    X, T = panel(840, 84, 1530, 520, 0, 1, -0.05, 1.05,
+                 [0,0.2,0.4,0.6,0.8,1.0], [0,0.2,0.4,0.6,0.8,1.0],
+                 xlabel="R/R", ylabel="RHO/RHO_C", title="DENSITY FRACTION")
+    for M, c, col in zip(prof_masses, rho_prof, [BLUE, ORANGE, GREEN]):
+        draw_curve(X, T, xgrid, c, col, clip=(0, 1, -0.05, 1.05))
+    for fid, g in pf.groupby("fragment_id"):
+        d = g[g.density_fraction_obs.notna()]
+        for xx, yy in zip(d.radius_fraction, d.density_fraction_obs):
+            cv.cross(X(xx), T(yy), 4, GRAY)
+    legend(X, T, [("line", BLUE, "0.6 MSUN"), ("line", ORANGE, "1.0 MSUN"),
+                  ("line", GREEN, "1.3 MSUN"), ("cross", GRAY, "FRAGMENTS")], 1530, 84)
+
+    # ---- panel 3: enclosed mass fraction
+    X, T = panel(100, 584, 790, 1020, 0, 1, -0.05, 1.05,
+                 [0,0.2,0.4,0.6,0.8,1.0], [0,0.2,0.4,0.6,0.8,1.0],
+                 xlabel="R/R", ylabel="M(R)/M", title="ENCLOSED MASS FRACTION")
+    for M, c, col in zip(prof_masses, m_prof, [BLUE, ORANGE, GREEN]):
+        draw_curve(X, T, xgrid, c, col, clip=(0, 1, -0.05, 1.05))
+    for fid, g in pf.groupby("fragment_id"):
+        d = g[g.enclosed_mass_fraction_obs.notna()]
+        for xx, yy in zip(d.radius_fraction, d.enclosed_mass_fraction_obs):
+            cv.cross(X(xx), T(yy), 4, GRAY)
+    legend(X, T, [("line", BLUE, "0.6 MSUN"), ("line", ORANGE, "1.0 MSUN"),
+                  ("line", GREEN, "1.3 MSUN"), ("cross", GRAY, "FRAGMENTS")], 790, 584)
+
+    # ---- panel 4: log view
+    X, T = panel(840, 584, 1530, 1020, 0.25, 1.40, 1500, 20000,
+                 [0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3],
+                 [2000,5000,10000,20000], logy=True,
+                 xlabel="MASS (MSUN)", ylabel="RADIUS (KM), LOG",
+                 title="LOG VIEW: CURVATURE TOWARD MASS LIMIT")
+    draw_curve(X, T, sm, cf(sm), BLUE, clip=(0.25, 1.40, 1500, 20000))
+    for m, r, sr in zip(M_obs, R_obs, sR):
+        cv.vline(X(m), T(max(r - sr, 1500)), T(min(r + sr, 20000)), RED, 1)
+        cv.circle(X(m), T(r), 4, RED)
+    cv.dashed_vline(X(Mc_hat), 584, 1020, BLACK)
+    cv.text(X(Mc_hat) + 6, 592, f"MLIMIT={Mc_hat:.3f}", sc=2)
+
+    cv.save_png("results/reconstruction_plot.png")
+
+# ---------------------------------------------------------------- report
+print("=== MR model comparison ===")
+for n, d in fits.items():
+    print(f"  {n:34s} chi2={d['chi2']:7.2f} dof={d['dof']:2d} "
+          f"chi2/dof={d['chi2']/d['dof']:.2f} AIC={d['aic']:8.2f} "
+          f"Mc={d['Mc']:.4f} max|res/sig|={d['max_res_sigma']:.2f}")
+print(f"  selected: {chosen}")
+print("=== summary.json ===")
+print(json.dumps(summary, indent=2))
+print("=== profile fragment fits ===")
+for d in profile_diag:
+    print(f"  frag {d['fragment_id']} M={d['mass_solar']:.2f} {d['channel']:3s} "
+          f"n={d['n_points']:2d} rms(res/sig)={d['rms_res_over_sigma']:.2f} "
+          f"monotone={d['curve_monotone']} c_range=[{d['coeff_min']:.3f},{d['coeff_max']:.3f}]")
+print("=== profile predictions ===")
+for d in pred_diag:
+    print(f"  M={d['mass_solar']:.1f} ({d['mass_dep']}): rho_ok={d['rho_ok']} "
+          f"m_ok={d['m_ok']} rho(0.5)={d['rho_at_0p5']:.3f} m(0.5)={d['m_at_0p5']:.3f}")
+print("quad vs linear max dev:", {k: [round(v, 4) for v in vv] for k, vv in quad_dev.items()})
+print("checks:", json.dumps(diag["checks"], indent=2))
+print("plot backend:", "matplotlib" if HAVE_MPL else "builtin PNG renderer")

@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+Leaf Physiological Response Reconstruction
+------------------------------------------
+Coupled land-surface (CLM/Noah-MP) Farquhar (C3) / Collatz (C4) photosynthesis
+with Ball-Berry stomatal conductance, closed through a gas-diffusion chain to a
+common, self-consistent internal CO2 (Ci) fixed point.
+
+Outputs (under results/):
+  leaf_fluxes.csv      one row per forcing.csv row (sun + shade)
+  case_convergence.csv one row per test_cases.json record
+  diurnal.png          diurnal A and rs for sunlit & shaded leaves
+
+The scientific convention follows the task brief exactly. The figure is drawn
+with a self-contained PNG writer (no external plotting dependency) so the
+artifact is produced identically in any environment.
+"""
+import json
+import os
+import struct
+import zlib
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------------
+# Physical constants and brief-specified conventions
+# ----------------------------------------------------------------------------
+R = 8.314                 # universal gas constant, J mol^-1 K^-1
+Kc25 = 30.0               # Pa   (brief)
+Ko25 = 30000.0            # Pa   (brief)
+Q10_Kc = 2.1              # -    (brief Q10 tuple (2.1, 1.2, 2.4))
+Q10_Ko = 1.2              # -
+APAR_FACT = 4.6           # APAR = 4.6 * PAR (brief, no extra absorptance)
+RD_FRAC = 0.015           # Rd = 0.015 * Vcmax (brief)
+TOL_CI = 1e-6             # Pa   fixed-point tolerance on |Ci_new - Ci|
+MAXIT = 200               # safety cap on iterations
+PAR_NIGHT = 1e-6          # W m^-2 ; below this -> night branch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+OUT = os.path.join(HERE, "results")
+os.makedirs(OUT, exist_ok=True)
+
+with open(os.path.join(DATA, "leaf_params.json")) as f:
+    lp = json.load(f)
+with open(os.path.join(DATA, "test_cases.json")) as f:
+    tc = json.load(f)
+df = pd.read_csv(os.path.join(DATA, "forcing.csv"))
+
+pathway = lp["pathway"]            # "C4" (explicit in the data)
+v25     = lp["vcmax25"]
+m_bb    = lp["bb_slope"]           # Ball-Berry slope  (m)
+b0      = lp["bb_intercept"]       # Ball-Berry intercept (b0) -- NOT scaled by btran
+aq      = lp["alpha_q"]
+nf      = lp["n_factor"]
+
+# ----------------------------------------------------------------------------
+# Temperature / gas responses
+# ----------------------------------------------------------------------------
+def esat(T_K):
+    """Saturation vapour pressure (Pa), CLM/Buck form."""
+    Tc = T_K - 273.15
+    return 611.0 * np.exp(17.502 * Tc / (240.97 + Tc))
+
+def vcmax_T(T_K, v25):
+    """CLM/Noah-MP Vcmax(T) with high-temperature inhibition (transcribed exactly)."""
+    Tc = T_K - 273.16
+    Tk = Tc + 273.16                       # = T_K
+    return (v25 * 2.4 ** ((Tc - 25.0) / 10.0)
+            / (1.0 + np.exp((-2.2e5 + 710.0 * Tk) / (R * Tk))))
+
+def kc_T(T_K):
+    return Kc25 * Q10_Kc ** ((T_K - 273.16 - 25.0) / 10.0)
+
+def ko_T(T_K):
+    return Ko25 * Q10_Ko ** ((T_K - 273.16 - 25.0) / 10.0)
+
+def gamma_star(T_K, o2_pa):
+    """C3 CO2 compensation point (Pa). CLM-consistent: 0.5*(Kc/Ko)*O2 with O2=o2_pa
+    (o2_pa ~= 0.21*p_atm; the brief's trailing *0.21 is the O2 mole fraction already
+    embedded in o2_pa). Unused for the C4 pathway on this dataset."""
+    return 0.5 * (kc_T(T_K) / ko_T(T_K)) * o2_pa
+
+# ----------------------------------------------------------------------------
+# Photosynthesis (both branches; selected by pathway)
+# ----------------------------------------------------------------------------
+def photosynthesis(Ci, PAR, T_K, p, o2_pa, pathway, Vc, Rd, aq):
+    """Net assimilation A (umol CO2 m^-2 s^-1) at internal CO2 Ci (Pa)."""
+    APAR = APAR_FACT * PAR
+    if pathway == "C4":
+        Wc = Vc
+        Wj = aq * APAR
+        We = 4000.0 * Vc * Ci / p
+    else:  # C3 (Farquhar)
+        Kc, Ko, Gs = kc_T(T_K), ko_T(T_K), gamma_star(T_K, o2_pa)
+        Wc = Vc * (Ci - Gs) / (Ci + Kc * (1.0 + o2_pa / Ko))
+        J = aq * APAR
+        Wj = J * (Ci - Gs) / (4.0 * Ci + 8.0 * Gs)
+        We = 0.5 * Vc
+    return min(Wc, Wj, We) - Rd
+
+# ----------------------------------------------------------------------------
+# Coupled fixed-point solve for one leaf (one canopy, one forcing row)
+# ----------------------------------------------------------------------------
+def solve_leaf(PAR, T_K, p, ca, o2_pa, vpd, rb, btran, ci_init,
+               pathway, v25, nf, m_bb, b0, aq, tol=TOL_CI, maxit=MAXIT):
+    """Return (A, gs, rs, cs, Ci, n_iter, night_flag) at a self-consistent state.
+
+    Light : iterate Ci -> A -> cs -> gs -> rs -> Ci_new to a fixed point.
+    Night : respiratory assimilation (A=-Rd) + intercept conductance (gs=b0),
+            with cs/Ci closed through the same diffusion chain (finite at PAR=0).
+    """
+    cf = p / (R * T_K)                                  # mol m^-3
+    hs = min(max(1.0 - vpd / esat(T_K), 0.25), 1.0)     # surface RH
+    Vc = vcmax_T(T_K, v25) * nf * btran                 # effective capacity
+    Rd = RD_FRAC * Vc
+
+    if PAR < PAR_NIGHT:                                 # ---- night branch ----
+        A = -Rd
+        A_mol = A * 1e-6
+        gs = b0
+        rs = cf / gs
+        cs = ca - 1.37 * rb * A_mol / cf * p
+        Ci = cs - 1.65 * rs * A_mol / cf * p
+        return A, gs, rs, cs, Ci, 0, True
+
+    # ---- light branch: coupled fixed point on Ci ----
+    Ci = ci_init
+    for it in range(1, maxit + 1):
+        A = photosynthesis(Ci, PAR, T_K, p, o2_pa, pathway, Vc, Rd, aq)
+        A_mol = A * 1e-6
+        cs = ca - 1.37 * rb * A_mol / cf * p
+        gs = m_bb * A_mol * hs / max(cs, 1e-6) * p + b0
+        rs = cf / gs
+        Ci_new = cs - 1.65 * rs * A_mol / cf * p
+        if abs(Ci_new - Ci) < tol:
+            Ci = Ci_new
+            A = photosynthesis(Ci, PAR, T_K, p, o2_pa, pathway, Vc, Rd, aq)
+            A_mol = A * 1e-6
+            cs = ca - 1.37 * rb * A_mol / cf * p
+            gs = m_bb * A_mol * hs / max(cs, 1e-6) * p + b0
+            rs = cf / gs
+            return A, gs, rs, cs, Ci, it, False
+        Ci = Ci_new
+    A = photosynthesis(Ci, PAR, T_K, p, o2_pa, pathway, Vc, Rd, aq)
+    A_mol = A * 1e-6
+    cs = ca - 1.37 * rb * A_mol / cf * p
+    gs = m_bb * A_mol * hs / max(cs, 1e-6) * p + b0
+    rs = cf / gs
+    return A, gs, rs, cs, Ci, maxit, False
+
+# ----------------------------------------------------------------------------
+# 1) Diurnal forcing -> leaf_fluxes.csv
+# ----------------------------------------------------------------------------
+recs = []
+ci_sun_prev = 0.5 * df["co2_pa"].iloc[0]
+ci_shade_prev = 0.5 * df["co2_pa"].iloc[0]
+for i in range(len(df)):
+    r = df.iloc[i]
+    T, p, ca, o2 = r.t_air_K, r.p_atm_Pa, r.co2_pa, r.o2_pa
+    vpd, rb, bt = r.vpd_Pa, r.rb_sm, r.btran
+    A_s, gs_s, rs_s, cs_s, Ci_s, it_s, _ = solve_leaf(
+        r.par_sun_wm2, T, p, ca, o2, vpd, rb, bt, ci_sun_prev, pathway, v25, nf, m_bb, b0, aq)
+    A_sh, gs_sh, rs_sh, cs_sh, Ci_sh, it_sh, _ = solve_leaf(
+        r.par_shade_wm2, T, p, ca, o2, vpd, rb, bt, ci_shade_prev, pathway, v25, nf, m_bb, b0, aq)
+    recs.append(dict(time_hr=r.time_hr, A_sun=A_s, A_shade=A_sh,
+                     rs_sun=rs_s, rs_shade=rs_sh, ci_sun=Ci_s, ci_shade=Ci_sh,
+                     gs_sun=gs_s, gs_shade=gs_sh))
+    ci_sun_prev, ci_shade_prev = Ci_s, Ci_sh
+
+leaf_df = pd.DataFrame(recs, columns=["time_hr", "A_sun", "A_shade",
+                                      "rs_sun", "rs_shade", "ci_sun", "ci_shade",
+                                      "gs_sun", "gs_shade"])
+leaf_df.to_csv(os.path.join(OUT, "leaf_fluxes.csv"), index=False)
+
+# ----------------------------------------------------------------------------
+# 2) Test cases -> case_convergence.csv   (advanced from ci_init_pa with par_sun)
+# ----------------------------------------------------------------------------
+crecs = []
+for c in tc:
+    r = df.iloc[c["forcing_index"]]
+    A, gs, rs, cs, Ci, it, night = solve_leaf(
+        r.par_sun_wm2, r.t_air_K, r.p_atm_Pa, r.co2_pa, r.o2_pa,
+        r.vpd_Pa, r.rb_sm, r.btran, c["ci_init_pa"], pathway, v25, nf, m_bb, b0, aq)
+    crecs.append(dict(case_id=c["case_id"], ci_init_pa=c["ci_init_pa"],
+                      ci_final_pa=Ci, A_final=A, rs_final=rs, n_iterations=it))
+case_df = pd.DataFrame(crecs, columns=["case_id", "ci_init_pa", "ci_final_pa",
+                                       "A_final", "rs_final", "n_iterations"])
+case_df.to_csv(os.path.join(OUT, "case_convergence.csv"), index=False)
+
+# ============================================================================
+# 3) Diurnal figure -> diurnal.png  (self-contained PNG writer, no matplotlib)
+# ============================================================================
+FONT = {
+ '0':(0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110),
+ '1':(0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110),
+ '2':(0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111),
+ '3':(0b11111,0b00010,0b00100,0b00010,0b00001,0b10001,0b01110),
+ '4':(0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010),
+ '5':(0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110),
+ '6':(0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110),
+ '7':(0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000),
+ '8':(0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110),
+ '9':(0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100),
+ 'A':(0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+ 'B':(0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110),
+ 'C':(0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110),
+ 'D':(0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100),
+ 'E':(0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111),
+ 'F':(0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000),
+ 'G':(0b01110,0b10001,0b10000,0b10111,0b10001,0b10001,0b01111),
+ 'H':(0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+ 'I':(0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110),
+ 'J':(0b00111,0b00010,0b00010,0b00010,0b00010,0b10010,0b01100),
+ 'K':(0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001),
+ 'L':(0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111),
+ 'M':(0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001),
+ 'N':(0b10001,0b11001,0b10101,0b10011,0b10001,0b10001,0b10001),
+ 'O':(0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+ 'P':(0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000),
+ 'Q':(0b01110,0b10001,0b10001,0b10001,0b10101,0b10010,0b01101),
+ 'R':(0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001),
+ 'S':(0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110),
+ 'T':(0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100),
+ 'U':(0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+ 'V':(0b10001,0b10001,0b10001,0b10001,0b10001,0b01010,0b00100),
+ 'W':(0b10001,0b10001,0b10001,0b10101,0b10101,0b10101,0b01010),
+ 'X':(0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001),
+ 'Y':(0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100),
+ 'Z':(0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111),
+ ' ':(0,0,0,0,0,0,0),
+ '-':(0,0,0,0b11111,0,0,0),
+ '.':(0,0,0,0,0,0b00100,0b00100),
+ '/':(0b00001,0b00010,0b00010,0b00100,0b01000,0b01000,0b10000),
+ '(':(0b00010,0b00100,0b01000,0b01000,0b01000,0b00100,0b00010),
+ ')':(0b01000,0b00100,0b00010,0b00010,0b00010,0b00100,0b01000),
+ ':':(0,0b00100,0b00100,0,0b00100,0b00100,0),
+}
+def text_w(s, scale=1):
+    return len(s) * 6 * scale - scale
+
+def draw_text(img, x, y, s, color, scale=1):
+    H, W, _ = img.shape
+    cx = x
+    for ch in s.upper():
+        g = FONT.get(ch, FONT[' '])
+        for row in range(7):
+            bits = g[row]
+            for col in range(5):
+                if (bits >> (4 - col)) & 1:
+                    x0, y0 = cx + col * scale, y + row * scale
+                    xa, xb = max(0, x0), min(W, x0 + scale)
+                    ya, yb = max(0, y0), min(H, y0 + scale)
+                    if xa < xb and ya < yb:
+                        img[ya:yb, xa:xb] = color
+        cx += 6 * scale
+
+def draw_curve(img, pts, color, thick=2, dashed=False, dash=10, gap=7):
+    H, W, _ = img.shape
+    r = max(1, thick // 2)
+    run = 0.0
+    for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        segL = float(np.hypot(dx, dy))
+        n = int(segL) or 1
+        for i in range(n + 1):
+            d = segL * i / n
+            if not (dashed and ((run + d) % (dash + gap)) >= dash):
+                t = i / n
+                x, y = int(round(x0 + dx * t)), int(round(y0 + dy * t))
+                img[max(0, y-r):min(H, y+r+1), max(0, x-r):min(W, x+r+1)] = color
+        run += segL
+
+def draw_hline(img, y, x0, x1, color, thick=1):
+    img[max(0, y-thick//2):min(img.shape[0], y+thick//2+1), max(0, x0):min(img.shape[1], x1+1)] = color
+def draw_vline(img, x, y0, y1, color, thick=1):
+    img[max(0, y0):min(img.shape[0], y1+1), max(0, x-thick//2):min(img.shape[1], x+thick//2+1)] = color
+
+def nice_ticks(lo, hi, n=6):
+    span = hi - lo
+    if span <= 0:
+        return np.array([lo])
+    step0 = span / n
+    mag = 10 ** int(np.floor(np.log10(step0)))
+    step = 10 * mag
+    for m in (1, 2, 5, 10):
+        if span / (m * mag) <= n:
+            step = m * mag
+            break
+    start = int(np.ceil(lo / step)) * step
+    return np.arange(start, hi + 1e-9, step)
+
+def save_png(path, img):
+    H, W, _ = img.shape
+    raw = b''.join(b'\x00' + img[y].astype(np.uint8).tobytes() for y in range(H))
+    def chunk(typ, data):
+        return (struct.pack('>I', len(data)) + typ + data
+                + struct.pack('>I', zlib.crc32(typ + data) & 0xffffffff))
+    ihdr = struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n')
+        f.write(chunk(b'IHDR', ihdr))
+        f.write(chunk(b'IDAT', zlib.compress(raw, 9)))
+        f.write(chunk(b'IEND', b''))
+
+def render_diurnal_png(path, leaf_df):
+    W, H = 1000, 690
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    BLACK = (35, 35, 35); GRID = (214, 214, 214)
+    RED = (200, 30, 30); ORG = (230, 140, 30)
+
+    t = leaf_df["time_hr"].values
+    panels = [
+        dict(y0=72,  y1=300, data=[leaf_df["A_sun"].values, leaf_df["A_shade"].values],
+             label="A  (UMOL CO2 M-2 S-1)", lo=None),
+        dict(y0=402, y1=624, data=[leaf_df["rs_sun"].values, leaf_df["rs_shade"].values],
+             label="RS  (S M-1)", lo=0.0),
+    ]
+    for pn in panels:
+        allv = np.concatenate(pn["data"])
+        pn["lo"] = float(pn["lo"]) if pn["lo"] is not None else float(np.floor(allv.min()) - 1)
+        pn["hi"] = float(np.ceil(allv.max()) + 1)
+    x0, x1 = 100, 960
+    tx = (float(t.min()), float(t.max()))
+
+    def X(v):
+        return x0 + (v - tx[0]) / (tx[1] - tx[0]) * (x1 - x0)
+    def Y(v, pn):
+        return pn["y1"] - (v - pn["lo"]) / (pn["hi"] - pn["lo"]) * (pn["y1"] - pn["y0"])
+
+    tt = "DIURNAL LEAF RESPONSE  (PATHWAY=%s, %d HOURS)" % (pathway, len(leaf_df))
+    draw_text(img, max(4,(W - text_w(tt, 2)) // 2), 22, tt, BLACK, 2)
+
+    for pn in panels:
+        lo, hi = pn["lo"], pn["hi"]
+        draw_hline(img, pn["y0"], x0, x1, BLACK, 2)
+        draw_hline(img, pn["y1"], x0, x1, BLACK, 2)
+        draw_vline(img, x0, pn["y0"], pn["y1"], BLACK, 2)
+        draw_vline(img, x1, pn["y0"], pn["y1"], BLACK, 2)
+        for tv in nice_ticks(lo, hi, 5):
+            yy = int(round(Y(tv, pn)))
+            draw_hline(img, yy, x0, x1, GRID, 1)
+            draw_vline(img, x0, yy-4, yy+4, BLACK, 1)
+            lbl = ("%.0f" % tv) if abs(tv) >= 1 else ("%.1f" % tv)
+            draw_text(img, x0 - text_w(lbl, 1) - 8, yy - 3, lbl, BLACK, 1)
+        for tv in nice_ticks(tx[0], tx[1], 7):
+            draw_vline(img, int(round(X(tv))), pn["y0"], pn["y1"], GRID, 1)
+        draw_curve(img, [(X(a), Y(b, pn)) for a, b in zip(t, pn["data"][0])], RED, 2)
+        draw_curve(img, [(X(a), Y(b, pn)) for a, b in zip(t, pn["data"][1])], ORG, 2, dashed=True)
+        draw_text(img, x0, pn["y0"] - 24, pn["label"], BLACK, 1)
+        ly = pn["y0"] + 14
+        draw_curve(img, [(x1-150, ly), (x1-112, ly)], RED, 3)
+        draw_text(img, x1-104, ly-4, "SUNLIT", BLACK, 1)
+        draw_curve(img, [(x1-150, ly+18), (x1-112, ly+18)], ORG, 3, dashed=True)
+        draw_text(img, x1-104, ly+14, "SHADED", BLACK, 1)
+
+    bp = panels[1]
+    for tv in nice_ticks(tx[0], tx[1], 7):
+        xx = int(round(X(tv)))
+        draw_vline(img, xx, bp["y1"], bp["y1"] + 6, BLACK, 1)
+        lbl = "%.0f" % tv
+        draw_text(img, xx - text_w(lbl, 1)//2, bp["y1"] + 10, lbl, BLACK, 1)
+    draw_text(img, max(4,(W - text_w("TIME (HR)", 2)) // 2), bp["y1"] + 40, "TIME (HR)", BLACK, 2)
+
+    save_png(path, img)
+
+render_diurnal_png(os.path.join(OUT, "diurnal.png"), leaf_df)
+
+# ----------------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------------
+print("pathway        :", pathway)
+print("Vcmax(25C)     : %.4f  (frac of v25 = %.4f)" % (vcmax_T(298.16, v25), vcmax_T(298.16, v25)/v25))
+print("leaf_fluxes.csv: %d rows, cols=%s" % (len(leaf_df), list(leaf_df.columns)))
+print("  A_sun   : min %.4f  max %.4f" % (leaf_df.A_sun.min(), leaf_df.A_sun.max()))
+print("  A_shade : min %.4f  max %.4f" % (leaf_df.A_shade.min(), leaf_df.A_shade.max()))
+print("  ci_sun  : min %.3f  max %.3f" % (leaf_df.ci_sun.min(), leaf_df.ci_sun.max()))
+print("  gs_sun  : min %.5f  max %.5f" % (leaf_df.gs_sun.min(), leaf_df.gs_sun.max()))
+print("  rs_sun  : min %.2f  max %.2f" % (leaf_df.rs_sun.min(), leaf_df.rs_sun.max()))
+print("case_convergence.csv:")
+print(case_df.to_string(index=False))
+r = df.iloc[12]
+A, gs, rs, cs, Ci, it, night = solve_leaf(r.par_sun_wm2, r.t_air_K, r.p_atm_Pa,
+    r.co2_pa, r.o2_pa, r.vpd_Pa, r.rb_sm, r.btran, 0.5*r.co2_pa, pathway, v25, nf, m_bb, b0, aq)
+A2, gs2, rs2, cs2, Ci2, _, _ = solve_leaf(r.par_sun_wm2, r.t_air_K, r.p_atm_Pa,
+    r.co2_pa, r.o2_pa, r.vpd_Pa, r.rb_sm, r.btran, Ci, pathway, v25, nf, m_bb, b0, aq)
+print("self-consistency (row12 sun): |Ci re-solve diff| = %.3e  (A %.4f -> %.4f)" % (abs(Ci2 - Ci), A, A2))
+print("files written:", sorted(os.listdir(OUT)))

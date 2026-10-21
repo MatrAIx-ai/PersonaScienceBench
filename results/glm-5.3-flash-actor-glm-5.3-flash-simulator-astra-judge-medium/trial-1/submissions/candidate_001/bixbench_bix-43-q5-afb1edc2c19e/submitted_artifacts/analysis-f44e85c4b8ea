@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+bixbench:bix-43-q5 -- CBD/cisplatin combination vs Untreated (control)
+Differential expression (DESeq2-equivalent in Python) + Reactome_2022 enrichment via gseapy.
+
+Contrast (primary): Cisplatin_IC50_CBD_IC50 (group 9) vs Untreated (group 1), 3 vs 3.
+Sensitivity checks: combination vs DMSO (group 3); combination-with-starvation (9+10) vs Untreated.
+DE filter: p < 0.05 (raw), |log2FC| > 0.5, baseMean > 10.
+Enrichment: gseapy.enrichr, gene_sets='Reactome_2022', organism='human'; primary term = lowest Adjusted P-value.
+
+DESeq2-equivalent implementation (documented; R/DESeq2 not provisioned in this sandbox):
+  1. Size factors: DESeq2 median-of-ratios (geometric mean per gene over all 30 samples).
+  2. Group means: for the saturated two-group design the NB MLE of each group mean equals the
+     mean of size-factor-normalized counts (exact for fixed dispersion).
+  3. Dispersion: per-gene method-of-moments from pooled within-group variance of normalized counts,
+     then DESeq2-style shrinkage to a parametric trend alpha = a1/mu + a0
+     (final alpha = max(raw, trend): shrink up to trend, keep raw when above trend).
+  4. Wald test: SE(beta_lfc) from the exact NB Fisher information of the saturated 2-group design,
+     Var(beta) = 1/A + 1/B, A = sum_j SF_j*mu1/(1+alpha*SF_j*mu1), B likewise for group 2.
+     p = 2*(1-Phi(|z|)), z = log2FC/SE (normal Wald, as in DESeq2 nbinomWaldTest).
+  5. No Cook's-distance outlier replacement and no independent-filtering p-value padding
+     (the question specifies an explicit raw-p filter); LFC is the unshrunken MLE.
+"""
+import json, os, subprocess, sys
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+os.makedirs('results', exist_ok=True)
+log_lines = []
+def log(msg):
+    print(msg); log_lines.append(str(msg))
+
+# ------------------------------------------------------------------ load inputs
+counts = pd.read_csv('data/counts_raw_unfiltered.csv', index_col=0)
+layout = pd.read_csv('data/sample_layout.csv')
+emap = pd.read_csv('data/ensg_to_gene_name.tsv', sep='\t')
+log(f'counts matrix: {counts.shape[0]} genes x {counts.shape[1]} samples; '
+    f'dtypes={sorted(set(map(str, counts.dtypes)))}; NAs={int(counts.isna().sum().sum())}')
+
+# --- SampleID -> count-column mapping: layout uses '1-1', counts columns use '1_1'
+layout['count_col'] = layout['SampleID'].str.replace('-', '_', regex=False)
+mapping_ok_set = set(layout['count_col']) == set(counts.columns)
+mapping_ok_order = list(layout['count_col']) == list(counts.columns)
+log(f'SampleID mapping validation: set match={mapping_ok_set}, row-order match={mapping_ok_order}')
+assert mapping_ok_set and mapping_ok_order, 'SampleID->count column mapping failed validation'
+col2group = dict(zip(layout['count_col'], layout['Group']))
+groups = np.array([col2group[c] for c in counts.columns])
+log('Group design (10 groups x 3 replicates):')
+for g in pd.unique(groups):
+    log(f'  {g}: {list(counts.columns[groups == g])}')
+
+def size_factors(df):
+    X = df.to_numpy(float)
+    with np.errstate(divide='ignore'):
+        logX = np.log(X, where=X > 0)
+    pos = (X > 0).all(axis=1)                    # genes with no zeros -> defined geomean
+    gm = np.exp(logX[pos].mean(axis=1))
+    sf = np.median(X[pos] / gm[:, None], axis=0)
+    return sf / np.exp(np.mean(np.log(sf)))       # mean(log sf)=0, as in DESeq2
+
+SF = size_factors(counts)
+log('size factors (median-of-ratios, all 30 samples): ' +
+    ', '.join(f'{c}={s:.3f}' for c, s in zip(counts.columns, SF)))
+
+# ------------------------------------------------------------------ DESeq2-equivalent core
+MIN_DISP, MAX_DISP = 1e-8, 10.0
+
+def deseq2_eq(g1_cols, g2_cols, label):
+    """g2 vs g1; returns full gene table with baseMean, log2FC, p, p_adj."""
+    n1, n2 = len(g1_cols), len(g2_cols)
+    sf1 = SF[[counts.columns.get_loc(c) for c in g1_cols]]
+    sf2 = SF[[counts.columns.get_loc(c) for c in g2_cols]]
+    Y1 = counts[g1_cols].to_numpy(float); Y2 = counts[g2_cols].to_numpy(float)
+    N1 = Y1 / sf1[None, :]; N2 = Y2 / sf2[None, :]          # normalized counts
+    mu1 = N1.mean(1); mu2 = N2.mean(1)
+    baseMean = np.concatenate([N1, N2], axis=1).mean(1)
+    testable = (mu1 > 0) & (mu2 > 0)
+
+    # dispersion: method of moments on pooled within-group variance (normalized counts)
+    v1 = N1.var(1, ddof=1); v2 = N2.var(1, ddof=1)
+    s2 = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+    mub = (mu1 + mu2) / 2
+    # parametric trend alpha = a1/mu + a0 fitted on all-nonzero genes (DESeq2 'useForFit')
+    allpos = (Y1 > 0).all(1) & (Y2 > 0).all(1)
+    fit = testable & allpos & (mub > 0)
+    a_raw = np.clip((s2 - mub) / mub**2, MIN_DISP, MAX_DISP)
+    Xf = np.column_stack([1.0 / mub[fit], np.ones(fit.sum())])
+    yf = a_raw[fit]
+    coef, *_ = np.linalg.lstsq(Xf, yf, rcond=None)
+    a1, a0 = max(coef[0], 0.0), coef[1]
+
+    alpha = np.full(len(mu1), np.nan)
+    alpha[testable] = np.maximum(a_raw[testable], np.clip(a1 / mub[testable] + a0, MIN_DISP, MAX_DISP))
+    log(f'[{label}] dispersion trend fit: alpha = {a1:.3g}/mu + {a0:.3g} (n fit genes={int(fit.sum())})')
+
+    # Wald test, exact NB information for the saturated 2-group design
+    A = (sf1[None, :] * mu1[:, None] / (1 + alpha[:, None] * sf1[None, :] * mu1[:, None])).sum(1)
+    B = (sf2[None, :] * mu2[:, None] / (1 + alpha[:, None] * sf2[None, :] * mu2[:, None])).sum(1)
+    var_b1 = 1 / A + 1 / B
+    se = np.sqrt(var_b1) / np.log(2)
+    lfc = np.log2(mu2 / mu1)
+    z = lfc / se
+    p = 2 * stats.norm.sf(np.abs(z))
+
+    # Benjamini-Hochberg (reported for reference; the question's filter uses raw p)
+    m = int(testable.sum()); adj = np.full(len(p), np.nan)
+    order = np.argsort(np.where(testable, p, np.inf), kind='stable')
+    ranked = p[order[:m]]
+    bh = np.minimum.accumulate((ranked * m / np.arange(1, m + 1))[::-1])[::-1]
+    adj[order[:m]] = np.clip(bh, 0, 1)
+
+    tab = pd.DataFrame({'ENSG': counts.index, 'baseMean': baseMean,
+                        'log2FC': lfc, 'p': p, 'p_adj': adj,
+                        'dispersion': alpha, 'tested': testable})
+    ndeg = int(((tab.p < 0.05) & (tab.log2FC.abs() > 0.5) & (tab.baseMean > 10)).sum())
+    log(f'[{label}] tested genes={m}; DE genes (p<0.05, |lfc|>0.5, baseMean>10)={ndeg}')
+    return tab
+
+def contrast(ref, treat, label):
+    g1 = list(counts.columns[groups == ref]); g2 = list(counts.columns[groups == treat])
+    log(f'contrast {label}: {g1} (ref) vs {g2}')
+    return deseq2_eq(g1, g2, label)
+
+tab_main = contrast('Untreated', 'Cisplatin_IC50_CBD_IC50', 'combo9_vs_untreated')
+tab_dmso = contrast('DMSO', 'Cisplatin_IC50_CBD_IC50', 'combo9_vs_DMSO')
+starv = list(counts.columns[np.isin(groups, ['Cisplatin_IC50_CBD_IC50',
+                                             'Cisplatin_IC50_CBD_IC50_Serum_starvation_16h'])])
+tab_all = deseq2_eq(list(counts.columns[groups == 'Untreated']), starv, 'combo9+10_vs_untreated')
+
+for tab, name in [(tab_main, 'combo9_vs_untreated'), (tab_dmso, 'combo9_vs_DMSO'),
+                  (tab_all, 'combo9+10_vs_untreated')]:
+    tab.to_csv(f'results/de_full_{name}.csv', index=False)
+
+# ------------------------------------------------------------------ DE filtering + symbol mapping
+def filter_and_map(tab, label):
+    deg = tab[(tab.p < 0.05) & (tab.log2FC.abs() > 0.5) & (tab.baseMean > 10)].copy()
+    log(f'[{label}] DE genes after filter: {len(deg)}')
+    m = deg.merge(emap, on='ENSG', how='left')
+    unmapped = int(m['gene_name'].isna().sum())
+    log(f'[{label}] DEGs mapped to gene_name: {len(m) - unmapped}/{len(m)} (unmapped={unmapped})')
+    m = m.dropna(subset=['gene_name'])
+    before = len(m)
+    m = m.sort_values('baseMean', ascending=False).drop_duplicates('gene_name')
+    log(f'[{label}] unique gene symbols after max-baseMean collapse: {len(m)} (from {before})')
+    return m
+
+deg_main = filter_and_map(tab_main, 'combo9_vs_untreated')
+deg_dmso = filter_and_map(tab_dmso, 'combo9_vs_DMSO')
+deg_all = filter_and_map(tab_all, 'combo9+10_vs_untreated')
+deg_main.to_csv('results/DEGs_combo9_vs_untreated.csv', index=False)
+deg_dmso.to_csv('results/DEGs_combo9_vs_DMSO.csv', index=False)
+deg_all.to_csv('results/DEGs_combo9+10_vs_untreated.csv', index=False)
+
+log('top up-regulated DEGs:\n' + deg_main.nlargest(10, 'log2FC')[
+    ['gene_name', 'log2FC', 'p', 'baseMean']].to_string(index=False))
+log('top down-regulated DEGs:\n' + deg_main.nsmallest(10, 'log2FC')[
+    ['gene_name', 'log2FC', 'p', 'baseMean']].to_string(index=False))
+
+# ------------------------------------------------------------------ enrichment (gseapy, Reactome_2022)
+enrich_status = {'tool': 'gseapy', 'library': 'Reactome_2022',
+                 'method': 'enrichr ORA on the DEG gene-symbol list'}
+def try_enrichment():
+    try:
+        import gseapy  # noqa
+        gp_installed = True
+    except ImportError:
+        r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', 'gseapy'],
+                           capture_output=True, text=True, timeout=300)
+        gp_installed = r.returncode == 0
+        if not gp_installed:
+            msg = (r.stderr or r.stdout).strip().splitlines()
+            enrich_status['install_error'] = msg[-3:] if msg else ['pip install failed']
+    import urllib.request
+    net_ok = False
+    for url in ['https://maayanlab.cloud/Enrichr/addList',
+                'https://maayanlab.cloud/Enrichr/datasetStatistics',
+                'https://pypi.org/simple/']:
+        try:
+            urllib.request.urlopen(url, timeout=15); net_ok = True
+            enrich_status['reachable'] = url; break
+        except Exception as e:
+            enrich_status.setdefault('network_errors', []).append(f'{url}: {e}')
+    if not gp_installed:
+        enrich_status['status'] = ('BLOCKED: gseapy not installed and pip cannot reach an index '
+                                   '(offline environment) - no Reactome_2022 library available locally')
+        return None
+    if not net_ok:
+        enrich_status['status'] = ('BLOCKED: gseapy importable but no network access for the Enrichr API '
+                                   'or the Reactome_2022 library download')
+        return None
+    import gseapy
+    log(f'gseapy version {gseapy.__version__}')
+    for name, deg in [('combo9_vs_untreated', deg_main),
+                      ('combo9_vs_DMSO', deg_dmso),
+                      ('combo9+10_vs_untreated', deg_all)]:
+        gl = sorted(deg['gene_name'].unique())
+        enr = gseapy.enrichr(gene_list=gl, gene_sets='Reactome_2022', organism='human',
+                             outdir=f'results/enrichr_{name}', no_plot=True)
+        res = enr.results.sort_values('Adjusted P-value')
+        res.to_csv(f'results/reactome2022_{name}.csv', index=False)
+        top = res.iloc[0]
+        log(f'[{name}] Reactome_2022 primary term (lowest Adjusted P-value): '
+            f"{top['Term']} | adj p={top['Adjusted P-value']:.3g} p={top['P-value']:.3g} "
+            f"overlap={top['Overlap']} genes={top['Genes']}")
+        if name == 'combo9_vs_untreated':
+            enrich_status['primary_term'] = top['Term']
+            enrich_status['primary_stats'] = {k: (float(top[k]) if k in
+                ('Adjusted P-value', 'P-value', 'Odds Ratio', 'Combined Score') else top[k])
+                for k in ['Term', 'Overlap', 'P-value', 'Adjusted P-value',
+                          'Odds Ratio', 'Combined Score', 'Genes']}
+    enrich_status['status'] = 'OK'
+    return True
+
+try:
+    try_enrichment()
+except Exception as e:
+    enrich_status['status'] = f'BLOCKED: {type(e).__name__}: {e}'
+log(f'enrichment status: {enrich_status}')
+
+
+# ------------------------------------------------------------------ robustness cross-check
+# Welch t-test on log2 normalized counts (independent method) vs NB-GLM Wald results
+cc = ['1_1', '1_2', '1_3', '9_1', '9_2', '9_3']
+sf_cc = counts[cc].sum(0) / np.exp(np.log(counts[cc].sum(0).to_numpy()).mean())
+norm = np.log2(counts[cc].div(sf_cc, axis=1) + 1)
+t, pt = stats.ttest_ind(norm[['9_1', '9_2', '9_3']], norm[['1_1', '1_2', '1_3']], axis=1)
+tt = pd.DataFrame({'t_p': pt,
+                   't_lfc': norm[['9_1', '9_2', '9_3']].mean(1).values
+                             - norm[['1_1', '1_2', '1_3']].mean(1).values},
+                  index=counts.index)
+mj = tab_main.set_index('ENSG').join(tt)
+sel = mj.tested & (mj.baseMean > 10)
+rho_p = stats.spearmanr(-np.log10(mj.loc[sel, 'p']), -np.log10(mj.loc[sel, 't_p'])).statistic
+rho_lfc = stats.spearmanr(mj.loc[sel, 'log2FC'], mj.loc[sel, 't_lfc']).statistic
+mydeg = set(mj[(mj.p < 0.05) & (mj.log2FC.abs() > 0.5) & (mj.baseMean > 10)].index)
+ttdeg = set(mj[(mj.t_p < 0.05) & (mj.t_lfc.abs() > 0.5) & (mj.baseMean > 10)].index)
+log(f'cross-check vs Welch t-test (baseMean>10, tested): Spearman rho(-log10 p)={rho_p:.3f}, '
+    f'rho(log2FC)={rho_lfc:.3f}; Welch DEGs={len(ttdeg)}, overlap with NB-GLM DEGs={len(mydeg & ttdeg)}')
+
+summary = {
+    'question': 'Primary cellular mechanism enriched in CBD/cisplatin combination (gseapy, Reactome_2022, '
+                'DEGs p<0.05, |lfc|>0.5, baseMean>10)',
+    'contrast': 'Cisplatin_IC50_CBD_IC50 vs Untreated (3 vs 3)',
+    'genes_in_matrix': int(counts.shape[0]),
+    'samples': int(counts.shape[1]),
+    'mapping_validation': {'set_match': bool(mapping_ok_set), 'order_match': bool(mapping_ok_order)},
+    'n_tested_genes': int(tab_main.tested.sum()),
+    'n_DEGs_main': len(deg_main),
+    'n_DEGs_sensitivity': {'combo9_vs_DMSO': len(deg_dmso), 'combo9+10_vs_untreated': len(deg_all)},
+    'enrichment': enrich_status,
+    'crosscheck_spearman': {'p': round(float(rho_p), 3), 'lfc': round(float(rho_lfc), 3)},
+    'crosscheck_welch_DEGs_overlap': len(mydeg & ttdeg),
+}
+with open('results/summary.json', 'w') as f:
+    json.dump(summary, f, indent=2, default=str)
+with open('results/analysis.log', 'w') as f:
+    f.write('\n'.join(log_lines) + '\n')
+log('DONE')

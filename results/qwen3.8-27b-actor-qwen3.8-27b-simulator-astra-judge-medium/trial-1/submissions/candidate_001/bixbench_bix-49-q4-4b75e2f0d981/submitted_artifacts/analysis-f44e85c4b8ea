@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+DESeq2-style differential expression (Python reimplementation) for ASXL1 disease vs control.
+- Counts: featureCounts (ENSG gene_id, whitespace-delimited); coldata: condition (ASXL1 vs Control), sex
+- Design: ~ condition (primary), ~ sex + condition (sensitivity)
+- Dispersion: per-gene MLE -> trend (spline) -> DESeq2 shrinkage
+- Wald test on LFC (log2); BH padj with DESeq2-style independent filtering (filterStat=baseMean, alpha=0.1)
+- LFC shrinkage: apeglm-style posterior-mean (for up/down reporting)
+NOTE: In DESeq2, lfcShrink changes only the LFC point estimate, NOT pvalue/padj.
+      Hence the padj<0.05 count is set by the NB-GLM Wald test + BH + independent filtering.
+"""
+import numpy as np, pandas as pd
+from scipy.special import gammaln
+from scipy.stats import norm
+from scipy.interpolate import UnivariateSpline
+
+LN2 = np.log(2.0)
+ETA_CLIP = 30.0
+
+# ---------------- data loading ----------------
+def load_counts(path):
+    with open(path) as f:
+        header = f.readline().split()
+        genes, mat = [], []
+        for line in f:
+            p = line.split()
+            if p:
+                genes.append(p[0]); mat.append(p[1:])
+    return pd.DataFrame(mat, index=genes, columns=header[1:]).astype(np.int64)
+
+def load_coldata(path):
+    return pd.read_excel(path)
+
+# ---------------- size factors (median of ratios, DESeq2) ----------------
+def median_of_ratios(counts):
+    pos = counts > 0
+    gmcnt = pos.sum(axis=1)
+    logsum = np.sum(np.where(pos, np.log(np.where(pos, counts, 1)), 0.0), axis=1)
+    gm = np.exp(logsum / np.maximum(gmcnt, 1))
+    gm = np.where(gmcnt > 0, gm, 1.0)
+    ratio = counts / gm[:, None]
+    sf = np.median(ratio, axis=0)
+    sf = np.where((sf == 0) | np.isnan(sf), 1.0, sf)
+    return sf
+
+# ---------------- NB GLM IRLS (vectorized over genes; alpha scalar or per-gene) ----------------
+def _init_beta(y, sf, X):
+    p = X.shape[1]
+    beta = np.zeros((y.shape[0], p))
+    yn = y / sf[None, :]
+    if p >= 2:  # condition column = 1
+        d = X[:, 1] == 1
+        md = yn[:, d].mean(axis=1); mc = yn[:, ~d].mean(axis=1)
+        beta[:, 1] = np.log(np.maximum(md, 1e-6) / np.maximum(mc, 1e-6))
+    return beta
+
+def irls_all(y, sf, X, alpha, beta=None, maxit=60, tol=1e-8):
+    G, n = y.shape; p = X.shape[1]
+    if G == 0:
+        return np.zeros((0, p)), np.zeros((0, n))
+    a = np.atleast_1d(np.asarray(alpha, float))
+    if a.size == 1:
+        a = np.full(G, a[0])
+    if beta is None:
+        beta = _init_beta(y, sf, X)
+    I = 1e-10 * np.eye(p)
+    for it in range(maxit):
+        eta = np.clip(beta @ X.T, -ETA_CLIP, ETA_CLIP)
+        mu = sf[None, :] * np.exp(eta)
+        W = mu / (1.0 + a[:, None] * mu)
+        z = eta + (y - mu) / mu
+        XtW = np.einsum('nk,gn,nl->gkl', X, W, X)
+        XtWz = np.einsum('nk,gn->gk', X, W * z)
+        newbeta = np.einsum('gkl,gl->gk', np.linalg.inv(XtW + I[None]), XtWz)
+        step = newbeta - beta
+        ms = np.abs(step).max(axis=1, keepdims=True)
+        scale = np.where(ms > 2.0, 2.0 / np.maximum(ms, 1e-12), 1.0)
+        damped = beta + step * scale
+        if np.abs(step * scale).max() < tol:
+            beta = damped; break
+        beta = damped
+    eta = np.clip(beta @ X.T, -ETA_CLIP, ETA_CLIP)
+    mu = sf[None, :] * np.exp(eta)
+    return beta, mu
+
+def _cov_from_mu(y, sf, X, mu, a):
+    W = mu / (1.0 + a[:, None] * mu)
+    XtW = np.einsum('nk,gn,nl->gkl', X, W, X)
+    return np.linalg.inv(XtW + 1e-10 * np.eye(X.shape[1])[None])
+
+def nb_loglik_all(y, mu, alpha):
+    r = 1.0 / alpha
+    return np.sum(gammaln(y + r) - gammaln(r) - gammaln(y + 1.0)
+                  + y * np.log(alpha * mu) - (r + y) * np.log1p(alpha * mu), axis=1)
+
+# ---------------- dispersion ----------------
+def estimate_dispersions(y, sf, X, alpha_grid):
+    G, n = y.shape
+    best_ll = -np.inf * np.ones(G); best_a = np.full(G, alpha_grid[0])
+    for a in alpha_grid:
+        beta, mu = irls_all(y, sf, X, a, maxit=40)
+        ll = nb_loglik_all(y, mu, a)
+        ll = np.where(np.isfinite(ll), ll, -np.inf)
+        m = ll > best_ll
+        best_ll[m] = ll[m]; best_a[m] = a
+    beta, mu = irls_all(y, sf, X, best_a, maxit=60)
+    cov = _cov_from_mu(y, sf, X, mu, best_a)
+    return best_a, beta, cov
+
+def fit_trend(means, disp_mle):
+    ok = (means > 0) & (disp_mle > 0)
+    x = np.log(means[ok]); yv = np.log(disp_mle[ok])
+    lo, hi = np.percentile(x, [2, 98])
+    sel = (x >= lo) & (x <= hi)
+    x, yv = x[sel], yv[sel]
+    order = np.argsort(x)
+    x, yv = x[order], yv[order]
+    ux, idx = np.unique(x, return_index=True)
+    # average y for duplicate x
+    uy = np.array([yv[idx[i]:idx[i+1]].mean() if i+1 < len(idx) else yv[idx[i]] for i in range(len(ux))])
+    s = 0.05 * np.sum((uy - np.mean(uy)) ** 2)
+    return UnivariateSpline(ux, uy, k=4, s=max(s, 1e-6))
+
+def shrink_dispersions(disp_mle, means, sp, n_params):
+    trend = np.exp(sp(np.clip(np.log(np.maximum(means, 1e-6)), sp.get_knots()[0], sp.get_knots()[-1])))
+    prior_disp = float(np.median(trend))
+    prior_weight = 1.0 / prior_disp
+    nHat = float(n_params)
+    shrunk = (prior_weight * trend + nHat * disp_mle) / (prior_weight + nHat)
+    return shrunk, prior_disp
+
+# ---------------- BH & independent filtering ----------------
+def bh(p):
+    p = np.asarray(p, float); n = len(p)
+    o = np.argsort(p); r = np.arange(1, n + 1)
+    adj = np.clip(p[o] * n / r, 0, 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    out = np.empty(n); out[o] = adj
+    return out
+
+def independent_filter(pvalues, baseMean, alpha=0.1):
+    pvalues = np.where(np.isnan(pvalues), 1.0, pvalues)
+    n = len(pvalues)
+    qs = np.quantile(baseMean, np.linspace(0, 1, 201))
+    best_thr, best_r, best = -np.inf, -1, None
+    for thr in qs:
+        keep = baseMean >= thr
+        if keep.sum() < 2:
+            continue
+        padj = bh(pvalues[keep])
+        r = int(np.sum(padj < alpha))
+        if r > best_r:
+            best_r = r; best_thr = thr; best = (keep, padj)
+    keep, padj_sub = best
+    padj = np.full(n, np.nan); padj[keep] = padj_sub
+    return padj, best_thr
+
+# ---------------- apeglm-style LFC shrinkage ----------------
+def apeglm_shrink(lfc, se):
+    v = lfc ** 2 - se ** 2
+    phi = float(np.median(np.where(v > 0, v, 0.0)))
+    phi = max(phi, 1e-4)
+    return lfc * phi / (phi + se ** 2), phi
+
+# ---------------- design ----------------
+def build_design(coldata, covariates, ref_condition='Control'):
+    X = np.ones((len(coldata), 1))
+    X = np.column_stack([X, (coldata['condition'].values != ref_condition).astype(float)])
+    for cv in covariates:
+        levels = sorted(coldata[cv].astype(str).unique()); ref = levels[0]
+        X = np.column_stack([X, (coldata[cv].astype(str).values != ref).astype(float)])
+    return X
+
+# ---------------- pipeline ----------------
+def run_deseq2(counts, coldata, covariates, ref_condition='Control', alpha_grid=None, if_alpha=0.1):
+    if alpha_grid is None:
+        alpha_grid = np.logspace(-4, 0.7, 30)
+    X = build_design(coldata, covariates, ref_condition)
+    n_params = X.shape[1]; cond_col = 1
+    sf = median_of_ratios(counts.values); y = counts.values.astype(float)
+    disp_mle, _, _ = estimate_dispersions(y, sf, X, alpha_grid)
+    baseMean = (y / sf[None, :]).mean(axis=1)
+    sp = fit_trend(baseMean, disp_mle)
+    disp_shrunk, prior_disp = shrink_dispersions(disp_mle, baseMean, sp, n_params)
+    beta, mu = irls_all(y, sf, X, disp_shrunk, maxit=60)
+    cov = _cov_from_mu(y, sf, X, mu, disp_shrunk)
+    lfc_nat = beta[:, cond_col]
+    se_nat = np.sqrt(np.clip(cov[:, cond_col, cond_col], 0, None))
+    lfc = lfc_nat / LN2; se = se_nat / LN2
+    stat = lfc_nat / np.where(se_nat > 0, se_nat, np.inf)
+    pval = 2 * norm.sf(np.abs(stat))
+    padj, thr = independent_filter(pval, baseMean, alpha=if_alpha)
+    lfc_shrunk, phi = apeglm_shrink(lfc, se)
+    res = pd.DataFrame({'gene_id': counts.index, 'baseMean': baseMean, 'disp': disp_shrunk,
+                        'log2FoldChange': lfc_shrunk, 'lfcSE': se, 'stat': stat,
+                        'pvalue': pval, 'padj': padj})
+    meta = dict(n_genes=len(res), n_samples=len(coldata), prior_disp=prior_disp,
+                if_threshold=thr, apeglm_phi=phi)
+    return res, meta
+
+def summarize(res, padj_cut=0.05):
+    sig = res[(res['padj'] < padj_cut) & res['padj'].notna()]
+    up = sig[sig['log2FoldChange'] > 0]; down = sig[sig['log2FoldChange'] < 0]
+    return dict(n_sig=len(sig), n_up=len(up), n_down=len(down),
+                n_nonNA_padj=int(res['padj'].notna().sum()))
+
+def main():
+    counts = load_counts('data/Issy_ASXL1_blood_featureCounts_GeneTable_final.txt')
+    coldata = load_coldata('data/Issy_ASXL1_blood_coldata_gender.xlsx')
+    keep = coldata['sample'].tolist()
+    dropped = sorted(set(counts.columns) - set(keep))
+    counts = counts[keep]
+    print("counts subset:", counts.shape, "| dropped (no metadata):", dropped)
+    asx = coldata[coldata.condition == 'ASXL1']['sample'].tolist()
+    ctl = coldata[coldata.condition == 'Control']['sample'].tolist()
+    print(f"ASXL1 (n={len(asx)}): {asx}")
+    print(f"Control (n={len(ctl)}): {ctl}")
+
+    min_cnt, min_smp = 10, 10
+    keepmask = (counts >= min_cnt).sum(axis=1) >= min_smp
+    csub = counts[keepmask]
+    print(f"filter >= {min_cnt} in >= {min_smp} samples: {len(csub)} genes kept")
+
+    lines = []
+    def log(s=""):
+        print(s); lines.append(s)
+
+    # PRIMARY: ~ condition, >=10 in >=10 samples  (the answer)
+    res, meta = run_deseq2(csub, coldata, covariates=[])
+    s = summarize(res)
+    res.to_csv('results_primary_condition.csv', index=False)
+    log("\n=== PRIMARY design ~ condition (filter >=10 in >=10 samples) ===")
+    log(f"genes={meta['n_genes']} prior_disp={meta['prior_disp']:.4f} apeglm_phi={meta['apeglm_phi']:.4f} IF_thr(baseMean)={meta['if_threshold']:.3f}")
+    log(f"padj<0.05:  total={s['n_sig']}  up={s['n_up']}  down={s['n_down']}  (non-NA padj={s['n_nonNA_padj']})")
+
+    # SENSITIVITY 1: ~ sex + condition
+    res2, _ = run_deseq2(csub, coldata, covariates=['sex'])
+    s2 = summarize(res2)
+    res2.to_csv('results_sex_condition.csv', index=False)
+    log(f"[sens] ~sex+condition (same filter):            total={s2['n_sig']}  up={s2['n_up']}  down={s2['n_down']}")
+
+    # SENSITIVITY 2: vignette default filter rowSums >= 10*n (22582 genes)
+    krs = counts.sum(axis=1) >= 10 * len(keep)
+    srs = summarize(run_deseq2(counts[krs], coldata, covariates=())[0])
+    log(f"[sens] ~condition, rowSums>=10*n ({krs.sum()} genes): total={srs['n_sig']}  up={srs['n_up']}  down={srs['n_down']}")
+
+    # SENSITIVITY 3: no prefilter
+    s3 = summarize(run_deseq2(counts, coldata, covariates=())[0])
+    log(f"[sens] ~condition, no prefilter ({len(counts)} genes): total={s3['n_sig']}  up={s3['n_up']}  down={s3['n_down']}")
+
+    # SENSITIVITY 4: IF alpha = 0.05 (vs default 0.1)
+    r4, _ = run_deseq2(csub, coldata, covariates=[], if_alpha=0.05)
+    s4 = summarize(r4)
+    log(f"[sens] ~condition, IF alpha=0.05:               total={s4['n_sig']}  up={s4['n_up']}  down={s4['n_down']}")
+
+    log(f"\nANSWER (primary ~condition, padj<0.05, non-NA, up+down): {s['n_sig']}")
+    open('analysis_summary.txt', 'w').write("\n".join(lines) + "\n")
+
+if __name__ == '__main__':
+    main()

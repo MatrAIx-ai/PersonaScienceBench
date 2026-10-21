@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""
+Implicit-solvent Poisson-Boltzmann binding-response analysis (asibench
+chemistry.implicit_solvent_pb_gb, 8-case disclosed dataset).
+
+Primary route (higher fidelity):
+  * SES/SAS surfaces per entity (assembly, part_a, part_b) reconstructed from
+    that entity's OWN sites.csv rows:
+      - VDW mask  : min_i(|r - r_i| - R_i) <= 0            (voxel classification)
+      - SAS mask  : min_i(|r - r_i| - (R_i+probe)) <= 0
+      - SES mask  : Euclidean dilation of VDW by `probe` (EDT of complement
+                    <= probe), then Euclidean erosion by `probe` (distance to
+                    the outside of the dilated set > probe), union VDW.
+      - SDF       : EDT(outside) - EDT(inside)  (scipy sampling=spacing)
+  * Node-centered 7-point finite-volume operator, harmonic face-averaged
+    dielectric coefficients, screening term kappa^2 * solvent_fraction,
+    Dirichlet zero ONLY on the outer grid boundary (interior nodes unknowns).
+  * Charge deposition: trilinear cloud-in-cell / spacing^3.
+  * Interior RHS: 4*pi*332.06371 * rho   (kcal/mol/e units).
+  * epsilon = eps_in + (eps_out - eps_in) * solvent_fraction
+      - 'mol'  (sharp)   : solvent_fraction = indicator(SDF_SES >= 0)
+      - 'smol' (smoothed): solvent_fraction = 0.5*(1 + tanh(SDF_SES / window))
+        (declared reading of "tanh transition defined by the SES signed
+         distance and manifest smoothing window"; window=0 degenerates to sharp)
+  * Response regime:
+      - linearized_screening : -div(eps grad phi) + kappa^2*s*phi = RHS
+      - nonlinear_screening  : -div(eps grad phi)
+                               + kappa^2*s*RT*sinh(phi/RT) = RHS
+        with RT = k_B * T_case (kcal/mol). DIMENSIONALLY CONSISTENT choice:
+        RT*sinh(phi/RT) -> phi for small phi, i.e. it linearizes EXACTLY to the
+        linearized_screening operator.  (Documented choice, approved.)
+  * Vacuum subtraction: same zero-boundary problem, uniform eps_in, zero
+    solvent fraction, kappa = 0.  Reaction field = phi_medium - phi_vacuum.
+  * Entity response energy = 0.5 * sum(q_i * reaction_field(r_i)) with
+    trilinear interpolation; binding = assembly - part_a - part_b.
+
+Secondary route (fast GB cross-term surrogate):
+  * Born radius per site = max(atom radius, nearest distance to that
+    component's reconstructed SES boundary).
+  * Only part_a/part_b cross term; skip a part_a site whose nearest part_b
+    site is farther than ~6.5 Angstrom.
+  * f_ij = sqrt(r_ij^2 + a_i a_j exp(-r_ij^2/(4 a_i a_j)))
+    secondary = -332.06371 * sum_i sum_j q_i q_j *
+                ((1/eps_in) - exp(-kappa f_ij)/eps_out) / f_ij
+"""
+import json
+import os
+import time
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy import ndimage
+from scipy.spatial import cKDTree
+
+DATA = "data"
+OUT = "results"
+KB_KCAL = 0.00198720425864083          # kcal/mol/K
+COULOMB_CONST = 332.06371              # kcal/mol/e (4*pi_eps0 factor folded)
+KAPPA0_FACTOR = 4.0 * np.pi * COULOMB_CONST
+TOL_NEWTON = 1e-9                      # infinity-norm residual tolerance
+MAX_NEWTON_IT = 40
+
+os.makedirs(OUT, exist_ok=True)
+t_start = time.time()
+manifest = json.load(open(f"{DATA}/manifest.json"))
+plane_spec = json.load(open(f"{DATA}/plane_spec.json"))
+sites = pd.read_csv(f"{DATA}/sites.csv")
+volume_a = np.load(f"{DATA}/volume_a.npy")   # (8,35,35,35) SES SDF of assembly
+volume_b = np.load(f"{DATA}/volume_b.npy")   # (8,35,35,35) SAS SDF of assembly
+queries = np.load(f"{DATA}/queries.npy")     # (8,24,3)
+case_ids = manifest["case_order"]
+assert [c["case_id"] for c in manifest["cases"]] == case_ids
+
+geom_report = []
+
+
+def grid_coords(case):
+    g = case["grid"]
+    n, h = g["shape"][0], g["spacing_angstrom"]
+    ctr = np.asarray(g["box_center_angstrom"], float)
+    idx = np.arange(n) - (n - 1) / 2.0
+    return ctr[None, :] + h * idx[:, None]      # (n,3) coordinate per axis
+
+
+def analytic_atom_sdf(points, P, R, chunk=8192, kneigh=256):
+    """min_i |r - r_i| - R_i, chunked, via k-nearest atoms per point."""
+    out = np.empty(len(points))
+    tree = cKDTree(P)
+    for s in range(0, len(points), chunk):
+        pts = points[s:s + chunk]
+        d, idx = tree.query(pts, k=min(kneigh, len(P)))
+        if d.ndim == 1:
+            d = d[:, None]; idx = idx[:, None]
+        out[s:s + chunk] = (d - R[idx]).min(axis=1)
+    return out
+
+
+def entity_sdf_sas(X, Y, Z, P, R, probe, spacing):
+    """SES/SAS masks + signed distances on the voxel grid (validated recipe)."""
+    shape = X.shape
+    pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    d = analytic_atom_sdf(pts, P, R)                      # VDW level set
+    vdw = (d <= 0.0).reshape(shape)
+    if probe > 0:
+        d_sas = analytic_atom_sdf(pts, P, R + probe)
+        sas = (d_sas <= 0.0).reshape(shape)
+        # Euclidean dilation by probe: distance (to complement of VDW) <= probe
+        dist_out = ndimage.distance_transform_edt(~vdw, sampling=spacing)
+        dilated = dist_out <= probe
+        # Euclidean erosion of the dilated set by probe: distance from a
+        # dilated voxel to the outside of the dilated set must exceed probe
+        ero = ndimage.distance_transform_edt(dilated, sampling=spacing)
+        ses = (ero > probe) | vdw
+    else:
+        sas = vdw
+        ses = vdw
+    def sdf(m):
+        return (ndimage.distance_transform_edt(~m, sampling=spacing)
+                - ndimage.distance_transform_edt(m, sampling=spacing))
+    return sdf(ses), sdf(sas)
+
+
+def deposit_charges(X, Y, Z, pos, q, spacing):
+    """Trilinear cloud-in-cell deposition, divided by spacing^3."""
+    rho = np.zeros(X.shape)
+    x0, y0, z0 = X[0, 0, 0], Y[0, 0, 0], Z[0, 0, 0]
+    nx, ny, nz = X.shape
+    for p, c in zip(pos, q):
+        fx = (p[0] - x0) / spacing
+        fy = (p[1] - y0) / spacing
+        fz = (p[2] - z0) / spacing
+        i0 = min(max(int(np.floor(fx)), 0), nx - 2)
+        j0 = min(max(int(np.floor(fy)), 0), ny - 2)
+        k0 = min(max(int(np.floor(fz)), 0), nz - 2)
+        tx, ty, tz = fx - i0, fy - j0, fz - k0
+        tx = min(max(tx, 0.0), 1.0); ty = min(max(ty, 0.0), 1.0); tz = min(max(tz, 0.0), 1.0)
+        for di in (0, 1):
+            wi = tx if di else 1 - tx
+            for dj in (0, 1):
+                wj = ty if dj else 1 - ty
+                for dk in (0, 1):
+                    wk = tz if dk else 1 - tz
+                    rho[i0 + di, j0 + dj, k0 + dk] += wi * wj * wk * c
+    return rho / spacing ** 3
+
+
+def build_operator(eps, h, screening=None):
+    """Node-centred 7-point FV operator, harmonic face-averaged coefficients.
+
+    Returns full-grid CSR matrix over all nodes (interior slicing for the
+    zero-Dirichlet problem is done by the caller).
+    """
+    n = eps.shape[0]
+    eps = eps.astype(float)
+    rows, cols, vals = [], [], []
+    diag = np.zeros(eps.size)
+    strides = [n * n, n, 1]
+    for axis in range(3):
+        block_shape = list(eps.shape); block_shape[axis] -= 1
+        idx = np.indices(block_shape, dtype=np.int64)
+        flat_idx = (idx[0] * n + idx[1]) * n + idx[2]
+        a = flat_idx.ravel()
+        b = a + strides[axis]
+        s0 = [slice(None)] * 3; s0[axis] = slice(0, n - 1)
+        s1 = [slice(None)] * 3; s1[axis] = slice(1, n)
+        e0 = eps[tuple(s0)].ravel()
+        e1 = eps[tuple(s1)].ravel()
+        face = 2.0 * e0 * e1 / (e0 + e1) / h ** 2
+        rows.append(a); cols.append(b); vals.append(-face)
+        rows.append(b); cols.append(a); vals.append(-face)
+        np.add.at(diag, a, face)
+        np.add.at(diag, b, face)
+    if screening is not None:
+        diag = diag + screening.ravel()
+    ar = np.arange(eps.size)
+    rows.append(ar); cols.append(ar); vals.append(diag)
+    A = sp.coo_matrix((np.concatenate(vals),
+                       (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(eps.size, eps.size)).tocsr()
+    return A
+
+
+def interior_index(n):
+    m = np.zeros((n, n, n), bool)
+    m[1:-1, 1:-1, 1:-1] = True
+    return np.where(m.ravel())[0]
+
+
+def _lu(A):
+    return spla.splu(A.tocsc(), permc_spec="MMD_AT_PLUS_A")
+
+
+def solve_medium_and_vacuum(eps, h, s_frac, kappa, rho, nonlinear, RT,
+                            vacuum_lu=None, eps_vacuum=None):
+    """Medium + vacuum solves with zero Dirichlet on the outer boundary.
+
+    Nonlinear regime: continuation in the capped dimensionless potential
+    u_cap (Picard with c = sinh(u)/u, u clipped to +-u_cap, u_cap doubling)
+    followed by a damped Newton polish on
+        F(phi) = A0 phi + kappa^2 s RT sinh(phi/RT) - 4*pi*332.06371*rho.
+    This is required because the linearized solution has |phi|/RT ~ O(10^2),
+    where plain Newton advances only ~RT per iteration (stiff sinh).
+    Returns (rf_array, diagnostics dict).
+    """
+    n = eps.shape[0]
+    inter = interior_index(n)
+    b_full = np.zeros(n ** 3)
+    b_full += KAPPA0_FACTOR * rho.ravel()
+    b_int = b_full[inter]
+
+    # ---- vacuum: uniform eps_in, zero solvent fraction, kappa = 0 (linear)
+    if vacuum_lu is None:
+        A_vac = build_operator(np.full(eps.shape, eps_vacuum), h, None)
+        vacuum_lu = _lu(A_vac[inter][:, inter])
+    phi_v = np.zeros(n ** 3)
+    phi_v[inter] = vacuum_lu.solve(b_int)
+
+    diag_s = (kappa ** 2) * s_frac.ravel()[inter]     # interior only
+    A0 = build_operator(eps, h, None)[inter][:, inter].tocsc()
+
+    s_int = s_frac.ravel()[inter]
+    has_screen = diag_s.max() > 0
+    if not nonlinear or not has_screen:
+        A_lin = (A0 + sp.diags(diag_s)).tocsc()
+        phi = np.zeros(n ** 3)
+        phi[inter] = _lu(A_lin).solve(b_int)
+        u_max = float(np.abs(phi[inter]).max() / RT)
+        d = {"method": "direct-linear", "iterations": 0, "final_resid": None,
+             "continuation_stages": 0, "u_max": u_max}
+        return (phi - phi_v).reshape(n, n, n), d
+
+    # ---------- nonlinear solve: charge continuation + damped Newton ----------
+    # The linearized warm start has |phi|/RT ~ O(10^2) where plain Newton
+    # advances only ~RT per iteration (stiff sinh).  Instead we continue in
+    # the source strength: F_lam(phi) = A0 phi + kappa^2 s RT sinh(phi/RT)
+    # - lam*b.  Along this path the solvent potential saturates at the
+    # screening balance (|phi|/RT ~ O(10)), so Newton converges locally at
+    # every stage; each stage reuses its LU factorization for several chord
+    # iterations.
+    def F(p, b_lam):
+        uu = np.clip(p / RT, -700, 700)
+        return A0.dot(p) + diag_s * RT * np.sinh(uu) - b_lam
+
+    def newton_stage(phi, b_lam, tol, max_outer=12):
+        nfact = 0
+        for _ in range(max_outer):
+            resid = np.abs(F(phi, b_lam)).max()
+            if resid <= tol:
+                return phi, nfact, resid
+            uu = np.clip(phi / RT, -700, 700)
+            J = (A0 + sp.diags(diag_s * np.cosh(uu))).tocsc()
+            lu = _lu(J)
+            nfact += 1
+            advanced = False
+            for _ in range(8):                      # chord iterations, frozen LU
+                resid = np.abs(F(phi, b_lam)).max()
+                if resid <= tol:
+                    return phi, nfact, resid
+                d = lu.solve(-F(phi, b_lam))
+                step, ok = 1.0, False
+                for _ in range(20):                 # Armijo-style backtracking
+                    cand = phi + step * d
+                    fn = np.abs(F(cand, b_lam)).max()
+                    if fn < resid:
+                        phi, resid, ok = cand, fn, True
+                        break
+                    step *= 0.5
+                if not ok:
+                    break
+                advanced = True
+            if not advanced:
+                break
+        return phi, nfact, np.abs(F(phi, b_lam)).max()
+
+    A_lin = (A0 + sp.diags(diag_s)).tocsc()
+    phi_lin = _lu(A_lin).solve(b_int)
+    u_lin = (np.abs(phi_lin) / RT)[s_int > 0]
+    u_lin = u_lin.max() if len(u_lin) else 0.0
+    b_scale = max(np.abs(b_int).max(), 1.0)
+    tol_stage = 1e-6 * b_scale
+    stages, nfacts, resid = 0, 0, np.inf
+    if u_lin < 2.0:
+        phi = phi_lin                    # already in the local Newton basin
+    else:
+        lam = min(1.0, 12.0 / max(u_lin, 1e-12))
+        lams = []
+        while lam < 1.0 - 1e-12:
+            lams.append(lam)
+            lam = min(1.0, lam * 2.0)
+        lams.append(1.0)
+        phi = lams[0] * phi_lin
+        for lam in lams:
+            phi, nf, resid = newton_stage(phi, lam * b_int,
+                                          tol_stage if lam < 1.0 else TOL_NEWTON)
+            stages += 1
+            nfacts += nf
+        it_newton = stages
+
+    u_max = float((np.abs(phi) / RT)[s_int > 0].max()) if (s_int > 0).any() else 0.0
+    d = {"method": "charge-continuation+newton", "stages": int(stages),
+         "lu_factorizations": int(nfacts), "final_resid": float(resid),
+         "tol": TOL_NEWTON, "u_max": u_max}
+    phi_full = np.zeros(n ** 3)
+    phi_full[inter] = phi
+    return (phi_full - phi_v).reshape(n, n, n), d
+
+
+def trilinear(field, pts, origin, h):
+    coords = np.empty((3, len(pts)))
+    for a in range(3):
+        coords[a] = (pts[:, a] - origin[a]) / h
+    return ndimage.map_coordinates(field, coords, order=1, mode="nearest")
+
+
+# ------------------------------------------------------------------ main loop
+rows_csv = []
+field_samples = np.zeros((8, 24), np.float32)
+field_slice = np.zeros((8, 35, 35), np.float32)
+solve_diagnostics = {}
+born_report = []
+
+for ci, cid in enumerate(case_ids):
+    case = manifest["cases"][ci]
+    assert case["case_id"] == cid
+    ckpt_path = f"{OUT}/ckpt_{cid}.npz"
+    if os.path.exists(ckpt_path):
+        z = np.load(ckpt_path, allow_pickle=True)
+        prim, sec = float(z["primary"]), float(z["secondary"])
+        rows_csv.append(dict(case_id=cid, metric_primary_kcal_mol=prim,
+                             metric_secondary_kcal_mol=sec,
+                             metric_gap_kcal_mol=prim - sec))
+        field_samples[ci] = z["fs"]
+        field_slice[ci] = z["fsl"]
+        geom_report.append((cid, float(z["e_ses"]), float(z["e_sas"])))
+        born_report.append(tuple(float(v) for v in z["born"]))
+        solve_diagnostics.update(json.loads(str(z["diag_json"])))
+        print(f"[{cid}] restored from checkpoint "
+              f"(primary={prim:.4f}, secondary={sec:.4f})")
+        continue
+    g = case["grid"]; h = g["spacing_angstrom"]
+    rp = case["response_parameters"]; sp_ = case["surface_parameters"]
+    eps_in, eps_out = rp["inner_dielectric"], rp["outer_dielectric"]
+    kappa = rp["screening_kappa_per_angstrom"]
+    probe = sp_["probe_radius_angstrom"]; window = sp_["smoothing_window_angstrom"]
+    nonlinear = rp["response_regime"] == "nonlinear_screening"
+    RT = KB_KCAL * rp["temperature_kelvin"]
+
+    C = grid_coords(case)
+    X, Y, Z = np.meshgrid(C[:, 0], C[:, 1], C[:, 2], indexing="ij")
+    origin = C[0]
+    pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+
+    # ---- surfaces per entity from that entity's own rows
+    sdfs = {}
+    for ent in ["assembly", "part_a", "part_b"]:
+        sub = sites[(sites.case_id == cid) & (sites.entity_id == ent)]
+        P = sub[["x_angstrom", "y_angstrom", "z_angstrom"]].values
+        R = sub["radius_angstrom"].values
+        ses, sas = entity_sdf_sas(X, Y, Z, P, R, probe, h)
+        sdfs[ent] = {"ses": ses, "sas": sas, "P": P, "R": R,
+                     "q": sub["charge_e"].values}
+
+    # ---- geometry assertion: assembly reconstruction == supplied tensors
+    e_ses = float(np.abs(sdfs["assembly"]["ses"] - volume_a[ci]).max())
+    e_sas = float(np.abs(sdfs["assembly"]["sas"] - volume_b[ci]).max())
+    geom_report.append((cid, e_ses, e_sas))
+    if not (e_ses < 1e-4 and e_sas < 1e-4):
+        print(f"WARNING geometry mismatch {cid}: ses {e_ses:.3e}, sas {e_sas:.3e}")
+
+    def frac(ent):
+        ses = sdfs[ent]["ses"]
+        if window > 0:
+            return 0.5 * (1.0 + np.tanh(ses / window))
+        return (ses >= 0.0).astype(float)
+
+    resp = {}
+    vacuum_lu = None
+    for ent in ["assembly", "part_a", "part_b"]:
+        s_frac = frac(ent)
+        eps = eps_in + (eps_out - eps_in) * s_frac
+        rho = deposit_charges(X, Y, Z, sdfs[ent]["P"], sdfs[ent]["q"], h)
+        rf, d = solve_medium_and_vacuum(eps, h, s_frac, kappa, rho, nonlinear, RT,
+                                        vacuum_lu=vacuum_lu, eps_vacuum=eps_in)
+        if vacuum_lu is None:
+            vac_A = build_operator(np.full(eps.shape, eps_in), h, None)
+            ii = interior_index(eps.shape[0])
+            vacuum_lu = spla.splu(vac_A[ii][:, ii], permc_spec="MMD_AT_PLUS_A")
+        resp[ent] = rf
+        solve_diagnostics[f"{cid}:{ent}"] = d
+        dstr = ", ".join(f"{k}={v}" for k, v in d.items())
+        print(f"[{cid}] {ent}: rf=[{rf.min():.4f},{rf.max():.4f}] {dstr}")
+
+    energies = {}
+    for ent in ["assembly", "part_a", "part_b"]:
+        vals = trilinear(resp[ent], sdfs[ent]["P"], origin, h)
+        energies[ent] = 0.5 * float(np.sum(sdfs[ent]["q"] * vals))
+    binding = energies["assembly"] - energies["part_a"] - energies["part_b"]
+
+    # ---- field samples / slice from the manifest field entity (assembly)
+    rf_asm = resp[case["field_entity_id"]]
+    field_samples[ci] = trilinear(rf_asm, queries[ci].astype(float), origin, h)
+    pl = plane_spec["planes"][ci]
+    assert pl["case_id"] == cid
+    p = pl["plane_index"]
+    ax = {"x": 0, "y": 1, "z": 2}[pl["axis"]]
+    coord_check = abs((origin[ax] + p * h) - pl["plane_coordinate_angstrom"])
+    assert coord_check < 1e-3, (cid, coord_check)
+    if pl["axis"] == "z":
+        sl = rf_asm[:, :, p]          # storage order (x, y)
+    elif pl["axis"] == "y":
+        sl = rf_asm[:, p, :]          # storage order (x, z)
+    else:
+        sl = rf_asm[p, :, :]          # storage order (y, z)
+    field_slice[ci] = sl
+
+    # ---- secondary GB cross term
+    pa, pb = sdfs["part_a"], sdfs["part_b"]
+    born = {}
+    for name, E in [("part_a", pa), ("part_b", pb)]:
+        ses_mask = E["ses"] < 0
+        bnd = ses_mask & ~ndimage.binary_erosion(ses_mask)
+        bnd_pts = pts[bnd.ravel()]
+        tree = cKDTree(bnd_pts)
+        d_bnd, _ = tree.query(E["P"], k=1)
+        born[name] = np.maximum(E["R"], d_bnd)
+    born_report.append((cid, born["part_a"].min(), born["part_a"].max(),
+                        born["part_b"].min(), born["part_b"].max()))
+
+    tree_b = cKDTree(pb["P"])
+    d_min, _ = tree_b.query(pa["P"], k=1)
+    keep = d_min <= 6.5
+    Pa, qa, aa = pa["P"][keep], pa["q"][keep], born["part_a"][keep]
+    if len(Pa) and len(pb["P"]):
+        r2 = ((Pa[:, None, :] - pb["P"][None, :, :]) ** 2).sum(-1)
+        aiaj = aa[:, None] * born["part_b"][None, :]
+        f = np.sqrt(r2 + aiaj * np.exp(-r2 / (4.0 * aiaj)))
+        term = ((1.0 / eps_in) - np.exp(-kappa * f) / eps_out) / f
+        secondary = -COULOMB_CONST * float(np.sum(qa[:, None] * pb["q"][None, :] * term))
+    else:
+        secondary = 0.0
+
+    rows_csv.append(dict(case_id=cid,
+                         metric_primary_kcal_mol=binding,
+                         metric_secondary_kcal_mol=secondary,
+                         metric_gap_kcal_mol=binding - secondary))
+    print(f"[{cid}] energies: asm={energies['assembly']:.4f} a={energies['part_a']:.4f} "
+          f"b={energies['part_b']:.4f} primary={binding:.4f} secondary={secondary:.4f} "
+          f"(kept {int(keep.sum())}/{len(pa['P'])} part_a sites; part_b n={len(pb['P'])})")
+    np.savez(ckpt_path, primary=binding, secondary=secondary,
+             fs=field_samples[ci], fsl=field_slice[ci],
+             e_ses=e_ses, e_sas=e_sas,
+             born=np.array([born["part_a"].min(), born["part_a"].max(),
+                            born["part_b"].min(), born["part_b"].max()]),
+             diag_json=json.dumps({k: v for k, v in solve_diagnostics.items()
+                                   if k.startswith(cid)}))
+
+# ------------------------------------------------------------------ outputs
+df_out = pd.DataFrame(rows_csv)[["case_id", "metric_primary_kcal_mol",
+                                 "metric_secondary_kcal_mol", "metric_gap_kcal_mol"]]
+df_out.to_csv(f"{OUT}/summary_metrics.csv", index=False)
+np.save(f"{OUT}/field_samples.npy", field_samples.astype(np.float32))
+np.save(f"{OUT}/field_slice.npy", field_slice.astype(np.float32))
+
+# ---- verification of outputs
+assert field_samples.shape == (8, 24) and field_samples.dtype == np.float32
+assert field_slice.shape == (8, 35, 35) and field_slice.dtype == np.float32
+gap_ok = np.allclose(df_out.metric_gap_kcal_mol,
+                     df_out.metric_primary_kcal_mol - df_out.metric_secondary_kcal_mol)
+assert gap_ok, "gap != primary - secondary"
+assert list(df_out.case_id) == case_ids
+
+# ---------------------------------------------------------------- overview.png
+# matplotlib is unavailable in this offline environment, so the overview
+# figure is rendered directly into a PNG raster (numpy + zlib) with a small
+# built-in bitmap font. Content is the same as a matplotlib figure: one
+# reaction-field slice panel per case (plane_spec order) plus a grouped bar
+# chart of primary vs secondary responses.
+import zlib, struct
+
+GLYPHS = {
+ 'A':["01110","10001","10001","11111","10001","10001","10001"],
+ 'B':["11110","10001","11110","10001","10001","10001","11110"],
+ 'C':["01110","10001","10000","10000","10000","10001","01110"],
+ 'D':["11110","10001","10001","10001","10001","10001","11110"],
+ 'E':["11111","10000","11110","10000","10000","10000","11111"],
+ 'G':["01110","10001","10000","10111","10001","10001","01111"],
+ 'I':["01110","00100","00100","00100","00100","00100","01110"],
+ 'K':["10001","10010","10100","11000","10100","10010","10001"],
+ 'L':["10000","10000","10000","10000","10000","10000","11111"],
+ 'M':["10001","11011","10101","10101","10001","10001","10001"],
+ 'N':["10001","11001","10101","10011","10001","10001","10001"],
+ 'O':["01110","10001","10001","10001","10001","10001","01110"],
+ 'P':["11110","10001","10001","11110","10000","10000","10000"],
+ 'R':["11110","10001","10001","11110","10100","10010","10001"],
+ 'S':["01111","10000","10000","01110","00001","00001","11110"],
+ 'T':["11111","00100","00100","00100","00100","00100","00100"],
+ 'U':["10001","10001","10001","10001","10001","10001","01110"],
+ 'V':["10001","10001","10001","10001","10001","01010","00100"],
+ 'Y':["10001","10001","01010","00100","00100","00100","00100"],
+ 'Z':["11111","00001","00010","00100","01000","10000","11111"],
+ '0':["01110","10001","10011","10101","11001","10001","01110"],
+ '1':["00100","01100","00100","00100","00100","00100","01110"],
+ '2':["01110","10001","00001","00110","01000","10000","11111"],
+ '3':["11110","00001","00001","01110","00001","00001","11110"],
+ '4':["00010","00110","01010","10010","11111","00010","00010"],
+ '5':["11111","10000","11110","00001","00001","10001","01110"],
+ '6':["00110","01000","10000","11110","10001","10001","01110"],
+ '7':["11111","00001","00010","00100","01000","01000","01000"],
+ '8':["01110","10001","10001","01110","10001","10001","01110"],
+ '9':["01110","10001","10001","01111","00001","00010","01100"],
+ '.':["00000","00000","00000","00000","00000","01100","01100"],
+ '-':["00000","00000","00000","11111","00000","00000","00000"],
+ '_':["00000","00000","00000","00000","00000","00000","11111"],
+ '/':["00001","00010","00010","00100","01000","01000","10000"],
+ '(':["00010","00100","01000","01000","01000","00100","00010"],
+ ')':["01000","00100","00010","00010","00010","00100","01000"],
+ ' ':["00000","00000","00000","00000","00000","00000","00000"],
+}
+
+def draw_text(img, x, y, s, color, scale=1):
+    for ch in s:
+        g = GLYPHS.get(ch.upper())
+        if g is not None:
+            for r, row in enumerate(g):
+                for cc, v in enumerate(row):
+                    if v == '1':
+                        img[y+r*scale:y+(r+1)*scale, x+cc*scale:x+(cc+1)*scale] = color
+        x += 6 * scale
+
+def write_png(path, img):
+    h, w = img.shape[:2]
+    raw = b''.join(b'\x00' + img[i].tobytes() for i in range(h))
+    def chunk(t, d):
+        return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+    with open(path, 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+                + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+
+def diverging(t):
+    """t in [-1,1]: blue -> white -> red."""
+    t = np.clip(t, -1.0, 1.0)
+    rgb = np.zeros(t.shape + (3,))
+    pos = t > 0
+    rgb[..., 0] = np.where(pos, 1.0 - 0.15 * t, 1.0 + t)
+    rgb[..., 1] = np.where(pos, 1.0 - 0.75 * t, 1.0 + 0.35 * t)
+    rgb[..., 2] = np.where(pos, 1.0 - 0.75 * t, 1.0)
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+W, H = 1400, 800
+img = np.full((H, W, 3), 255, np.uint8)
+draw_text(img, 14, 8, "IMPLICIT-SOLVENT PB BINDING RESPONSE - 8 CASES", (20, 20, 20), 2)
+draw_text(img, 14, 28, "PRIMARY: FINITE-VOLUME PB (SES/SAS RECONSTRUCTED PER ENTITY)  VS  SECONDARY: GB CROSS-TERM", (90, 90, 90), 1)
+
+# ---- slice panels (row 1)
+S, PW = 46, 150
+for ci, cid in enumerate(case_ids):
+    x0 = 20 + ci * (PW + 14)
+    y0 = 60
+    sl = field_slice[ci].astype(float)
+    vmax = max(np.abs(sl).max(), 1e-12)
+    tiles = diverging(sl / vmax)
+    big = np.kron(tiles, np.ones((4, 4, 1))).astype(np.uint8)  # 140x140
+    img[y0:y0 + 140, x0:x0 + 140] = big[:img.shape[0]-y0, :img.shape[1]-x0]
+    pl = plane_spec["planes"][ci]
+    draw_text(img, x0, y0 + 144, cid.upper(), (20, 20, 20), 1)
+    draw_text(img, x0 + 70, y0 + 144, f"{pl['axis'].upper()}{pl['plane_index']}", (120, 120, 120), 1)
+    draw_text(img, x0, y0 + 154, f"VMAX {vmax:.2f}", (120, 120, 120), 1)
+
+# ---- bar chart (row 2)
+cx0, cy0, cw, ch = 70, 300, 1260, 380
+vals = np.concatenate([df_out.metric_primary_kcal_mol, df_out.metric_secondary_kcal_mol])
+vmin, vmax = vals.min(), vals.max()
+pad = 0.08 * (vmax - vmin + 1e-9)
+lo, hi = vmin - pad, vmax + pad
+def vy(v):
+    return int(cy0 + ch - (v - lo) / (hi - lo) * ch)
+img[cy0:cy0 + ch + 1, cx0 - 1:cx0 + 1] = (60, 60, 60)        # y axis
+img[cy0 + ch:cy0 + ch + 2, cx0 - 1:cx0 + cw + 2] = (60, 60, 60)  # x axis
+# zero line if inside range
+if lo < 0 < hi:
+    yz = vy(0)
+    img[yz:yz + 1, cx0:cx0 + cw] = (150, 150, 150)
+for gi in range(8):
+    gcx = cx0 + int((gi + 0.5) * cw / 8)
+    for off, val, col in [(-38, df_out.metric_primary_kcal_mol[gi], (52, 119, 235)),
+                          (+38, df_out.metric_secondary_kcal_mol[gi], (255, 160, 30))]:
+        y = vy(val)
+        yb = vy(0) if lo < 0 < hi else cy0 + ch
+        ytop, ybot = min(y, yb), max(y, yb)
+        img[ytop:ybot + 1, gcx + off - 14:gcx + off + 14] = col
+        txt = f"{val:.2f}"
+        draw_text(img, gcx + off - 3 * len(txt), ytop - 10, txt, (40, 40, 40), 1)
+    draw_text(img, gcx - 3 * 4, cy0 + ch + 8, case_ids[gi].upper(), (40, 40, 40), 1)
+# y-axis ticks (5 ticks)
+for tt in np.linspace(lo, hi, 5):
+    y = vy(tt)
+    img[y:y + 1, cx0 - 6:cx0] = (60, 60, 60)
+    txt = f"{tt:.1f}"
+    draw_text(img, cx0 - 12 - 6 * len(txt), y - 3, txt, (90, 90, 90), 1)
+# legend
+draw_text(img, cx0 + cw - 330, cy0 + 10, "PB PRIMARY", (52, 119, 235), 1)
+img[cy0 + 8:cy0 + 16, cx0 + cw - 350:cx0 + cw - 336] = (52, 119, 235)
+draw_text(img, cx0 + cw - 330, cy0 + 24, "GB SECONDARY", (200, 120, 20), 1)
+img[cy0 + 22:cy0 + 30, cx0 + cw - 350:cx0 + cw - 336] = (255, 160, 30)
+draw_text(img, cx0, cy0 + ch + 30, "Y UNIT: KCAL/MOL   GAP = PRIMARY - SECONDARY", (90, 90, 90), 1)
+
+write_png(f"{OUT}/overview.png", img)
+print(f"overview.png written: {W}x{H} RGB PNG (matplotlib unavailable offline; "
+      "rendered with numpy+zlib raster writer)")
+print("\n=== geometry assertion (assembly reconstruction vs supplied tensors) ===")
+for cid, e_ses, e_sas in geom_report:
+    flag = "OK" if max(e_ses, e_sas) < 1e-4 else "MISMATCH"
+    print(f"  {cid}: max|SES-volA|={e_ses:.3e}  max|SAS-volB|={e_sas:.3e}  [{flag}]")
+print("\n=== Born radii (min/max, Angstrom) ===")
+for cid, a0, a1, b0, b1 in born_report:
+    print(f"  {cid}: part_a [{a0:.2f},{a1:.2f}]  part_b [{b0:.2f},{b1:.2f}]")
+print("\n=== solve diagnostics ===")
+for k, d in solve_diagnostics.items():
+    print(f"  {k}: {d}")
+print(f"\nTotal wall time: {time.time()-t_start:.1f} s")
+print(df_out.to_string(index=False))

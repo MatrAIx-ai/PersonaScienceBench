@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Shared-mode recovery from complex response curves (end-to-end).
+
+Model:  R(x) = a0_m + sum_{k=1..K} a_{k,m} / (1 + (i * x * tau_k)**phi_k)
+Shared across curves: K, tau_k > 0, 0 < phi_k <= 1.
+Curve specific:       a0_m (free), a_{k,m} >= 0.
+
+Method: joint variable projection (linear in per-curve amplitudes):
+  inner : constrained linear LS (scipy.optimize.lsq_linear), hard bounds
+          a_{k,m} >= 0, a0_m free;
+  outer : scipy.optimize.least_squares on (log tau_k, phi_k) with bounds,
+          principal branch (i*x*tau)^phi = (x*tau)^phi * e^{i*pi*phi/2};
+  multistart per K (deterministic grid + seeded random);
+  order : BIC (N=960 real obs, p = 2K + 5*(K+1)) + multistart stability
+          (dominant cluster) + significance (>=3 sigma) of added mode;
+  safety net: drop insignificant / near-degenerate modes before output.
+
+Outputs: results/modes.csv (header tau,a_0,...,a_4; rows sorted by tau).
+"""
+
+import itertools
+import json
+import os
+
+import numpy as np
+from scipy.optimize import least_squares, lsq_linear
+
+# ----------------------------- configuration ------------------------------
+SEED = 42
+K_RANGE = (1, 2, 3, 4)
+N_GRID_STARTS = 30        # grid-based starts per K
+N_RANDOM_STARTS = 10      # seeded-random starts per K
+LN_TAU_LO, LN_TAU_HI = -9.0, 9.0     # natural-log search range for tau
+MIN_LN_TAU_GAP = 2.0      # min separation between initial modes (ln units)
+PHI_LO, PHI_HI = 1e-3, 1.0
+MAX_NFEV = 300
+SIG_FACTOR = 3.0          # significance threshold in sigma
+CLUSTER_DLN = 0.5         # clustering tolerance on ln(tau)
+CLUSTER_DPHI = 0.25       # clustering tolerance on phi
+
+
+# ------------------------------- data --------------------------------------
+def load_data(path):
+    d = np.genfromtxt(path, delimiter=',', names=True)
+    curves = np.unique(d['curve'].astype(int))
+    x = None
+    Y = None
+    for c in curves:
+        m = d['curve'] == c
+        xc, rc, ic = d['x'][m], d['re'][m], d['im'][m]
+        if x is None:
+            x = xc
+        else:
+            if not np.allclose(x, xc):
+                raise ValueError('curves do not share the same x grid')
+        y = np.empty(2 * len(xc))
+        y[0::2] = rc
+        y[1::2] = ic
+        Y = y[None, :] if Y is None else np.vstack([Y, y[None, :]])
+    return x, Y, curves
+
+
+# ------------------------- model / design matrix ---------------------------
+def build_A1(x, ln_tau, phi):
+    """Design rows for one curve: (2n, K). Row 2j: real, row 2j+1: imag."""
+    K = len(ln_tau)
+    u = np.exp(phi[:, None] * np.log(x[None, :] * np.exp(ln_tau)[:, None]))
+    c = np.cos(0.5 * np.pi * phi)
+    s = np.sin(0.5 * np.pi * phi)
+    D = 1.0 + 2.0 * u * c[:, None] + u * u
+    A1 = np.zeros((2 * len(x), K))
+    A1[0::2, :] = ((1.0 + u * c[:, None]) / D).T
+    A1[1::2, :] = (-(u * s[:, None]) / D).T
+    return A1
+
+
+def build_Aj(x, ln_tau, phi, M):
+    """Joint design matrix (2n*M, M*(K+1)): per-curve block [1, B_1..B_K]."""
+    A1 = build_A1(x, ln_tau, phi)
+    K = A1.shape[1]
+    n = len(x)
+    Aj = np.zeros((2 * n * M, M * (K + 1)))
+    for m in range(M):
+        ridx = np.arange(m * 2 * n, (m + 1) * 2 * n)
+        c0 = m * (K + 1)
+        Aj[ridx, c0 + 1:c0 + 1 + K] = A1
+        Aj[ridx[0::2], c0] = 1.0
+    return Aj
+
+
+def amp_bounds(M, K):
+    lb = np.zeros(M * (K + 1))
+    ub = np.full(M * (K + 1), np.inf)
+    for m in range(M):
+        lb[m * (K + 1)] = -np.inf   # a0 free
+    return lb, ub
+
+
+def solve_amplitudes(Aj, Y, lb, ub):
+    """Constrained linear LS for all curves at once. (theta, SSE, resid)"""
+    sol = lsq_linear(Aj, Y.ravel(), bounds=(lb, ub))
+    theta = sol.x
+    r = Y.ravel() - Aj @ theta
+    return theta, float(r @ r), r
+
+
+# ------------------------------ outer loop ----------------------------------
+def outer_residual(p, x, Y, M, K, lb, ub):
+    ln_tau, phi = p[:K], p[K:]
+    Aj = build_Aj(x, ln_tau, phi, M)
+    _, _, r = solve_amplitudes(Aj, Y, lb, ub)
+    return r
+
+
+def canonical(p, K):
+    """Sort modes by ln(tau); return (ln_tau_sorted, phi_sorted)."""
+    order = np.argsort(p[:K])
+    return p[:K][order], p[K:][order]
+
+
+def run_start(p0, x, Y, M, K, lb, ub, plo, ph):
+    res = lambda p: outer_residual(p, x, Y, M, K, lb, ub)
+    out = least_squares(res, p0, bounds=(plo, ph), max_nfev=MAX_NFEV,
+                        xtol=1e-10, ftol=1e-10, gtol=1e-10)
+    ln_tau, phi = canonical(out.x, K)
+    Aj = build_Aj(x, ln_tau, phi, M)
+    theta, sse, _ = solve_amplitudes(Aj, Y, lb, ub)
+    return sse, out.x.copy(), theta, bool(out.success)
+
+
+def make_starts(rng, K):
+    starts = []
+    levels = np.linspace(-8.0, 8.0, 17)
+    def _gap_ok(c):
+        vals = levels[list(c)]
+        return vals.size < 2 or np.diff(vals).min() >= MIN_LN_TAU_GAP - 1e-12
+    combos = [c for c in itertools.combinations(range(len(levels)), K)
+              if _gap_ok(c)]
+    idx = rng.permutation(len(combos))[:N_GRID_STARTS]
+    for i in idx:
+        c = combos[i]
+        lt = levels[list(c)]
+        phi = np.full(K, 0.5 + 0.5 * (i % 2))     # alternate 0.5 / 1.0
+        starts.append(np.concatenate([lt, phi]))
+    added = 0
+    while added < N_RANDOM_STARTS:
+        lt = np.sort(rng.uniform(LN_TAU_LO, LN_TAU_HI, K))
+        if lt.size >= 2 and np.diff(lt).min() < MIN_LN_TAU_GAP:
+            continue
+        phi = rng.uniform(0.25, PHI_HI, K)
+        starts.append(np.concatenate([lt, phi]))
+        added += 1
+    return starts
+
+
+# ------------------------------ clustering ----------------------------------
+def cluster_solutions(sols):
+    clusters = []
+    for s in sols:
+        placed = False
+        for cl in clusters:
+            ref = cl[0]
+            if (np.abs(s['ln_tau'] - ref['ln_tau']).max() < CLUSTER_DLN
+                    and np.abs(s['phi'] - ref['phi']).max() < CLUSTER_DPHI):
+                cl.append(s)
+                placed = True
+                break
+        if not placed:
+            clusters.append([s])
+    return clusters
+
+
+# ------------------------------ main ----------------------------------------
+def main():
+    rng = np.random.default_rng(SEED)
+    x, Y, curves = load_data('data/curves.csv')
+    M = len(curves)
+    N = Y.size                       # real observations (re+im, all curves)
+    assert N == 960, f'expected 960 real observations, got {N}'
+
+    results = {}
+    print('=' * 78)
+    print(f'Loaded {M} curves x {len(x)} points, N = {N} real observations')
+    print('=' * 78)
+
+    for K in K_RANGE:
+        lb, ub = amp_bounds(M, K)
+        plo = np.concatenate([np.full(K, LN_TAU_LO), np.full(K, PHI_LO)])
+        ph = np.concatenate([np.full(K, LN_TAU_HI), np.full(K, PHI_HI)])
+        starts = make_starts(rng, K)
+        sols = []
+        for p0 in starts:
+            sse, p, theta, ok = run_start(p0, x, Y, M, K, lb, ub, plo, ph)
+            lt, phiv = canonical(p, K)
+            sols.append(dict(sse=sse, ln_tau=lt, phi=phiv, theta=theta, ok=ok))
+        sols.sort(key=lambda s: s['sse'])
+        best = sols[0]
+        clusters = cluster_solutions(sols)
+        dom = max(clusters, key=lambda cl: (len(cl), any(s is best for s in cl)))
+        n_conv = sum(s['ok'] for s in sols)
+        p = 2 * K + M * (K + 1)
+        bic = N * np.log(best['sse'] / N) + p * np.log(N)
+        results[K] = dict(sols=sols, best=best, clusters=clusters, dom=dom,
+                          n_starts=len(starts), n_conv=n_conv, p=p, bic=bic)
+        print(f'K={K}: starts={len(starts)} converged={n_conv} '
+              f'clusters={len(clusters)} dominant={len(dom)} '
+              f'sse={best["sse"]:.4f} bic={bic:.2f} '
+              f'ln_tau=[{", ".join(f"{v:.3f}" for v in best["ln_tau"])}] '
+              f'phi=[{", ".join(f"{v:.3f}" for v in best["phi"])}]')
+
+    # ---------------- order selection ---------------------------------------
+    print('-' * 78)
+    print('Cluster diagnostics per K (top clusters: size, best sse, ln_tau, phi,')
+    print('per-mode max-over-curves amplitude):')
+    for K in K_RANGE:
+        r = results[K]
+        print(f'  K={K}:')
+        for ci, cl in enumerate(sorted(r['clusters'], key=len, reverse=True)[:4]):
+            b = min(cl, key=lambda s: s['sse'])
+            amps = [float(b['theta'][j + 1::K + 1].max()) for j in range(K)]
+            print(f'    cluster {ci}: n={len(cl):2d} sse={b["sse"]:.4f} '
+                  f'ln_tau=[{", ".join(f"{v:+.3f}" for v in b["ln_tau"])}] '
+                  f'phi=[{", ".join(f"{v:.3f}" for v in b["phi"])}] '
+                  f'maxAmp/mode=[{", ".join(f"{a:.4f}" for a in amps)}]')
+
+    def residual_structure(K):
+        b = results[K]['best']
+        Aj = build_Aj(x, b['ln_tau'], b['phi'], M)
+        _, _, resid = solve_amplitudes(Aj, Y, amp_bounds(M, K)[0], amp_bounds(M, K)[1])
+        lx = np.log10(x)
+        bins = np.linspace(lx.min(), lx.max(), 13)
+        print(f'  K={K} residual structure (mean re-resid / im-resid per 0.64-decade bin):')
+        for bi in range(12):
+            m = (lx >= bins[bi]) & (lx < bins[bi + 1])
+            rr = []
+            for mm in range(M):
+                ridx = np.arange(mm * 2 * len(x), (mm + 1) * 2 * len(x))
+                rrr = resid[ridx]
+                rr.append((rrr[0::2][m].mean(), rrr[1::2][m].mean()))
+            mre = np.mean([t[0] for t in rr]); mim = np.mean([t[1] for t in rr])
+            print(f'    [{bins[bi]:+.2f},{bins[bi+1]:+.2f}): re {mre:+.4f}  im {mim:+.4f}')
+
+    print('Residual structure of best solutions:')
+    for K in K_RANGE:
+        residual_structure(K)
+
+    print('-' * 78)
+    print('Order comparison (BIC, N=960, p = 2K + 5*(K+1)):')
+    bic_min = min(results[K]['bic'] for K in K_RANGE)
+    for K in K_RANGE:
+        r = results[K]
+        print(f'  K={K}: sse={r["best"]["sse"]:12.4f}  p={r["p"]:3d}  '
+              f'bic={r["bic"]:10.2f}  dBIC={r["bic"]-bic_min:7.2f}  '
+              f'dominant={len(r["dom"]):2d}/{r["n_starts"]}')
+
+    def extra_mode_sig(K):
+        """Max-over-curves amplitude of the mode in K+1 absent from K."""
+        bK, bK1 = results[K]['best'], results[K + 1]['best']
+        matched = [j for j in range(K + 1)
+                   if min(abs(bK1['ln_tau'][j] - bK['ln_tau'][i])
+                          for i in range(K)) < CLUSTER_DLN]
+        extra = [j for j in range(K + 1) if j not in matched]
+        if not extra:
+            return None
+        # bK1 has K+1 modes -> per-curve block size is (K+1)+1 = K+2
+        a = bK1['theta'][extra[0] + 1::K + 2]
+        return float(a.max()), float(np.sqrt(bK1['sse'] / N))
+
+    print('Significance of added mode (K -> K+1):')
+    sig = {}
+    for K in range(1, max(K_RANGE)):
+        e = extra_mode_sig(K)
+        sig[K] = e
+        if e is None:
+            print(f'  K={K}->{K+1}: no clearly extra mode (mode sets overlap)')
+        else:
+            amax, sgm = e
+            print(f'  K={K}->{K+1}: extra-mode max amplitude = {amax:.4f} '
+                  f'= {amax/sgm:.1f} sigma (sigma={sgm:.4f})')
+
+    K_bic = min(K_RANGE, key=lambda K: results[K]['bic'])
+
+    def justified(K):
+        if K == 1:
+            return True
+        e = sig.get(K - 1)
+        return True if e is None else e[0] >= SIG_FACTOR * e[1]
+
+    candidates = [K for K in K_RANGE
+                  if results[K]['bic'] - bic_min < 2.0 and justified(K)]
+    if not candidates:
+        candidates = [K_bic]
+    stab = {K: len(results[K]['dom']) / results[K]['n_starts'] for K in K_RANGE}
+    K_sel = max(candidates, key=lambda K: (stab[K], -K))
+    print(f'BIC-min K={K_bic}; candidates (dBIC<2, justified)={candidates}; '
+          f'selected K={K_sel} (stability {stab[K_sel]:.0%})')
+
+    # ---------------- final solution & safety net ---------------------------
+    r = results[K_sel]
+    ln_tau, phi = r['best']['ln_tau'].copy(), r['best']['phi'].copy()
+    lb, ub = amp_bounds(M, K_sel)
+    plo = np.concatenate([np.full(K_sel, LN_TAU_LO), np.full(K_sel, PHI_LO)])
+    ph = np.concatenate([np.full(K_sel, LN_TAU_HI), np.full(K_sel, PHI_HI)])
+    out = least_squares(lambda p: outer_residual(p, x, Y, M, K_sel, lb, ub),
+                        np.concatenate([ln_tau, phi]), bounds=(plo, ph),
+                        max_nfev=300, xtol=1e-12, ftol=1e-12, gtol=1e-12)
+    ln_tau, phi = canonical(out.x, K_sel)
+    Aj = build_Aj(x, ln_tau, phi, M)
+    theta, sse, resid = solve_amplitudes(Aj, Y, lb, ub)
+    sigma = np.sqrt(sse / N)
+    print('-' * 78)
+    print(f'Final K={K_sel}: sse={sse:.4f}, sigma={sigma:.5f}')
+    for k in range(K_sel):
+        print(f'  mode {k+1}: tau={np.exp(ln_tau[k]):12.6g} '
+              f'(ln tau={ln_tau[k]:+.4f})  phi={phi[k]:.4f}')
+    print('per-mode max-over-curves amplitude (significance vs sigma):')
+    for k in range(K_sel):
+        amax = float(theta[k + 1::K_sel + 1].max())
+        print(f'  mode {k+1}: max amp = {amax:.5f} = {amax/sigma:.1f} sigma')
+    print('per-curve amplitudes (a0, a_1..a_K):')
+    for m in range(M):
+        a = theta[m * (K_sel + 1):(m + 1) * (K_sel + 1)]
+        print(f'  curve {m}: ' + ', '.join(f'{v:+.5f}' for v in a))
+
+    keep = list(range(K_sel))
+    dropped = []
+    for k in range(K_sel):
+        if theta[k + 1::K_sel + 1].max() < SIG_FACTOR * sigma:
+            keep.remove(k)
+            dropped.append((k, 'insignificant (max amp < 3 sigma)'))
+    for i in range(len(keep)):
+        for j in range(i + 1, len(keep)):
+            ki, kj = keep[i], keep[j]
+            if abs(ln_tau[ki] - ln_tau[kj]) < 0.15:
+                victim = ki if theta[ki + 1::K_sel + 1].sum() < theta[kj + 1::K_sel + 1].sum() else kj
+                keep.remove(victim)
+                dropped.append((victim, 'near-degenerate twin'))
+    keep.sort()
+    K_rep = len(keep)
+    if dropped:
+        print('DROPPED modes (safety net):', dropped)
+    else:
+        print('Safety net: no modes dropped.')
+
+    print('per-curve residual std (homogeneous noise check):')
+    for m in range(M):
+        rm = resid[m * 2 * len(x):(m + 1) * 2 * len(x)]
+        print(f'  curve {m}: {rm.std():.5f}')
+
+    # ---------------- write results/modes.csv --------------------------------
+    os.makedirs('results', exist_ok=True)
+    header = 'tau,' + ','.join(f'a_{m}' for m in range(M))
+    rows = sorted(((float(np.exp(ln_tau[k])),
+                    [float(theta[m * (K_sel + 1) + 1 + k]) for m in range(M)])
+                   for k in keep), key=lambda t: t[0])
+    with open('results/modes.csv', 'w') as f:
+        f.write(header + '\n')
+        for tau, amps in rows:
+            f.write(f'{tau:.10g},' + ','.join(f'{a:.10g}' for a in amps) + '\n')
+    print('-' * 78)
+    print('Wrote results/modes.csv:')
+    with open('results/modes.csv') as f:
+        print(f.read())
+
+    summary = dict(
+        K_selected=int(K_sel), K_reported=int(K_rep),
+        tau=[float(np.exp(v)) for v in ln_tau[keep]],
+        phi=[float(v) for v in phi[keep]],
+        a0=[float(theta[m * (K_sel + 1)]) for m in range(M)],
+        amplitudes={f'curve_{m}': [float(theta[m * (K_sel + 1) + 1 + k]) for k in keep]
+                    for m in range(M)},
+        sse=float(sse), sigma=float(sigma),
+        bic={int(K): float(results[K]['bic']) for K in K_RANGE},
+        sse_by_K={int(K): float(results[K]['best']['sse']) for K in K_RANGE},
+        dominant_cluster_size=int(len(r['dom'])),
+        n_starts=int(r['n_starts']), n_converged=int(r['n_conv']),
+        stability={int(K): float(stab[K]) for K in K_RANGE},
+        dropped=[(int(k), why) for k, why in dropped],
+    )
+    with open('results/summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    print('Wrote results/summary.json')
+
+
+if __name__ == '__main__':
+    main()

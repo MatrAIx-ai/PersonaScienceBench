@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+Confidence-interval engine forensics (asibench:computer_science.bci_forensics).
+
+Reproducible analysis built ONLY from the files in data/.
+
+Method summary
+--------------
+Targets        : for each case the population statistic is estimated as the mean of
+                 the public statistic over the 108 calibration replications
+                 (Monte-Carlo estimate; exact targets are not public inputs).
+Coverage       : per case and engine, using the engine's calibration interval panels
+                 against the calibration-derived target (inclusive bounds):
+                 empirical coverage, mean width, miss-low/miss-high rates.
+                 Engine aggregates: coverage_gap = mean |emp - nominal|,
+                 tail_imbalance = mean |miss_low - miss_high|,
+                 width_ratio = engine mean calibration width / reference percentile
+                 width (per-replication percentile bootstrap of the calibration
+                 resample panels), case_dispersion = std over cases of the
+                 per-case composite gap (coverage gap + width-ratio deviation).
+Probe families : one finite severity value per case x family x engine, larger = worse.
+                 probe_00 |observed_low - baseline_low| / baseline width
+                 probe_01 mean_reps |calibration_low - ref_low| / ref width
+                 probe_02 deviation of the engine's probe-panel-02 response from
+                          the median response across engines (a neutral
+                          perturbation-response consistency test)
+                 probe_03 probe-panel-03 split instability: mean |split endpoint -
+                          observed endpoint| over the 6 splits, low and high
+                 probe_04 mean_reps |calibration_high - ref_high| / ref width
+                 diagnostic_score = diagnostic_value / max(value within the same
+                 case and family) (0 if the family is flat for that case).
+Engine score   : reliability in [0,1], higher = better:
+                 1 - (0.40 * coverage_block + 0.60 * mean probe score),
+                 coverage_block = 0.4*coverage_gap + 0.2*tail_imbalance +
+                 0.2*|width_ratio-1| + 0.2*case_dispersion (each min-max
+                 normalised across engines; constant components -> 0).
+Failure labels : evidence scores per engine x label are computed from measured
+                 signatures (reflection fit, uniform width inflation / quantile
+                 level alias, discrete-case excess deviation, systematic
+                 high-side compression, perturbation under-/over-response, and
+                 overall quality). Each engine's predicted label is its top-ranked
+                 label; labels may repeat and no one-to-one mapping is forced.
+Ablation       : leave-one-probe-family-out: the combined score is recomputed
+                 with that family's weight removed (remaining weights
+                 renormalised); 'none' uses the full score.
+Figure         : matplotlib if available, otherwise a self-contained PNG writer
+                 (numpy + zlib, embedded 5x7 bitmap font) so the run is
+                 reproducible in either environment.
+"""
+import json
+import os
+import struct
+import zlib
+
+import numpy as np
+import pandas as pd
+
+DATA = "data"
+OUT = "results"
+os.makedirs(OUT, exist_ok=True)
+
+study = json.load(open(f"{DATA}/study_manifest.json"))
+probe_manifest = json.load(open(f"{DATA}/probe_manifest.json"))
+panels = np.load(f"{DATA}/engine_interval_panels.npz", allow_pickle=True)
+cal_samples = np.load(f"{DATA}/calibration_samples.npz")
+cal_resample = np.load(f"{DATA}/calibration_resample_panels.npz")
+obs_resample = np.load(f"{DATA}/resample_panels.npz")
+obs_df = pd.read_csv(f"{DATA}/observed_samples.csv")
+
+ALPHA = 1.0 - study["confidence_level"]
+ENGINES = [str(e) for e in panels["engine_ids"]]          # explicit ordering
+CASES = [str(c) for c in panels["case_ids"]]              # explicit ordering
+CASE_META = {m["case_id"]: m for m in study["cases"]}
+PROBES = list(probe_manifest["probe_families"])
+LABELS = list(study["failure_label_vocabulary"])
+N_REPS = cal_samples[CASES[0]].shape[0]                   # actual calibration axis
+
+obs = {
+    c: obs_df[obs_df.case_id == c].sort_values("observation_id").value.to_numpy()
+    for c in CASES
+}
+
+
+def stat_value(name, params, x, axis=-1):
+    """Public statistic definitions from the study manifest."""
+    if name == "mean":
+        return x.mean(axis=axis)
+    if name == "median":
+        return np.median(x, axis=axis)
+    if name == "coefficient_of_variation":
+        return x.std(axis=axis, ddof=params["std_ddof"]) / x.mean(axis=axis)
+    if name == "upper_tail_rate":
+        return (x >= params["threshold"]).mean(axis=axis)
+    raise ValueError(f"unknown statistic {name}")
+
+
+# ------------------------------------------------- targets & references
+targets, ref_low, ref_high, ref_width = {}, {}, {}, {}
+for case in CASES:
+    meta = CASE_META[case]
+    x = cal_samples[case]                                  # (108, 74)
+    targets[case] = float(stat_value(meta["statistic_name"],
+                                     meta["statistic_parameters"], x).mean())
+    idx = cal_resample[case].astype(np.int64)              # (108, 374, 74)
+    boot = x[np.arange(N_REPS)[:, None, None], idx]        # (108, 374, 74)
+    bs = stat_value(meta["statistic_name"], meta["statistic_parameters"], boot)
+    ref_low[case] = np.quantile(bs, ALPHA / 2.0, axis=1)
+    ref_high[case] = np.quantile(bs, 1.0 - ALPHA / 2.0, axis=1)
+    ref_width[case] = float(np.mean(ref_high[case] - ref_low[case]))
+
+baseline_low, baseline_high = panels["baseline_low"], panels["baseline_high"]
+base_width = baseline_high - baseline_low
+obs_low, obs_high = panels["observed_low"], panels["observed_high"]
+cal_low, cal_high = panels["calibration_low"], panels["calibration_high"]
+p2_low, p2_high = panels["probe_panel_02_low"], panels["probe_panel_02_high"]
+p3_low, p3_high = panels["probe_panel_03_low"], panels["probe_panel_03_high"]
+obs_stat = panels["observed_stat"]
+n_eng, n_case = len(ENGINES), len(CASES)
+
+# ------------------------------------------------- coverage audit
+cov_rows = []
+emp = np.zeros((n_eng, n_case))
+m_low = np.zeros_like(emp)
+m_high = np.zeros_like(emp)
+m_width = np.zeros_like(emp)
+for j, case in enumerate(CASES):
+    t = targets[case]
+    for e in range(n_eng):
+        lo, hi = cal_low[e, j], cal_high[e, j]
+        emp[e, j] = ((lo <= t) & (t <= hi)).mean()
+        m_low[e, j] = (t < lo).mean()
+        m_high[e, j] = (t > hi).mean()
+        m_width[e, j] = (hi - lo).mean()
+gap_table = np.abs(emp - study["confidence_level"])
+max_gap = max(gap_table.max(), 1e-12)
+for j, case in enumerate(CASES):
+    for e in range(n_eng):
+        cov_rows.append({
+            "case_id": case,
+            "regime": CASE_META[case]["regime"],
+            "engine_id": ENGINES[e],
+            "nominal_coverage": round(study["confidence_level"], 6),
+            "empirical_coverage": round(float(emp[e, j]), 6),
+            "mean_width": round(float(m_width[e, j]), 6),
+            "miss_low_rate": round(float(m_low[e, j]), 6),
+            "miss_high_rate": round(float(m_high[e, j]), 6),
+            "n_replications": int(N_REPS),
+            "coverage_score": round(float(1.0 - gap_table[e, j] / max_gap), 6),
+        })
+pd.DataFrame(cov_rows).to_csv(f"{OUT}/coverage_audit.csv", index=False)
+
+# ------------------------------------------------- engine aggregates
+coverage_gap = gap_table.mean(axis=1)
+tail_imbalance = np.abs(m_low - m_high).mean(axis=1)
+width_ratio = np.array([
+    np.mean([m_width[e, j] / ref_width[CASES[j]] for j in range(n_case)])
+    for e in range(n_eng)
+])
+per_case_gap = gap_table + np.array([
+    [abs(m_width[e, j] / ref_width[CASES[j]] - 1.0) for j in range(n_case)]
+    for e in range(n_eng)
+])
+case_dispersion = per_case_gap.std(axis=1, ddof=1)
+
+
+def minmax(v):
+    v = np.asarray(v, dtype=float)
+    lo, hi = v.min(), v.max()
+    if hi - lo < 1e-12:
+        return np.zeros_like(v)
+    return (v - lo) / (hi - lo)
+
+
+cov_block_raw = (0.4 * minmax(coverage_gap)
+                 + 0.2 * minmax(tail_imbalance)
+                 + 0.2 * minmax(np.abs(width_ratio - 1.0))
+                 + 0.2 * minmax(case_dispersion))
+
+# ------------------------------------------------- probe diagnostics
+diag = {f: np.zeros((n_eng, n_case)) for f in PROBES}      # severity, larger = worse
+for j, case in enumerate(CASES):
+    bw = max(base_width[j], 1e-12)
+    diag["probe_00"][:, j] = np.abs(obs_low[:, j] - baseline_low[j]) / bw
+    diag["probe_01"][:, j] = (np.abs(cal_low[:, j] - ref_low[case]).mean(axis=1)
+                              / max(ref_width[case], 1e-12))
+    resp = (np.abs(p2_low[:, j] - obs_low[:, j])
+            + np.abs(p2_high[:, j] - obs_high[:, j])) / (2.0 * bw)
+    med = float(np.median(resp))
+    diag["probe_02"][:, j] = np.abs(resp - med)
+    d3 = (np.abs(p3_low[:, j] - obs_low[:, j][:, None]).mean(axis=1)
+          + np.abs(p3_high[:, j] - obs_high[:, j][:, None]).mean(axis=1)) / 2.0
+    diag["probe_03"][:, j] = d3 / bw
+    diag["probe_04"][:, j] = (np.abs(cal_high[:, j] - ref_high[case]).mean(axis=1)
+                              / max(ref_width[case], 1e-12))
+
+dscore = {f: np.zeros_like(diag[f]) for f in PROBES}
+flat_family_cases = {}
+for f in PROBES:
+    for j, case in enumerate(CASES):
+        col = diag[f][:, j]
+        m = col.max()
+        if m < 1e-12:
+            dscore[f][:, j] = 0.0
+            flat_family_cases.setdefault(f, []).append(case)
+        else:
+            dscore[f][:, j] = col / m
+
+probe_rows = []
+profile_rows = []
+for j, case in enumerate(CASES):
+    for e in range(n_eng):
+        for f in PROBES:
+            probe_rows.append({
+                "case_id": case,
+                "probe_family": f,
+                "engine_id": ENGINES[e],
+                "diagnostic_value": round(float(diag[f][e, j]), 8),
+                "diagnostic_score": round(float(dscore[f][e, j]), 6),
+            })
+        sig = [round(float(diag[f][e, j]), 8) for f in PROBES]
+        profile_rows.append({
+            "case_id": case,
+            "engine_id": ENGINES[e],
+            "probe_signal_00": sig[0], "probe_signal_01": sig[1],
+            "probe_signal_02": sig[2], "probe_signal_03": sig[3],
+            "probe_signal_04": sig[4],
+            "profile_score": round(float(np.mean([dscore[f][e, j] for f in PROBES])), 6),
+        })
+pd.DataFrame(probe_rows).to_csv(f"{OUT}/probe_audit.csv", index=False)
+pd.DataFrame(profile_rows).to_csv(f"{OUT}/case_probe_profile.csv", index=False)
+
+probe_metric = np.stack([dscore[f].mean(axis=1) for f in PROBES], axis=1)  # (9,5)
+probe_mean = probe_metric.mean(axis=1)
+
+# ------------------------------------------------- combined engine score
+W_COV, W_PROBE = 0.40, 0.60
+badness = W_COV * cov_block_raw + W_PROBE * probe_mean
+engine_score = 1.0 - badness                              # higher = more reliable
+
+engine_audit = pd.DataFrame({
+    "engine_id": ENGINES,
+    "coverage_gap": [round(float(v), 6) for v in coverage_gap],
+    "tail_imbalance": [round(float(v), 6) for v in tail_imbalance],
+    "width_ratio": [round(float(v), 6) for v in width_ratio],
+    "case_dispersion": [round(float(v), 6) for v in case_dispersion],
+    **{f"probe_metric_{k:02d}": [round(float(probe_metric[e, k]), 6) for e in range(n_eng)]
+       for k in range(5)},
+    "engine_score": [round(float(v), 6) for v in engine_score],
+})
+engine_audit.to_csv(f"{OUT}/engine_audit.csv", index=False)
+
+selected_idx = int(np.argmax(engine_score))
+selected_id = ENGINES[selected_idx]
+
+# ------------------------------------------------- failure evidence
+direct_dev = np.array([
+    sum(abs(obs_low[e, j] - baseline_low[j]) + abs(obs_high[e, j] - baseline_high[j])
+        for j in range(n_case)) for e in range(n_eng)])
+refl_dev = np.array([
+    sum(abs((2 * obs_stat[j] - obs_high[e, j]) - baseline_low[j])
+        + abs((2 * obs_stat[j] - obs_low[e, j]) - baseline_high[j])
+        for j in range(n_case)) for e in range(n_eng)])
+# reflection fits when mirroring the baseline explains the engine's endpoints
+# far better than the direct comparison does.
+s_reflection = np.clip(1.0 - refl_dev / np.maximum(direct_dev, 1e-12), 0.0, 1.0)
+
+wr_c = np.array([[m_width[e, j] / ref_width[CASES[j]] for j in range(n_case)]
+                 for e in range(n_eng)])
+m_infl = np.abs(wr_c.mean(axis=1) - 1.0)
+# uniform width inflation with a shifted effective quantile level
+s_baseline_alias = np.minimum(1.0, m_infl / 0.12) * np.maximum(
+    0.0, 1.0 - wr_c.std(axis=1, ddof=1) / np.maximum(m_infl, 1e-12))
+
+case3 = CASES.index("case_03")
+dev00 = diag["probe_00"]
+excess3 = np.array([
+    dev00[e, case3] / max(np.mean([dev00[e, j] for j in range(n_case) if j != case3]),
+                          1e-12) for e in range(n_eng)])
+s_discrete = np.minimum(1.0, excess3 / 3.0)
+
+ratio_base = np.array([
+    (baseline_high[j] - obs_stat[j]) / max(obs_stat[j] - baseline_low[j], 1e-12)
+    for j in range(n_case)])
+ratio_eng = np.array([
+    (obs_high[e, j] - obs_stat[j]) / max(obs_stat[j] - obs_low[e, j], 1e-12)
+    for e in range(n_eng) for j in range(n_case)]).reshape(n_eng, n_case)
+d_shape = np.mean(np.abs(ratio_eng / ratio_base[None, :] - 1.0), axis=1)
+consistency = np.mean(ratio_eng < ratio_base[None, :], axis=1)
+s_shape = np.minimum(1.0, d_shape / 0.22) * consistency
+
+# per-case response pattern of the neutral probe panel, relative to the
+# reference (selected) engine, over the cases where the reference responds
+resp_all = np.zeros((n_eng, n_case))
+for j, case in enumerate(CASES):
+    bw = max(base_width[j], 1e-12)
+    resp_all[:, j] = (np.abs(p2_low[:, j] - obs_low[:, j])
+                      + np.abs(p2_high[:, j] - obs_high[:, j])) / (2.0 * bw)
+ref_resp = resp_all[selected_idx]
+responsive = ref_resp > 1e-9
+resp_sub = resp_all[:, responsive]                      # (9, k), ref > 0 here
+ratio = resp_sub / ref_resp[responsive][None, :]
+# over-response amplifies noise; missing or weak response is a scale mismatch
+s_noise = np.clip(np.maximum(0.0, ratio - 1.0).mean(axis=1) / 1.5, 0.0, 1.0)
+miss = (resp_sub < 1e-9).mean(axis=1)
+under_mean = np.zeros(n_eng)
+for e in range(n_eng):
+    acted = resp_sub[e] > 1e-9
+    if acted.any():
+        under_mean[e] = np.maximum(0.0, 1.0 - ratio[e][acted]).mean()
+s_scale = np.clip(0.5 * miss + 0.3 * under_mean
+                  + 0.2 * minmax(wr_c.std(axis=1, ddof=1)), 0.0, 1.0)
+s_reliable = np.clip(1.0 - 2.0 * minmax(badness), 0.0, 1.0)
+
+evidence = {
+    "reliable_engine": s_reliable,
+    "baseline_quantile_alias": s_baseline_alias,
+    "reflection_alias": s_reflection,
+    "discrete_boundary_mismatch": s_discrete,
+    "shape_correction_mismatch": s_shape,
+    "scale_response_mismatch": s_scale,
+    "noise_amplifying_engine": s_noise,
+}
+ev_rows = []
+predicted = {}
+for e in range(n_eng):
+    scores = sorted(((lab, float(evidence[lab][e])) for lab in LABELS),
+                    key=lambda t: (-t[1], t[0]))
+    predicted[ENGINES[e]] = scores[0][0]
+    for rank, (lab, sc) in enumerate(scores, start=1):
+        ev_rows.append({
+            "engine_id": ENGINES[e],
+            "failure_label": lab,
+            "evidence_score": round(sc, 6),
+            "label_rank": rank,
+            "is_predicted_label": 1 if rank == 1 else 0,
+        })
+pd.DataFrame(ev_rows).to_csv(f"{OUT}/failure_evidence.csv", index=False)
+
+with open(f"{OUT}/failure_modes.json", "w") as fh:
+    json.dump({"selected_engine_id": selected_id,
+               "failure_modes": {e: predicted[e] for e in ENGINES}}, fh, indent=2)
+with open(f"{OUT}/selected_engine.json", "w") as fh:
+    json.dump({"selected_engine_id": selected_id,
+               "selected_failure_mode": predicted[selected_id],
+               "selected_engine_score": round(float(engine_score[selected_idx]), 6)},
+              fh, indent=2)
+
+# ------------------------------------------------- interval summary
+int_rows = []
+for j, case in enumerate(CASES):
+    lo, hi = obs_low[selected_idx, j], obs_high[selected_idx, j]
+    int_rows.append({
+        "case_id": case,
+        "statistic_name": CASE_META[case]["statistic_name"],
+        "observed_stat": round(float(obs_stat[j]), 6),
+        "selected_engine_id": selected_id,
+        "selected_low": round(float(lo), 6),
+        "selected_high": round(float(hi), 6),
+        "baseline_low": round(float(baseline_low[j]), 6),
+        "baseline_high": round(float(baseline_high[j]), 6),
+        "selected_width": round(float(hi - lo), 6),
+        "baseline_width_ratio": round(float((hi - lo) / max(base_width[j], 1e-12)), 6),
+    })
+pd.DataFrame(int_rows).to_csv(f"{OUT}/interval_summary.csv", index=False)
+
+# ------------------------------------------------- family ablation
+def ablated_scores(excluded):
+    """Reliability scores with one probe family's weight removed."""
+    if excluded is None:
+        return engine_score.copy()
+    k = PROBES.index(excluded)
+    w_total = W_COV + W_PROBE * (len(PROBES) - 1) / len(PROBES)
+    pm = np.delete(probe_metric, k, axis=1).mean(axis=1)
+    b = (W_COV * cov_block_raw + W_PROBE * pm) / w_total
+    return 1.0 - b
+
+abl_rows = []
+for excluded in [None] + PROBES:
+    s = ablated_scores(excluded)
+    order = np.argsort(-s)
+    top, second = ENGINES[order[0]], ENGINES[order[1]]
+    sel_rank = int(np.where(order == selected_idx)[0][0]) + 1
+    abl_rows.append({
+        "excluded_probe_family": "none" if excluded is None else excluded,
+        "top_engine_id": top,
+        "selected_engine_rank": sel_rank,
+        "runner_up_engine_id": second,
+        "score_margin": round(float(s[order[0]] - s[order[1]]), 6),
+    })
+pd.DataFrame(abl_rows).to_csv(f"{OUT}/family_ablation.csv", index=False)
+
+# ------------------------------------------------- reliability report
+warnings = {}
+for j, case in enumerate(CASES):
+    e = selected_idx
+    parts = []
+    g = float(gap_table[e, j])
+    if g >= 0.04:
+        parts.append(f"selected engine coverage gap {g:.3f} vs nominal "
+                     f"{study['confidence_level']:.4f}")
+    if abs(m_low[e, j] - m_high[e, j]) >= 0.05:
+        parts.append(f"miss rates skewed (low {m_low[e, j]:.3f} vs high "
+                     f"{m_high[e, j]:.3f})")
+    worst = int(np.argmax(gap_table[:, j]))
+    if gap_table[worst, j] >= 0.06:
+        parts.append(f"worst engine {ENGINES[worst]} gap {gap_table[worst, j]:.3f}")
+    warnings[case] = "; ".join(parts) if parts else "no anomalies detected"
+
+ranking = [ENGINES[i] for i in np.argsort(-engine_score)]
+report = {
+    "selected_engine_id": selected_id,
+    "aggregate_coverage_gap": round(float(coverage_gap[selected_idx]), 6),
+    "aggregate_tail_imbalance": round(float(tail_imbalance[selected_idx]), 6),
+    "aggregate_probe_score": round(float(probe_mean[selected_idx]), 6),
+    "engine_ranking": ranking,
+    "case_warnings": warnings,
+}
+with open(f"{OUT}/reliability_report.json", "w") as fh:
+    json.dump(report, fh, indent=2)
+
+# ------------------------------------------------- figure
+GL = {
+    'A': ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    'B': ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    'C': ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    'D': ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    'E': ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    'F': ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    'G': ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    'H': ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    'I': ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    'L': ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    'M': ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    'N': ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    'O': ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    'R': ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    'S': ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    'T': ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    'U': ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    'Y': ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    '0': ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    '1': ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    '2': ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+    '3': ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    '4': ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    '5': ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    '6': ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+    '7': ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    '8': ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    '9': ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+    ' ': ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    '-': ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    '.': ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    ':': ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+}
+
+
+def write_png_fallback(path, title, labels, values):
+    """Render a bar chart to PNG with numpy+zlib only (no matplotlib needed)."""
+    W, H = 1100, 560
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+
+    def draw_text(x, y, text, scale=2, color=(20, 20, 20)):
+        for ch in text:
+            g = GL.get(ch.upper(), GL[' '])
+            for r in range(7):
+                for c in range(5):
+                    if g[r][c] == '1':
+                        img[y + r * scale:y + (r + 1) * scale,
+                            x + c * scale:x + (c + 1) * scale] = color
+            x += 6 * scale
+
+    draw_text(30, 24, title, scale=3)
+    x0, y0, x1, y1 = 90, 480, 1050, 90
+    img[y0:y1, x0] = 120
+    img[y0, x0:x1] = 120
+    n = len(labels)
+    bw_px = (x1 - x0 - 40) / n
+    best = labels[int(np.argmax(values))]
+    for i, (lab, v) in enumerate(zip(labels, values)):
+        h = int(v * (y0 - y1 - 40))
+        bx = int(x0 + 20 + i * bw_px + bw_px * 0.15)
+        bwid = int(bw_px * 0.7)
+        img[y0 - h:y0, bx:bx + bwid] = (30, 140, 60) if lab == best else (60, 110, 200)
+        draw_text(bx - 6, y0 + 8, lab, scale=2)
+        draw_text(bx - 6, y0 - h - 22, f"{v:.3f}", scale=2)
+    raw = b"".join(b"\x00" + img[y].tobytes() for y in range(H))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+fig_path = f"{OUT}/engine_overview.png"
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10, 5))
+    order = np.argsort(-engine_score)
+    ax.bar([ENGINES[i] for i in order], [engine_score[i] for i in order],
+           color=["#2a8c46" if i == selected_idx else "#4a76c4" for i in order])
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("engine_score (reliability, higher = better)")
+    ax.set_title("Engine audit: combined reliability score by anonymous engine")
+    for i in order:
+        ax.text(order.tolist().index(i), engine_score[i] + 0.01,
+                f"{engine_score[i]:.3f}", ha="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=110)
+    plt.close(fig)
+except ImportError:
+    order = np.argsort(-engine_score)
+    write_png_fallback(fig_path, "ENGINE AUDIT: RELIABILITY SCORE BY ENGINE",
+                       [ENGINES[i] for i in order],
+                       [float(engine_score[i]) for i in order])
+
+# ------------------------------------------------- console summary
+print("targets:", {c: round(targets[c], 4) for c in CASES})
+print("selected engine:", selected_id, "label:", predicted[selected_id],
+      "score:", round(float(engine_score[selected_idx]), 4))
+print("ranking:", ranking)
+for f in PROBES:
+    v = diag[f]
+    msg = (f"probe {f}: cross-engine mean spread "
+           f"{v.mean(axis=1).max() - v.mean(axis=1).min():.6f} "
+           f"(range {v.min():.6f}..{v.max():.6f})")
+    if f in flat_family_cases:
+        msg += "  [flat cases: " + ",".join(flat_family_cases[f]) + "]"
+    print(msg)
+print("predicted labels:", predicted)

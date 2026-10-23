@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -28,10 +29,22 @@ def check_readme(text, delivery):
             fields = [field.strip() for field in line.split("|")]
             if fields[1] in labels:
                 table[labels[fields[1]]] = int(fields[2])
-    assert table == delivery["counts"], "README table differs from the verified data"
+    assert set(delivery["counts"]) <= set(labels.values())
+    assert table == {status: delivery["counts"].get(status, 0) for status in labels.values()}, \
+        "README table differs from the verified data"
     assert f'**{delivery["numeric_scores"]} slots have numeric primary scores:' in text
-    assert delivery["judge_cap_amendment_state"] == "not_approved", "Update README after any judge-cap decision"
-    assert "not applied, awaiting Robert's decision" in text
+    assert delivery["judge_cap_amendment_state"] == "run", "README describes an executed judge amendment"
+    assert "**250 to 4,096 tokens was approved and applied**" in text
+    assert delivery["grading_pending"] == 0 and "no grades remain pending" in text
+    assert "All seven remaining grades recovered." in text
+    verification = export.read(export.OUT / "provenance/recovery/judge_cap4096_verification.json")
+    assert verification["approved_slots"] == verification["recovered_slots"] == 7
+    assert verification["actor_reruns"] == 0
+    for reference in re.findall(r"`(provenance/[^`]+)`", text):
+        if "*" in reference:
+            assert list(export.OUT.glob(reference)), reference
+        else:
+            assert (export.OUT / reference).exists(), reference
     assert not delivery["checkpoint"] and not delivery["infrastructure_unresolved"]
 
 

@@ -2,6 +2,7 @@
 """Independent semantic checks for the delivered trial. Offline; no inference."""
 import argparse
 from collections import Counter
+from datetime import datetime
 import gzip
 import hashlib
 import json
@@ -79,6 +80,94 @@ def native_case(run, row):
     return run / "episodes" / prefix / row["arm"] / f'attempt-{row["attempt"]}' / "output" / name
 
 
+def verify_judge_amendment(bundle, episodes):
+    """Check portable evidence; full wire equality is a separate private-log audit."""
+    recovery = "provenance/recovery/"
+    sources = "provenance/recovery-source/"
+    approval_bytes = bundle.raw(recovery + "judge_cap_approval.json")
+    approval = json.loads(approval_bytes)
+    assert approval["approved"] is True and approval["approver"] == "Robert"
+    assert approval["remaining_native_judge_cap"] == 4096
+    bindings = {
+        "judge_cap_amendment_plan.json": recovery,
+        "recover_judges_amended.py": sources,
+        "recover_judges_v2.py": sources,
+    }
+    assert set(approval["approved_file_sha256"]) == set(bindings)
+    for name, prefix in bindings.items():
+        assert sha(bundle.raw(prefix + name)) == approval["approved_file_sha256"][name]
+    bound_approval = {**approval, "approval_file_sha256": sha(approval_bytes)}
+    plan = bundle.json(recovery + "judge_recovery_cap4096/plan.json")
+    assert plan["approval"] == bound_approval
+    assert plan["judge_model"] == "us.openai.gpt-6-astra" and plan["reasoning_effort"] == "low"
+    assert plan["native_variable_relation_cap"] == 250 and plan["remaining_variable_relation_cap"] == 4096
+    approved = {tuple(k) for k in approval["slots"]}
+    assert len(approved) == len(approval["slots"]) == 7
+    assert plan["slots"] == approval["slots"]
+    outcomes = bundle.json(recovery + "judge_recovery_cap4096/results.json")
+    assert len(outcomes) == 7 and {slot(row) for row in outcomes} == approved
+    inputs = [
+        bundle.json(path) for path in bundle.receipt["files"]
+        if path.startswith(recovery + "judge_recovery_cap4096/") and path.endswith("/inputs.json")
+    ]
+    assert len(inputs) == 7 and {slot(row) for row in inputs} == approved
+    for row in outcomes + inputs:
+        assert row["budget_amendment"] == bound_approval and row["actor_rerun"] is False
+        assert datetime.fromisoformat(row["created_at"]) >= datetime.fromisoformat(approval["received_at"])
+        assert row["script_sha256"] == approval["approved_file_sha256"]["recover_judges_v2.py"]
+    history = [
+        row for row in bundle.jsonl("provenance/judge-recovery-history.jsonl")
+        if row["cohort"] == "judge_recovery_cap4096"
+    ]
+    assert len(history) == 7 and {slot(row) for row in history} == approved
+    input_map = {slot(row): row for row in inputs}
+    outcome_map = {slot(row): row for row in outcomes}
+    reused_count = fresh_count = transport_retries = 0
+    for row in history:
+        k = slot(row)
+        assert row["status"] == outcome_map[k]["status"] == "recovered"
+        assert row["evaluation"]["status"] == outcome_map[k]["evaluation"]["status"] == "scored"
+        assert row["budget_amendment"] == bound_approval and row["actor_rerun"] is False
+        assert row["evaluation"]["details"]["judge_recovery"]["caps_changed"] is True
+        for field in ("episode_sha256", "submission_sha256", "artifact_hashes",
+                      "original_result_sha256", "source_api_log_sha256", "config_sha256"):
+            assert row[field] == input_map[k][field] == outcome_map[k][field]
+        receipts = row["replay_receipts"]
+        cached = [item for item in receipts if not item["new_model_call"]]
+        fresh = [item for item in receipts if item["new_model_call"]]
+        calls = row["fresh_native_calls"]
+        assert [item["call"] for item in receipts] == list(range(1, len(receipts) + 1))
+        assert len(cached) == row["cached_calls"] == row["reused_calls"]
+        assert len(fresh) == len(calls) == row["fresh_calls"]
+        for receipt, call in zip(fresh, calls):
+            assert receipt["native_max_output_tokens"] == 250
+            assert receipt["transmitted_max_output_tokens"] == call["cap"] == 4096
+            assert receipt["transmitted_request_sha256"] == call["request_sha256"]
+            assert call["requested_model"] == call["actual_model"] == "us.openai.gpt-6-astra"
+            assert call["reasoning"]["effort"] == "low" and call["status"] == "completed"
+            assert isinstance(call["transport_retries"], int) and call["transport_retries"] >= 0
+            transport_retries += call["transport_retries"]
+        reused_count += len(cached)
+        fresh_count += len(fresh)
+    assert reused_count == 28 and fresh_count == 14 and transport_retries == 0
+    report = bundle.json(recovery + "judge_cap4096_verification.json")
+    assert report["verifier_sha256"] == sha(bundle.raw(sources + "verify_judge_amendment.py"))
+    assert report["approved_slots"] == report["recovered_slots"] == 7 and report["actor_reruns"] == 0
+    assert report["actual_judge_model"] == "us.openai.gpt-6-astra" and report["reasoning_effort"] == "low"
+    assert report["original_prefix_calls_reused"] == reused_count and report["fresh_calls"] == fresh_count
+    assert report["fresh_call_cap"] == 4096 and report["amended_helper_calls"] == 14
+    assert report["transport_retries"] == transport_retries
+    for k, row in episodes.items():
+        directory = row["judge_recovery"]
+        expected = ("approved_helper_cap4096_recovery" if k in approved else
+                    "original_cap_recovery" if directory else "native_configuration")
+        assert (directory == "judge_recovery_cap4096") == (k in approved)
+        assert row["judge_budget_cohort"] == expected
+    return {"approved_slots": 7, "recovered_slots": 7,
+            "original_prefix_calls_reused": reused_count, "fresh_calls": fresh_count,
+            "transport_retries": transport_retries}
+
+
 def verify(bundle, native_run=None):
     report = bundle.verify()
     episodes = keyed(bundle.csv("episodes.csv"))
@@ -152,6 +241,7 @@ def verify(bundle, native_run=None):
             evaluation = finals[k]["grading_overlay"]
             assert evaluation["status"] == recovery["evaluation"]["status"]
             assert evaluation["metrics"] == recovery["evaluation"]["metrics"]
+    amendment = verify_judge_amendment(bundle, episodes)
     ordered_traces = bundle.jsonl("traces/shared-events.jsonl")
     for row in indexes.values():
         assert attempt_key(ordered_traces[int(row["jsonl_line"]) - 1]) == attempt_key(row)
@@ -207,6 +297,7 @@ def verify(bundle, native_run=None):
     report.update(semantic_verified=True, frozen_metadata_files=len(payload["files"]),
                   native_files_compared=checked_files, native_artifacts_compared=checked_artifacts,
                   original_event_text_verified=bool(native_run),
+                  judge_amendment=amendment,
                   metric_contract="Pinned TEAM_HANDOFF section 4 and native final/initial EXP selection.")
     return report
 

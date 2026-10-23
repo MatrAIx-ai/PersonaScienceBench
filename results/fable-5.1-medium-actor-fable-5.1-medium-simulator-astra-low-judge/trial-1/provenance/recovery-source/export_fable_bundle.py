@@ -392,6 +392,8 @@ def export(checkpoint=False):
                "researcher_requests": result.get("researcher_requests", collaboration.get("researcher_requests", "")),
                "termination": collaboration.get("termination", result.get("collaboration_termination", "")),
                "judge_recovery": grade_record[0] if grade_record else "",
+               "judge_budget_cohort": ("approved_helper_cap4096_recovery" if grade_record and grade_record[0] == "judge_recovery_cap4096"
+                                       else "original_cap_recovery" if grade_record else "native_configuration"),
                "judge_recovery_status": recovery.get("status", ""),
                "judge_reused_calls": recovery.get("reused_calls", ""),
                "judge_fresh_calls": recovery.get("fresh_calls", ""),

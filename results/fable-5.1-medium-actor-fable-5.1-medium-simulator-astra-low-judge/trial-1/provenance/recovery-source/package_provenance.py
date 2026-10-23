@@ -71,6 +71,7 @@ def judge_history():
                         "requested_model": request["model"], "actual_model": raw["model"],
                         "reasoning": request["reasoning"], "cap": request["max_output_tokens"],
                         "status": raw["status"], "incomplete_details": raw.get("incomplete_details"),
+                        "transport_retries": call["transport_retries"],
                         "usage": raw.get("usage"), "request_sha256": bundle.sha(json.dumps(request, ensure_ascii=False,
                             sort_keys=True, separators=(",", ":")).encode()),
                         "response_sha256": bundle.sha(json.dumps(raw, ensure_ascii=False,
@@ -159,7 +160,8 @@ def main():
             copy(path, "provenance/recovery-source/" + path.name)
     for name in ["startup_recovery_plan.json", "startup_recovery_launch.json",
                  "startup_recovery_results.json", "judge_cap_amendment_plan.json",
-                 "judge_cap_approval.json", "verification_tests.json", "all_states.before.json"]:
+                 "judge_cap_approval.json", "judge_cap4096_launch.json", "judge_cap4096_verification.json",
+                 "verification_tests.json", "all_states.before.json"]:
         if (ROOT / name).is_file():
             copy(ROOT / name, "provenance/recovery/" + name, normalize=True)
     for path in sorted(ROOT.glob("current*-environment.json")):

@@ -1,0 +1,497 @@
+diff --git a/scripts/run_main.py b/scripts/run_main.py
+index c657356..6b62d8f 100755
+--- a/scripts/run_main.py
++++ b/scripts/run_main.py
+@@ -68,7 +68,7 @@ def main():
+     p.add_argument('--baseline-run', type=Path, help='Existing matching trial supplying persona-off; allows persona-only expansion batches')
+     p.add_argument('--workers', type=int, default=30)
+     p.add_argument('--model', default='gpt-6-astra')
+-    p.add_argument('--provider', choices=['openai','openrouter'], default='openai')
++    p.add_argument('--provider', choices=['openai','openrouter','bedrock'], default='openai')
+     p.add_argument('--judge-max-tokens', type=int, default=4096)
+     p.add_argument('--reasoning-effort', default='low')
+     p.add_argument('--actor-model', help='Override only the actor; keep researcher/judge on --model')
+@@ -76,6 +76,7 @@ def main():
+     p.add_argument('--researcher-model', help='Override the researcher simulator model')
+     p.add_argument('--researcher-reasoning-effort', help='Override researcher simulator reasoning')
+     p.add_argument('--require-prepared', action='store_true', help='Require frozen prepared tasks; never regenerate source conversions')
++    p.add_argument('--pilot', action='store_true', help='Qualify one preselected slot per source, then resume the same 1,000-slot run without this flag')
+     p.add_argument('--retry-infrastructure', action='store_true')
+     p.add_argument('--retry-missing', action='store_true', help='Retry missing submissions; retain earlier attempts and report this as a repair pass')
+     a = p.parse_args()
+@@ -127,7 +128,7 @@ def main():
+     model = {'model':a.model, 'provider':a.provider, 'reasoning_effort':a.reasoning_effort}
+     if (run/'fatal_api.json').exists():
+         raise RuntimeError('Resolve fatal_api.json before resuming')
+-    catalog = preflight(models) if a.provider == 'openrouter' else None
++    catalog = preflight(models) if a.provider in ('openrouter', 'bedrock') else None
+     for arm in arms:
+         persona = {'enabled':False} if arm == 'persona_off' else {'enabled':True, 'id':arm, 'system_prompt':(ROOT/f'configs/main_run/personas/{arm}.md').read_text()}
+         for kind in ('shared','exp'):
+@@ -138,7 +139,9 @@ def main():
+                 if role == 'judge':spec['max_output_tokens' if kind=='exp' else 'max_tokens']=a.judge_max_tokens
+                 if kind == 'exp':
+                     prices = {'gpt-6-astra': (10, 50), 'gpt-5.6-sol': (4, 20)}
+-                    if catalog is not None:
++                    if a.provider == 'bedrock':
++                        input_price = output_price = None
++                    elif catalog is not None:
+                         input_price=float(catalog[role]['pricing']['prompt'])*1_000_000
+                         output_price=float(catalog[role]['pricing']['completion'])*1_000_000
+                     else:
+@@ -214,6 +217,15 @@ def main():
+     print(f'Prepared {len(prepared_tasks)}/200 tasks; starting actual episodes',flush=True)
+     jobs = [(row,arm) for row in rows for arm in arms if (row['source'],row['task_id']) in prepared_tasks]
+     random.Random(20260929).shuffle(jobs)
++    if a.pilot:
++        if arms != ARMS:
++            raise ValueError("The balanced pilot requires the complete five-arm campaign")
++        sources = sorted(counts)
++        pilot_slots = {(source, next(r["task_id"] for r in rows if r["source"] == source), ARMS[i])
++                       for i, source in enumerate(sources)}
++        jobs = [(row, arm) for row, arm in jobs if (row["source"], row["task_id"], arm) in pilot_slots]
++        write(run/'pilot_selection.json', {"selection_policy": "first frozen CSV task per source; sorted source order paired with fixed arm order",
++            "slots": [{"source": row["source"], "task_id": row["task_id"], "arm": arm} for row, arm in jobs]})
+ 
+     def one(job):
+         row, arm = job; source = row['source']
+@@ -263,7 +275,7 @@ def main():
+         futures = [pool.submit(one,j) for j in jobs]
+         for future in as_completed(futures):
+             results.append(future.result())
+-            write(run/'progress.json', {'planned':len(rows)*len(arms),'preparation_failed_episodes':len(arms)*len(failures), 'processed':len(results),'statuses':dict(Counter(r['status'] for r in results)),'updated_at':time.time()})
++            write(run/'progress.json', {'planned':len(rows)*len(arms),'phase':'pilot' if a.pilot else 'full','scheduled':len(jobs),'preparation_failed_episodes':len(arms)*len(failures), 'processed':len(results),'statuses':dict(Counter(r['status'] for r in results)),'updated_at':time.time()})
+     write(run/'results.json',results)
+     if failures or any(r['status']=='infrastructure_error' for r in results):
+         return 1
+diff --git a/src/expbench/actor.py b/src/expbench/actor.py
+index 568dc7a..8e00752 100644
+--- a/src/expbench/actor.py
++++ b/src/expbench/actor.py
+@@ -74,7 +74,11 @@ class GatewayLLM(LLM):
+                 if k in raw_message
+             }
+         usage = response["usage"]
+-        self.metrics.add_cost(self._episode.gateway.ledger.records[-1]["budget_charge_usd"])
++        charge = self._episode.gateway.ledger.records[-1]["budget_charge_usd"]
++        # SDK cost metrics accept numbers only. The authoritative ledger retains
++        # null for an unpriced call; do not convert unavailable cost to zero.
++        if charge is not None:
++            self.metrics.add_cost(charge)
+         self.metrics.add_token_usage(
+             prompt_tokens=usage["prompt_tokens"], completion_tokens=usage["completion_tokens"],
+             cache_read_tokens=0, cache_write_tokens=0,
+diff --git a/src/expbench/budget.py b/src/expbench/budget.py
+index 2c0de94..69b31a0 100644
+--- a/src/expbench/budget.py
++++ b/src/expbench/budget.py
+@@ -12,6 +12,7 @@ class BudgetExceeded(RuntimeError):
+ class Budget:
+     limit: float | None
+     charged: float = 0.0
++    unknown_charges: int = 0
+     lock: object = field(default_factory=RLock, repr=False, compare=False)
+ 
+ 
+@@ -32,15 +33,17 @@ class Ledger:
+         self.run.charged += amount
+         self.episode.charged += amount
+ 
+-    def settle(self, reserved: float, charged: float, record: dict):
++    def settle(self, reserved: float, charged: float | None, record: dict):
+         with self.run.lock:
+-            self.run.charged += charged - reserved
+-            self.episode.charged += charged - reserved
++            for budget in (self.run, self.episode):
++                budget.charged += (charged or 0.0) - reserved
++                budget.unknown_charges += int(charged is None)
+             self.records.append({**record, "budget_charge_usd": charged})
+ 
+     def summary(self):
+         return {
+-            "budget_charge_usd": round(self.episode.charged, 6),
+-            "run_budget_charge_usd": round(self.run.charged, 6),
++            "budget_charge_usd": None if self.episode.unknown_charges else round(self.episode.charged, 6),
++            "run_budget_charge_usd": None if self.run.unknown_charges else round(self.run.charged, 6),
++            "unknown_charge_requests": self.episode.unknown_charges,
+             "records": self.records,
+         }
+diff --git a/src/expbench/collaboration.py b/src/expbench/collaboration.py
+index 3a78c52..670da96 100644
+--- a/src/expbench/collaboration.py
++++ b/src/expbench/collaboration.py
+@@ -20,6 +20,9 @@ class ResearcherBackend:
+         return response["choices"][0]["message"]["content"]
+ 
+     def complete_decision(self, messages, schema):
++        if self.gateway.models["researcher"].provider == "bedrock":
++            response = self.gateway.complete("researcher", messages, schema=schema)
++            return response["choices"][0]["message"]["content"]
+         name = "researcher_decision"
+         response = self.gateway.complete("researcher", messages, tools=[{"type":"function", "function":{
+             "name":name, "description":"Return one researcher decision for this turn.", "parameters":schema}}],
+diff --git a/src/expbench/gateway.py b/src/expbench/gateway.py
+index 3fabe52..02fdf22 100644
+--- a/src/expbench/gateway.py
++++ b/src/expbench/gateway.py
+@@ -119,6 +119,32 @@ class OpenAITransport:
+         pass
+ 
+ 
++class BedrockTransport:
++    mock = False
++
++    def __init__(self, key, timeout):
++        self.timeout = timeout
++        self.transports = {}
++
++    def preflight(self, models, *, enforce_price_caps=True):
++        from personasciencebench.bedrock_transport import preflight
++        if enforce_price_caps and any(s.input_usd_per_million is None for s in models.values()):
++            raise ModelError("Cannot enforce dollar caps with unavailable model pricing")
++        return preflight({r: s.model_dump() for r, s in models.items()})
++
++    def complete(self, role, payload):
++        from personasciencebench.bedrock_transport import transport
++        if role not in self.transports:
++            self.transports[role] = transport(payload["model"], self.timeout)
++        try:
++            return self.transports[role].complete(payload)
++        except Exception as error:
++            raise ModelError(str(error)) from None
++
++    def close(self):
++        pass
++
++
+ class Gateway:
+     def __init__(self, transport, models: dict[str, ModelSettings], ledger: Ledger,
+                  log_path: Path):
+@@ -136,6 +162,9 @@ class Gateway:
+             raise ModelError("Inference stopped after an earlier request failure")
+         spec = self.models[role]
+         bounded = self.ledger.run.limit is not None or self.ledger.episode.limit is not None
++        priced = spec.input_usd_per_million is not None and spec.output_usd_per_million is not None
++        if bounded and not priced:
++            raise ModelError("Cannot reserve a dollar budget without verified prices")
+         payload = {
+             "model": spec.model, "messages": copy.deepcopy(messages),
+             "max_tokens": spec.max_output_tokens, "stream": False,
+@@ -164,8 +193,8 @@ class Gateway:
+         # Conservative guard: UTF-8 byte count plus framing allowance, rather
+         # than dividing characters by four. This is not a provider billing quote.
+         input_bound = len(json.dumps(payload, ensure_ascii=False).encode()) + 2048
+-        reserved = (input_bound * spec.input_usd_per_million
+-                    + spec.max_output_tokens * spec.output_usd_per_million) / 1e6
++        reserved = ((input_bound * spec.input_usd_per_million
++                     + spec.max_output_tokens * spec.output_usd_per_million) / 1e6) if priced else 0.0
+         if self.transport.mock:
+             reserved = 0.0
+         self.ledger.reserve(reserved)
+@@ -174,7 +203,7 @@ class Gateway:
+         base = {"call_id": call_id, "role": role, "requested_model": spec.model,
+                 "mock": self.transport.mock}
+         append_jsonl(self.log_path, {**base, "phase": "request", "payload": payload,
+-                                     "reserved_usd": reserved})
++                                     "reserved_usd": reserved if priced else None})
+         settled = False
+         try:
+             result = self.transport.complete(role, payload)
+@@ -185,21 +214,22 @@ class Gateway:
+                 if type(usage.get(field)) is not int or usage[field] < 0:
+                     raise ModelError("Invalid token accounting in model response")
+             # Completion tokens already include reasoning tokens: do not add twice.
+-            estimate = (usage["prompt_tokens"] * spec.input_usd_per_million
+-                        + usage["completion_tokens"] * spec.output_usd_per_million) / 1e6
++            estimate = ((usage["prompt_tokens"] * spec.input_usd_per_million
++                         + usage["completion_tokens"] * spec.output_usd_per_million) / 1e6) if priced else None
+             reported_cost = usage.get("cost")
+             if reported_cost is not None and (
+                 not isinstance(reported_cost, (int, float))
+                 or not math.isfinite(reported_cost) or reported_cost < 0
+             ):
+                 raise ModelError("Invalid cost accounting in model response")
+-            charge = max(estimate, reported_cost or 0.0)
++            charge = max(estimate, reported_cost or 0.0) if priced else reported_cost
+             if self.transport.mock:
+                 charge = 0.0
+             record = {**base, "usage": usage, "estimated_uncached_usd": estimate,
+                       "returned_model": result.get("model"),
+                       "provider": result.get("provider"), "response_id": result.get("id"),
+-                      "billing_status": "mock" if self.transport.mock else "reported_or_estimated",
++                      "billing_status": "mock" if self.transport.mock else
++                          "unknown_price" if charge is None else "reported_or_estimated",
+                       "elapsed_seconds": round(time.monotonic() - start, 3)}
+             self.ledger.settle(reserved, charge, record)
+             settled = True
+@@ -209,15 +239,15 @@ class Gateway:
+             choices = result.get("choices")
+             if not choices or not isinstance(choices[0].get("message"), dict):
+                 raise ModelError("Missing completion message")
+-            if choices[0].get("finish_reason") in ("length", "content_filter"):
++            if choices[0].get("finish_reason") in ("length", "content_filter", "error"):
+                 raise ModelError("Incomplete or filtered response; no automatic retry")
+             return result
+         except Exception as exc:
+             self.failed = True
+             if not settled:
+                 rejected = isinstance(exc, AuthenticationRejected)
+-                self.ledger.settle(reserved, 0.0 if rejected else reserved, {
+-                    **base, "billing_status": "auth_rejected" if rejected else "unknown_reserved",
++                self.ledger.settle(reserved, 0.0 if rejected else reserved if priced else None, {
++                    **base, "billing_status": "auth_rejected" if rejected else "unknown_reserved" if priced else "unknown_price",
+                     "error_type": type(exc).__name__,
+                 })
+             append_jsonl(self.log_path, {**base, "phase": "error", "error_type": type(exc).__name__})
+diff --git a/src/expbench/realistic.py b/src/expbench/realistic.py
+index 88aa8d9..4479948 100644
+--- a/src/expbench/realistic.py
++++ b/src/expbench/realistic.py
+@@ -138,7 +138,7 @@ def run_episode(episode, *, validate_execution=False):
+             actor_calls=episode.actor_calls, researcher_questions=episode.researcher.questions,
+             actor_status=episode.actor_status,
+             reproduction_command=episode.reproduction_command,
+-            budget_charge_usd=round(episode.gateway.ledger.episode.charged, 7))
++            budget_charge_usd=episode.gateway.ledger.summary()["budget_charge_usd"])
+         if episode.config.collaboration is not None:
+             from personasciencebench.collaboration import POLICY
+             result.update(interaction_protocol=POLICY,
+@@ -247,7 +247,7 @@ def main(argv=None):
+             if args.env_file:
+                 load_env(args.env_file)
+             key = os.environ.get("OPENAI_API_KEY" if config.models.actor.provider == "openai" else "OPENROUTER_API_KEY", "")
+-            if not key:
++            if not key and config.models.actor.provider != "bedrock":
+                 raise ValueError("Set OPENROUTER_API_KEY or supply --env-file; no requests made")
+         args.output.mkdir(parents=True, exist_ok=False)
+         args.output.chmod(0o700)
+@@ -271,8 +271,9 @@ def main(argv=None):
+         write_json(args.output / "manifest.json", manifest)
+         budget, results = Budget(config.limits.run_usd), []
+         if args.mode == "live":
+-            from expbench.gateway import OpenAITransport
+-            transport_class = OpenAITransport if config.models.actor.provider == "openai" else OpenRouterTransport
++            from expbench.gateway import OpenAITransport, BedrockTransport
++            transport_class = {"openai": OpenAITransport, "openrouter": OpenRouterTransport,
++                               "bedrock": BedrockTransport}[config.models.actor.provider]
+             transport = transport_class(key, config.limits.request_timeout_seconds)
+             roles = ["actor", "judge"] + (["researcher"] if args.input_mode == "interactive" else [])
+             catalog = transport.preflight({r: getattr(config.models, r) for r in roles},
+diff --git a/src/expbench/realistic_actor.py b/src/expbench/realistic_actor.py
+index d79ead5..9bff55d 100644
+--- a/src/expbench/realistic_actor.py
++++ b/src/expbench/realistic_actor.py
+@@ -14,6 +14,7 @@ from expbench.actor import GatewayLLM, BenchmarkObservation
+ from expbench.artifacts import append_jsonl
+ from expbench.gateway import ModelError
+ from expbench import realistic_prompts as prompts
++from personasciencebench.machine_policy import execution_note
+ from openhands.sdk import Agent, Action, ToolDefinition
+ from openhands.sdk.context import AgentContext
+ from openhands.sdk.conversation.state import ConversationExecutionStatus
+@@ -114,7 +115,7 @@ class RealisticTools(ToolDefinition):
+         episode = _EPISODES[episode_id]
+         definitions = [
+             ("inspect_repository", InspectRepositoryAction, "List a repository directory or read a text file. Paths are relative to the task workspace."),
+-            ("execute_check", ExecuteCheckAction, "Run a shell command in the isolated task workspace. Use small exploratory checks before submitting your plan."),
++            ("execute_check", ExecuteCheckAction, "Run a shell command in the isolated task workspace. Use small exploratory checks before submitting your plan." + execution_note()),
+             ("submit_plan", SubmitPlanAction, "Save your initial research plan in natural language."),
+         ]
+         if episode.config.collaboration is not None:
+diff --git a/src/expbench/schema.py b/src/expbench/schema.py
+index 193788b..682140b 100644
+--- a/src/expbench/schema.py
++++ b/src/expbench/schema.py
+@@ -17,10 +17,16 @@ class ModelSettings(Record):
+     provider: str = "openrouter"
+     model: str = Field(min_length=1)
+     max_output_tokens: int = Field(ge=256, le=32768)
+-    input_usd_per_million: float = Field(ge=0)
+-    output_usd_per_million: float = Field(ge=0)
++    input_usd_per_million: float | None = Field(ge=0)
++    output_usd_per_million: float | None = Field(ge=0)
+     reasoning_effort: str | None = None
+ 
++    @model_validator(mode="after")
++    def paired_prices(self):
++        if (self.input_usd_per_million is None) != (self.output_usd_per_million is None):
++            raise ValueError("Both model prices must be known, or both explicitly unavailable")
++        return self
++
+ 
+ class Models(Record):
+     actor: ModelSettings
+@@ -42,6 +48,14 @@ class Config(Record):
+     persona: Persona | None = None
+     collaboration: CollaborationConfig | None = None
+ 
++    @model_validator(mode="after")
++    def bounded_prices(self):
++        if self.limits.run_usd is not None or self.limits.episode_usd is not None:
++            if any(getattr(self.models, role).input_usd_per_million is None
++                   for role in ("actor", "researcher", "judge")):
++                raise ValueError("A dollar cap requires verified model prices")
++        return self
++
+     @classmethod
+     def load(cls, path: Path):
+         data = json.loads(path.read_text()) if path.suffix == ".json" else tomllib.loads(path.read_text())
+diff --git a/src/personasciencebench/actor.py b/src/personasciencebench/actor.py
+index 383ef1d..756eeb0 100644
+--- a/src/personasciencebench/actor.py
++++ b/src/personasciencebench/actor.py
+@@ -17,6 +17,7 @@ from typing import Any, Literal
+ from uuid import uuid4
+ 
+ from personasciencebench.schema import Submission
++from personasciencebench.machine_policy import execution_note
+ 
+ 
+ SYSTEM_PROMPT = """You are a scientific research actor working on the supplied benchmark task.
+@@ -324,7 +325,7 @@ def _load_sdk() -> dict[str, Any]:
+             def create(cls, conv_state, *, run_id):
+                 controller = _RUNS[run_id]
+                 definitions = [
+-                    ("execute_command", CommandAction, "Execute a shell command inside the isolated /workspace to inspect files, write code, or run analysis."),
++                    ("execute_command", CommandAction, "Execute a shell command inside the isolated /workspace to inspect files, write code, or run analysis." + execution_note()),
+                     ("ask_researcher", ResearcherAction, "Ask about reviewed study context or the researcher's preferences; asking is optional. Preferences do not override task requirements."),
+                     ("report_progress", ProgressAction, "Share a concise progress update with the researcher, making it part of shared conversation memory."),
+                     ("submit_plan", PlanAction, "Save an immutable initial plan. Full-workflow tasks continue after this checkpoint."),
+diff --git a/src/personasciencebench/inference.py b/src/personasciencebench/inference.py
+index 2eaa841..af1d665 100644
+--- a/src/personasciencebench/inference.py
++++ b/src/personasciencebench/inference.py
+@@ -17,8 +17,11 @@ class OpenRouterClient:
+             raise ValueError(f"Select a model for the {role} role before inference")
+         self.model, self.role = model, role
+         self.provider = provider
+-        if provider not in ("openrouter", "openai"):
++        if provider not in ("openrouter", "openai", "bedrock"):
+             raise ValueError("Unknown API provider")
++        if provider == "bedrock":
++            from personasciencebench.bedrock_transport import transport
++            self.bedrock = transport(model, timeout)
+         if provider == "openai":
+             from personasciencebench.openai_transport import ResponsesTransport
+             self.openai = ResponsesTransport(timeout)
+@@ -38,6 +41,10 @@ class OpenRouterClient:
+ 
+     def complete_decision(self, messages, schema):
+         """One typed researcher decision, without a generated multi-turn transcript."""
++        if self.provider == "bedrock":
++            self.format_adaptations.append({"decision_format": "bedrock_native_json_schema",
++                "reason": "Fable rejects forced tool_choice", "schema_unchanged": True})
++            return self.completion(messages, schema=schema)["choices"][0]["message"]["content"]
+         name = "researcher_decision"
+         response = self.completion(messages, tools=[{"type":"function", "function":{
+             "name":name, "description":"Return the single researcher decision for the current turn.",
+@@ -54,12 +61,12 @@ class OpenRouterClient:
+                                             "json_value_unchanged": True})
+         return normalized
+ 
+-    def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None):
++    def completion(self, messages, tools=None, *, json_mode=False, settings=None, tool_choice=None, schema=None):
+         import httpx
+ 
+         key_name = "OPENAI_API_KEY" if self.provider == "openai" else "OPENROUTER_API_KEY"
+         key = os.environ.get(key_name)
+-        if not key:
++        if self.provider != "bedrock" and not key:
+             raise ValueError(f"{key_name} is not configured")
+         allowed = {"temperature", "max_tokens", "top_p", "seed", "logprobs", "top_logprobs",
+                    "frequency_penalty", "presence_penalty"}
+@@ -86,7 +93,14 @@ class OpenRouterClient:
+                 payload["tool_choice"] = tool_choice
+         if json_mode:
+             payload["response_format"] = {"type": "json_object"}
+-        if self.provider == "openai":
++        if schema is not None:
++            if json_mode or tools:
++                raise ValueError("Decision JSON schema cannot be combined with tools or JSON object mode")
++            payload["response_format"] = {"type": "json_schema", "json_schema": {
++                "name": "researcher_decision", "strict": True, "schema": schema}}
++        if self.provider == "bedrock":
++            data = self.bedrock.complete(payload)
++        elif self.provider == "openai":
+             data = self.openai.complete(payload)
+         else:
+             try:
+@@ -105,7 +119,7 @@ class OpenRouterClient:
+                          "request": payload, "response": data,
+                          "requested_native_settings": requested_settings,
+                          "omitted_native_settings": omitted,
+-                         "usage": data.get("usage", {}), "automatic_retries": getattr(response, "_psb_rate_limit_retries", 0) if self.provider == "openrouter" else 0})
++                         "usage": data.get("usage", {}), "automatic_retries": getattr(response, "_psb_rate_limit_retries", 0) if self.provider == "openrouter" else data.get("_rate_limit_retries", 0)})
+         if data.get("error"):
+             raise RuntimeError(f"{self.role}: OpenRouter returned an error response")
+         try:
+@@ -120,6 +134,9 @@ class OpenRouterClient:
+             raise RuntimeError(f"{self.role}: incomplete completion ({choice['finish_reason']})")
+         if not isinstance(content, str) and not (tools and choice["message"].get("tool_calls")):
+             raise RuntimeError(f"{self.role}: completion must contain text")
++        if schema is not None:
++            from jsonschema import validate
++            validate(json.loads(content), schema)
+         return data
+ 
+ 
+@@ -142,6 +159,9 @@ def load_env(path: Path):
+ 
+ def preflight(models: dict, *, timeout=45) -> dict:
+     """Check authenticated access and exact model names without requesting inference."""
++    if all(s.get("provider") == "bedrock" for s in models.values()):
++        from personasciencebench.bedrock_transport import preflight as bedrock_preflight
++        return bedrock_preflight(models, timeout)
+     if all(s.get("provider") == "openai" for s in models.values()):
+         from personasciencebench.openai_transport import preflight as openai_preflight
+         return openai_preflight(models, timeout)
+diff --git a/src/personasciencebench/openai_transport.py b/src/personasciencebench/openai_transport.py
+index ddb00b5..c10fd68 100644
+--- a/src/personasciencebench/openai_transport.py
++++ b/src/personasciencebench/openai_transport.py
+@@ -94,6 +94,24 @@ class ResponsesTransport:
+         for name in ('temperature', 'top_p'):
+             if name in payload:
+                 request[name] = payload[name]
++        raw, retry = self._send(request)
++        if raw.get('status') != 'completed':
++            raise RuntimeError(f"OpenAI response {raw.get('status')}: {raw.get('incomplete_details') or raw.get('error')}")
++        output = raw.get('output', [])
++        calls = [{'id': o['call_id'], 'type': 'function', 'function': {'name': o['name'], 'arguments': o['arguments']}} for o in output if o['type'] == 'function_call']
++        content = ''.join(c.get('text', '') for o in output if o['type'] == 'message' for c in o['content'] if c['type'] == 'output_text')
++        if calls:
++            self.history[calls[0]['id']] = output
++        u = raw.get('usage', {})
++        usage = {'prompt_tokens': u.get('input_tokens', 0), 'completion_tokens': u.get('output_tokens', 0), 'total_tokens': u.get('total_tokens', 0), 'prompt_tokens_details': u.get('input_tokens_details', {}), 'completion_tokens_details': u.get('output_tokens_details', {})}
++        message = {'role': 'assistant', 'content': content or None}
++        if calls:
++            message['tool_calls'] = calls
++        return {'id': raw['id'], 'object': 'chat.completion', 'model': raw['model'], 'provider': getattr(self, 'provider', 'openai'),
++                'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}],
++                'usage': usage, '_responses_request': request, '_responses_response': raw, '_rate_limit_retries': retry}
++
++    def _send(self, request):
+         key = os.environ.get('OPENAI_API_KEY')
+         if not key:
+             raise ValueError('OPENAI_API_KEY is not configured')
+@@ -123,19 +141,4 @@ class ResponsesTransport:
+             if fatal and response.status_code in (400, 401, 403, 404):
+                 Path(fatal).write_text(json.dumps({'status': response.status_code, 'error': detail}, indent=2))
+             raise RuntimeError(f'OpenAI HTTP {response.status_code}: {detail}')
+-        raw = response.json()
+-        if raw.get('status') != 'completed':
+-            raise RuntimeError(f"OpenAI response {raw.get('status')}: {raw.get('incomplete_details') or raw.get('error')}")
+-        output = raw.get('output', [])
+-        calls = [{'id': o['call_id'], 'type': 'function', 'function': {'name': o['name'], 'arguments': o['arguments']}} for o in output if o['type'] == 'function_call']
+-        content = ''.join(c.get('text', '') for o in output if o['type'] == 'message' for c in o['content'] if c['type'] == 'output_text')
+-        if calls:
+-            self.history[calls[0]['id']] = output
+-        u = raw.get('usage', {})
+-        usage = {'prompt_tokens': u.get('input_tokens', 0), 'completion_tokens': u.get('output_tokens', 0), 'total_tokens': u.get('total_tokens', 0), 'prompt_tokens_details': u.get('input_tokens_details', {}), 'completion_tokens_details': u.get('output_tokens_details', {})}
+-        message = {'role': 'assistant', 'content': content or None}
+-        if calls:
+-            message['tool_calls'] = calls
+-        return {'id': raw['id'], 'object': 'chat.completion', 'model': raw['model'], 'provider': 'openai',
+-                'choices': [{'index': 0, 'finish_reason': 'tool_calls' if calls else 'stop', 'message': message}],
+-                'usage': usage, '_responses_request': request, '_responses_response': raw, '_rate_limit_retries': retry}
++        return response.json(), retry

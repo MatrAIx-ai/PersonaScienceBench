@@ -1,21 +1,31 @@
 # Gemini 3.8 Flash actor / simulator, medium — trial 1
 
-Status: **partial_collection_checkpoint**. All 1,000 frozen slots are indexed. Selected
-dispositions: `{"grading_pending": 809, "missing_submission": 190, "execution_error": 1}`. There are 1035 retained
-attempts, including originals and explicitly authorized repairs. Judge calls: 0.
+Status: **partial_graded_checkpoint**. All 1,000 frozen slots and all 1035 original/repair attempts are retained.
+Selected final dispositions: `{"scored": 806, "missing_submission": 190, "grading_error": 3, "execution_error": 1}`. Final grading complete: **False**.
 
-Actor and researcher simulator: Gemini 3.8 Flash, `reasoning_effort=medium`. Final judge: GPT-6 Astra / low, **deferred**.
-The gateway's advertised deployment/accounting-model discrepancy is preserved in
-`provenance/run/api_access.json`; the requested model ID has not been relabeled.
-One trial: 200 questions, 40 per benchmark, off / 155 / 001 / 003 / 046.
-Actual protocol/configs and limits are in `provenance/run/configs/`.
+Actor and simulator: **Gemini 3.8 Flash actor / simulator, medium**. Final judge: **GPT-6 Astra, low effort**.
+Exact collection role IDs/settings: `{"actor": {"model": "gcp/google/gemini-3.8-flash", "provider": "nvidia", "reasoning_effort": "medium"}, "researcher": {"model": "gcp/google/gemini-3.8-flash", "provider": "nvidia", "reasoning_effort": "medium"}, "judge": {"model": "gpt-6-astra", "provider": "openai", "reasoning_effort": "low"}}`.
+Actual posthoc judge routing/settings: `{"model": "openai/openai/gpt-6-astra", "provider": "nvidia", "reasoning_effort": "low", "max_tokens": 4096, "timeout": 600, "unsupported_parameters": "omit_and_record"}`.
+(The collection judge configuration was deferred; the posthoc route above performed final grading.)
+No actor/simulator episodes were rerun for grading. Native rubrics, scoring and EXP integrity gates were retained.
+Grading evaluated saved submissions; 1 unresolved execution errors remain unavailable.
+Policy refusals skipped at user request: **2**. Their scores remain unavailable, not zero.
 
-## Remaining execution error
+`judging/all-attempts.jsonl.gz` maps every original/repair attempt to its native evaluation.
+`judging/judgements.jsonl.gz` retains final judge text and token usage, without private reasoning or API prompt bodies.
+`judging/collection-only/` preserves the original ungraded indices and checksum manifest.
+The original collection history in `repairs/` is unchanged. Final scores use the same selected attempts, never best-score selection.
+Exact judge routing, implementation snapshots and effective settings are recorded under `judging/provenance/`.
+All posthoc API calls were judge calls; actor and simulator calls repeated: **0**.
+`judging/verified-inputs.json` verifies every original grading input hash;
+`grading_inputs/native/` preserves native conversation/specification text and artifact manifests.
+Non-finite native diagnostics are represented as null with their original values
+and source checksum in adjacent `native_score.json.export-receipt.json` files.
 
-The simulator terminated with `content_filter` on DiscoveryBench
-`test/nls_raw/metadata_6.json/0/0`, setting `candidate_003`, attempt 4.
-This slot remains unavailable, not a scientific zero. The user authorized
-delivery of this partial checkpoint with no further retries.
+Grading command (using the preserved raw run and the recorded runtime):
+```bash
+.venv/bin/python scripts/grade_collection.py --run-dir /path/to/raw-run --output /path/to/raw-run/grading/astra-low-v1 --env-file /path/to/.env --workers 4
+```
 
 ## Commands and provenance
 
@@ -70,14 +80,30 @@ historical bundle lacked tree hashes; that source limitation is preserved.
 
 ## Grading and validation
 
-Scores remain null until the receiving team performs native/Astra grading.
+Final native/Astra grades are in `episodes.csv` and `evaluations/metrics.jsonl`. Unavailable scores remain null.
 Scientific non-submissions follow native zero conventions; execution errors are
 unavailable, not zeros. The receiving team computes the four separate scorecard
 columns and CIs using the repository handoff definitions; no aggregate score is
 claimed here. Repetition uses original shared actor text; SciConv fact recovery
-requires pending native evaluation with the preserved task facts.
+uses the recorded native entity_recovery metric with the preserved task facts.
 
 Verify every path/size/SHA-256 in `bundle_manifest.json` and all 1,000 slot keys.
 `delivery.json` records any unresolved execution errors. A partial checkpoint
 must never be labeled a completed collection. All files are included directly;
 `.gz` files are standard gzip streams, not missing external payloads.
+
+## Unresolved selected cases
+
+Full error messages and selected attempt keys: `judging/unresolved-cases.json`.
+
+| Benchmark | Task | Persona | Attempt | Status |
+|---|---|---|---:|---|
+| discoverybench | test/archaeology/metadata_16.json/0/0 | candidate_046 | 1 | grading_error |
+| discoverybench | test/nls_raw/metadata_6.json/0/0 | candidate_003 | 4 | execution_error |
+| expbench | iclr2024/19281/1 | candidate_046 | 1 | grading_error |
+| expbench | neurips2024/97431/8 | persona_off | 1 | grading_error |
+
+Grading resume used `--retry-errors` with one `--skip-policy-refusal ID` flag for each recorded skipped attempt:
+
+- `expbench_iclr2024_19281_1-0aedaf6a9390/candidate_046/attempt-1`
+- `expbench_neurips2024_97431_8-833eedc8ebc5/persona_off/attempt-1`

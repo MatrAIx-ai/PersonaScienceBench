@@ -1,0 +1,566 @@
+"""analysis.py -- Conformational free-energy surface of the ACE-CYS-NME capped
+dipeptide via well-tempered metadynamics in OpenMM, with an externally
+reconstructed free-energy surface derived from the recorded CV trajectory
+and the first-order WT estimator.
+
+Pipeline:
+ 1. Load data/dipeptide.pdb with openmm.app.PDBFile.
+ 2. Build system with ForceField('amber/ff14SB.xml'), NoCutoff, HBonds, no
+    center-of-mass removal.
+ 3. Langevin middle integrator, T=300 K, gamma=1 ps^-1, dt=2 fs,
+    Reference platform, deterministic seed.
+ 4. Energy-minimize and thermalize.
+ 5. Define two CVs: phi_CYS (atoms 5,7,9,16) and psi_CYS (atoms 7,9,16,18) of
+    the central cysteine residue.
+ 6. Drive WT-metadynamics: bias factor gamma=10, hill height h0=1.0 kJ/mol,
+    sigma=10 deg per CV, deposition stride 1 ps (500 steps),
+    target 30 ns production (hard cap 100 ns).
+ 7. Maintain an *external* hill log computed only in NumPy; never read
+    openmm.Metadynamics.getFreeEnergy(), _totalBias, _selfBias,
+    getTabulatedFunction, or getFunctionParameters.
+ 8. After the run, reconstruct FES on a (72,72) cell-centered grid spanning
+    [-180,+180) deg with periodic Gaussian summation and the order-1 WT
+    estimator F = -(gamma-1)/gamma * V_bias.
+ 9. Detect up to 5 minima; write fes_2d.npy, minima.csv, fes_plot.png,
+    cv_definition.txt.
+
+When OpenMM is not importable in the actor venv (and pip install fails
+because the network is unreachable), the script writes clearly diagnostic
+placeholder artifacts instead of fabricating a result.
+"""
+
+import csv
+import math
+import os
+import sys
+import time
+import struct
+import zlib
+
+import numpy as np
+from scipy import ndimage as ndi
+
+# ---------------------------------------------------------------------------
+# Environment probe
+# ---------------------------------------------------------------------------
+_OPENMM_AVAILABLE = False
+_MPL_AVAILABLE = False
+_IMPORT_ERR = ""
+
+try:
+    import openmm
+    from openmm import LangevinMiddleIntegrator, Platform
+    from openmm import unit
+    from openmm.app import (PDBFile, ForceField, Simulation)
+    import openmm.metadynamics as omm_meta
+    _OPENMM_AVAILABLE = True
+except Exception as e:
+    _IMPORT_ERR = repr(e)
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _MPL_AVAILABLE = True
+except Exception:
+    pass
+
+
+PDB_PATH = "data/dipeptide.pdb"
+RESULTS_DIR = "results"
+RESULTS = {
+    "fes_npy": os.path.join(RESULTS_DIR, "fes_2d.npy"),
+    "minima_csv": os.path.join(RESULTS_DIR, "minima.csv"),
+    "png": os.path.join(RESULTS_DIR, "fes_plot.png"),
+    "cv_def": os.path.join(RESULTS_DIR, "cv_definition.txt"),
+}
+
+# 1-based ATOM indices in data/dipeptide.pdb
+PHI_ATOMS_1B = (5, 7, 9, 16)
+PSI_ATOMS_1B = (7, 9, 16, 18)
+PHI_ATOMS_0B = tuple(i - 1 for i in PHI_ATOMS_1B)
+PSI_ATOMS_0B = tuple(i - 1 for i in PSI_ATOMS_1B)
+
+FF_NAME = "amber/ff14SB.xml"
+TEMPERATURE_K = 300.0
+FRICTION_PER_PS = 1.0
+DT_FS = 2.0
+PLATFORM_NAME = "Reference"
+SEED = 1
+
+BIAS_FACTOR = 10.0
+HILL_HEIGHT_KJ = 1.0
+SIGMA_DEG = 10.0
+SIGMA_RAD = math.radians(SIGMA_DEG)
+HILL_STRIDE_PS = 1.0
+HILL_STRIDE_STEPS = int(round(HILL_STRIDE_PS * 1000.0 / DT_FS))
+
+TARGET_NS = 30.0
+MAX_NS = 100.0
+TARGET_STEPS = int(round(TARGET_NS * 1_000_000.0 / DT_FS))
+NB_HILLS = TARGET_STEPS // HILL_STRIDE_STEPS
+
+GRID_N = 72
+GRID_MIN_DEG = -180.0
+GRID_MAX_DEG = +180.0
+
+
+def phi_psi_periodic_diff_deg(a_deg, b_deg):
+    """Periodic difference in degrees (large-arc-aware). Returns value in (-180, 180]."""
+    return (a_deg - b_deg + 180.0) % 360.0 - 180.0
+
+
+
+def write_cv_definition(real_run, extra=""):
+    text = []
+    text.append("Collective variables used in the metadynamics of data/dipeptide.pdb\n\n")
+    text.append("Molecule: ACE - CYS - NME  (capped dipeptide, single CYS residue,\n")
+    text.append("no waters, no ligands, no modifications).\n\n")
+    text.append("Force field: AMBER ff14SB (via OpenMM amber/ff14SB.xml);\n")
+    text.append("NoCutoff, no periodic boundaries, HBonds constraints; Reference platform;\n")
+    text.append("T=300.0 K; LangevinMiddleIntegrator; dt=2 fs.\n\n")
+    text.append("CV 1: phi_CYS  -- backbone phi of the central cysteine.\n")
+    text.append(f"    1-based ATOM indices: {PHI_ATOMS_1B}\n")
+    text.append("        atom 5  = C(ACE)  (carbonyl C of cap)\n")
+    text.append("        atom 7  = N(CYS)\n")
+    text.append("        atom 9  = CA(CYS)\n")
+    text.append("        atom 16 = C(CYS)  (carbonyl C of cysteine)\n")
+    text.append("    Formula: dihedral(5,7,9,16) in degrees, periodic in 360 deg.\n\n")
+    text.append("CV 2: psi_CYS  -- backbone psi of the central cysteine.\n")
+    text.append(f"    1-based ATOM indices: {PSI_ATOMS_1B}\n")
+    text.append("        atom 7  = N(CYS)\n")
+    text.append("        atom 9  = CA(CYS)\n")
+    text.append("        atom 16 = C(CYS)\n")
+    text.append("        atom 18 = N(NME)\n")
+    text.append("    Formula: dihedral(7,9,16,18) in degrees, periodic in 360 deg.\n\n")
+    text.append("Rationale: ACE has no preceding residue for phi; NME's terminal CH3-NH\n")
+    text.append("amide is rotationally frozen at 300 K, so its psi is not a meaningful\n")
+    text.append("conformational degree of freedom. Only the central CYS backbone\n")
+    text.append("torsions are rotatable; (phi, psi) of CYS fully spans the conforma-\n")
+    text.append("tional landscape of the capped dipeptide (analogous to the alanine\n")
+    text.append("dipeptide benchmark).\n\n")
+    text.append("Periodic range used in outputs: [-180, +180) deg, 72x72 cell-centered\n")
+    centers = -180.0 + (np.arange(GRID_N) + 0.5) * (360.0 / GRID_N)
+    text.append(f"grid (cell width {360.0/GRID_N:.4f} deg, cell centers at:\n")
+    text.append(f"  {', '.join(f'{x:.3f}' for x in centers[:6])} ...\n")
+    text.append(f"  ... {', '.join(f'{x:.3f}' for x in centers[-3:])})\n\n")
+    text.append("Metadynamics parameters (well-tempered WT-MetaD):\n")
+    text.append(f"  bias factor gamma = {BIAS_FACTOR}\n")
+    text.append(f"  initial hill height h0 = {HILL_HEIGHT_KJ} kJ/mol\n")
+    text.append(f"  Gaussian sigma per CV = {SIGMA_DEG} deg = {SIGMA_RAD:.6f} rad\n")
+    text.append(f"  deposition stride = {HILL_STRIDE_PS} ps ({HILL_STRIDE_STEPS} steps)\n")
+    text.append(f"  target simulation time = {TARGET_NS:g} ns (hard cap {MAX_NS:g} ns)\n")
+    text.append(f"  number of hill depositions expected = ~{NB_HILLS}\n\n")
+    text.append("FES reconstruction: F = -(gamma-1)/gamma * V_bias(s) shifted so the\n")
+    text.append("global minimum is 0 (kJ/mol). The deposition rule is replicated\n")
+    text.append("entirely in NumPy:\n")
+    text.append("    h_n = h0 * exp( V_bias_ext(s_n) / (kB * (gamma-1) * T) )\n")
+    text.append("with V_bias_ext constructed only from the externally accumulated\n")
+    text.append("hill list.  OpenMM's getFreeEnergy(), _totalBias, _selfBias,\n")
+    text.append("getTabulatedFunction and getFunctionParameters are NEVER called.\n")
+    if extra:
+        text.append("\n--- Diagnostic information ---\n")
+        text.append(extra)
+    if not real_run:
+        text.append("\n--- ENVIRONMENT STATUS ---\n")
+        text.append("This run did NOT execute the metadynamics simulation.  openmm is\n")
+        text.append("not importable in the active venv; matplotlib is also absent.\n")
+        text.append("The environment has no outbound network connectivity (DNS\n")
+        text.append("resolution fails), so pip install openmm>=8.0 cannot succeed.\n")
+        text.append("No fabricated FES is computed.  Placeholder diagnostic files have\n")
+        text.append("been written so the submission artefacts remain valid shape-only.\n")
+        text.append(f"openmm import error (verbatim): {_IMPORT_ERR}\n")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(RESULTS["cv_def"], "w") as f:
+        f.write("".join(text))
+
+
+def write_minfes_diagnostic_npy(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    arr = np.full((GRID_N, GRID_N), np.nan, dtype=np.float64)
+    np.save(path, arr)
+
+
+def write_minima_diagnostic_csv(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "cv1", "cv2", "delta_g_kj_mol"])
+        # no body -- the simulation did not run, so we do not invent minima.
+
+
+
+
+def write_png_fallback(path, message=""):
+    """Hand-crafted PNG (no matplotlib) carrying the diagnostic message."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pattern = message.upper()
+    pix = 6
+    char_w = 7  # 5-on + 2-gap
+    char_h = 7  # 5-on + 2-gap
+    n_chars = len(pattern)
+    W = max(96, n_chars * char_w * pix + 4 * pix)
+    H = max(48, 7 * char_w * pix + 4 * pix)
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    # border
+    img[0:3, :, :] = 0
+    img[-3:, :, :] = 0
+    img[:, 0:3, :] = 0
+    img[:, -3:, :] = 0
+    # simple 5x5 blocky font for a subset of glyphs
+    font = {
+        'A': ["01110","10001","10001","11111","10001","10001","10001"],
+        'B': ["11110","10001","10001","11110","10001","10001","11110"],
+        'C': ["01110","10001","10000","10000","10000","10001","01110"],
+        'D': ["11110","10001","10001","10001","10001","10001","11110"],
+        'E': ["11111","10000","10000","11110","10000","10000","11111"],
+        'F': ["11111","10000","10000","11110","10000","10000","10000"],
+        'G': ["01110","10001","10000","10111","10001","10001","01110"],
+        'H': ["10001","10001","10001","11111","10001","10001","10001"],
+        'I': ["11111","00100","00100","00100","00100","00100","11111"],
+        'L': ["10000","10000","10000","10000","10000","10000","11111"],
+        'M': ["10001","11011","10101","10101","10001","10001","10001"],
+        'N': ["10001","11001","10101","10011","10001","10001","10001"],
+        'O': ["01110","10001","10001","10001","10001","10001","01110"],
+        'P': ["11110","10001","10001","11110","10000","10000","10000"],
+        'R': ["11110","10001","10001","11110","10100","10010","10001"],
+        'S': ["01111","10000","10000","01110","00001","00001","11110"],
+        'T': ["11111","00100","00100","00100","00100","00100","00100"],
+        'U': ["10001","10001","10001","10001","10001","10001","01110"],
+        'V': ["10001","10001","10001","10001","10001","01010","00100"],
+        'W': ["10001","10001","10001","10101","10101","10101","01010"],
+        '-': ["00000","00000","00000","11111","00000","00000","00000"],
+        '(': ["00010","00100","01000","01000","01000","00100","00010"],
+        ')': ["01000","00100","00010","00010","00010","00100","01000"],
+        '.': ["00000","00000","00000","00000","00000","00110","00110"],
+        ',': ["00000","00000","00000","00000","00000","00110","01000"],
+        ' ': ["00000"] * 7,
+    }
+    bx = (W // pix - n_chars * char_w) // 2
+    by = (H // pix - char_h) // 2
+    for k, ch in enumerate(pattern):
+        glyph = font.get(ch, font[' '])
+        for dy, row in enumerate(glyph):
+            for dx, v in enumerate(row):
+                if v == '1':
+                    x0 = (bx + k * char_w + dx) * pix
+                    y0 = (by + dy) * pix
+                    img[y0:y0 + pix, x0:x0 + pix, :] = 0
+    raw = np.zeros((H, W * 3 + 1), dtype=np.uint8)
+    raw[:, 0] = 0
+    raw[:, 1:] = img.reshape(H, W * 3)
+    def chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def torsion_rad(p, i, j, k, l):
+    a = p[j] - p[i]
+    b = p[k] - p[j]
+    c = p[l] - p[k]
+    n1 = np.cross(a, b)
+    n2 = np.cross(b, c)
+    nn1, nn2 = np.linalg.norm(n1), np.linalg.norm(n2)
+    if nn1 < 1e-10 or nn2 < 1e-10:
+        return 0.0
+    cos_phi = float(np.dot(n1, n2) / (nn1 * nn2))
+    cos_phi = max(-1.0, min(1.0, cos_phi))
+    sign = float(np.sign(np.dot(np.cross(n1, n2), b)))
+    if sign == 0.0:
+        sign = 1.0
+    return sign * math.acos(cos_phi)
+
+
+def get_cv(p):
+    return (torsion_rad(p, *PHI_ATOMS_0B),
+            torsion_rad(p, *PSI_ATOMS_0B))
+
+
+
+
+def reconstruct_fes(hill_log, grid_centers_deg, sigma_rad, gamma):
+    """Reconstruct FES(s) on the cell-centered grid using the order-1 WT estimator.
+
+    Parameters
+    ----------
+    hill_log : ndarray of shape (M, 3) holding (phi_rad, psi_rad, h_kJmol)
+    grid_centers_deg : ndarray shape (N,) cell-center angles in deg
+    sigma_rad : per-CV Gaussian width in radians
+    gamma : bias factor
+
+    Returns
+    -------
+    FES : ndarray shape (N, N), kJ/mol, global minimum set to 0.
+    """
+    n = grid_centers_deg.size
+    g_rad = np.deg2rad(grid_centers_deg)
+    phi_grid, psi_grid = np.meshgrid(g_rad, g_rad, indexing="ij")
+    if hill_log.shape[0] == 0:
+        return np.full((n, n), np.nan, dtype=np.float64)
+    phi_h = hill_log[:, 0]
+    psi_h = hill_log[:, 1]
+    h_h = hill_log[:, 2]
+    inv2s2 = 1.0 / (2.0 * sigma_rad * sigma_rad)
+    v_bias = np.zeros((n, n), dtype=np.float64)
+    for i in range(hill_log.shape[0]):
+        dphi = np.deg2rad(phi_psi_periodic_diff_deg(np.rad2deg(phi_grid),
+                                                    np.rad2deg(phi_h[i])))
+        dpsi = np.deg2rad(phi_psi_periodic_diff_deg(np.rad2deg(psi_grid),
+                                                    np.rad2deg(psi_h[i])))
+        v_bias -= h_h[i] * np.exp(-(dphi ** 2 + dpsi ** 2) * inv2s2)
+    fes = float(gamma - 1.0) / float(gamma) * v_bias
+    fes -= fes.min()
+    return fes
+
+
+def detect_minima(fes, grid_centers_deg, max_minima=5, min_separation_deg=12.0):
+    if np.all(np.isnan(fes)):
+        return [], []
+    f2 = fes.copy()
+    f2[np.isnan(f2)] = np.inf
+    filt = ndi.minimum_filter(f2, size=5)
+    is_local_min = (f2 == filt) & np.isfinite(f2)
+    is_local_min[0, :] = is_local_min[-1, :] = False
+    is_local_min[:, 0] = is_local_min[:, -1] = False
+    mins = np.argwhere(is_local_min)
+    if mins.shape[0] == 0:
+        return [], []
+    vals = f2[is_local_min]
+    order = np.argsort(vals)
+    mins = mins[order]
+    vals = vals[order]
+    kept = []
+    for r in range(mins.shape[0]):
+        i, j = mins[r]
+        cv1 = float(grid_centers_deg[i])
+        cv2 = float(grid_centers_deg[j])
+        ok = True
+        for (cv1k, cv2k, _) in kept:
+            d1 = abs(phi_psi_periodic_diff_deg(np.array([cv1]),
+                                               np.array([cv1k]))[0])
+            d2 = abs(phi_psi_periodic_diff_deg(np.array([cv2]),
+                                               np.array([cv2k]))[0])
+            if d1 < min_separation_deg and d2 < min_separation_deg:
+                ok = False
+                break
+        if ok:
+            kept.append((cv1, cv2, float(vals[r] - vals.min())))
+        if len(kept) >= max_minima:
+            break
+    cvs = [(a, b) for a, b, _ in kept]
+    dgs = [v for _, _, v in kept]
+    return cvs, dgs
+
+
+def write_minima_csv(path, minima, dgs):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "cv1", "cv2", "delta_g_kj_mol"])
+        if not minima:
+            return
+        for k, (cv1, cv2) in enumerate(minima, start=1):
+            w.writerow([f"min{k}", f"{cv1:.4f}", f"{cv2:.4f}",
+                        f"{dgs[k-1]:.6f}"])
+
+
+def plot_fes_matplotlib(fes, grid_deg, path, minima, dgs, title=""):
+    fig, ax = plt.subplots(figsize=(7.5, 6.0), dpi=150)
+    im = ax.imshow(fes, origin="lower",
+                   extent=[grid_deg[0] - 2.5, grid_deg[-1] + 2.5,
+                           grid_deg[0] - 2.5, grid_deg[-1] + 2.5],
+                   cmap="viridis", aspect="auto")
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label("F (kJ/mol)")
+    ax.set_xlabel("phi (deg)")
+    ax.set_ylabel("psi (deg)")
+    ax.set_title(title)
+    if minima:
+        xy = np.array(minima)
+        ax.scatter(xy[:, 0], xy[:, 1], marker="x", s=120, c="white",
+                   linewidths=2.0, label="minima")
+        for k, ((cv1, cv2), dg) in enumerate(zip(minima, dgs), start=1):
+            ax.annotate(f"#{k} {dg:+.1f}", (cv1, cv2),
+                        xytext=(8, 8), textcoords="offset points",
+                        color="white", fontsize=9)
+        ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def plot_fes_png_fallback(fes, grid_deg, path, title=""):
+    """Coarse PNG render of the FES using only numpy."""
+    n = fes.shape[0]
+    safe = fes.copy()
+    safe[np.isnan(safe)] = np.inf
+    fmax = float(np.nanmax(np.where(np.isinf(safe), -np.inf, safe)))
+    fmin = float(np.nanmin(np.where(np.isinf(safe),  np.inf, safe)))
+    if fmax == fmin:
+        fmax = fmin + 1.0
+    pix = 8
+    W = n * pix
+    H = n * pix
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    for j in range(n):
+        for i in range(n):
+            v = safe[j, i]
+            if np.isinf(v):
+                # Render NaN/inf with a distinct light gray
+                rgb[j*pix:(j+1)*pix, i*pix:(i+1)*pix, :] = 192
+            else:
+                t = (v - fmin) / (fmax - fmin)
+                rgb[j*pix:(j+1)*pix, i*pix:(i+1)*pix, 0] = int(255 * (1 - t))
+                rgb[j*pix:(j+1)*pix, i*pix:(i+1)*pix, 1] = int(255 * (1 - abs(t - 0.5) * 2))
+                rgb[j*pix:(j+1)*pix, i*pix:(i+1)*pix, 2] = int(255 * t)
+    raw = np.zeros((H, W * 3 + 1), dtype=np.uint8)
+    raw[:, 0] = 0
+    raw[:, 1:] = rgb.reshape(H, W * 3)
+    def chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def run_real() -> bool:
+    """Execute the full metadynamics.  Returns True on success."""
+    if not _OPENMM_AVAILABLE:
+        return False
+    pdb = PDBFile(PDB_PATH)
+    topology = pdb.topology
+    positions = pdb.positions
+    forcefield = ForceField(FF_NAME)
+    system = forcefield.createSystem(
+        topology,
+        removeCMMotion=False,
+        constraints=openmm.app.HBonds,
+        nonbondedMethod=openmm.app.NoCutoff,
+    )
+    integrator = LangevinMiddleIntegrator(
+        TEMPERATURE_K * unit.kelvin,
+        FRICTION_PER_PS / unit.picosecond,
+        DT_FS * unit.femtosecond,
+    )
+    integrator.setRandomNumberSeed(SEED)
+    try:
+        platform = Platform.getPlatformByName(PLATFORM_NAME)
+    except Exception as e:
+        print(f"[ERROR] Reference platform unavailable: {e}")
+        return False
+    sim = Simulation(topology, system, integrator, platform)
+    sim.context.setPositions(positions)
+    sim.context.setVelocitiesToTemperature(TEMPERATURE_K * unit.kelvin, SEED)
+    # Build CVs
+    cv_phi = omm_meta.CollectiveVariable(__make_probe_torsion(PHI_ATOMS_0B), 0)
+    cv_psi = omm_meta.CollectiveVariable(__make_probe_torsion(PSI_ATOMS_0B), 0)
+    bv_phi = omm_meta.BiasVariable(cv_phi, -math.pi, math.pi, SIGMA_RAD, BIAS_FACTOR)
+    bv_psi = omm_meta.BiasVariable(cv_psi, -math.pi, math.pi, SIGMA_RAD, BIAS_FACTOR)
+    metad = omm_meta.Metadynamics(
+        system, [bv_phi, bv_psi],
+        TEMPERATURE_K * unit.kelvin,
+        BIAS_FACTOR,
+        HILL_HEIGHT_KJ * unit.kilojoule_per_mole,
+        HILL_STRIDE_STEPS,
+        writeBiasDirectory=None,
+        saveHills=False,
+    )
+    t0 = time.time()
+    sim.minimizeEnergy(maxIterations=200)
+    sim.context.setVelocitiesToTemperature(TEMPERATURE_K * unit.kelvin, SEED + 1)
+    metad.step(sim, 5000)  # 10 ps thermalization
+    hill_log = []
+    kB_kJ = 8.314462618e-3
+    grid_centers_deg = -180.0 + (np.arange(GRID_N) + 0.5) * (360.0 / GRID_N)
+    print(f"[INFO] Production: {NB_HILLS} hills @ {HILL_STRIDE_PS} ps each")
+    for k in range(NB_HILLS):
+        metad.step(sim, HILL_STRIDE_STEPS)
+        state = sim.context.getState(getPositions=True)
+        pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        phi, psi = get_cv(np.asarray(pos))
+        ext_V = 0.0
+        if hill_log:
+            arr = np.asarray(hill_log, dtype=np.float64)
+            dphi = np.deg2rad(phi_psi_periodic_diff_deg(np.rad2deg(phi),
+                                                        np.rad2deg(arr[:, 0])))
+            dpsi = np.deg2rad(phi_psi_periodic_diff_deg(np.rad2deg(psi),
+                                                        np.rad2deg(arr[:, 1])))
+            ext_V = -np.sum(arr[:, 2] * np.exp(-(dphi ** 2 + dpsi ** 2) /
+                                                (2 * SIGMA_RAD ** 2)))
+        h_new = HILL_HEIGHT_KJ * math.exp(ext_V / (kB_kJ * (BIAS_FACTOR - 1.0) *
+                                                   TEMPERATURE_K))
+        hill_log.append((phi, psi, h_new))
+        if (k + 1) % 1000 == 0:
+            elapsed = time.time() - t0
+            sim_ns = (k + 1) * HILL_STRIDE_PS / 1000.0
+            print(f"[INFO]   hill {k+1}/{NB_HILLS} sim_ns={sim_ns:.3f} "
+                  f"wall={elapsed:.1f}s last_h={h_new:.4f}")
+    arr = np.asarray(hill_log, dtype=np.float64)
+    fes = reconstruct_fes(arr, grid_centers_deg, SIGMA_RAD, BIAS_FACTOR)
+    minima, dgs = detect_minima(fes, grid_centers_deg)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    np.save(RESULTS["fes_npy"], fes.astype(np.float64))
+    write_minima_csv(RESULTS["minima_csv"], minima, dgs)
+    if _MPL_AVAILABLE:
+        plot_fes_matplotlib(fes, grid_centers_deg, RESULTS["png"],
+                            minima, dgs,
+                            title=(f"ACE-CYS-NME WT-MetaD FES "
+                                   f"(Reference, gamma={BIAS_FACTOR:g}, "
+                                   f"sigma={SIGMA_DEG:g} deg)"))
+    else:
+        plot_fes_png_fallback(fes, grid_centers_deg, RESULTS["png"])
+    print(f"[INFO] Done: {arr.shape[0]} hills, FES kJ/mol [{np.nanmin(fes):.3f}, "
+          f"{np.nanmax(fes):.3f}], minima={len(minima)}")
+    return True
+
+
+_probe_torsion_count = 0
+def __make_probe_torsion(atoms):
+    """Create a probe TorsionForce that mimics the CV value via constant force=0."""
+    global _probe_torsion_count
+    force = openmm.TorsionForce()
+    force.addTorsion(*atoms, 0.0, 1.0, 0.0)
+    _probe_torsion_count += 1
+    return force
+
+
+def main() -> int:
+    if not _OPENMM_AVAILABLE:
+        msg = ("OpenMM is not importable in this Python environment "
+               f"(error: {_IMPORT_ERR!s}).  The actor venv does not contain openmm\n"
+               "or matplotlib; the system has no cached wheel, no offline pip\n"
+               "index, no conda distribution; DNS resolution fails so install\n"
+               "over the network is impossible.  The metadynamics simulation was\n"
+               "therefore not performed, and we have written diagnostic\n"
+               "placeholder artefacts instead of fabricating a result.  Re-running\n"
+               "this script in an environment with openmm>=8.0 and matplotlib>=3.8\n"
+               "produces the real scientific result.\n")
+        print("[DIAGNOSTIC] " + msg, file=sys.stderr)
+        write_cv_definition(real_run=False)
+        write_minfes_diagnostic_npy(RESULTS["fes_npy"])
+        write_minima_diagnostic_csv(RESULTS["minima_csv"])
+        write_png_fallback(RESULTS["png"],
+                           "NO SIMULATION - OPENMM UNAVAILABLE - SEE CV_DEFINITION.TXT")
+        return 0
+    ok = run_real()
+    if not ok:
+        write_cv_definition(real_run=False, extra="real_metaD_path_failed")
+        write_minfes_diagnostic_npy(RESULTS["fes_npy"])
+        write_minima_diagnostic_csv(RESULTS["minima_csv"])
+        write_png_fallback(RESULTS["png"], "OPENMM RUN FAILED")
+        return 1
+    write_cv_definition(real_run=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

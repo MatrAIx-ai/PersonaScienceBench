@@ -1,0 +1,370 @@
+"""
+analysis.py
+============
+
+Tabular behavior-cloning policy combined with a hard geometric prior,
+designed to be a strong, frugal action-prior for the grid-search scorer.
+
+EXPORTS
+-------
+- make_policy(training_data, config=None) -> Policy
+- Policy                                     (also exposed at top level)
+
+INTERFACE USED BY THE SCORER
+----------------------------
+    policy.action_probs(level, state, legal_actions) -> dict[str, float]
+        level         : dict with ONLY non-spatial metadata. We never read a
+                        spatial field from it (no `grid`, no coords). If a
+                        future scorer opaquely provides coords, the policy
+                        silently ignores them -- staying safe.
+        state         : dict of LOCAL observation fields. We defensively read
+                        (via `state.get(...)`) the keys listed in the public
+                        task: `cell`, `neighbors`, `previous_action`,
+                        `history`, `history_tail`, `run_length_bucket`,
+                        `depth`, `depth_mod`, `depth_phase`, `legal_mask`,
+                        `legal_actions`. Anything missing is treated as
+                        default / unknown.
+        legal_actions : list[str] in {'U','D','L','R'}. The output is
+                        restricted to exactly this set; any non-listed
+                        direction gets the implicit rule "no reverse".
+
+DESIGN
+------
+Given features F = (legal_mask_sig, previous_action, run_length_bucket,
+history_tail [, depth_mod]) the score for a legal action `a` is
+
+        score(a) = ( N(a | F) + alpha ) * geom_weight(a)
+
+with
+    - geom_weight(a) = 0  if `a` reverses the previous direction (hard ban),
+                    = 3  if `a` equals the previous direction (continuation),
+                    = 1  otherwise (turn).
+    - alpha = 0.5 Laplace smoothing across all four directions so that
+      unseen-but-legal actions still receive finite weight (default prior
+      becomes "continue 3x vs. turn 1x", which matches training statistics:
+      ~80% of training steps are continuation moves).
+    - If the depth-mod exact key is missing, the policy falls back to a
+      version of the table indexed only on (legal_mask_sig, prev, rle,
+      history_tail). This makes the policy robust to a different `depth_mod`
+      definition than our internal `depth % 4`.
+
+Why this shape?
+- Trajectories in `training_levels.json` are monotone piecewise-straight
+  walks with 1-3 direction changes per solution; P(reverse) = 0 over ~6500
+  transitions, so `geom_weight(reverse) = 0` is a *real* constraint.
+- Tile letters (`a..v` + `G` + `#`) are decorative, not semantic. Including
+  `cell`/`neighbors` in the key would only inflate table size without
+  predictive power (we verified empirically -- see the inspection log).
+  We deliberately omit them.
+- `history_tail` (capped to last 6 actions) captures the run-length pattern
+  AND the direction-change history -- sufficient for switching heuristics at
+  run boundaries.
+- `legal_mask` already encodes local wall geometry known to the scorer; the
+  table can learn per-corridor preferences without needing raw coordinates.
+
+DEPENDENCIES
+------------
+Pure-stdlib: json, collections. No numpy / pandas / sklearn.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+
+DIRECTIONS = ('U', 'D', 'L', 'R')
+OPPOSITE = {'U': 'D', 'D': 'U', 'L': 'R', 'R': 'L'}
+DELTA = {'U': (-1, 0), 'D': (1, 0), 'L': (0, -1), 'R': (0, 1)}
+
+# Soft fall-back: depth-mod convention used during table construction.
+INTERNAL_DEPTH_MOD = 4
+
+
+# ---------------------------------------------------------------------------
+# Small defensive helpers
+# ---------------------------------------------------------------------------
+
+def _norm_dir(action):
+    """Map any incoming action-ish value to one of 'U','D','L','R' or None."""
+    if action is None:
+        return None
+    try:
+        s = str(action).strip().upper()
+    except Exception:
+        return None
+    if not s:
+        return None
+    return s[0] if s[0] in DIRECTIONS else None
+
+
+def _norm_runlength(rl):
+    try:
+        rl = int(rl)
+    except Exception:
+        rl = 0
+    if rl < 0:
+        rl = 0
+    if rl > 9:
+        rl = 9
+    return rl
+
+
+def _norm_tail(history_tail, history):
+    """Compact trailing actions string of length <= 6 on alphabet UDLR?"""
+    s = history_tail
+    if s is None and history is not None:
+        try:
+            s = ''.join(_norm_dir(a) or '?' for a in list(history)[-6:])
+        except Exception:
+            s = ''
+    if s is None:
+        s = ''
+    cleaned = ''.join(c for c in str(s) if c in 'UDLR?')
+    return cleaned[-6:]
+
+
+def _norm_depth_tag(tag):
+    if tag is None:
+        return ''
+    try:
+        return int(tag)
+    except Exception:
+        return str(tag)
+
+
+def _legal_mask_sig(legal_mask, legal_set):
+    """Canonical 4-bit string '0101' indicating which directions are legal."""
+    out = []
+    for d in DIRECTIONS:
+        if isinstance(legal_mask, dict) and d in legal_mask:
+            flag = bool(legal_mask[d])
+        else:
+            flag = d in legal_set
+        out.append('1' if flag else '0')
+    return ''.join(out)
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+class Policy:
+    """Tabular behavioral-cloning + hand-coded geometric prior.
+
+    Two tables:
+      * `table_loose`        : indexed by (legal_mask_sig, prev, rle, tail)
+      * `table_with_depth`   : indexed by ((...), depth_mod) for finer match
+
+    Lookup precedence: precise (with depth) > loose (without depth). If both
+    miss, fall back to the pure geometric prior of the previous-action
+    information alone (continue x3 vs. turn x1; reverse x0).
+    """
+
+    def __init__(self, table_loose, table_with_depth, alpha=0.5):
+        self.table_loose = table_loose
+        self.table_with_depth = table_with_depth
+        self.alpha = float(alpha)
+
+    # The scorer-facing API.
+    def action_probs(self, level, state, legal_actions):
+        legal_list = [a for a in (legal_actions or []) if a in DIRECTIONS]
+        legal_set = set(legal_list)
+        if not legal_set:
+            return {}
+
+        # Defensive extraction of every field we may rely on.
+        if isinstance(state, dict):
+            prev = _norm_dir(state.get('previous_action'))
+            if prev is None:
+                prev = _norm_dir(state.get('prev_action'))
+            legal_mask_raw = state.get('legal_mask')
+            rl = _norm_runlength(state.get('run_length_bucket'))
+            ht = _norm_tail(state.get('history_tail'), state.get('history'))
+            depth_tag = _norm_depth_tag(state.get('depth_mod'))
+            if depth_tag == '':
+                depth_tag = _norm_depth_tag(state.get('depth_phase'))
+            # `cell`, `neighbors`, `depth` are deliberately not used as
+            # features (empirical check: they carry no action-relevant
+            # signal on these grids).
+        else:
+            prev = None
+            legal_mask_raw = None
+            rl = 0
+            ht = ''
+            depth_tag = ''
+
+        if not isinstance(legal_mask_raw, dict):
+            legal_mask_raw = None
+
+        lmask_sig = _legal_mask_sig(legal_mask_raw, legal_set)
+        primary = (lmask_sig, prev, rl, ht)
+
+        # 1) Try depth-aware table
+        tab_dist = self.table_with_depth.get((primary, depth_tag), {}) if depth_tag != '' else {}
+        # 2) Otherwise fall back to depth-agnostic lookup
+        if not tab_dist:
+            tab_dist = self.table_loose.get(primary, {})
+
+        scores = {}
+        for a in legal_list:
+            # Geometric prior over-rides the table: never reverse.
+            if prev is not None and a == OPPOSITE.get(prev):
+                # Explicit zero (still emitted in the output dict below).
+                scores[a] = 0.0
+                continue
+            tab_w = tab_dist.get(a, 0.0)
+            geom_w = 3.0 if (prev is not None and a == prev) else 1.0
+            scores[a] = (tab_w + self.alpha) * geom_w
+
+        # Final safety net.
+        if not any(v > 0 for v in scores.values()):
+            n = len(legal_list)
+            return {a: 1.0 / n for a in legal_list}
+
+        total = sum(scores.values())
+        if total <= 0.0:
+            n = len(legal_list)
+            return {a: 1.0 / n for a in legal_list}
+
+        # Emit *all* legal actions with explicit zeros for reverses.
+        return {a: (scores[a] / total) for a in legal_list}
+
+
+# ---------------------------------------------------------------------------
+# Tabular policy factory
+# ---------------------------------------------------------------------------
+
+def _features_for_training_step(grid, r, c):
+    """Read the local legal-mask context at (r,c)."""
+    h = len(grid)
+    legal_mask = {}
+    legal_acts = []
+    for d in DIRECTIONS:
+        dr, dc = DELTA[d]
+        nr, nc = r + dr, c + dc
+        is_open = (
+            0 <= nr < h
+            and 0 <= nc < len(grid[nr])
+            and grid[nr][nc] != '#'
+        )
+        legal_mask[d] = is_open
+        if is_open:
+            legal_acts.append(d)
+    lmask_sig = ''.join('1' if legal_mask[d] else '0' for d in DIRECTIONS)
+    return lmask_sig, legal_mask, legal_acts
+
+
+def _validate_and_walk_level(grid, start, goal, solution):
+    """Yield ((lmask_sig, prev, rle, history_tail, depth_tag), action)
+    at the local state just BEFORE the action is taken.
+
+    Stops the moment the trajectory becomes inconsistent with the grid; the
+    caller discards any partial levels automatically.
+    """
+    h = len(grid)
+    if h == 0:
+        return
+    try:
+        sr, sc = int(start[0]), int(start[1])
+        gr, gc = int(goal[0]), int(goal[1])
+    except Exception:
+        return
+    if not (0 <= sr < h and 0 <= sc < len(grid[sr])):
+        return
+    if not (0 <= gr < h and 0 <= gc < len(grid[gr])) or grid[gr][gc] == '#':
+        return
+
+    r, c = sr, sc
+    prev = None
+    rle = 0
+    depth = 0
+    ht = ''  # last 6 actions string
+
+    target = (gr, gc)
+    for raw_a in solution:
+        a = _norm_dir(raw_a)
+        if a is None:
+            return
+        # Validate: is the action physically executable from (r,c)?
+        dr, dc = DELTA[a]
+        nr, nc = r + dr, c + dc
+        if not (0 <= nr < h and 0 <= nc < len(grid[nr])) or grid[nr][nc] == '#':
+            return  # inconsistent trajectory; discard rest of level
+        # Compute features BEFORE the move.
+        lmask_sig, _, _ = _features_for_training_step(grid, r, c)
+        depth_tag = depth % INTERNAL_DEPTH_MOD
+        yield (lmask_sig, prev, min(rle, 9), ht, depth_tag), a
+        # Step
+        r, c = nr, nc
+        ht = (ht + a)[-6:]
+        rle = rle + 1 if a == prev else 1
+        prev = a
+        depth += 1
+        if (r, c) == target:
+            return
+
+
+def make_policy(training_data, config=None):
+    """Build a Policy by counting (state_features, action) pairs on training.
+
+    training_data: dict with key 'levels' (list), or directly a list of
+        level dicts (`{grid, start, goal, solution, ...}`).
+    config: optional dict (e.g. {'alpha': 0.5}).
+    """
+    cfg = dict(config or {})
+    alpha = float(cfg.get('alpha', 0.5))
+
+    levels = []
+    if isinstance(training_data, dict):
+        levels = training_data.get('levels', []) or []
+    elif isinstance(training_data, list):
+        levels = training_data
+
+    table_loose = defaultdict(lambda: defaultdict(float))
+    table_with_depth = defaultdict(lambda: defaultdict(float))
+
+    for lv in levels:
+        if not isinstance(lv, dict):
+            continue
+        grid = lv.get('grid')
+        start = lv.get('start')
+        goal = lv.get('goal')
+        solution = lv.get('solution') or []
+        if not grid or not start or not goal or not solution:
+            continue
+        try:
+            for (lmask_sig, prev, rle, ht, depth_tag), a in _validate_and_walk_level(
+                grid, start, goal, solution,
+            ):
+                loose_key = (lmask_sig, prev, rle, ht)
+                deep_key = (loose_key, depth_tag)
+                table_loose[loose_key][a] += 1.0
+                table_with_depth[deep_key][a] += 1.0
+        except Exception:
+            continue
+
+    return Policy(
+        table_loose={k: dict(v) for k, v in table_loose.items()},
+        table_with_depth={k: dict(v) for k, v in table_with_depth.items()},
+        alpha=alpha,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convenience (only useful inside this module; harmless when imported)
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':  # pragma: no cover
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else 'data/training_levels.json'
+    with open(path) as f:
+        td = json.load(f)
+    p = make_policy(td)
+    print('Policy built.')
+    print('  loose keys:', len(p.table_loose))
+    print('  deep keys :', len(p.table_with_depth))

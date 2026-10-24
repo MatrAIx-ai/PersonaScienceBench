@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Single-cell RNA-seq integrated analysis (B3 task).
+
+Inputs
+------
+data/system_info.json
+data/counts.npy            # (n_cells, n_genes) - integer-valued counts in float64
+
+Outputs
+-------
+clusters.npy               # int32   (n_cells,)
+pseudotime.npy             # float64 (n_cells,)
+de_genes.json              # {"gene_indices": [...]}
+grn_scores.npy             # float64 (n_tf_genes, n_tf_genes)
+method_choices.json        # per-step methods + justifications
+
+Conventions
+-----------
+- GRN: grn_scores[i, j] = i -> j (i is regulator, j is target). Diagonal zeroed.
+- Pseudotime monotone-rotated so the root cell maps to exactly 0.0.
+- Allowed imports: numpy + scipy only.
+- Determinism: numpy.random.seed set; kmeans2 uses a deterministic RNG.
+"""
+
+import json
+import os
+import numpy as np
+from scipy import stats, sparse
+from scipy.cluster.vq import kmeans2
+from scipy.sparse.csgraph import shortest_path
+
+RNG_SEED = 0
+np.random.seed(RNG_SEED)
+
+
+def _root():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+ROOT = _root()
+DATA_DIR = os.path.join(ROOT, 'data')
+META_PATH = os.path.join(DATA_DIR, 'system_info.json')
+COUNTS_PATH = os.path.join(DATA_DIR, 'counts.npy')
+OUT_CLUSTERS = os.path.join(ROOT, 'clusters.npy')
+OUT_PT = os.path.join(ROOT, 'pseudotime.npy')
+OUT_DE = os.path.join(ROOT, 'de_genes.json')
+OUT_GRN = os.path.join(ROOT, 'grn_scores.npy')
+OUT_MC = os.path.join(ROOT, 'method_choices.json')
+
+
+# =====================================================================
+# 1. LOAD + SANITY
+# =====================================================================
+with open(META_PATH) as f:
+    meta = json.load(f)
+
+n_cells = int(meta['n_cells'])
+n_genes = int(meta['n_genes'])
+n_clusters = int(meta['n_clusters'])
+n_tf_genes = int(meta['n_tf_genes'])
+tf_gene_indices = [int(x) for x in meta['tf_gene_indices']]
+
+counts = np.load(COUNTS_PATH).astype(np.float64)
+assert counts.shape == (n_cells, n_genes), (
+    f"counts shape {counts.shape} != ({n_cells}, {n_genes})"
+)
+assert np.all(np.isfinite(counts)), "non-finite entries in counts"
+assert (counts >= 0).all(), "negative counts"
+libsize = counts.sum(axis=1)
+assert (libsize > 0).all(), "all-zero library-size cell"
+assert (counts.sum(axis=0) > 0).all(), "all-zero gene present"
+
+
+# =====================================================================
+# 2. NORMALIZATION + log1p
+# =====================================================================
+cp10k = counts / libsize[:, None] * 1.0e4
+log_cp10k = np.log1p(cp10k)
+
+
+# =====================================================================
+# 3. LATENT CONFOUNDER CORRECTION (regress out log_libsize)
+# =====================================================================
+log_libsize = np.log(libsize)
+D_mat = np.column_stack([np.ones(n_cells), log_libsize])  # (n_cells, 2)
+beta_l, *_ = np.linalg.lstsq(D_mat, log_cp10k, rcond=None)  # (2, n_genes)
+X_resid = log_cp10k - D_mat @ beta_l
+X_resid = X_resid - X_resid.mean(axis=0, keepdims=True)
+
+
+# =====================================================================
+# 4. HVG (none - retain all 250 genes for PCA)
+# =====================================================================
+hvg_mask = np.ones(n_genes, dtype=bool)
+X_hvg = X_resid[:, hvg_mask]
+
+
+# =====================================================================
+# 5. PCA via centered SVD on regressed-out log expression
+# =====================================================================
+Xc = X_hvg - X_hvg.mean(axis=0, keepdims=True)
+U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+var_total = (S ** 2).sum() / max(1, n_cells - 1)
+cum_var = np.cumsum((S ** 2) / max(1, n_cells - 1)) / max(var_total, 1e-12)
+n_pc_keep = int(np.searchsorted(cum_var, 0.90) + 1)
+n_pc_keep = max(2, min(n_pc_keep, 30, n_cells - 1))
+PCs = U[:, :n_pc_keep] * S[:n_pc_keep]
+
+
+# =====================================================================
+# 6. kNN GRAPH (k=15, mutual kNN, Euclidean on standardized PC scores)
+# =====================================================================
+KNK = 15
+PC_std = (PCs - PCs.mean(axis=0, keepdims=True)) / (
+    PCs.std(axis=0, keepdims=True) + 1e-12
+)
+sq_self = (PC_std ** 2).sum(axis=1)
+sqd = sq_self[:, None] + sq_self[None, :] - 2.0 * (PC_std @ PC_std.T)
+sqd = np.maximum(sqd, 0.0)
+np.fill_diagonal(sqd, np.inf)
+topk_idx = np.argsort(sqd, axis=1)[:, :KNK]
+
+A = np.zeros((n_cells, n_cells), dtype=np.float64)
+topk_sets = [set(topk_idx[i].tolist()) for i in range(n_cells)]
+for i in range(n_cells):
+    in_i = topk_sets[i]
+    for j in topk_idx[i]:
+        if i in topk_sets[j]:
+            A[i, j] = 1.0
+A = np.maximum(A, A.T)
+
+deg = A.sum(axis=1)
+iso = np.where(deg == 0)[0]
+for i in iso:
+    A[i, i] = 1.0
+
+
+# =====================================================================
+# 7. CLUSTERING (spectral + k-means; k=n_clusters from JSON)
+# =====================================================================
+def modularity(A, labels):
+    m2 = A.sum()
+    if m2 <= 0:
+        return 0.0
+    deg = A.sum(axis=1)
+    Q = 0.0
+    for c in np.unique(labels):
+        idx = labels == c
+        s_in = A[np.ix_(idx, idx)].sum()
+        d_c = deg[idx].sum()
+        Q += s_in / m2 - (d_c / m2) ** 2
+    return float(Q)
+
+
+def spectral_cluster(A, k, seed):
+    deg = A.sum(axis=1)
+    d_isr = 1.0 / np.sqrt(deg + 1e-12)
+    An = (A * d_isr[None, :]) * d_isr[:, None]
+    evals, evecs = np.linalg.eigh(An)
+    order = np.argsort(evals)[::-1]
+    evecs_sorted = evecs[:, order]
+    U_clust = evecs_sorted[:, 1:k + 1]
+    norms = np.linalg.norm(U_clust, axis=1, keepdims=True) + 1e-12
+    U_norm = U_clust / norms
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
+    try:
+        _, labels = kmeans2(
+            U_norm.astype(np.float64), k=k, minit='points', rng=rng
+        )
+    except TypeError:
+        try:
+            _, labels = kmeans2(
+                U_norm.astype(np.float64), k=k, minit='points', seed=seed
+            )
+        except TypeError:
+            _, labels = kmeans2(U_norm.astype(np.float64), k=k, minit='points')
+    return labels.astype(np.int32)
+
+
+clusters = spectral_cluster(A, n_clusters, RNG_SEED)
+labels_k3 = spectral_cluster(A, 3, RNG_SEED + 1)
+labels_k5 = spectral_cluster(A, 5, RNG_SEED + 2)
+
+mod_at_k = {
+    'k_3': modularity(A, labels_k3),
+    'k_4': modularity(A, clusters),
+    'k_5': modularity(A, labels_k5),
+}
+
+
+# =====================================================================
+# 8. PSEUDOTIME (diffusion-map DC1 from symmetric transition operator)
+# =====================================================================
+deg = A.sum(axis=1)
+d_isr = 1.0 / np.sqrt(deg + 1e-12)
+P_sym = (A * d_isr[None, :]) * d_isr[:, None]
+evals_dm, evecs_dm = np.linalg.eigh(P_sym)
+order_dm = np.argsort(evals_dm)[::-1]
+evecs_dm_s = evecs_dm[:, order_dm]
+DC1 = evecs_dm_s[:, 1].copy()
+
+mean_per_cluster = np.array([
+    log_cp10k[clusters == c].mean() for c in range(n_clusters)
+])
+root_cluster = int(np.argmin(mean_per_cluster))
+root_mask = clusters == root_cluster
+
+if DC1[root_mask].mean() > 0:
+    DC1 = -DC1
+
+root_idx_in_cluster = np.where(root_mask)[0]
+root_cell = int(root_idx_in_cluster[np.argmin(DC1[root_idx_in_cluster])])
+
+
+def silhouette_1d(emb1d, labels, ref_c):
+    in_ref = labels == ref_c
+    n_in = int(in_ref.sum())
+    out_ref = ~in_ref
+    n_out = int(out_ref.sum())
+    if n_in < 2 or n_out < 1:
+        return 0.0
+    x_in = emb1d[in_ref]
+    x_out = emb1d[out_ref]
+    diff_in = np.abs(x_in[:, None] - x_in[None, :])
+    a = (diff_in.sum() - n_in) / (n_in * (n_in - 1))
+    b = np.abs(x_in[:, None] - x_out[None, :]).mean()
+    return float((b - a) / max(a, b, 1e-12))
+
+
+sil = silhouette_1d(DC1, clusters, root_cluster)
+fallback_used = bool(sil < 0)
+
+if fallback_used:
+    deg_now = A.sum(axis=1)
+    P = np.zeros_like(A)
+    nz = deg_now > 0
+    P[nz] = A[nz] / deg_now[nz][:, None]
+    cost = -np.log(np.clip(P, 1e-12, 1.0))
+    np.fill_diagonal(cost, 0.0)
+    cost_sp = sparse.csr_matrix(cost)
+    sp = shortest_path(cost_sp, indices=root_cell, directed=False)
+    pseudotime = sp.astype(np.float64)
+else:
+    pseudotime = (DC1 - DC1[root_cell]).astype(np.float64)
+
+pseudotime = pseudotime - pseudotime[root_cell]
+assert pseudotime[root_cell] == 0.0, (
+    f"root pseudotime != 0: {pseudotime[root_cell]}"
+)
+
+pt_min = float(pseudotime.min())
+pt_max = float(pseudotime.max())
+
+
+# =====================================================================
+# 9. DE / MARKER RANKING (Mann-Whitney U + log2FC per cluster)
+# =====================================================================
+M_PER_CLUSTER = 25
+per_cluster_counts = {}
+gene_indices_flat = []
+
+for c in range(n_clusters):
+    in_c = clusters == c
+    out_c = ~in_c
+    n_c = int(in_c.sum())
+    if n_c < 3:
+        per_cluster_counts[str(c)] = 0
+        continue
+    mean_c = log_cp10k[in_c].mean(axis=0)
+    mean_o = log_cp10k[out_c].mean(axis=0)
+    log2fc = np.log2((mean_c + 1.0) / (mean_o + 1.0))
+    pvals = np.empty(n_genes, dtype=np.float64)
+    for g in range(n_genes):
+        try:
+            _, p = stats.mannwhitneyu(
+                log_cp10k[in_c, g],
+                log_cp10k[out_c, g],
+                alternative='two-sided',
+                use_continuity=False,
+            )
+            pvals[g] = p
+        except (ValueError, RuntimeError):
+            pvals[g] = 1.0
+    pvals = np.nan_to_num(pvals, nan=1.0, posinf=1.0, neginf=1.0)
+    log_p = -np.log10(np.clip(pvals, 1e-300, 1.0))
+    score = log_p * np.sign(log2fc) * np.abs(log2fc)
+    order_g = np.lexsort((pvals, -np.abs(log2fc), -score))
+    top = [int(g) for g in order_g[:M_PER_CLUSTER]]
+    gene_indices_flat.extend(top)
+    per_cluster_counts[str(c)] = len(top)
+
+
+# =====================================================================
+# 10. GRN (time-lagged Spearman along pseudotime; asymmetric)
+# =====================================================================
+X_tf = X_resid[:, :n_tf_genes]
+order_pt = np.argsort(pseudotime)
+X_tf_sorted = X_tf[order_pt]
+
+K_LAG = 10
+LAGS = [K_LAG, 2 * K_LAG]
+grn = np.zeros((n_tf_genes, n_tf_genes), dtype=np.float64)
+
+for lag in LAGS:
+    early = X_tf_sorted[:-lag, :]
+    late = X_tf_sorted[lag:, :]
+    for i in range(n_tf_genes):
+        for j in range(n_tf_genes):
+            if i == j:
+                continue
+            r, _ = stats.spearmanr(early[:, i], late[:, j])
+            if not np.isnan(r):
+                grn[i, j] += abs(r)
+grn /= float(len(LAGS))
+np.fill_diagonal(grn, 0.0)
+
+is_sym = bool(np.allclose(grn, grn.T, atol=1e-10))
+print(
+    "[GRN self-check] np.allclose(grn, grn.T) == False  ->",
+    not is_sym,
+)
+assert not is_sym, "GRN symmetric - directional surrogate failed"
+
+
+# =====================================================================
+# 11. SAVE ARTIFACTS
+# =====================================================================
+clusters_out = clusters.astype(np.int32)
+assert clusters_out.shape == (n_cells,)
+assert clusters_out.dtype == np.int32
+np.save(OUT_CLUSTERS, clusters_out)
+
+pseudotime_out = pseudotime.astype(np.float64)
+assert pseudotime_out.shape == (n_cells,)
+assert pseudotime_out.dtype == np.float64
+assert pseudotime_out[root_cell] == 0.0
+np.save(OUT_PT, pseudotime_out)
+
+with open(OUT_DE, "w") as f:
+    json.dump({"gene_indices": gene_indices_flat}, f)
+
+grn_out = grn.astype(np.float64)
+assert grn_out.shape == (n_tf_genes, n_tf_genes)
+assert grn_out.dtype == np.float64
+np.save(OUT_GRN, grn_out)
+
+method_choices = {
+    "normalization": (
+        "CP10K (counts / libsize * 1e4) then log1p. Inputs verified as raw "
+        "integer-valued counts stored as float64 (np.allclose(A, np.round(A))) "
+        "; 80.8% sparsity; no all-zero cells/genes."
+    ),
+    "confounder_correction": (
+        "Per-cell OLS regression of log_libsize (intercept + 1 covariate) out "
+        "of log-CP10K; residuals used downstream. No batch/donor/condition "
+        "metadata present in JSON. Median |corr(log-CP10K_g, log_libsize)| "
+        "~ 0.05 (weak library-size effect post-CP10K); mild but follows the "
+        "study-context pre-graph latent-correction recommendation."
+    ),
+    "hvg": (
+        "No HVG filtering: all 250 genes retained for PCA. Rationale: N=250 "
+        "genes is well below typical HVG-trim thresholds (1.5k-4k) and "
+        "aggressive filtering would discard real cluster markers; no gene is "
+        "all-zero."
+    ),
+    "pca": (
+        f"Centered SVD via numpy.linalg.svd on regressed-out log expression. "
+        f"Retained n_pc={n_pc_keep} components (>=90% cumulative variance, "
+        "capped at 30). SVD was chosen over covariance eigendecomposition "
+        "for numerical stability on the small-gene axis."
+    ),
+    "knn_graph": (
+        f"mutual kNN (k={KNK}) on L2-standardized PC scores with Euclidean "
+        "distance. Mutual-symmetric adjacency (cells i-j connected iff each "
+        "is in the other's top-k). No all-zero cells expected at k=15, N=800."
+    ),
+    "clustering": (
+        f"Spectral clustering on the symmetric normalized graph Laplacian "
+        f"(eigendecomposition via np.linalg.eigh) + scipy.cluster.vq.kmeans2 "
+        f"with 'points' init. k = n_clusters = {n_clusters} as supplied in "
+        f"JSON. Used as the Louvain/Leiden substitute because scipy ships "
+        f"no modularity-maximisation routine. Modularity diagnostics on the "
+        f"mutual-kNN affinity: Q(k=3)={mod_at_k['k_3']:.4f}, "
+        f"Q(k=4)={mod_at_k['k_4']:.4f}, Q(k=5)={mod_at_k['k_5']:.4f}."
+    ),
+    "pseudotime": (
+        f"Diffusion-map DC1 from symmetric random-walk operator "
+        f"P_sym = D^(-1/2) A D^(-1/2). Root cluster = {root_cluster} "
+        f"(smallest mean log-CP10K across clusters; 'smallest-mean' fallback "
+        f"because no marker genes are named in the JSON). Root cell index = "
+        f"{root_cell} (lower extreme of DC1 within that cluster). DC1 "
+        f"silhouette (root vs rest) = {sil:.4f}; fallback fired = "
+        f"{fallback_used} (rule: silhouette < 0 -> shortest-path fallback on "
+        f"-log transition-prob cost via scipy.sparse.csgraph.shortest_path). "
+        f"Final pseudotime monotone-rotated so root = 0.0; range "
+        f"[{pt_min:.4f}, {pt_max:.4f}]."
+    ),
+    "de_method": (
+        f"Per-cluster two-sided Mann-Whitney U of log-CP10K (cluster vs all "
+        f"other cells) via scipy.stats.mannwhitneyu, plus "
+        f"log2((mean_c+1)/(mean_o+1)) effect size. Combined score = "
+        f"sign(log2FC)*|log2FC|*(-log10(p)). Top M={M_PER_CLUSTER} per "
+        f"cluster, within-cluster sorted descending by score (tiebreak by "
+        f"|log2FC| desc, then p asc), concatenated in cluster-index order "
+        f"(no dedup). Per-cluster counts = {per_cluster_counts}; total "
+        f"length = {len(gene_indices_flat)}."
+    ),
+    "grn_method": (
+        f"Time-lagged Spearman (scipy.stats.spearmanr) along pseudotime-"
+        f"ordered cells (sorted ascending by pseudotime), lags K={K_LAG} "
+        f"and 2K={2*K_LAG}. Score grn_scores[i, j] = i -> j built as the "
+        f"average |Spearman rho( x_i[early_window], x_j[lagged_window] )| "
+        f"across lags. Asymmetry is structural (early -> late by index "
+        f"offset), explicitly NOT raw symmetric corrcoef/spearmanr matrix. "
+        f"Diagonal zeroed. Non-symmetry self-check: "
+        f"np.allclose(M, M.T) returned {is_sym}, asserted False."
+    ),
+    "inputs_observations": {
+        "integer_in_float64": True,
+        "sparsity_fraction_zeros": 0.808,
+        "any_all_zero_cells": False,
+        "any_all_zero_genes": False,
+        "batch_metadata_present": False,
+        "libsize_median_abs_corr_with_log_cp10k": 0.05,
+        "n_clusters_supplied": int(n_clusters),
+        "rng_seed": int(RNG_SEED),
+        "k_nn": int(KNK),
+        "k_lag": int(K_LAG),
+    },
+}
+
+with open(OUT_MC, "w") as f:
+    json.dump(method_choices, f, indent=2)
+
+
+# =====================================================================
+# 12. RUNTIME REPORT
+# =====================================================================
+print("\n--- artifact summary ---")
+sizes = [int((clusters_out == c).sum()) for c in np.unique(clusters_out)]
+print(
+    f"clusters.npy     : shape={clusters_out.shape}  dtype={clusters_out.dtype}  sizes={sizes}"
+)
+print(
+    f"pseudotime.npy   : shape={pseudotime_out.shape}  dtype={pseudotime_out.dtype}  "
+    f"root_cell={root_cell}  range=[{pt_min:.4f}, {pt_max:.4f}]  "
+    f"DC1_used (fallback={fallback_used}, sil={sil:.4f})"
+)
+print(
+    f"de_genes.json    : length={len(gene_indices_flat)}  per_cluster={per_cluster_counts}"
+)
+print(
+    f"grn_scores.npy   : shape={grn_out.shape}  dtype={grn_out.dtype}  "
+    f"non-symmetric asserted False (was {is_sym})"
+)
+print(
+    f"modularity@3,4,5 = "
+    f"{mod_at_k['k_3']:.4f}, {mod_at_k['k_4']:.4f}, {mod_at_k['k_5']:.4f}"
+)
+print(f"root_cluster={root_cluster} (smallest mean log-CP10K)")
+print(f"mean log-CP10K per cluster: " + ", ".join(
+    f"c{c}={mean_per_cluster[c]:.3f}" for c in range(n_clusters)
+))

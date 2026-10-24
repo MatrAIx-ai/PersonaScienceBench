@@ -1,0 +1,257 @@
+"""
+B3 signal-recovery: recover latent summary and predict future component-A values.
+
+Algorithm per case (applied to obs_0 only):
+  1. Lomb-Scargle periodogram on obs_0 (P in [0.5, 80] d, dense grid).
+  2. Top-8 peaks with separation >= 1 d; parabolic sub-bin refinement.
+  3. Detect 2:1 harmonic pair (P, P/2) within tolerance 0.06; P_B_init = max of strongest such pair.
+     Fallback: P_B_init = top LS peak.
+  4. Refine P_B by 1-D OLS-RSS search (bounded +/-10% around P_B_init).
+  5. Fit B-only model: offset + sin/cos(P_B) + sin/cos(P_B/2). Compute residual_std/noise ratio.
+  6. If ratio > 1.30:
+       - Prewhiten, mask B fundamental/harmonic neighborhoods in the periodogram, take top residual peak (parabolic refine).
+       - Refine P_A by 1-D OLS-RSS search (bounded +/-30%, then +/-50% defensively).
+       - Fit full 7-parameter model.
+       - A_present = (BIC_no_A - BIC_with_A > 6) AND (A_amp > 2 * noise).
+     Else: A_present = 0; P_A = 0; A coefficients = 0.
+  7. basis1_u0..basis4_u0, offset_u0 read from the final LSQ coefficients (t0=0 => t-t0 = t).
+  8. Predictions = a1 sin(2 pi t / P_A) + a2 cos(2 pi t / P_A); 0.0 if A absent.
+"""
+import json
+import numpy as np
+import pandas as pd
+from scipy.signal import lombscargle
+from scipy.optimize import minimize_scalar
+
+# ---------- I/O ----------
+with open('data/input_0.json', 'r') as f:
+    meta = json.load(f)
+ref_epoch = float(meta['reference_epoch_day'])
+case_order = list(meta['case_order'])
+
+obs = pd.read_csv('data/input_1.csv')
+tgt = pd.read_csv('data/input_2.csv')
+
+# Periodogram grid
+P_MIN, P_MAX, N_GRID = 0.5, 80.0, 64000
+p_grid = np.linspace(P_MIN, P_MAX, N_GRID)
+w_grid = 2 * np.pi / p_grid
+
+
+# ---------- helpers ----------
+def fit_ols(t, y, periods_with_offsets):
+    """periods_with_offsets: list of (period, harmonic_factor).
+       Column 0 is constant offset (1's); for each (P,h) we add sin(2 pi h t / P) and cos(...).
+    """
+    cols = [np.ones_like(t)]
+    for P, h in periods_with_offsets:
+        ang = 2 * np.pi * h / P * t
+        cols.append(np.sin(ang))
+        cols.append(np.cos(ang))
+    X = np.column_stack(cols)
+    c, *_ = np.linalg.lstsq(X, y, rcond=None)
+    r = y - X @ c
+    return c, X, X @ c, r
+
+
+def bic(N, rss, k):
+    return N * np.log(rss / N) + k * np.log(N)
+
+
+def ls_periodogram(t, y):
+    Yn = (y - y.mean()) / y.std() if y.std() > 0 else (y - y.mean())
+    return lombscargle(t, Yn, w_grid, normalize=True)
+
+
+def top_peaks_parabolic(pgram, sep_days=1.0, n=8):
+    min_sep = int(sep_days / (p_grid[1] - p_grid[0]))
+    peaks_idx = []
+    idx_sorted = np.argsort(pgram)
+    for i in idx_sorted[::-1]:
+        ok = True
+        for ip in peaks_idx:
+            if abs(ip - i) < min_sep:
+                ok = False; break
+        if ok:
+            peaks_idx.append(i)
+            if len(peaks_idx) >= n:
+                break
+    out = []
+    for ip in peaks_idx:
+        if 0 < ip < len(p_grid) - 1:
+            y0, y1, y2 = pgram[ip - 1], pgram[ip], pgram[ip + 1]
+            dx = 0.5 * (y0 - y2) / (y0 - 2 * y1 + y2) if (y0 - 2 * y1 + y2) != 0 else 0.0
+            out.append((p_grid[ip] + dx * (p_grid[1] - p_grid[0]), int(ip)))
+        else:
+            out.append((p_grid[ip], int(ip)))
+    return out  # list of (period, power_index)
+
+
+def masked_top_residual(t, r, mask_freqs, margin=0.003):
+    if r.std() <= 0:
+        return None, 0.0
+    Yr = (r - r.mean()) / r.std()
+    pg = lombscargle(t, Yr, w_grid, normalize=True)
+    keep = np.ones(len(p_grid), dtype=bool)
+    for f0 in mask_freqs:
+        for k in range(1, 12):
+            keep &= np.abs(1.0 / p_grid - k * f0) > margin
+            keep &= np.abs(1.0 / p_grid - f0 / k) > margin
+    pg_kept = np.where(keep, pg, 0.0)
+    idx = int(np.argmax(pg_kept))
+    if 0 < idx < len(p_grid) - 1:
+        y0, y1, y2 = pg[idx - 1], pg[idx], pg[idx + 1]
+        dx = 0.5 * (y0 - y2) / (y0 - 2 * y1 + y2) if (y0 - 2 * y1 + y2) != 0 else 0.0
+        return p_grid[idx] + dx * (p_grid[1] - p_grid[0]), float(pg[idx])
+    return float(p_grid[idx]), float(pg[idx])
+
+
+# ---------- main loop ----------
+summary = []
+predictions = []
+
+print("=== Recovery per case ===")
+for c in case_order:
+    sub = obs[obs['case_id'] == c].sort_values('time_day')
+    t = sub['time_day'].values - ref_epoch
+    y = sub['obs_0'].values
+    err = sub['obs_0_err'].values
+    N = len(t)
+    noise = float(err.mean())
+
+    pgram = ls_periodogram(t, y)
+    peaks = top_peaks_parabolic(pgram, sep_days=1.0, n=8)
+    refined_peaks = [pk[0] for pk in peaks]
+
+    pairs = []
+    for i in range(len(peaks)):
+        for j in range(i + 1, len(peaks)):
+            a, b = sorted([peaks[i][0], peaks[j][0]])
+            if abs(a / b - 0.5) < 0.06:
+                pairs.append((b, a, pgram[peaks[i][1]] + pgram[peaks[j][1]]))
+    if pairs:
+        pairs.sort(key=lambda x: -x[2])
+        P_B_init = pairs[0][0]
+    else:
+        P_B_init = refined_peaks[0]
+    print(f"\n{c}: N={N}, noise={noise:.3f}, top peaks={[round(p,3) for p in refined_peaks[:6]]}, P_B_init={P_B_init:.4f}")
+
+    # Refine P_B
+    def rss_PB(logP):
+        P = np.exp(logP)
+        _, _, _, r = fit_ols(t, y, [(P, 1), (P, 2)])
+        return float(np.sum(r ** 2))
+
+    res = minimize_scalar(rss_PB, bounds=(np.log(max(P_MIN, P_B_init * 0.9)),
+                                          np.log(P_B_init * 1.1)),
+                          method='bounded', options=dict(xatol=1e-7))
+    P_B = float(np.exp(res.x))
+
+    cB, XB, fitB, rB = fit_ols(t, y, [(P_B, 1), (P_B, 2)])
+    rss_B = float(np.sum(rB ** 2))
+    bic_B = bic(N, rss_B, XB.shape[1])
+    resid_std_B = float(np.sqrt(rss_B / N))
+    ratio = resid_std_B / noise
+    print(f"  P_B={P_B:.5f}  rss_B={rss_B:.2f}  resid_std(no-A)={resid_std_B:.3f}  ratio={ratio:.3f}  BIC={bic_B:.2f}")
+
+    A_present = False
+    P_A = 0.0
+    A1 = A2 = 0.0
+    B1, B2 = float(cB[1]), float(cB[2])
+    B3, B4 = float(cB[3]), float(cB[4])
+    offset_val = float(cB[0])
+
+    if ratio > 1.30:
+        mask_freqs = [1.0 / P_B, 2.0 / P_B]
+        P_A_init, pwr = masked_top_residual(t, rB, mask_freqs=mask_freqs, margin=0.003)
+        if P_A_init is None:
+            P_A_init = 0.5 * P_B
+        print(f"  Top residual peak (B freqs masked) -> P_A_init={P_A_init:.4f} d  power={pwr:.4f}")
+
+        best_rss = np.inf
+        best_PA = P_A_init
+        best_cA = cB
+        for frac in (0.30, 0.50):
+            lo = max(np.log(P_MIN), np.log(P_A_init * (1 - frac)))
+            hi = np.log(min(P_MAX, P_A_init * (1 + frac)))
+            if hi <= lo:
+                continue
+            resA = minimize_scalar(lambda lp: (
+                lambda P: float(np.sum(fit_ols(t, y, [(P, 1), (P_B, 1), (P_B, 2)])[3] ** 2))
+            )(np.exp(lp)),
+                bounds=(lo, hi), method='bounded', options=dict(xatol=1e-7))
+            P_try = float(np.exp(resA.x))
+            c_try, X_try, _, r_try = fit_ols(t, y, [(P_try, 1), (P_B, 1), (P_B, 2)])
+            rss_try = float(np.sum(r_try ** 2))
+            if rss_try < best_rss:
+                best_rss = rss_try
+                best_PA = P_try
+                best_cA = c_try
+        P_A = best_PA
+        cA, XA, fitA, rA = fit_ols(t, y, [(P_A, 1), (P_B, 1), (P_B, 2)])
+        rss_A = float(np.sum(rA ** 2))
+        bic_A = bic(N, rss_A, XA.shape[1])
+        RA = float(np.hypot(cA[1], cA[2]))
+        RB = float(np.hypot(cA[3], cA[4]))
+        RH = float(np.hypot(cA[5], cA[6]))
+        offset_val_final = float(cA[0])
+        delta_bic = bic_B - bic_A
+
+        print(f"  with-A: P_A={P_A:.5f}  resid_std={np.sqrt(rss_A/N):.3f} ({np.sqrt(rss_A/N)/noise:.2f}σ)")
+        print(f"  A_amp={RA:.3f} ({RA/noise:.2f}σ)  B_fund={RB:.3f}  B_harm={RH:.3f}  offset={offset_val_final:.3f}")
+        print(f"  ΔBIC = BIC(no-A) - BIC(with-A) = {delta_bic:.2f}")
+
+        A_present = (delta_bic > 6.0) and (RA > 2.0 * noise)
+        print(f"  A_present decision = {A_present}")
+
+        if A_present:
+            offset_val = offset_val_final
+            A1, A2 = float(cA[1]), float(cA[2])
+            B1, B2 = float(cA[3]), float(cA[4])
+            B3, B4 = float(cA[5]), float(cA[6])
+        else:
+            P_A = 0.0
+    else:
+        print(f"  ratio <= 1.30 -> A absent.")
+
+    P_A_for_csv = float(P_A) if A_present else 0.0
+
+    summary.append(dict(
+        case_id=c,
+        component_a_present=int(A_present),
+        component_a_period_day=P_A_for_csv,
+        component_a_basis1_u0=A1,
+        component_a_basis2_u0=A2,
+        component_b_period_day=float(P_B),
+        component_b_basis1_u0=B1,
+        component_b_basis2_u0=B2,
+        component_b_basis3_u0=B3,
+        component_b_basis4_u0=B4,
+        offset_u0=offset_val,
+    ))
+
+    for _, row in tgt[tgt['case_id'] == c].iterrows():
+        tpred = float(row['time_day']) - ref_epoch
+        if A_present:
+            A_val = A1 * np.sin(2 * np.pi * tpred / P_A) + A2 * np.cos(2 * np.pi * tpred / P_A)
+        else:
+            A_val = 0.0
+        predictions.append(dict(case_id=c, time_day=float(row['time_day']),
+                                component_a_value_u0=float(A_val)))
+
+# ---------- write outputs ----------
+cols_sum = ['case_id', 'component_a_present', 'component_a_period_day',
+            'component_a_basis1_u0', 'component_a_basis2_u0',
+            'component_b_period_day', 'component_b_basis1_u0',
+            'component_b_basis2_u0', 'component_b_basis3_u0',
+            'component_b_basis4_u0', 'offset_u0']
+sum_df = pd.DataFrame(summary)[cols_sum]
+sum_df.to_csv('signal_summary.csv', index=False)
+
+pred_df = pd.DataFrame(predictions)[['case_id', 'time_day', 'component_a_value_u0']]
+pred_df.to_csv('target_predictions.csv', index=False)
+
+print("\n=== signal_summary.csv ===")
+print(sum_df.to_string(index=False))
+print("\n=== target_predictions.csv ===")
+print(pred_df.to_string(index=False))

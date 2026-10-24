@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+Single-cell RNA-seq Integrated Analysis Pipeline
+Implemented using strictly NumPy and SciPy.
+
+Steps:
+1. Preprocessing and Normalization:
+   - Library size normalization (counts scaled per cell to target sum of 10,000)
+   - Log1p transformation: log(1 + normalized_counts)
+   - Dimensionality reduction via SVD/PCA on centered expression matrix
+
+2. Clustering:
+   - Agglomerative Hierarchical Clustering (Ward's criterion) on top principal components
+   - Deterministic partition into n_clusters (k=4)
+
+3. Pseudotime Estimation:
+   - Manifold connectivity graph construction combining k-nearest neighbors (k=15)
+     and Minimum Spanning Tree (MST) to guarantee global connectivity
+   - Root cell identification at the extremal manifold boundary (minimum PC1 pole)
+   - Dijkstra shortest path geodesic distance from root, scaled to [0, 1]
+
+4. Differential Expression / Marker Gene Identification:
+   - One-vs-rest two-sample Welch's t-test for each cluster across all genes
+   - Maximum positive t-statistic ranking across clusters
+   - Export full ranked permutation of all gene indices to de_genes.json
+
+5. Directed TF Regulatory Network Inference:
+   - Multivariate regularized (Ridge) linear regression on standardized TF expression
+   - Predicts target TF j from all candidate regulators i != j
+   - grn_scores[i, j] = |W_{ij}| (directed edge i -> j), with zero diagonal
+"""
+
+import json
+import os
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree, dijkstra
+from scipy.stats import ttest_ind
+
+
+def main():
+    # ---------------------------------------------------------
+    # 0. Load Data and Metadata
+    # ---------------------------------------------------------
+    data_dir = "data"
+    system_info_path = os.path.join(data_dir, "system_info.json")
+    counts_path = os.path.join(data_dir, "counts.npy")
+
+    with open(system_info_path, "r") as f:
+        meta = json.load(f)
+
+    n_cells = meta["n_cells"]
+    n_genes = meta["n_genes"]
+    n_clusters = meta["n_clusters"]
+    n_tf_genes = meta["n_tf_genes"]
+
+    counts = np.load(counts_path)
+    assert counts.shape == (n_cells, n_genes), f"Unexpected counts shape: {counts.shape}"
+
+    # ---------------------------------------------------------
+    # 1. Preprocessing & Normalization
+    # ---------------------------------------------------------
+    lib_size = counts.sum(axis=1, keepdims=True)
+    target_sum = 1e4
+    norm_counts = np.log1p(counts / lib_size * target_sum)
+
+    # Dimensionality reduction via SVD / PCA
+    gene_means = norm_counts.mean(axis=0)
+    centered = norm_counts - gene_means
+    u, s, _ = np.linalg.svd(centered, full_matrices=False)
+    # Project onto top 4 principal components capturing cluster structure
+    pcs = u[:, :4] * s[:4]
+
+    # ---------------------------------------------------------
+    # 2. Clustering (Ward's Hierarchical Clustering)
+    # ---------------------------------------------------------
+    linkage_matrix = linkage(pcs, method="ward")
+    cluster_labels = fcluster(linkage_matrix, t=n_clusters, criterion="maxclust") - 1
+    clusters = cluster_labels.astype(np.int32)
+
+    np.save("clusters.npy", clusters)
+
+    # ---------------------------------------------------------
+    # 3. Pseudotime Estimation (Graph Dijkstra Shortest Paths)
+    # ---------------------------------------------------------
+    dist_matrix = squareform(pdist(pcs, metric="euclidean"))
+
+    # Construct k-NN adjacency (k=15)
+    k = 15
+    knn_matrix = np.zeros_like(dist_matrix)
+    for i in range(n_cells):
+        nn_idx = np.argsort(dist_matrix[i])[1:k + 1]
+        knn_matrix[i, nn_idx] = dist_matrix[i, nn_idx]
+    knn_sym = np.maximum(knn_matrix, knn_matrix.T)
+
+    # Construct MST to ensure global connectivity across clusters
+    mst = minimum_spanning_tree(csr_matrix(dist_matrix)).toarray()
+    mst_sym = np.maximum(mst, mst.T)
+
+    # Combined graph: local k-NN topology + minimal spanning bridges
+    graph_adj = np.maximum(knn_sym, mst_sym)
+    graph_csr = csr_matrix(graph_adj)
+
+    # Identify root cell as the extremal manifold pole along PC1
+    root_cell = int(np.argmin(pcs[:, 0]))
+
+    # Compute geodesic shortest paths from root
+    geo_dist = dijkstra(graph_csr, indices=root_cell)
+    pseudotime = (geo_dist - geo_dist.min()) / (geo_dist.max() - geo_dist.min())
+    pseudotime = pseudotime.astype(np.float64)
+
+    np.save("pseudotime.npy", pseudotime)
+
+    # ---------------------------------------------------------
+    # 4. Marker Gene Identification / Differential Expression
+    # ---------------------------------------------------------
+    de_scores = np.zeros(n_genes, dtype=np.float64)
+
+    for c in range(n_clusters):
+        in_mask = (clusters == c)
+        out_mask = ~in_mask
+        in_expr = norm_counts[in_mask]
+        out_expr = norm_counts[out_mask]
+
+        t_stat, _ = ttest_ind(in_expr, out_expr, axis=0, equal_var=False)
+        pos_t_stat = np.where(t_stat > 0, t_stat, 0.0)
+        de_scores = np.maximum(de_scores, pos_t_stat)
+
+    ranked_gene_indices = [int(idx) for idx in np.argsort(-de_scores)]
+
+    de_output = {"gene_indices": ranked_gene_indices}
+    with open("de_genes.json", "w") as f:
+        json.dump(de_output, f, indent=2)
+
+    # ---------------------------------------------------------
+    # 5. Directed TF Regulatory Network Scoring
+    # ---------------------------------------------------------
+    tf_expr = norm_counts[:, :n_tf_genes]
+    # Standardize TF expression
+    tf_mean = tf_expr.mean(axis=0)
+    tf_std = tf_expr.std(axis=0) + 1e-8
+    tf_scaled = (tf_expr - tf_mean) / tf_std
+
+    grn_scores = np.zeros((n_tf_genes, n_tf_genes), dtype=np.float64)
+    ridge_alpha = 1.0
+
+    for j in range(n_tf_genes):
+        regulators = [i for i in range(n_tf_genes) if i != j]
+        X = tf_scaled[:, regulators]
+        y = tf_scaled[:, j]
+
+        # Solve Ridge regression: w = (X^T X + alpha * I)^{-1} X^T y
+        XtX = X.T @ X
+        reg_mat = XtX + ridge_alpha * np.eye(len(regulators))
+        w = np.linalg.solve(reg_mat, X.T @ y)
+
+        for idx, reg_idx in enumerate(regulators):
+            grn_scores[reg_idx, j] = abs(w[idx])
+
+    # Ensure diagonal is strictly zero
+    np.fill_diagonal(grn_scores, 0.0)
+
+    np.save("grn_scores.npy", grn_scores)
+
+    # ---------------------------------------------------------
+    # 6. Method Choices and Justifications
+    # ---------------------------------------------------------
+    method_choices = {
+        "preprocessing": {
+            "method": "Library size normalization (CPM-style) and log1p transformation followed by PCA via SVD",
+            "justification": "Counts per cell vary due to sequencing depth; scaling total counts to 10,000 counts per cell and applying log(1 + x) stabilizes technical variance across the dynamic range. PCA via SVD isolates dominant biological variance from Poisson count noise while projecting cells into an orthogonal low-dimensional manifold.",
+            "parameters": {
+                "target_sum": 10000,
+                "n_components": 4
+            }
+        },
+        "clustering": {
+            "method": "Agglomerative Hierarchical Clustering with Ward linkage criterion",
+            "justification": "Ward's criterion minimizes within-cluster variance, producing compact, spherical, and well-balanced clusters in PCA space. Unlike K-means, Ward hierarchical clustering is fully deterministic, requires no random initialization, and cleanly separates the 4 synthetic cell groups.",
+            "parameters": {
+                "n_clusters": n_clusters,
+                "linkage": "ward",
+                "space": "PCA (top 4 components)"
+            }
+        },
+        "pseudotime": {
+            "method": "Geodesic shortest-path distance (Dijkstra) on a combined k-NN and Minimum Spanning Tree (MST) graph",
+            "justification": "Cellular differentiation manifests as a continuous non-linear trajectory across the latent manifold. A k-NN graph captures local cellular transitions, while MST ensures global connectivity across cluster boundaries without introducing spurious shortcut edges. Root identification at the extreme pole of the primary component (minimum PC1) establishes a directional origin, and Dijkstra shortest path computes continuous geodesic distance normalized to [0, 1].",
+            "parameters": {
+                "k_neighbors": 15,
+                "root_criterion": "minimum PC1 coordinate",
+                "distance_metric": "Euclidean on PCA space"
+            }
+        },
+        "differential_expression": {
+            "method": "One-versus-rest Welch's two-sample t-test ranked by maximum positive test statistic",
+            "justification": "Welch's t-test accounts for potential unequal variances between clusters and background cells. Taking the maximum positive t-statistic across all clusters specifically scores marker genes uniquely upregulated in at least one cluster, and sorting yields a comprehensive ranked list across all 250 genes.",
+            "parameters": {
+                "test": "two-sample Welch's t-test (equal_var=False)",
+                "ranking_statistic": "max(positive t-statistic across clusters)",
+                "output_scope": "all 250 genes in descending order of marker specificity"
+            }
+        },
+        "grn_inference": {
+            "method": "Multivariate regularized (Ridge) linear regression per target transcription factor",
+            "justification": "To infer directed regulatory interactions i -> j, each target TF j is modeled as a linear combination of all potential regulators i != j. Multiple regression isolates the direct regulatory effect of TF i on TF j conditioned on all co-regulators, yielding directed, asymmetric interaction coefficients W_{ij} != W_{ji}. Ridge regularization provides numerical stability against multicollinearity among correlated TFs.",
+            "parameters": {
+                "model": "Ridge regression",
+                "regularization_alpha": 1.0,
+                "input_standardization": "zero mean, unit variance per TF",
+                "diagonal_handling": "set to 0.0"
+            }
+        }
+    }
+
+    with open("method_choices.json", "w") as f:
+        json.dump(method_choices, f, indent=2)
+
+    print("Pipeline execution completed successfully.")
+    print(f"Generated artifacts: clusters.npy ({clusters.shape}, {clusters.dtype}), "
+          f"pseudotime.npy ({pseudotime.shape}, {pseudotime.dtype}), "
+          f"de_genes.json ({len(ranked_gene_indices)} genes), "
+          f"grn_scores.npy ({grn_scores.shape}, {grn_scores.dtype}), "
+          f"method_choices.json")
+
+
+if __name__ == "__main__":
+    main()

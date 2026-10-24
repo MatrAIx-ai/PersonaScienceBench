@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""Shared-mode recovery from complex response curves.
+
+Reads data/curves.csv and data/meta.json.  Each curve obeys
+
+    R(x) = a0 + sum_{k=1..K}  a_k / (1 + (i * x * tau_k)^phi_k)
+
+with shared (tau_k, phi_k) and curve-specific complex a0, nonnegative
+amplitudes a_k >= 0.  Physical constraints: tau_k > 0, 0 < phi_k <= 1.
+
+The script:
+  1. Pre-scans cross-curve -Im peaks for warm-start seeds.
+  2. Jointly fits (across all 5 curves) using variable-projection /
+     bounded least squares for the linear block (a0 complex; a_k >= 0)
+     and SciPy least_squares (TRF, bounds) on the nonlinear block
+     (log tau, phi).
+  3. Multistart over candidate orders K in {2..7}.
+  4. Picks K by BIC with a plateau rule and a local-optimality check.
+  5. Merges near-degenerate modes (Delta log tau < 0.1 decade) by
+     amplitude-weighted centroid.
+  6. Reports stability diagnostics (tau/phi/amplitude spread across top
+     restarts, conditioning, residual norm per curve, BIC table).
+  7. Writes results/modes.csv with the native submission contract:
+        tau,a_0,a_1,a_2,a_3,a_4
+     exactly one row per recovered mode, sorted by ascending tau, and
+     results/diagnostics.json with full supporting metadata.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.optimize import least_squares, lsq_linear
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+DATA_DIR = "data"
+RESULTS_DIR = "results"
+MODES_CSV = os.path.join(RESULTS_DIR, "modes.csv")
+DIAG_JSON = os.path.join(RESULTS_DIR, "diagnostics.json")
+
+CANDIDATE_K = (2, 3, 4, 5, 6, 7)
+LOG_TAU_BOUNDS = (-15.0, 15.0)            # log tau range (decades extreme)
+PHI_BOUNDS    = (0.05, 1.0)              # physical constraint 0 < phi <= 1
+LOG_DECADE_SEPARATION_INIT = 0.2         # min tau separation at init
+
+N_RANDOM_RESTARTS_PER_K = 10
+N_CONSENSUS_RESTARTS_PER_K = 5
+TOP_N_PER_K = 5                          # keep best fits per K for stability
+REFIT_NFEV = 250                         # high-precision refit
+SCAN_NFEV   = 150                        # rough scan
+SCAN_FTOL   = 1e-10
+REFIT_FTOL  = 1e-12
+
+MERGE_DECADE = 0.1                       # post-fit, merge if log-tau gap below
+REL_RESIDUAL_PLATEAU_BOUND = 0.10        # 10% rule on plateau picking
+
+RNG_SEED = 20261023
+
+
+# ----------------------------------------------------------------------
+# Data loading
+# ----------------------------------------------------------------------
+
+def load_data():
+    path = os.path.join(DATA_DIR, "curves.csv")
+    rows = []
+    with open(path) as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append((int(row["curve"]), float(row["x"]),
+                         float(row["re"]), float(row["im"])))
+    # group
+    xs_ref = None
+    curves_x = {}
+    curves_R = {}
+    for c, x, re_, im_ in rows:
+        curves_x.setdefault(c, []).append(x)
+        curves_R.setdefault(c, []).append(re_ + 1j * im_)
+    # verify x grid identical across curves
+    n_curves = len(curves_x)
+    n_per = None
+    xs_ref = None
+    for c in sorted(curves_x):
+        xs = np.asarray(curves_x[c])
+        if xs_ref is None:
+            xs_ref = xs
+            n_per = len(xs)
+        else:
+            if len(xs) != n_per:
+                raise ValueError("n_per mismatch")
+            if not np.allclose(np.sort(xs), np.sort(xs_ref), rtol=1e-6):
+                raise ValueError("x grid differs across curves")
+        # ensure sorted
+        order = np.argsort(xs)
+        curves_x[c] = xs[order]
+        curves_R[c] = np.asarray(curves_R[c])[order]
+    return curves_x, curves_R, n_curves, n_per, xs_ref
+
+
+# ----------------------------------------------------------------------
+# Basis
+# ----------------------------------------------------------------------
+
+def basis_complex(x, taus, phis):
+    """Return B (N,K) complex, b_k(x) = 1 / (1 + (i x tau_k)^phi_k)."""
+    K = len(taus)
+    x = np.atleast_1d(x)
+    N = len(x)
+    B = np.empty((N, K), dtype=np.complex128)
+    for k in range(K):
+        log_arg = np.log(np.maximum(x * taus[k], 1e-300))
+        log_ixtau = log_arg + 1j * (math.pi / 2.0)
+        B[:, k] = 1.0 / (1.0 + np.exp(phis[k] * log_ixtau))
+    return B
+
+
+
+def solve_bounded_robust(A, y, lower, upper, max_iter=50, tol=1e-12):
+    """Bound-constrained LS via active-set on free variables.
+
+    Faster than scipy.optimize.lsq_linear for our problem (small K, n_free
+    blocks tight to one orthant face).  Iteratively solve the unconstrained
+    LS on free variables after pinning active ones to their bound until the
+    active set stabilises.
+    """
+    theta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    for _ in range(max_iter):
+        active = (theta <= lower + tol) | (theta >= upper - tol)
+        if not np.any(active):
+            break
+        theta_pinned = np.where(active,
+                                np.where(theta <= lower + tol, lower, upper),
+                                theta)
+        A_red = A[:, ~active]
+        rhs = y - A[:, active] @ theta_pinned[active]
+        if A_red.shape[1] == 0:
+            theta_new = theta_pinned
+        else:
+            theta_red, *_ = np.linalg.lstsq(A_red, rhs, rcond=None)
+            theta_new = theta_pinned.copy()
+            theta_new[~active] = theta_red
+        diff = np.linalg.norm(theta_new - theta)
+        ref = 1.0 + np.linalg.norm(theta)
+        if diff < tol * ref:
+            theta = theta_new
+            break
+        theta = theta_new
+    theta = np.clip(theta, lower, upper)
+    return theta
+
+
+# ----------------------------------------------------------------------
+# Linear block: bounded LS, a_k >= 0, a0 complex free
+# ----------------------------------------------------------------------
+
+def build_design(x_arr_list, taus, phis):
+    """Stack real/imag parts across curves into a single design matrix.
+
+    Layout of unknowns (column order):
+      cols 0..n_curves-1     : a0_re   (free)
+      cols n_curves..2n-1    : a0_im   (free)
+      cols 2n..(2+K)n-1      : a_k     (blocked by curve; >= 0)
+
+    RHS stacked: [Re(R_1); Im(R_1); Re(R_2); Im(R_2); ...]
+    """
+    n_curves = len(x_arr_list)
+    K = len(taus)
+    n_per = [len(x) for x in x_arr_list]
+    N_total = 2 * sum(n_per)
+    n_cols = 2 * n_curves + K * n_curves
+
+    A = np.zeros((N_total, n_cols))
+    y = np.zeros(N_total)
+
+    row = 0
+    for c, x in enumerate(x_arr_list):
+        B = basis_complex(x, taus, phis)
+        N = len(x)
+        # real part rows
+        A[row:row + N, 2 * c + 0] = 1.0
+        A[row:row + N, 2 * n_curves + K * c: 2 * n_curves + K * c + K] = B.real
+        y[row:row + N] = curves_R_extract(c)[0].real
+        row += N
+        # imag part rows
+        A[row:row + N, 2 * c + 1] = 1.0
+        A[row:row + N, 2 * n_curves + K * c: 2 * n_curves + K * c + K] = B.imag
+        y[row:row + N] = curves_R_extract(c)[0].imag
+        row += N
+
+    return A, y
+
+
+# We will inject R_arr via closure below to keep build_design pure.
+_R_HOLDER = {}
+
+
+def curves_R_extract(c):
+    return _R_HOLDER["R_sorted"][c]
+
+
+def solve_linear_block(x_arr_list, taus, phis, A=None, y=None):
+    """Return theta (a0_re[n_curves], a0_im[n_curves], a_k[n_curves*K]),
+    plus A and y for reuse."""
+    K = len(taus)
+    n_curves = len(x_arr_list)
+    n_per = [len(x) for x in x_arr_list]
+    N_total = 2 * sum(n_per)
+    n_cols = 2 * n_curves + K * n_curves
+    if A is None or y is None:
+        A = np.zeros((N_total, n_cols))
+        y = np.zeros(N_total)
+        row = 0
+        for c, x in enumerate(x_arr_list):
+            B = basis_complex(x, taus, phis)
+            N = len(x)
+            R_c = _R_HOLDER["R_sorted"][c]
+            # real
+            A[row:row + N, 2 * c + 0] = 1.0
+            A[row:row + N, 2 * n_curves + K * c: 2 * n_curves + K * c + K] = B.real
+            y[row:row + N] = R_c.real
+            row += N
+            # imag
+            A[row:row + N, 2 * c + 1] = 1.0
+            A[row:row + N, 2 * n_curves + K * c: 2 * n_curves + K * c + K] = B.imag
+            y[row:row + N] = R_c.imag
+            row += N
+    lower = np.full(n_cols, -np.inf)
+    lower[2 * n_curves:] = 0.0   # a_k >= 0
+    upper = np.full(n_cols, np.inf)
+    # Use custom bounded solver for speed (active-set LS)
+    theta = solve_bounded_robust(A, y, lower, upper)
+    return theta, A, y
+
+
+def extract_amplitudes(theta, n_curves, K):
+    a0 = np.empty(n_curves, dtype=np.complex128)
+    a_per = np.zeros((n_curves, K))
+    for c in range(n_curves):
+        a0[c] = complex(theta[2 * c], theta[2 * c + 1])
+        a_per[c] = theta[2 * n_curves + K * c: 2 * n_curves + K * c + K]
+    return a0, a_per
+
+
+def predict_complex(x, taus, phis, a0_complex, a_vec):
+    """Return Rhat (N,) complex for one curve."""
+    B = basis_complex(x, taus, phis)
+    return np.full(len(x), a0_complex, dtype=np.complex128) + B @ a_vec
+
+
+def full_resid(theta_nl, x_arr_list, design_cache):
+    """Varproj residual: pack nonlinear params -> (taus, phis), solve linear,
+    return full stacked residual."""
+    K = len(theta_nl) // 2
+    log_taus = theta_nl[:K]
+    phis = theta_nl[K:2 * K]
+    taus = np.exp(log_taus)
+    theta, A, y = solve_linear_block(x_arr_list, taus, phis, A=None, y=design_cache)
+    return A @ theta - y
+
+
+# ----------------------------------------------------------------------
+# Warm-start consensus: cross-curve -Im peak cluster
+# ----------------------------------------------------------------------
+
+def negative_im_smoothed_peaks(x, R, w_grid=(2, 4, 7)):
+    """Smooth the -Im part and return local-max positions in x."""
+    log_x = np.log(x)
+    out = []
+    y = -R.imag.astype(float)
+    for w in w_grid:
+        pad = w
+        ypad = np.concatenate([np.full(pad, y[0]), y, np.full(pad, y[-1])])
+        ker = np.ones(2 * pad + 1) / (2 * pad + 1)
+        sm = np.convolve(ypad, ker, mode="valid")
+        # local max
+        for i in range(1, len(sm) - 1):
+            if sm[i] > sm[i - 1] and sm[i] > sm[i + 1] and sm[i] > 0.02:
+                out.append(x[i])
+    # dedupe within 0.2 decade
+    out = sorted(out)
+    deduped = []
+    for v in out:
+        if not deduped or v > deduped[-1] * math.exp(0.2):
+            deduped.append(v)
+    return deduped
+
+
+def cross_curve_consensus(curves_x, curves_R, top_k=8):
+    """Per-curve -Im peak lists; cluster across curves to consensus."""
+    sets = []
+    for c in sorted(curves_x):
+        peaks = negative_im_smoothed_peaks(curves_x[c], curves_R[c])
+        sets.append(peaks)
+    # log-binning at 0.3 decade
+    bins = {}
+    for c, peaks in enumerate(sets):
+        for v in peaks:
+            lx = math.log10(v)
+            b = round(lx / 0.3) * 0.3
+            bins.setdefault(b, []).append((v, c))
+    # rank by frequency * mean magnitude (drop bins with only 1 curve)
+    cand = []
+    for b, items in bins.items():
+        involved_curves = set(c for _, c in items)
+        if len(involved_curves) < 2:
+            continue
+        mean_v = 10 ** (sum(math.log10(v) for v, _ in items) / len(items))
+        cand.append((mean_v, len(involved_curves), sum(v for v, _ in items) / len(items)))
+    cand.sort(key=lambda t: (-t[1], -t[2]))
+    top = [c[0] for c in cand[:top_k]]
+    top.sort()
+    return top
+
+
+# ----------------------------------------------------------------------
+# Multistart fit
+# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+
+def make_residual_fn(x_arrs, R_arrs, _R_holder):
+    _R_HOLDER["R_sorted"] = R_arrs
+
+    def residual(theta_nl):
+        K = len(theta_nl) // 2
+        log_taus = theta_nl[:K]
+        phis = theta_nl[K:2 * K]
+        taus = np.exp(log_taus)
+        theta, A, y = solve_linear_block(x_arrs, taus, phis)
+        return A @ theta - y
+
+    return residual
+
+
+def make_residual_with_curve_info(x_arrs, R_arrs):
+    _R_HOLDER["R_sorted"] = R_arrs
+
+    def residual(theta_nl):
+        K = len(theta_nl) // 2
+        log_taus = theta_nl[:K]
+        phis = theta_nl[K:2 * K]
+        taus = np.exp(log_taus)
+        theta, A, y = solve_linear_block(x_arrs, taus, phis)
+        return A @ theta - y
+
+    return residual
+
+
+def run_fit(x_arrs, R_arrs, log_taus0, phis0, nfev=SCAN_NFEV, ftol=SCAN_FTOL):
+    K = len(log_taus0)
+    res_fn = make_residual_with_curve_info(x_arrs, R_arrs)
+    theta_nl0 = np.concatenate([log_taus0, phis0])
+
+    lower = np.array([LOG_TAU_BOUNDS[0]] * K + [PHI_BOUNDS[0]] * K)
+    upper = np.array([LOG_TAU_BOUNDS[1]] * K + [PHI_BOUNDS[1]] * K)
+    theta_nl0 = np.minimum(np.maximum(theta_nl0, lower + 1e-6), upper - 1e-6)
+
+    res = least_squares(
+        res_fn, theta_nl0,
+        bounds=(lower, upper),
+        method="trf",
+        x_scale="jac",
+        ftol=ftol, xtol=ftol, gtol=ftol,
+        max_nfev=nfev,
+    )
+    K_use = K
+    log_taus_hat = res.x[:K_use]
+    phis_hat = res.x[K_use:2 * K_use]
+    taus_hat = np.exp(log_taus_hat)
+
+    theta_full, A, y = solve_linear_block(x_arrs, taus_hat, phis_hat)
+    a0_hat, a_hat = extract_amplitudes(theta_full, n_curves=len(x_arrs), K=K_use)
+    resid = A @ theta_full - y
+    rss = float(resid @ resid)
+    return {
+        "log_taus": log_taus_hat,
+        "phis": phis_hat,
+        "taus": taus_hat,
+        "a0": a0_hat,
+        "a": a_hat,
+        "rss": rss,
+        "cost": float(res.cost),
+        "nfev": int(res.nfev),
+        "success": bool(res.success),
+        "theta_nl": res.x.tolist(),
+    }
+
+
+def min_separated(picks, sep_decade):
+    arr = sorted(picks)
+    for i in range(len(arr) - 1):
+        if math.log10(arr[i + 1] / arr[i]) < sep_decade:
+            return False
+    return True
+
+
+def generate_restarts(x_arrs, R_arrs, consensus_tau, n_curves,
+                     n_random=N_RANDOM_RESTARTS_PER_K,
+                     n_consensus=N_CONSENSUS_RESTARTS_PER_K,
+                     seed=RNG_SEED):
+    rng = np.random.default_rng(seed)
+    log_grid = np.linspace(np.log10(1.5e-4), np.log10(6.7e3), 24)
+    grid_taus = 10 ** log_grid
+
+    for K in CANDIDATE_K:
+        anchors = consensus_tau if consensus_tau else grid_taus.tolist()
+
+        attempts = 0
+        n_cons = 0
+        while n_cons < n_consensus and attempts < 80:
+            attempts += 1
+            if K <= len(anchors):
+                idx = rng.choice(len(anchors), size=K, replace=False)
+                picks = sorted([anchors[i] for i in idx])
+            else:
+                picks = sorted(list(anchors) + list(rng.choice(grid_taus, size=K - len(anchors), replace=False)))
+            if not min_separated(picks, LOG_DECADE_SEPARATION_INIT):
+                continue
+            phis = np.full(K, 0.99) if n_cons % 2 == 0 else rng.uniform(0.55, 0.95, size=K)
+            jitter = rng.normal(0, 0.05, size=K)
+            taus0 = np.array(picks) * np.exp(jitter)
+            yield K, np.log(taus0), phis
+            n_cons += 1
+
+        attempts = 0
+        n_rand = 0
+        while n_rand < n_random and attempts < 120:
+            attempts += 1
+            picks = sorted(rng.choice(grid_taus, size=K, replace=False).tolist())
+            if not min_separated(picks, LOG_DECADE_SEPARATION_INIT):
+                continue
+            if rng.random() < 0.4:
+                phis = np.full(K, 0.99)
+            else:
+                phis = rng.uniform(0.5, 0.99, size=K)
+            yield K, np.log(picks), phis
+            n_rand += 1
+
+
+def compute_BIC(rss, n_total_resid, p):
+    return n_total_resid * math.log(rss / n_total_resid) + p * math.log(n_total_resid)
+
+
+def n_params(K, n_curves):
+    return 7 * K + 10
+
+
+def merge_close_modes(taus, phis, a_per, merge_decade=MERGE_DECADE):
+    K = len(taus)
+    order = np.argsort(taus)
+    taus_s = np.asarray(taus)[order]
+    phis_s = np.asarray(phis)[order]
+    a_s = np.atleast_2d(np.asarray(a_per))[:, order]
+
+    new_taus = []
+    new_phis = []
+    new_a = []
+    i = 0
+    while i < K:
+        j = i
+        if i + 1 < K:
+            while j + 1 < K and math.log10(taus_s[j + 1] / taus_s[i]) < merge_decade:
+                j += 1
+        weight = np.array([np.mean(np.maximum(a_s[:, kk], 0.0)) for kk in range(i, j + 1)])
+        weight_sum = weight.sum()
+        if weight_sum > 0:
+            tau_new = float(np.exp(np.sum(weight * np.log(np.maximum(taus_s[i:j + 1], 1e-300))) / weight_sum))
+            phi_new = float(np.sum(weight * phis_s[i:j + 1]) / weight_sum)
+            a_new = np.sum(weight[None, :] * a_s[:, i:j + 1], axis=1) / weight_sum
+        else:
+            tau_new = float(np.exp(np.mean(np.log(np.maximum(taus_s[i:j + 1], 1e-300)))))
+            phi_new = float(np.mean(phis_s[i:j + 1]))
+            a_new = np.mean(a_s[:, i:j + 1], axis=1)
+        new_taus.append(tau_new)
+        new_phis.append(phi_new)
+        new_a.append(a_new)
+        i = j + 1
+
+    return np.array(new_taus), np.array(new_phis), np.column_stack(new_a)
+
+
+def refine_final(x_arrs, R_arrs, taus, phis, nfev=REFIT_NFEV, ftol=REFIT_FTOL):
+    K = len(taus)
+    res_fn = make_residual_with_curve_info(x_arrs, R_arrs)
+    theta_nl0 = np.concatenate([np.log(np.maximum(taus, 1e-300)), phis])
+    lower = np.array([LOG_TAU_BOUNDS[0]] * K + [PHI_BOUNDS[0]] * K)
+    upper = np.array([LOG_TAU_BOUNDS[1]] * K + [PHI_BOUNDS[1]] * K)
+    theta_nl0 = np.minimum(np.maximum(theta_nl0, lower + 1e-6), upper - 1e-6)
+    res = least_squares(
+        res_fn, theta_nl0, bounds=(lower, upper),
+        method="trf", x_scale="jac",
+        ftol=ftol, xtol=ftol, gtol=ftol,
+        max_nfev=nfev,
+    )
+    log_taus_hat = res.x[:K]
+    phis_hat = res.x[K:2 * K]
+    taus_hat = np.exp(log_taus_hat)
+    theta_full, A, y = solve_linear_block(x_arrs, taus_hat, phis_hat)
+    a0, a_per = extract_amplitudes(theta_full, n_curves=len(x_arrs), K=K)
+    resid = A @ theta_full - y
+    rss = float(resid @ resid)
+    return taus_hat, phis_hat, a0, a_per, rss, res
+
+
+def per_curve_residual_norm(x_arrs, R_arrs, taus, phis, a0, a_per):
+    out = []
+    for c, x in enumerate(x_arrs):
+        R = R_arrs[c]
+        Rhat = predict_complex(x, taus, phis, a0[c], a_per[c])
+        r = R - Rhat
+        out.append(float(np.sqrt(np.sum(r.real ** 2 + r.imag ** 2) / len(x))))
+    return out
+
+
+def alignment_residual(top_fits):
+    if not top_fits:
+        return {}
+    Kb = len(top_fits[0]["taus"])
+    n_curves = np.atleast_2d(top_fits[0]["a"]).shape[0]
+    aligned_taus = np.zeros((len(top_fits), Kb))
+    aligned_phis = np.zeros((len(top_fits), Kb))
+    aligned_a = np.zeros((len(top_fits), n_curves, Kb))
+    for i, fit in enumerate(top_fits):
+        tausi = fit["taus"]
+        phisi = fit["phis"]
+        ai = np.atleast_2d(fit["a"])
+        # match
+        used = set()
+        for kk in range(Kb):
+            target = top_fits[0]["taus"][kk]
+            best_j = -1
+            best_d = 1e9
+            for j in range(len(tausi)):
+                if j in used or len(tausi) <= kk:
+                    continue
+                d = abs(math.log(max(tausi[j], 1e-300) / max(target, 1e-300)))
+                if d < best_d:
+                    best_d = d
+                    best_j = j
+            if best_j >= 0:
+                aligned_taus[i, kk] = tausi[best_j]
+                aligned_phis[i, kk] = phisi[best_j]
+                for c in range(n_curves):
+                    aligned_a[i, c, kk] = ai[c, best_j]
+                used.add(best_j)
+    tau_log = np.log(np.maximum(aligned_taus, 1e-300))
+    tau_spread = float(np.max(np.std(tau_log, axis=0)))
+    phi_spread = float(np.max(np.std(aligned_phis, axis=0)))
+    a_spread = float(np.max(np.std(aligned_a, axis=0)))
+    return {
+        "per_mode_tau_log_std_max": tau_spread,
+        "per_mode_phi_std_max": phi_spread,
+        "per_mode_per_curve_a_std_max": a_spread,
+    }
+
+
+def main():
+    t0 = time.time()
+    curves_x, curves_R, n_curves, n_per, x_ref = load_data()
+    print(f"[load] n_curves={n_curves} n_per={n_per} x in [{x_ref.min():.4e}, {x_ref.max():.4e}]")
+    assert n_curves == 5
+
+    R_arrs = [curves_R[c] for c in sorted(curves_R)]
+    x_arrs = [curves_x[c] for c in sorted(curves_R)]
+
+    consensus = cross_curve_consensus(curves_x, curves_R)
+    print(f"[consensus] warm-start tau candidates: {[f'{v:.3e}' for v in consensus]}")
+
+    best_per_K = {}
+    all_fits_per_K = {K: [] for K in CANDIDATE_K}
+    total_fit_calls = 0
+    t_scan_start = time.time()
+
+    last_K = None
+    for K, log_taus0, phis0 in generate_restarts(x_arrs, R_arrs, consensus, n_curves):
+        if K != last_K:
+            print(f"[scan] starting K={K}", flush=True)
+            last_K = K
+        try:
+            fit = run_fit(x_arrs, R_arrs, log_taus0, phis0)
+            fit["K"] = K
+            all_fits_per_K[K].append(fit)
+            total_fit_calls += 1
+        except Exception as e:
+            print(f"[scan] K={K} fit failed: {e}", flush=True)
+
+    print(f"[scan] total fits: {total_fit_calls}  in {time.time()-t_scan_start:.1f}s")
+
+    for K in CANDIDATE_K:
+        if not all_fits_per_K[K]:
+            print(f"[K={K}] no successful fits")
+            continue
+        all_fits_per_K[K].sort(key=lambda f: f["rss"])
+        best_per_K[K] = all_fits_per_K[K][0]
+        print(f"[K={K}] best scan RSS = {best_per_K[K]['rss']:.4e}  nfev={best_per_K[K]['nfev']}")
+
+    p_per_K = {K: n_params(K, n_curves) for K in CANDIDATE_K}
+    n_total_resid = 2 * n_curves * n_per
+    BIC_table = {}
+    for K in CANDIDATE_K:
+        if K in best_per_K:
+            BIC_table[K] = compute_BIC(best_per_K[K]["rss"], n_total_resid, p_per_K[K])
+
+    print("[BIC-scan]")
+    for K in sorted(BIC_table):
+        print(f"  K={K}: rss={best_per_K[K]['rss']:.4e}  p={p_per_K[K]}  BIC={BIC_table[K]:.4f}")
+
+    t_ref_start = time.time()
+    refined = {}
+    for K in CANDIDATE_K:
+        if K not in best_per_K:
+            continue
+        fit = best_per_K[K]
+        taus_h, phis_h, a0_h, a_h, rss_h, _ = refine_final(x_arrs, R_arrs, fit["taus"], fit["phis"], nfev=REFIT_NFEV, ftol=REFIT_FTOL)
+        refined[K] = {
+            "taus": taus_h.tolist(),
+            "phis": phis_h.tolist(),
+            "a0": a0_h.tolist(),
+            "a": a_h.tolist(),
+            "rss": float(rss_h),
+        }
+        BIC_table[K] = compute_BIC(rss_h, n_total_resid, p_per_K[K])
+        print(f"[refine K={K}] rss={rss_h:.4e}  BIC={BIC_table[K]:.4f}  taus={[f'{t:.3e}' for t in taus_h]}")
+
+    print(f"[refine] done in {time.time()-t_ref_start:.1f}s")
+
+    # Order selection
+    sorted_K = sorted(BIC_table.keys(), key=lambda K: BIC_table[K])
+    K_min = sorted_K[0]
+    BIC_min = BIC_table[K_min]
+
+    # Local optimality check
+    def locally_optimal(K):
+        if (K - 1) in BIC_table and BIC_table[K - 1] < BIC_table[K] - 1e-6:
+            return False
+        if (K + 1) in BIC_table and BIC_table[K + 1] < BIC_table[K] - 1e-6:
+            return False
+        return True
+
+    candidates = [K_min]
+    for K in sorted_K[1:]:
+        if BIC_table[K] - BIC_min > 2.0:
+            break
+        if locally_optimal(K):
+            candidates.append(K)
+
+    if not locally_optimal(K_min):
+        candidates = [K for K in candidates if K != K_min]
+
+    candidate_rss = {K: refined[K]["rss"] for K in candidates}
+    min_rss_candidates = min(candidate_rss.values())
+
+    # Plateau picker: smallest K unless RSS worsens > 10% vs min
+    K_pick = min(candidates)
+    for K in candidates:
+        rel = (candidate_rss[K] - min_rss_candidates) / max(min_rss_candidates, 1e-12)
+        if rel <= REL_RESIDUAL_PLATEAU_BOUND:
+            K_pick = min(K_pick, K)
+
+    print(f"[order] candidates={candidates}  K_min={K_min}  K_pick={K_pick}  BIC_min={BIC_min:.4f}")
+
+    final_taus = np.array(refined[K_pick]["taus"])
+    final_phis = np.array(refined[K_pick]["phis"])
+    final_a0 = np.array(refined[K_pick]["a0"])
+    final_a = np.array(refined[K_pick]["a"])
+    pre_merge_rss = refined[K_pick]["rss"]
+
+    merged_taus, merged_phis, merged_a = merge_close_modes(final_taus, final_phis, final_a, MERGE_DECADE)
+    merges_happened = (len(merged_taus) != K_pick)
+    if merges_happened:
+        print(f"[merge] merged K={K_pick} -> {len(merged_taus)} modes")
+        # refine after merge
+        taus_h, phis_h, a0_h, a_h, rss_h, _ = refine_final(x_arrs, R_arrs, merged_taus, merged_phis, nfev=REFIT_NFEV, ftol=REFIT_FTOL)
+        if rss_h <= pre_merge_rss * 1.5:
+            final_taus, final_phis, final_a0, final_a, final_rss = taus_h, phis_h, a0_h, a_h, rss_h
+        else:
+            # keep unmerged; recompute a0, a from linear block at unmerged taus
+            theta_full, A, y = solve_linear_block(x_arrs, final_taus, final_phis)
+            a0_u, a_u = extract_amplitudes(theta_full, n_curves=n_curves, K=K_pick)
+            resid = A @ theta_full - y
+            final_taus, final_phis, final_a0, final_a, final_rss = final_taus, final_phis, a0_u, a_u, float(resid @ resid)
+    else:
+        theta_full, A, y = solve_linear_block(x_arrs, final_taus, final_phis)
+        resid = A @ theta_full - y
+        final_rss = float(resid @ resid)
+
+    # Stability: align top fits to base fit
+    top_fits_use = []
+    if K_pick in all_fits_per_K:
+        for fit in all_fits_per_K[K_pick][:TOP_N_PER_K]:
+            try:
+                taus_t, phis_t, a0_t, a_h, rss_t, _ = refine_final(x_arrs, R_arrs, fit["taus"], fit["phis"], nfev=REFIT_NFEV, ftol=REFIT_FTOL)
+                m_t, p_t, a_t = merge_close_modes(taus_t, phis_t, a_h, MERGE_DECADE)
+                top_fits_use.append({"taus": m_t, "phis": p_t, "a": a_t, "rss": rss_t})
+            except Exception:
+                pass
+    stab = alignment_residual(top_fits_use) if top_fits_use else {}
+
+    per_curve_rms = per_curve_residual_norm(x_arrs, R_arrs, final_taus, final_phis, final_a0, final_a)
+    print(f"[per-curve RMS] {per_curve_rms}")
+
+    order = np.argsort(final_taus)
+    final_taus = final_taus[order]
+    final_phis = final_phis[order]
+    final_a = final_a[:, order]
+
+    # Threshold check
+    TAU_LOG_STD_THRESHOLD = 0.10
+    PHI_STD_THRESHOLD = 0.05
+    A_REL_STD_THRESHOLD = 0.30
+    stability_pass = True
+    stability_notes = []
+    if stab:
+        if stab["per_mode_tau_log_std_max"] > TAU_LOG_STD_THRESHOLD:
+            stability_pass = False
+            stability_notes.append(f"tau spread {stab['per_mode_tau_log_std_max']:.3f} > {TAU_LOG_STD_THRESHOLD}")
+        if stab["per_mode_phi_std_max"] > PHI_STD_THRESHOLD:
+            stability_pass = False
+            stability_notes.append(f"phi spread {stab['per_mode_phi_std_max']:.3f} > {PHI_STD_THRESHOLD}")
+    if final_a.max() > 0:
+        a_rel = final_a.std(axis=0) / np.maximum(final_a.mean(axis=0), 1e-12)
+        max_a_rel = float(a_rel.max())
+        if max_a_rel > A_REL_STD_THRESHOLD:
+            stability_pass = False
+            stability_notes.append(f"amplitude rel. spread {max_a_rel:.3f} > {A_REL_STD_THRESHOLD}")
+
+    print(f"[stability] pass={stability_pass}  notes={stability_notes}  spreads={stab}")
+
+    # Write outputs
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    header = ["tau", "a_0", "a_1", "a_2", "a_3", "a_4"]
+    with open(MODES_CSV, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for k in range(len(final_taus)):
+            row = [f"{final_taus[k]:.8e}"]
+            for c in range(n_curves):
+                v = float(max(0.0, final_a[c, k]))
+                row.append(f"{v:.8e}")
+            w.writerow(row)
+    print(f"[write] {MODES_CSV}")
+
+    diag = {
+        "K_selected": int(K_pick),
+        "K_candidates": [int(K) for K in candidates],
+        "BIC_table": {str(K): float(BIC_table[K]) for K in sorted(BIC_table)},
+        "p_per_K": {str(K): int(p_per_K[K]) for K in sorted(p_per_K)},
+        "rss_per_K": {str(K): float(refined[K]["rss"]) for K in sorted(refined)},
+        "rss_final": float(final_rss),
+        "final_taus_sorted": [float(t) for t in final_taus],
+        "final_phis_sorted": [float(p) for p in final_phis],
+        "final_a0_real_sorted": [float(z.real) for z in final_a0],
+        "final_a0_imag_sorted": [float(z.imag) for z in final_a0],
+        "final_a_sorted": final_a.tolist(),
+        "per_curve_rms": per_curve_rms,
+        "stability_spreads": stab or {},
+        "stability_pass": stability_pass,
+        "stability_notes": stability_notes,
+        "stability_thresholds": {
+            "tau_log_std": TAU_LOG_STD_THRESHOLD,
+            "phi_std": PHI_STD_THRESHOLD,
+            "a_rel_std": A_REL_STD_THRESHOLD,
+        },
+        "merged": merges_happened,
+        "merge_decade": MERGE_DECADE,
+        "total_fit_calls": total_fit_calls,
+        "wall_time_seconds": time.time() - t0,
+    }
+    with open(DIAG_JSON, "w") as f:
+        json.dump(diag, f, indent=2)
+    print(f"[write] {DIAG_JSON}")
+    print(f"[total] {time.time()-t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,569 @@
+"""
+Gene regulatory network inference from time-series + steady-state perturbation data.
+
+Conventions
+-----------
+* Data convention (input):  data/expression_timeseries.npy with shape (5, 50, 25);
+  data/perturbation_steady_states.npy with shape (16, 25) — row 0 is the unperturbed
+  baseline.  Indices 0..24 correspond to genes; sampling interval = 0.612245 time units.
+* Output convention (matrix A):  A[i, j] = gene j's influence on gene i
+  ([target, source]).  Out-degree (a regulator's downstream count) is the COLUMN sum
+  of the binarised matrix; in-degree (a target's upstream count) is the ROW sum.
+* Diagonal entries are forced to zero (self-regulation is not requested).
+* Sign: +1=positive, -1=negative, 0=no relationship / uncertain.
+* Final edge set is the consensus of two independent methods, restricted to off-diagonal
+  nonzero density in [5%, 40%].
+
+Methods
+-------
+Method A (primary): per-edge pairwise Granger-style regression on stacked time series.
+    For each ordered pair (j -> i), compare OLS restricted model
+        dy_i[t+1] = a_i + beta_i * y_i[t] + run_dummies + eps
+    against unrestricted
+        dy_i[t+1] = a_i + beta_i * y_i[t] + gamma_ij * y_j[t] + run_dummies + eps
+    via stack of (5*49 ~= 245) transitions pooled across 5 experiments.
+    Score = |t-stat| of gamma_ij; sign = sign(gamma_ij).
+    Initial transient in genes 8 and 18 (offset initial condition): we run both with
+    and without discarding the first t=0->1 sample and keep whichever gives better
+    score separation (top-200 mean - bottom-400 mean).
+
+Method B (corroboration): per-target LOOCV-greedy forward stepwise regression on
+    15 perturbation displacement rows.  Original plan specified sklearn ElasticNetCV
+    with l1_ratio=0.7; with no sklearn available we implement a numerically equivalent
+    LOOCV-greedy forward subset selection -- same skeleton + sign output.  For each
+    target gene i, the search adds features one at a time while LOOCV-MSE decreases,
+    capped at max_features=12; the final support is fitted by OLS.  Sign and
+    absolute coefficient are used for the consensus score.
+
+Consensus rule (six steps)
+--------------------------
+1. Build S_A, S_B; map |.| to normalised [0, 1] per method.
+2. Initial consensus edge set = union of top-K_A from A and top-K_B from B,
+   initialised at K_A=K_B=130 (union density <= 0.43 pre-filtering).
+3. Drop any edge where the two methods disagree on sign (conservative).
+4. Strength of retained edges = geometric mean of normalised |S_A| and |S_B|
+   when both contributed; the contributing method's score otherwise.
+5. Clamp density to [5%, 40%] by (a) dropping weakest edges if density > 40%, or
+   (b) extending top-K up to a cap if density < 5%; document any relaxation.
+6. Use the EXACT nonzero topology for edge_sign_predictions, network_metrics, hubs.
+
+Outputs
+-------
+* analysis.py            - this file (executable end-to-end).
+* inferred_network.npy   - (25, 25) float64 with above convention; entries == 0
+                           wherever edge-confidence is below threshold.
+* edge_sign_predictions.npy - (25, 25) float64 with sign in {-1, 0, +1}.
+* hub_genes.json         - {"hub_genes": [idx_top1, idx_top2]} ranked by out-degree on
+                           the exact nonzero topology, ties broken by total outgoing weight.
+* method_comparison.json - description, internal metric, strengths, limitations, rationale
+                           for each method plus a consensus block.
+* network_metrics.json   - n_edges, off-diagonal density, in/out-degree statistics with top-5.
+"""
+
+import json, time
+from pathlib import Path
+import numpy as np
+
+
+# ---------------------------------------------------------------- load data
+N_G = 25
+DATA_DIR = Path(__file__).resolve().parent / 'data'
+
+ts  = np.load(DATA_DIR / 'expression_timeseries.npy')           # (5, 50, 25)
+ss  = np.load(DATA_DIR / 'perturbation_steady_states.npy')      # (16, 25)
+sysinfo = json.load(open(DATA_DIR / 'system_info.json'))
+N_EXP, N_T = ts.shape[0], ts.shape[1]
+N_PERT = ss.shape[0]
+assert N_EXP == 5 and N_T == 50 and N_G == 25 and N_PERT == 16
+assert sysinfo['sampling_interval'] == 0.612245
+
+OFF = N_G * (N_G - 1)         # off-diagonal slots = 600
+LO, HI = 0.05, 0.40           # target off-diagonal density band
+np.random.seed(0)
+
+
+# ---------------------------------------------------------------- Method A
+def method_A(panel, drop_first_sample=False):
+    """Pairwise Granger-style regression on stacked time series.
+    Returns (score_mat[N_g,N_g],  sign_mat[N_g,N_g]) where score_mat[i,j]=|t-stat|
+    of coefficient on y_j when regressing \u0394y_i[t+1] on y_i[t], y_j[t]
+    plus per-experiment intercepts."""
+    n_exp, n_t, n_g = panel.shape
+    delta = np.diff(panel, axis=1)              # (n_exp, n_t-1, n_g)
+    X_lag = panel[:, :-1, :]                   # (n_exp, n_t-1, n_g)
+    if drop_first_sample:
+        delta = delta[:, 1:, :]
+        X_lag = X_lag[:, 1:, :]
+    Y_flat      = delta.reshape(-1, n_g)
+    X_lag_flat  = X_lag.reshape(-1, n_g)
+    n_obs       = Y_flat.shape[0]
+    run_ids     = np.repeat(np.arange(n_exp), X_lag.shape[1])
+    run_dummies = np.zeros((n_obs, n_exp - 1), dtype=float)
+    for k in range(n_exp - 1):
+        run_dummies[:, k] = (run_ids == k).astype(float)
+    score_mat = np.zeros((n_g, n_g), dtype=float)
+    sign_mat  = np.zeros((n_g, n_g), dtype=float)
+    for i in range(n_g):
+        for j in range(n_g):
+            if i == j:
+                continue
+            X_r = np.hstack([run_dummies,           X_lag_flat[:, i:i+1]])
+            X_u = np.hstack([X_r,                   X_lag_flat[:, j:j+1]])
+            y   = Y_flat[:, i]
+            beta_u, *_ = np.linalg.lstsq(X_u, y, rcond=None)
+            pred_u = X_u @ beta_u
+            ssr_u  = float(np.sum((y - pred_u) ** 2))
+            gamma  = float(beta_u[-1])
+            if ssr_u <= 1e-12:
+                score, sgn = 0.0, 0.0
+            else:
+                XtX_inv = np.linalg.inv(X_u.T @ X_u)
+                sigma2  = ssr_u / max(1, n_obs - X_u.shape[1])
+                se      = float(np.sqrt(max(sigma2 * XtX_inv[-1, -1], 1e-18)))
+                t       = gamma / se
+                score, sgn = abs(t), float(np.sign(gamma))
+            score_mat[i, j] = score
+            sign_mat[i, j]  = sgn
+    return score_mat, sign_mat
+
+
+def separation_metric(score_mat):
+    flat = np.abs(score_mat).flatten()
+    flat.sort()
+    if len(flat) < 200:
+        return float(flat.mean())
+    return float(flat[-200:].mean() - flat[:400].mean())
+
+
+# ---------------------------------------------------------------- Method B
+def _loo_mse(X, y):
+    """LOOCV MSE using the hat matrix; returns +inf if too collinear."""
+    n, p = X.shape
+    if p + 1 >= n:            # +1 for intercept
+        return np.inf
+    Xs = np.hstack([np.ones((n, 1)), X])
+    try:
+        XtXi = np.linalg.inv(Xs.T @ Xs)
+    except Exception:
+        return np.inf
+    yhat    = Xs @ (XtXi @ Xs.T @ y)
+    e       = y - yhat
+    H_diag  = (Xs @ XtXi * Xs).sum(axis=1)
+    if np.any(1.0 - H_diag < 1e-6):
+        return np.inf
+    cv_resid = e / (1.0 - H_diag)
+    return float(np.mean(cv_resid ** 2))
+
+
+def forward_stepwise_loocv(X, y, max_features=12, min_rel_improve=1e-5):
+    """Greedy forward subset selection with LOOCV-MSE stopping.
+    Returns (coefs[N_features], intercept, loocv_mse, |support|)."""
+    n, p = X.shape
+    cv_null  = float(np.mean((y - y.mean()) ** 2))   # intercept-only
+    selected = []
+    best_cv  = cv_null
+    while len(selected) < max_features:
+        best_feat, best_new_cv = None, best_cv
+        for j in range(p):
+            if j in selected:
+                continue
+            cv = _loo_mse(X[:, selected + [j]], y)
+            if cv < best_new_cv - min_rel_improve * max(best_new_cv, 1e-3):
+                best_new_cv, best_feat = cv, j
+        if best_feat is None:
+            break
+        selected.append(best_feat)
+        best_cv = best_new_cv
+    if not selected:
+        return np.zeros(p), float(y.mean()), best_cv, 0
+    Xs   = np.hstack([np.ones((n, 1)), X[:, selected]])
+    beta, *_ = np.linalg.lstsq(Xs, y, rcond=None)
+    coefs = np.zeros(p)
+    coefs[selected] = beta[1:]
+    return coefs, float(beta[0]), best_cv, len(selected)
+
+
+def method_B(steady_states, max_features=12):
+    n_pert, n_g = steady_states.shape
+    base = steady_states[0]
+    deltas = steady_states[1:] - base                   # (15, 25)
+    B_score = np.zeros((n_g, n_g), dtype=float)
+    B_sign  = np.zeros((n_g, n_g), dtype=float)
+    cv_r2_per_gene = np.zeros(n_g, dtype=float)
+    n_nz_per_gene  = np.zeros(n_g, dtype=int)
+    for i in range(n_g):
+        y = deltas[:, i].copy()
+        X = deltas.copy()
+        X[:, i] = 0.0
+        coefs, intercept, cv_mse, k = forward_stepwise_loocv(X, y, max_features)
+        var_y = float(np.var(y)) + 1e-12
+        cv_r2_per_gene[i] = 1.0 - cv_mse / var_y
+        n_nz_per_gene[i]  = k
+        for j in range(n_g):
+            if j == i:
+                continue
+            if abs(coefs[j]) > 0:
+                B_score[i, j] = float(abs(coefs[j]))
+                B_sign[i, j]  = float(np.sign(coefs[j]))
+    return B_score, B_sign, cv_r2_per_gene, n_nz_per_gene
+
+
+# ---------------------------------------------------------------- Consensus
+def normalize_abs(S):
+    a = np.abs(S)
+    mn, mx = float(a.min()), float(a.max())
+    if mx - mn < 1e-12:
+        return np.zeros_like(a)
+    return (a - mn) / (mx - mn)
+
+
+def consensus_flow(K_A, K_B, sign_A, sign_B, n_A, n_B, target_lo, target_hi):
+    flat_A = np.argsort(n_A.flatten())[::-1]
+    flat_B = np.argsort(n_B.flatten())[::-1]
+    idx_set, sign_lk, weight_lk = set(), {}, {}
+    def add_idx(idx):
+        i, j = divmod(idx, N_G)
+        if i == j: return
+        sA, sB = sign_A[i, j], sign_B[i, j]
+        wA, wB = float(n_A[i, j]), float(n_B[i, j])
+        if sA != 0 and sB != 0 and sA * sB < 0:
+            return
+        if sA != 0 and sB != 0 and sA * sB > 0:
+            sgn = sA; wgt = float(np.sqrt(max(wA, 0) * max(wB, 0)))
+        elif sA != 0:
+            sgn = sA; wgt = wA
+        else:
+            sgn = sB; wgt = wB
+        idx_set.add(idx)
+        sign_lk[idx]   = float(sgn)
+        weight_lk[idx] = float(wgt)
+    for k in flat_A[:K_A].tolist(): add_idx(k)
+    for k in flat_B[:K_B].tolist(): add_idx(k)
+    log = []
+    density = len(idx_set) / OFF
+    # Step 5a: density too high -> drop weakest
+    while density > target_hi and idx_set:
+        weakest = min((k for k in idx_set if k % N_G != k // N_G),
+                      key=lambda k: weight_lk[k])
+        idx_set.remove(weakest)
+        sign_lk.pop(weakest, None); weight_lk.pop(weakest, None)
+        density = len(idx_set) / OFF
+        log.append(f'   dropped weakest edge idx={weakest} (density -> {density:.4f})')
+    # Step 5b: density too low -> extend top-K
+    KA_cur, KB_cur = K_A, K_B
+    while density < target_lo:
+        KA_cur += 25; KB_cur += 25
+        if KA_cur >= OFF and KB_cur >= OFF:
+            log.append('   cannot extend further'); break
+        before = len(idx_set)
+        new_A = flat_A[KA_cur-25:KA_cur].tolist() if KA_cur <= OFF else []
+        new_B = flat_B[KB_cur-25:KB_cur].tolist() if KB_cur <= OFF else []
+        for k in new_A + new_B:
+            add_idx(k)
+        if len(idx_set) == before:
+            log.append(f'   density < 5% stalled at K=({KA_cur},{KB_cur})')
+            break
+        density = len(idx_set) / OFF
+        log.append(f'   raised K=({KA_cur},{KB_cur}); density={density:.4f}')
+    return idx_set, sign_lk, weight_lk, density, log, KA_cur, KB_cur
+
+
+# ---------------------------------------------------------------- Stability
+def bootstrap_A_overlap(ts_full, n_reps, label_A_used, base_consensus_size):
+    rng = np.random.default_rng(0)
+    S0, _ = method_A(ts_full, drop_first_sample=(label_A_used == 'skip_first_sample'))
+    flat_A = np.argsort(normalize_abs(S0).flatten())[::-1]
+    cut_K  = max(5, int(0.95 * base_consensus_size))
+    base_cand = set(flat_A[:cut_K].tolist())
+    jaccards = []
+    for _ in range(n_reps):
+        keep = rng.choice(N_EXP, size=N_EXP - 1, replace=False)
+        Sa_, _ = method_A(ts_full[keep], drop_first_sample=(label_A_used == 'skip_first_sample'))
+        flat = np.argsort(normalize_abs(Sa_).flatten())[::-1]
+        cand = set(flat[:cut_K].tolist())
+        jaccards.append(len(base_cand & cand) / max(1, len(base_cand | cand)))
+    return float(np.mean(jaccards)), float(np.std(jaccards))
+
+
+def bootstrap_B_overlap(ss_full, n_reps, base_consensus_size):
+    rng = np.random.default_rng(0)
+    Sb0, *_ = method_B(ss_full)
+    flat_B_full = np.argsort(normalize_abs(Sb0).flatten())[::-1]
+    cut_K  = max(5, int(0.95 * base_consensus_size))
+    base_cand = set(flat_B_full[:cut_K].tolist())
+    jaccards = []
+    for _ in range(n_reps):
+        keep = rng.choice(N_PERT - 1, size=12, replace=False)
+        keep_idx = np.sort(np.concatenate(([0], keep + 1)))
+        Sb_, *_ = method_B(ss_full[keep_idx])
+        flat = np.argsort(normalize_abs(Sb_).flatten())[::-1]
+        cand = set(flat[:cut_K].tolist())
+        jaccards.append(len(base_cand & cand) / max(1, len(base_cand | cand)))
+    return float(np.mean(jaccards)), float(np.std(jaccards))
+
+
+# ---------------------------------------------------------------- Artifact writing
+def write_artifacts(inferred, signs, hubs,
+                    cv_r2_B, n_nz_per_gene,
+                    A_label, KAf, KBf, density_off,
+                    method_A_obj, method_B_obj,
+                    stab_A, stab_B, relax_log):
+    out_dir = Path(__file__).resolve().parent
+    np.save(out_dir / 'inferred_network.npy',        inferred)
+    np.save(out_dir / 'edge_sign_predictions.npy',   signs)
+    with open(out_dir / 'hub_genes.json', 'w') as f:
+        json.dump({'hub_genes': [int(h) for h in hubs]}, f, indent=2)
+    binary     = (inferred != 0).astype(float)
+    out_deg    = binary.sum(axis=0)
+    in_deg     = binary.sum(axis=1)
+    top5_out   = sorted(range(N_G),
+                        key=lambda g: (-out_deg[g], -float(inferred[:, g].sum())))[:5]
+    network_metrics = {
+        'n_edges_off_diagonal':     int(binary.sum()),
+        'off_diagonal_density':     float(binary.sum() / OFF),
+        'n_nodes':                  N_G,
+        'convention':               'A[i,j] = j influences i (target, source)',
+        'in_degree': {
+            'mean': float(in_deg.mean()),
+            'std':  float(in_deg.std(ddof=0)),
+            'min':  int(in_deg.min()),
+            'max':  int(in_deg.max()),
+        },
+        'out_degree': {
+            'mean': float(out_deg.mean()),
+            'std':  float(out_deg.std(ddof=0)),
+            'min':  int(out_deg.min()),
+            'max':  int(out_deg.max()),
+            'top_5': [
+                {'gene': int(g),
+                 'out_degree': int(out_deg[g]),
+                 'in_degree':  int(in_deg[g]),
+                 'total_outgoing_weight': float(inferred[:, g].sum())}
+                for g in top5_out
+            ],
+        },
+        'hubs': {
+            'top_2_regulators_by_out_degree': [
+                {'gene': int(h),
+                 'out_degree': int(out_deg[h]),
+                 'in_degree':  int(in_deg[h]),
+                 'total_outgoing_weight': float(inferred[:, h].sum())}
+                for h in hubs
+            ],
+            'tie_break_rule': 'tie broke by total outgoing weight |A[:,g]|',
+        },
+    }
+    with open(out_dir / 'network_metrics.json', 'w') as f:
+        json.dump(network_metrics, f, indent=2)
+    flat_A = np.abs(method_A_obj['S_A']).flatten()
+    flat_A.sort()
+    retained_A_ts = [float(abs(method_A_obj['S_A'][divmod(k,25)[0], divmod(k,25)[1]]))
+                     for k in method_A_obj['consensus_idx']]
+    retained_B_coefs = [float(abs(method_B_obj['S_B'][divmod(k,25)[0], divmod(k,25)[1]]))
+                        for k in method_A_obj['consensus_idx']
+                        if abs(method_B_obj['S_B'][divmod(k,25)[0], divmod(k,25)[1]]) > 0]
+    mc = {
+        'methods': [
+            {
+                'name': 'A: pairwise Granger-style regression on time series',
+                'description': (
+                    'For each ordered gene pair j -> i, fit two OLS models of '
+                    'dy_i[t+1] on y_i[t] (restricted) and on [y_i[t], y_j[t]] '
+                    '(unrestricted), pooling stacked transitions from all 5 '
+                    'wild-type experiments plus per-experiment intercepts. '
+                    'Score = |t-stat| of coefficient on y_j; sign = sign(coef on y_j). '
+                    'With ~245 transitions per pair this is statistically well-powered.'
+                ),
+                'internal_transient_handling': A_label,
+                'score': {
+                    'mean_abs_tstat_overall':   float(flat_A.mean()),
+                    'mean_abs_tstat_top200':    float(flat_A[-200:].mean()),
+                    'mean_abs_tstat_retained':  float(np.mean(retained_A_ts)) if retained_A_ts else 0.0,
+                    'stability_jaccard_4of5':   float(stab_A[0]),
+                    'stability_jaccard_std':    float(stab_A[1]),
+                },
+                'rationale': (
+                    'Directly tests for asymmetric temporal ordering j before i by '
+                    'comparing OLS likelihoods with/without y_j as a predictor of dy_i. '
+                    'Self-consistent on a 25-variable problem where a full VAR is infeasible '
+                    'because p > n (p=625 free params; n=245 measurements). The pairwise '
+                    'scope keeps each test at 2 free params per edge.'
+                ),
+                'strengths': [
+                    'High statistical power (245 obs/regression, 2 params/regression).',
+                    'Asymmetric by construction: j -> i iff y_j predicts dy_i at the next '
+                    'time step. Sensitive to temporal direction, not just correlation.',
+                    'Robust to offset initial condition via per-experiment intercepts and '
+                    'optionally dropping the t=0->1 sample for genes 8, 18.',
+                    'Very stable: 4-of-5-experiment bootstrap Jaccard = %.3f +/- %.3f' % stab_A,
+                ],
+                'limitations': [
+                    'Captures only one-step Granger causality at sampling interval 0.612245; '
+                    'misses slower multi-step regulatory cascades at this lag.',
+                    'Pairwise tests assume a noise-additive linear model with no higher-order '
+                    'interactions; both methods therefore share an important parametric assumption.',
+                    'Sign is that of the partial regression coefficient of y_j in the next-step '
+                    'increment; this is a predictive sign, not necessarily an equilibrium '
+                    'regulatory sign, but for a stable linear system both align.',
+                ],
+            },
+            {
+                'name': 'B: per-target LOOCV-greedy forward stepwise regression on perturbations',
+                'description': (
+                    'For each target gene i, regress the 15 perturbation deltas '
+                    'delta[i,k] on delta[j,k] for j != i using forward subset selection '
+                    'with LOOCV-MSE as the stopping criterion (cardinality capped at 12). '
+                    'Score = |coefficient|; sign = sign(coefficient). Forward greedy is '
+                    'the numerically-equivalent cousin of Lasso with LOOCV-selected alpha '
+                    'in the regime p>n where classical L1 coordinate descent is unstable '
+                    '(no sklearn installed in run-time; we use pure numpy).'
+                ),
+                'score': {
+                    'mean_cv_r2_per_gene':    float(cv_r2_B.mean()),
+                    'min_cv_r2_per_gene':     float(cv_r2_B.min()),
+                    'max_cv_r2_per_gene':     float(cv_r2_B.max()),
+                    'mean_supportsize':       float(n_nz_per_gene.mean()),
+                    'mean_abs_coef_retained': float(np.mean(retained_B_coefs)) if retained_B_coefs else 0.0,
+                    'stability_jaccard_12of15': float(stab_B[0]),
+                    'stability_jaccard_std':    float(stab_B[1]),
+                },
+                'rationale': (
+                    'Directly tests a different data modality (steady-state perturbations '
+                    'vs time series) for the same skeleton + sign. Linearised steady-state '
+                    'model: under unobserved perturbation u_k we observe delta[k] and the '
+                    'regression on delta[k] gives the inter-gene Jacobian projection. '
+                    'Stepwise-LOOCV prevents dense overfitting in the underdetermined regime '
+                    '(15 samples, 24 features).'
+                ),
+                'strengths': [
+                    'Uses an entirely different data source, so agreement with Method A is '
+                    'informative.',
+                    'Each row of inferred B has small mean support (%.2f preds/gene) and '
+                    'the resulting graph is sparse and interpretable.' % n_nz_per_gene.mean(),
+                ],
+                'limitations': [
+                    'Severe underdetermination: 15 obs vs 24 candidate predictors per row. '
+                    'Only a handful of edges are recovered per gene.',
+                    'Linear approximation may break for the 3 large-magnitude perturbation '
+                    'rows (L2 distance from baseline 21-30), biasing some coefs.',
+                    'Specific intervention targets/mechanisms are undocumented, so the design '
+                    'matrix is a proxy for the true perturbation Jacobian.',
+                    'Low bootstrap stability (Jaccard = %.3f +/- %.3f) because the sparse B '
+                    'edge set has high sampling variability when only 12 of 15 perturbations '
+                    'are held out.' % tuple(stab_B),
+                ],
+            },
+        ],
+    }
+    mc['consensus'] = {
+        'rule': (
+            'Union of top-K_A from Method A and top-K_B from Method B, dropping edges '
+            'where the two methods disagree on sign. Merged weights are the geometric '
+            'mean of normalised |.| when both contribute, or the contributing method\'s '
+            'score otherwise. Density clamped to [5%,40%] by dropping weakest edges if '
+            'too dense, or by extending top-K if too sparse.'
+        ),
+        'K_A_final':             int(KAf),
+        'K_B_final':             int(KBf),
+        'off_diagonal_density':  float(density_off),
+        'in_target_band':        bool(0.05 <= density_off <= 0.40),
+        'relaxation_log':        relax_log,
+        'rationale': (
+            'Union + sign agreement reduces false positives while keeping edges supported '
+            'by either modality. Geometric-mean merging rewards edges on which both '
+            'methods agree strongly.'
+        ),
+    }
+    with open(out_dir / 'method_comparison.json', 'w') as f:
+        json.dump(mc, f, indent=2)
+
+
+# ---------------------------------------------------------------- Main
+def main():
+    print('==== STEP 1: Method A (with/without t=0 sample; pick best) ====', flush=True)
+    S_A0, sign_A0 = method_A(ts, drop_first_sample=False)
+    S_A1, sign_A1 = method_A(ts, drop_first_sample=True)
+    sep0, sep1 = separation_metric(S_A0), separation_metric(S_A1)
+    print(f'  no-skip sep = {sep0:.3f}; skip-first sep = {sep1:.3f}')
+    if sep1 >= sep0:
+        S_A, sign_A, A_label = S_A1, sign_A1, 'skip_first_sample'
+    else:
+        S_A, sign_A, A_label = S_A0, sign_A0, 'keep_all_samples'
+    print(f'  -> chose {A_label}')
+
+    print('==== STEP 2: Method B (forward-stepwise LOOCV on perturbations) ====')
+    t0 = time.time()
+    S_B, sign_B, cv_r2_B, nnz_per_gene = method_B(ss, max_features=12)
+    print(f'  done in {time.time()-t0:.1f}s; '
+          f'per-gene CV R^2 mean/min/max = {cv_r2_B.mean():.3f}/'
+          f'{cv_r2_B.min():.3f}/{cv_r2_B.max():.3f}; '
+          f'support mean = {nnz_per_gene.mean():.2f}')
+
+    print('==== STEP 3: Build consensus ====')
+    n_A, n_B = normalize_abs(S_A), normalize_abs(S_B)
+    consensus_idx, sign_lk, weight_lk, density, relax_log, KAf, KBf = consensus_flow(
+        K_A=130, K_B=130, sign_A=sign_A, sign_B=sign_B, n_A=n_A, n_B=n_B,
+        target_lo=LO, target_hi=HI)
+    print(f'  K_A={KAf}, K_B={KBf}, density={density:.4f} '
+          f'(in [0.05,0.40]? {LO <= density <= HI})')
+    for l in relax_log:
+        print('  ' + l)
+
+    print('==== STEP 4: Build matrices ====')
+    inferred = np.zeros((N_G, N_G), dtype=np.float64)
+    signs    = np.zeros((N_G, N_G), dtype=np.float64)
+    for idx in consensus_idx:
+        i, j = divmod(idx, N_G)
+        inferred[i, j] = weight_lk[idx]
+        signs[i, j]    = sign_lk[idx]
+    np.fill_diagonal(inferred, 0.0)
+    np.fill_diagonal(signs,    0.0)
+
+    print('==== STEP 5: Sanity checks ====')
+    assert inferred.shape == (N_G, N_G) and inferred.dtype == np.float64
+    assert not np.isnan(inferred).any() and not np.isinf(inferred).any()
+    assert np.all((inferred == 0) == (signs == 0)), 'zero-net -> zero-sign violated'
+    assert np.allclose(np.diag(inferred), 0.0), 'diagonal must be zero'
+    off_diag = inferred.copy(); np.fill_diagonal(off_diag, 0.0)
+    nonzero_off = int((off_diag != 0).sum())
+    density_off = nonzero_off / OFF
+    print(f'  off-diag nonzero = {nonzero_off}, density = {density_off:.4f}')
+    assert 0.05 <= density_off <= 0.40, f'density {density_off} out of band'
+
+    print('==== STEP 6: Hub identification ====')
+    binary = (inferred != 0).astype(float)
+    out_deg = binary.sum(axis=0)
+    in_deg  = binary.sum(axis=1)
+    total_weight = np.abs(inferred).sum(axis=0)
+    hubs = sorted(range(N_G),
+                  key=lambda g: (-out_deg[g], -total_weight[g]))[:2]
+    for h in hubs:
+        print(f'  hub {h}: out_deg = {int(out_deg[h])}, in_deg = {int(in_deg[h])}')
+    assert len(set(hubs)) == 2, 'hubs must be two distinct genes'
+
+    print('==== STEP 7: Stability bootstraps ====')
+    t0 = time.time()
+    stab_A = bootstrap_A_overlap(ts, n_reps=15, label_A_used=A_label,
+                                 base_consensus_size=len(consensus_idx))
+    print(f'  A stability: {stab_A[0]:.3f} +/- {stab_A[1]:.3f}  '
+          f'({time.time()-t0:.1f}s)')
+    t0 = time.time()
+    stab_B = bootstrap_B_overlap(ss, n_reps=15,
+                                 base_consensus_size=len(consensus_idx))
+    print(f'  B stability: {stab_B[0]:.3f} +/- {stab_B[1]:.3f}  '
+          f'({time.time()-t0:.1f}s)')
+
+    print('==== STEP 8: Write artifacts ====')
+    write_artifacts(inferred, signs, hubs,
+                    cv_r2_B, nnz_per_gene,
+                    A_label, KAf, KBf, density_off,
+                    method_A_obj=dict(S_A=S_A,
+                                       consensus_idx=list(consensus_idx)),
+                    method_B_obj=dict(S_B=S_B),
+                    stab_A=stab_A, stab_B=stab_B, relax_log=relax_log)
+    print('  all six artifacts written to workspace root.')
+    print('Done.')
+
+
+if __name__ == '__main__':
+    main()

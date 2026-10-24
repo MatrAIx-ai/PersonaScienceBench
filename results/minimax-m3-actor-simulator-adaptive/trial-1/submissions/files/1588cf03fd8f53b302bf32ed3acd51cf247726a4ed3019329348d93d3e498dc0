@@ -1,0 +1,228 @@
+"""Optimistic horizon-indexed Q-learning with cumulative-mean one-step backup targets and a Bernstein-style bonus.
+
+Design rationale (driven by the brief's "drift / burn-in" critique):
+
+ 1. **Two-role Q surface.** The single ``Q`` table holds the cumulative-mean
+    of unbiased one-step bootstrap targets ``Y = R + V_clean(h+1)``, where
+    ``V_clean`` is computed from ``Q`` alone (no bonus). This decouples the
+    bootstrap target from any optimistic correction, eliminating the
+    contamination that drives the UCB-B finite-sample burn-in.
+
+ 2. **Reward-clipped running variance.** A Welford ``M2`` accumulator tracks
+    the spread of observed bootstrap targets per cell. The bonus uses a
+    Bernstein-style form ``sigma^2 * log t / N`` together with a range term
+    ``c * R_max * sqrt(log t / N)``; a per-step cap bounds tail risk.
+
+ 3. **Per-cell log-of-t epoch term.** ``log_t`` is computed once per episode
+    (``log_offset`` controls the early-episode offset to keep the bonus
+    non-degenerate) and explicitly clipped to a horizon-aware maximum
+    ``L_max`` to avoid superlinear growth on long schedules.
+
+ 4. **Optimistic terminal bonus + small Q init.** Unvisited (h,s,a) cells
+    receive a fixed optimistic bonus bounded by ``terminal_bonus_floor * H``
+    to drive initial exploration; visited cells start with a small positive
+    ``Q_init`` so that ``V_clean`` for downstream states used as bootstrap
+    targets is non-negative and non-degenerate before any visit.
+
+Storage is provably ``O(H*S*A)`` plus one bounded in-flight episode trace of
+length ``H``. The agent never enumerates over next states, never estimates
+a transition model, has no replay buffer, no learned policy-gradient or
+deep value-gradient term, and produces a deterministic-yet-tie-broken
+integer action per ``act`` call.
+"""
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import numpy as np
+
+
+_DEFAULTS: dict[str, Any] = {
+    "c": 0.8,
+    "R_max": 0.3,
+    "L_max": 8.0,
+    "log_offset": 5.0,
+    "bonus_cap": None,
+    "Q_init": 0.3,
+    "bonus_floor": 0.0,
+    "terminal_bonus_floor": 1.0,
+    "m2_init": 0.0,
+}
+
+
+class _OptimisticQLearningAgent:
+    def __init__(self, env_spec: dict, seed: int, hyper: dict[str, Any]):
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.H = int(env_spec["H"])
+        self.rng = np.random.default_rng(int(seed))
+
+        hp = dict(_DEFAULTS)
+        if hyper:
+            hp.update(hyper)
+        self.hp = hp
+        self.c = float(hp["c"])
+        rmax = hp["R_max"]
+        if isinstance(rmax, str) and rmax.lower() in {"auto_h", "h"}:
+            self.rmax_mode_h = True
+            self.R_max_base = float(self.H)
+        else:
+            self.rmax_mode_h = False
+            self.R_max_base = float(rmax)
+        self.L_max = float(hp["L_max"])
+        self.log_offset = float(hp["log_offset"])
+        bc = hp["bonus_cap"]
+        if isinstance(bc, str) and bc.lower() in {"h", "auto_h"}:
+            self.bonus_cap_value = float(self.H)
+        elif bc is None:
+            self.bonus_cap_value = float("inf")
+        else:
+            self.bonus_cap_value = float(bc)
+        self.Q_init = float(hp["Q_init"])
+        self.bonus_floor = float(hp["bonus_floor"])
+        self.terminal_bonus_floor = float(hp["terminal_bonus_floor"])
+        self.m2_init = float(hp["m2_init"])
+
+        H_idx = self.H + 1
+        self.N = np.zeros((H_idx, self.S, self.A), dtype=np.int64)
+        self.Q = np.full((H_idx, self.S, self.A), self.Q_init, dtype=np.float64)
+        if self.m2_init > 0.0:
+            self.M2 = np.full((H_idx, self.S, self.A), self.m2_init, dtype=np.float64)
+        else:
+            self.M2 = np.zeros((H_idx, self.S, self.A), dtype=np.float64)
+        self.episode_count = 0
+        self._trace: list[tuple[int, int, int, float, int]] = []
+
+    def _log_term(self) -> float:
+        t = self.episode_count + self.log_offset
+        if t <= 1.0:
+            v = 0.0
+        else:
+            v = math.log(t)
+        if v < 0.0:
+            v = 0.0
+        if v > self.L_max:
+            v = self.L_max
+        return v
+
+    def _R_at(self, h: int) -> float:
+        if self.rmax_mode_h:
+            return max(1.0, float(self.H - h + 1))
+        return self.R_max_base
+
+    def _bonus(self, h: int, s: int, a: int) -> float:
+        n = int(self.N[h, s, a])
+        if n == 0:
+            return self.terminal_bonus_floor * max(self.H, 1)
+        sigma2 = float(self.M2[h, s, a]) / float(n)
+        log_t = self._log_term()
+        rmax = self._R_at(h)
+        b_var = sigma2 * log_t / n
+        b_range = self.c * rmax * math.sqrt(log_t / n)
+        b = b_var + b_range
+        if b > self.bonus_cap_value:
+            b = self.bonus_cap_value
+        if b < self.bonus_floor:
+            b = self.bonus_floor
+        return float(b)
+
+    def _V_clean(self, h: int, s: int) -> float:
+        """Return ``max_a Q[h, s, a]`` (clean, no bonus) for use as the
+        one-step bootstrap target during backup."""
+        if h > self.H:
+            return 0.0
+        q_row = self.Q[h, s]
+        out = float("-inf")
+        for a in range(self.A):
+            sc = float(q_row[a])
+            if sc > out:
+                out = sc
+        if math.isnan(out):
+            return 0.0
+        return out
+
+    def _safe_int(self, value: Any, lo: int, hi: int) -> int:
+        try:
+            v = int(value)
+        except Exception:
+            return lo
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def act(self, h: Any, state: Any) -> int:
+        hh = self._safe_int(h, 1, self.H)
+        ss = self._safe_int(state, 0, self.S - 1)
+        max_q = float(self.H - hh + 1)
+        scores = [0.0] * self.A
+        q_row = self.Q[hh, ss]
+        for a in range(self.A):
+            sc = float(q_row[a]) + self._bonus(hh, ss, a)
+            scores[a] = sc
+        capped = []
+        for sc in scores:
+            if math.isnan(sc):
+                sc = 0.0
+            if sc < 0.0:
+                sc = 0.0
+            elif sc > max_q:
+                sc = max_q
+            capped.append(sc)
+        max_score = max(capped)
+        candidates = [a for a in range(self.A) if capped[a] >= max_score - 1e-9]
+        if not candidates:
+            action = 0
+        else:
+            action = int(self.rng.choice(np.asarray(candidates, dtype=np.int64)))
+        return action
+
+    def observe(self, h: Any, s: Any, a: Any, r: Any, s_next: Any, done: Any) -> None:
+        hh = self._safe_int(h, 1, self.H)
+        ss = self._safe_int(s, 0, self.S - 1)
+        aa = self._safe_int(a, 0, self.A - 1)
+        ss_next = self._safe_int(s_next, 0, self.S - 1)
+        try:
+            rr = float(r)
+        except Exception:
+            rr = 0.0
+        is_done = bool(done)
+        self._trace.append((hh, ss, aa, rr, ss_next))
+        if is_done:
+            self.episode_count += 1
+            self._replay_trace()
+            self._trace.clear()
+
+    def _replay_trace(self) -> None:
+        for (hh, ss, aa, rr, ss_next) in reversed(self._trace):
+            if hh >= self.H:
+                next_val = 0.0
+            else:
+                next_val = self._V_clean(hh + 1, ss_next)
+            v = rr + next_val
+            max_q_h = float(self.H - hh + 1)
+            if v < 0.0:
+                v = 0.0
+            elif v > max_q_h:
+                v = max_q_h
+            old_n = int(self.N[hh, ss, aa])
+            new_n = old_n + 1
+            old_q = float(self.Q[hh, ss, aa])
+            new_q = (old_n * old_q + v) / float(new_n)
+            delta_old = v - old_q
+            delta_new = v - new_q
+            self.M2[hh, ss, aa] += delta_old * delta_new
+            self.Q[hh, ss, aa] = new_q
+            self.N[hh, ss, aa] = new_n
+
+
+def make_agent(env_spec: dict, seed: int) -> Any:
+    hyper: dict[str, Any] = {}
+    if "_HYPER" in globals():
+        try:
+            hyper = dict(globals()["_HYPER"])  # type: ignore[name-defined]
+        except Exception:
+            hyper = {}
+    return _OptimisticQLearningAgent(env_spec, seed, hyper)

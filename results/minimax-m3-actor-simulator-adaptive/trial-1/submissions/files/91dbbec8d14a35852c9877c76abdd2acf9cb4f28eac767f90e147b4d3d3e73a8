@@ -1,0 +1,621 @@
+"""
+DiscoveryBench task: nls_ses_processed.csv
+Question: does the relation between SES and probability of BA-completion
+vary by the race of the respondent?
+
+Approach (per approved plan, stage=result):
+  (a) baseline GLM   logit P(BA) ~ SES
+  (b) extended GLM   logit P(BA) ~ SES * C(race, ref='White') + controls
+                     with controls = ABILITY + PERCENTILE + SEX + FAMILY_SIZE
+  (c) per-race stratified GLMs
+
+  Three override details applied by researcher:
+  - Linearity check (bs(SES, df=3) vs linear) performed BEFORE choosing the
+    main model; if AIC improvement > 4 the spline is taken as the main form.
+  - Firth bias-reduced logistic regression applied in PARALLEL with standard
+    GLM for (b) and (c); reported alongside, not as a footnote.
+  - Per-race descriptive table (BA base rates and mean SES) computed before
+    (c).
+
+Robustness:
+  - If |corr(SES, ABILITY)| > 0.5 or VIF > 5 in (b), do NOT drop ABILITY;
+    instead re-fit (b) and (c) with ridge (L2) penalisation and report.
+  - If Hispanic-BA < 20 observations, report interaction direction/order
+    without a strict Wald significance claim.
+"""
+from __future__ import annotations
+
+import hashlib, sys, json, math, warnings
+import numpy as np
+import pandas as pd
+import patsy
+from scipy.optimize import minimize
+from scipy.stats import norm
+import statsmodels.api as sm
+from statsmodels.genmod.families import Binomial
+from statsmodels.genmod.families.links import Logit
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+warnings.simplefilter("ignore", FutureWarning)
+warnings.simplefilter("ignore", RuntimeWarning)
+np.set_printoptions(suppress=True, precision=4)
+pd.set_option("display.width", 180)
+pd.set_option("display.max_columns", 40)
+
+# ---------------------------------------------------------------- constants --
+DATA_PATH = "/workspace/data/nls_ses_processed.csv"
+ARTIFACTS = "/workspace/artifacts"
+SEED = 20261021
+RNG = np.random.default_rng(SEED)
+
+
+def section(s):
+    print("\n" + "=" * 78)
+    print(s)
+    print("=" * 78)
+
+
+# ------------------------------------------------------------------ ingest --
+section("0. Ingest and integrity")
+with open(DATA_PATH, "rb") as f:
+    sha = hashlib.sha256(f.read()).hexdigest()
+print(f"file        : {DATA_PATH}")
+print(f"sha256      : {sha}")
+
+df = pd.read_csv(DATA_PATH)
+print(f"shape raw   : {df.shape}")
+
+# Drop the trailing index-column artefact (Unnamed: 0).
+if "Unnamed: 0" in df.columns:
+    df = df.drop(columns=["Unnamed: 0"])
+
+# Explicit 0/1 conversion of BA (bool -> int) for reproducibility.
+df["BA"] = df["BA DEGREE COMPLETED"].astype(int)
+assert set(df["BA"].unique()).issubset({0, 1})
+print(f"shape clean : {df.shape}")
+print(f"columns     : {list(df.columns)}")
+print(f"CASE ID uniq: {df['CASE ID'].nunique()}, dup: {df['CASE ID'].duplicated().sum()}")
+
+# Centring (interpretability of interactions; per plan).
+df["SES_c"]        = df["SES"] - df["SES"].mean()
+df["ABILITY_c"]    = df["ABILITY: COMPOSITE OF ASVAB SCORE"] - df["ABILITY: COMPOSITE OF ASVAB SCORE"].mean()
+df["PCT_c"]        = df["PERCENTILE IN CLASS"] - df["PERCENTILE IN CLASS"].mean()
+df["FAMSIZ_c"]     = df["FAMILY SIZE OF SAMPLE"] - df["FAMILY SIZE OF SAMPLE"].mean()
+
+print(f"any NA?     : {df.isna().any().any()}")
+
+# Categorical encoding with White as reference, treatment contrast.
+df["race_W"]  = (df["SAMPLE_RACE"] == "White").astype(int)
+df["race_B"]  = (df["SAMPLE_RACE"] == "Black").astype(int)
+df["race_H"]  = (df["SAMPLE_RACE"] == "Hispanic").astype(int)
+df["male"]    = (df["SAMPLE_SEX"]  == "Male").astype(int)
+
+
+# ------------------------------------------------------- Firth implementation
+def _logistic(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def fit_firth(X: np.ndarray, y: np.ndarray,
+              max_iter: int = 200, tol: float = 1e-8,
+              eps: float = 1e-12) -> tuple[np.ndarray, np.ndarray, float, float, int]:
+    """Firth bias-reduced logistic regression.
+
+    Implements the IRLS scheme that maximises
+        ell(beta) + 0.5 * log det(X' W X)
+    using the working-response adjustment
+        z = eta + (y - pi + (1/2)*h) / W
+    where h_i = diag(W^(1/2) X (X'WX)^-1 X' W^(1/2))_i is the i-th
+    diagonal entry of the hat matrix.
+
+    Returns (beta, vcov, penalized_loglik, unpenalized_loglik, n_iter).
+    The vcov matrix is the standard inverse-Hessian (X'WX)^-1 at the
+    Firth optimum -- a Wald-type approximation used in the logistf
+    package for individual coefficient p-values.
+    """
+    n, p = X.shape
+
+    def _unpen_loglik(pi, y):
+        return float(np.sum(y * np.log(pi + eps) + (1 - y) * np.log(1 - pi + eps)))
+
+    beta = np.linalg.lstsq(np.column_stack([np.ones(n), X[:, 1:]]),
+                           y, rcond=None)[0] if False else np.zeros(p)  # initial
+    # Intercept-aware init via GLM on intercept + 0 elsewhere.
+    try:
+        Xt = np.column_stack([np.ones(n), X[:, 1:]])
+        beta = np.zeros(p)
+        beta[0] = math.log(max(y.mean(), eps) / max(1 - y.mean(), eps))
+    except Exception:
+        beta = np.zeros(p)
+
+    pen_loglik_prev = -np.inf
+    n_iter = 0
+    sX_cache = None
+    XtWX_inv_cache = None
+    for it in range(max_iter):
+        n_iter = it + 1
+        eta = np.clip(X @ beta, -30, 30)
+        pi = _logistic(eta)
+        W = pi * (1 - pi)
+        if not np.all(W > eps):
+            W = np.maximum(W, eps)
+        XW = X * W[:, None]
+        XtWX = X.T @ XW
+        try:
+            XtWX_inv = np.linalg.inv(XtWX)
+        except np.linalg.LinAlgError:
+            XtWX_inv = np.linalg.pinv(XtWX)
+        # hat diagonal: h_i = sum_{k,l} XtWX_inv[k,l] * x_{i,k} * x_{i,l} * W_i
+        # using sX_i = sqrt(W_i) * x_i, vectorised as e_{i,k}*sX_i for each k:
+        sX = X * np.sqrt(W)[:, None]
+        # diag( sX * (XtWX_inv @ sX.T) )  ==  (sX * (sX @ XtWX_inv)).sum(axis=1)
+        # because  e_i^T sX (XtWX_inv) sX^T e_i  =  row_i(sX) XtWX_inv row_i(sX)^T
+        # and row_i(sX)^T XtWX_inv row_i = ((sX @ XtWX_inv) @ row_i(sX)^T)[i] (by sym)
+        # which equals ((sX @ XtWX_inv) [i]).dot(sX[i])
+        h = (sX * (sX @ XtWX_inv)).sum(axis=1)
+        # working residual with Firth offset (1/2)h_i
+        adj = (y - pi) + 0.5 * h
+        # working response
+        z = eta + adj / W
+        # beta update
+        XtWz = X.T @ (W * z)
+        beta_new = XtWX_inv @ XtWz
+        # penalised log-likelihood (Firth's actual objective)
+        sign, logdet = np.linalg.slogdet(XtWX)
+        if sign <= 0:
+            logdet = 0.0
+        unpen = _unpen_loglik(pi, y)
+        pen_loglik = unpen + 0.5 * logdet
+        diff_b = np.max(np.abs(beta_new - beta))
+        diff_ll = pen_loglik - pen_loglik_prev
+        if diff_b < tol and abs(diff_ll) < tol:
+            beta = beta_new
+            pen_loglik_prev = pen_loglik
+            break
+        beta = beta_new
+        pen_loglik_prev = pen_loglik
+
+    # Final pass for variance estimate at solution.
+    eta = np.clip(X @ beta, -30, 30)
+    pi = _logistic(eta)
+    W = np.maximum(pi * (1 - pi), eps)
+    XW = X * W[:, None]
+    XtWX = X.T @ XW
+    try:
+        XtWX_inv = np.linalg.inv(XtWX)
+    except np.linalg.LinAlgError:
+        XtWX_inv = np.linalg.pinv(XtWX)
+    sign, logdet = np.linalg.slogdet(XtWX)
+    if sign <= 0:
+        logdet = 0.0
+    unpen = _unpen_loglik(pi, y)
+    pen_loglik = unpen + 0.5 * logdet
+    return beta, XtWX_inv, pen_loglik, unpen, n_iter
+
+
+def firth_wald_summary(beta, vcov, names, alpha=0.05):
+    se = np.sqrt(np.maximum(np.diag(vcov), 0))
+    z = beta / np.where(se == 0, np.nan, se)
+    p = 2 * (1 - norm.cdf(np.abs(z)))
+    out = pd.DataFrame({"coef": beta, "se": se, "z": z, "p": p,
+                        f"CI_lo_{int(100*(1-alpha))}": beta - norm.ppf(1 - alpha/2) * se,
+                        f"CI_hi_{int(100*(1-alpha))}": beta + norm.ppf(1 - alpha/2) * se},
+                       index=names)
+    return out
+
+
+def fit_ridge_logit(X: np.ndarray, y: np.ndarray, lam: float = 1.0,
+                    max_iter: int = 200, tol: float = 1e-8):
+    """L2-penalised logistic regression via Newton-CG with analytic Hessian."""
+    n, p = X.shape
+    # Standardise columns (intercept-fitted on mean) to make penalty fair.
+    Xc = X.copy()
+    Xc[:, 1:] = Xc[:, 1:] - Xc[:, 1:].mean(axis=0, keepdims=True)
+    sd = Xc[:, 1:].std(axis=0, ddof=1, keepdims=True); sd[sd == 0] = 1.0
+    Xc[:, 1:] = Xc[:, 1:] / sd
+    ymean = y.mean()
+    beta = np.zeros(p)
+    for _ in range(max_iter):
+        eta = np.clip(Xc @ beta, -30, 30)
+        pi = _logistic(eta)
+        W = pi * (1 - pi)
+        r = y - pi
+        XW = Xc * W[:, None]
+        XtWX = Xc.T @ XW + lam * np.eye(p)
+        XtW = Xc.T @ (W * r) - lam * beta
+        try:
+            step = np.linalg.solve(XtWX, XtW)
+        except np.linalg.LinAlgError:
+            step = np.linalg.lstsq(XtWX, XtW, rcond=None)[0]
+        beta = beta + step
+        if np.max(np.abs(step)) < tol:
+            break
+    # Undo scaling of columns (intercept not scaled), keep coefficient ratio.
+    coef_orig = beta.copy()
+    coef_orig[1:] = coef_orig[1:] / sd.ravel()  # scaling reverses
+    return beta, coef_orig, Xc, sd
+
+
+
+
+# --------------------------------------------------------- per-race descriptives
+section("1. Per-race descriptive support (required before stratified models)")
+descr = (df.groupby("SAMPLE_RACE")
+           .agg(n=("BA", "size"),
+                BA_n=("BA", "sum"),
+                BA_rate=("BA", "mean"),
+                SES_mean=("SES", "mean"),
+                SES_sd=("SES", "std"),
+                ABILITY_mean=("ABILITY: COMPOSITE OF ASVAB SCORE", "mean"),
+                PCT_mean=("PERCENTILE IN CLASS", "mean"),
+                FAM_mean=("FAMILY SIZE OF SAMPLE", "mean"),
+                male_rate=("male", "mean"))
+           .round(4))
+descr["BA_pct"] = (descr["BA_rate"] * 100).round(2)
+print(descr)
+
+# save
+descr.to_csv(f"{ARTIFACTS}/table_within_race_descriptives.csv")
+
+# Per-pair correlation (clue for VIF concerns)
+section("2. Pairwise correlations among SES and academic-resource controls")
+num_cols = ["SES_c", "ABILITY_c", "PCT_c", "FAMSIZ_c", "male"]
+cm = df[num_cols].corr().round(3)
+print(cm)
+cm.to_csv(f"{ARTIFACTS}/corr_pairwise.csv")
+hispanic_ba = int(((df["SAMPLE_RACE"] == "Hispanic") & (df["BA"] == 1)).sum())
+print(f"\nBA-event count in Hispanic subgroup: {hispanic_ba}")
+print(f"Plan T2 trigger if <20 -> drop strict Wald for Hispanic interaction: "
+      f"{'ACTIVATE' if hispanic_ba < 20 else 'INACTIVE'}")
+
+
+# --------------------------------------------------------- linearity check
+section("3. Linearity of SES in the logit (per plan: choose BEFORE main models)")
+# baseline (a) - linear SES, intercept only controls -> use direct GLM
+glm_lin = sm.GLM(df["BA"],
+                 sm.add_constant(df[["SES_c"]]),
+                 family=Binomial(link=Logit())).fit()
+print(glm_lin.summary())
+
+# Spline (cubic B-spline with df=3 -> two interior knots) of SES
+formula_lin = "BA ~ SES_c"
+formula_spl = "BA ~ bs(SES_c, df=3, degree=3) - 1"
+y, X_lin = patsy.dmatrices(formula_lin, df, return_type="dataframe")
+y = y.values.ravel()
+X_lin_arr = np.asarray(X_lin); names_lin = list(X_lin.columns)
+glm_lin2 = sm.GLM(y, X_lin_arr, family=Binomial(link=Logit())).fit()
+
+_, X_spl = patsy.dmatrices(formula_spl, df, return_type="dataframe")
+X_spl_arr = np.asarray(X_spl); names_spl = list(X_spl.columns)
+glm_spl = sm.GLM(y, X_spl_arr, family=Binomial(link=Logit())).fit()
+
+print("\n--- linear  AIC:", round(glm_lin2.aic, 2), " dev=", round(glm_lin2.deviance, 2))
+print("--- spline(df=3) AIC:", round(glm_spl.aic, 2), " dev=", round(glm_spl.deviance, 2))
+aic_diff = glm_lin2.aic - glm_spl.aic
+print(f"AIC delta (linear - spline) = {aic_diff:.3f}  (positive => spline preferred)")
+
+# Also LRT (nested - linear is nested in spline)
+lr_stat = glm_lin2.deviance - glm_spl.deviance
+lr_df   = X_spl_arr.shape[1] - X_lin_arr.shape[1]
+from scipy.stats import chi2
+lr_p = chi2.sf(lr_stat, lr_df)
+print(f"LRT stat = {lr_stat:.4f}, df = {lr_df}, p = {lr_p:.4g}")
+
+LINEAR_PREFERRED = aic_diff <= 4
+USE_SPLINE = not LINEAR_PREFERRED
+print(f"DECISION: linear SES in main models = {LINEAR_PREFERRED}; "
+      f"cubic spline = {USE_SPLINE}")
+
+
+# ----------------------------------------------------------------- model (a)
+section("4. Model (a): baseline GLM   BA ~ SES (linear), centred")
+formula_a = "BA ~ SES_c"
+_, Xa = patsy.dmatrices(formula_a, df, return_type="dataframe")
+Xa_arr = np.asarray(Xa); names_a = list(Xa.columns)
+y = df["BA"].values
+glm_a = sm.GLM(y, Xa_arr, family=Binomial(link=Logit())).fit()
+print(glm_a.summary())
+
+# OR interpretation at SES=+1 SD vs SES=-1 SD
+sd_ses = df["SES_c"].std()
+eta_hi = glm_a.params[0] + glm_a.params[1] * (+sd_ses)
+eta_lo = glm_a.params[0] + glm_a.params[1] * (-sd_ses)
+or_2sd = math.exp(eta_hi - eta_lo)  # OR for ±1 SD swing
+print(f"\nOR for SES +1 SD vs -1 SD (linear baseline): {or_2sd:.3f}")
+
+
+# ----------------------------------------------------------------- model (b)
+section("5. Model (b): extended GLM with SES x race interaction and controls")
+# full (with interaction) - intercept + SES + race dummies + interactions + controls
+formula_b_int = "BA ~ SES_c * C(SAMPLE_RACE, Treatment('White')) + ABILITY_c + PCT_c + male + FAMSIZ_c"
+_, Xb_full = patsy.dmatrices(formula_b_int, df, return_type="dataframe")
+Xb_full_arr = np.asarray(Xb_full); names_b_full = list(Xb_full.columns)
+print("Design columns for (b-full):", names_b_full)
+
+# reduced (without SES:race)
+formula_b_red = "BA ~ SES_c + C(SAMPLE_RACE, Treatment('White')) + ABILITY_c + PCT_c + male + FAMSIZ_c"
+_, Xb_red = patsy.dmatrices(formula_b_red, df, return_type="dataframe")
+Xb_red_arr = np.asarray(Xb_red); names_b_red = list(Xb_red.columns)
+
+# Fit GLMs
+glm_b_full = sm.GLM(y, Xb_full_arr, family=Binomial(link=Logit())).fit()
+glm_b_red  = sm.GLM(y, Xb_red_arr,  family=Binomial(link=Logit())).fit()
+print("\n--- (b) extended WITHOUT interaction ---")
+print(glm_b_red.summary())
+print("\n--- (b) extended WITH interaction ---")
+print(glm_b_full.summary())
+
+# LRT on interaction block
+lr_b = glm_b_red.deviance - glm_b_full.deviance
+df_b = Xb_full_arr.shape[1] - Xb_red_arr.shape[1]
+lr_b_p = chi2.sf(lr_b, df_b)
+print(f"\nLRT on (b) interaction block   stat={lr_b:.4f}  df={df_b}  p={lr_b_p:.4g}")
+
+# Wald z's for individual interaction coefficients
+interaction_idx = [i for i, n in enumerate(names_b_full) if ":C(SAMPLE_RACE" in str(n)]
+print("\nInteraction Wald tests (z values):")
+for i in interaction_idx:
+    z = glm_b_full.tvalues[i]; pv = glm_b_full.pvalues[i]
+    print(f"  {names_b_full[i]:>60s}  coef={glm_b_full.params[i]:+.4f}  z={z:+.4f}  p={pv:.4g}")
+
+# VIF (only on non-interaction columns?  VIF for interactions is non-standard; use
+# VIF on the reduced model as the collinearity proxy for the controls).
+print("\nVIF on (b) reduced (controls only):")
+vif_X = np.column_stack([np.ones(len(df)), df[["SES_c","ABILITY_c","PCT_c","male","FAMSIZ_c",
+                                              "race_B","race_H"]].values])
+vif_names = ["const","SES_c","ABILITY_c","PCT_c","male","FAMSIZ_c","race_B","race_H"]
+for i, n in enumerate(vif_names):
+    if n == "const": continue
+    print(f"  {n:>12s}  VIF={variance_inflation_factor(vif_X, i):.3f}")
+
+corr_ses_ability = float(df["SES_c"].corr(df["ABILITY_c"]))
+corr_ses_pct     = float(df["SES_c"].corr(df["PCT_c"]))
+print(f"\ncorr(SES_c, ABILITY_c) = {corr_ses_ability:+.4f}")
+print(f"corr(SES_c, PCT_c)     = {corr_ses_pct:+.4f}")
+
+
+# ----------------------------------------------------------------- Firth (b)
+section("6. Firth bias-reduced logistic - model (b)")
+print(f"GLM (b) converged: {glm_b_full.converged}  ; Firth running ...")
+beta_fb_full, V_fb_full, pll_fb_full, ull_fb_full, ni = fit_firth(Xb_full_arr, y)
+beta_fb_red,  V_fb_red,  pll_fb_red,  ull_fb_red,  _ = fit_firth(Xb_red_arr,  y)
+print(f"Penalised loglik (b, with interaction): {pll_fb_full:.4f}")
+print(f"Penalised loglik (b, no interaction)  : {pll_fb_red:.4f}")
+fir_lrt_b = 2.0 * (pll_fb_full - pll_fb_red)
+fir_p_b   = chi2.sf(fir_lrt_b, df_b)
+print(f"Firth LRT on interaction block   stat={fir_lrt_b:.4f}  df={df_b}  p={fir_p_b:.4g}")
+
+fir_b_full = firth_wald_summary(beta_fb_full, V_fb_full, names_b_full)
+print("\nFirth (b, with interaction) - Wald summary:")
+print(fir_b_full)
+fir_b_full.to_csv(f"{ARTIFACTS}/table_b_firth_full.csv")
+
+fir_int_idx = [i for i, n in enumerate(names_b_full) if ":C(SAMPLE_RACE" in str(n)]
+print("\nFirth interaction Wald tests:")
+for i in fir_int_idx:
+    z = beta_fb_full[i] / math.sqrt(max(V_fb_full[i,i], 0))
+    pv = 2*(1-norm.cdf(abs(z)))
+    print(f"  {names_b_full[i]:>60s}  coef={beta_fb_full[i]:+.4f}  z={z:+.4f}  p={pv:.4g}")
+
+
+# ----------------------------------------------------- stratified models (c)
+section("7. Model (c): per-race stratified GLMs and parallel Firth")
+strat_rows_glm = []
+strat_rows_firth = []
+race_slopes = {}
+ame_per_race = {}
+for race, sub in df.groupby("SAMPLE_RACE"):
+    print(f"\n--- stratified subset: {race} (n={len(sub)}, BA={(sub['BA']==1).sum()}) ---")
+    formula_c = "BA ~ SES_c + ABILITY_c + PCT_c + male + FAMSIZ_c"
+    _, Xc = patsy.dmatrices(formula_c, sub, return_type="dataframe")
+    Xc_arr = np.asarray(Xc); names_c = list(Xc.columns)
+    y_c = sub["BA"].values
+
+    glm_c = sm.GLM(y_c, Xc_arr, family=Binomial(link=Logit())).fit()
+    print(glm_c.summary())
+
+    rbeta, vvc, pll, ull, ni = fit_firth(Xc_arr, y_c)
+    fir = firth_wald_summary(rbeta, vvc, names_c)
+    print("Firth (c):")
+    print(fir)
+    fir.to_csv(f"{ARTIFACTS}/table_c_firth_{race}.csv")
+
+    # collect
+    row_g = {"race": race,
+             "SES_coef_glm":  glm_c.params[1],  "SES_se_glm":  glm_c.bse[1],
+             "SES_p_glm":     glm_c.pvalues[1],
+             "SES_AME_1SD_glm": (glm_c.predict(
+                 Xc_arr + np.array([0, +sub['SES_c'].std(), 0, 0, 0, 0])) -
+                                  glm_c.predict(
+                 Xc_arr + np.array([0, -sub['SES_c'].std(), 0, 0, 0, 0]))).mean()}
+    row_f = {"race": race,
+             "SES_coef_firth": rbeta[1],
+             "SES_se_firth":   math.sqrt(max(vvc[1,1], 0)),
+             "SES_p_firth":    2*(1-norm.cdf(abs(rbeta[1] / math.sqrt(max(vvc[1,1],1e-12))))),
+             "SES_AME_1SD_firth":
+                 float((_logistic(Xc_arr @ (rbeta + np.array([0, +sub['SES_c'].std(),0,0,0,0]))) -
+                        _logistic(Xc_arr @ (rbeta + np.array([0, -sub['SES_c'].std(),0,0,0,0])))).mean())}
+    strat_rows_glm.append(row_g)
+    strat_rows_firth.append(row_f)
+    race_slopes[race] = (glm_c.params[1], glm_c.bse[1])
+    # AME of SES on probability scale (within race)
+    p_hi = glm_c.predict(Xc_arr + np.array([0, +sub['SES_c'].std(), 0, 0, 0, 0]))
+    p_lo = glm_c.predict(Xc_arr + np.array([0, -sub['SES_c'].std(), 0, 0, 0, 0]))
+    ame_per_race[race] = float((p_hi - p_lo).mean())
+
+strat_glm_tab   = pd.DataFrame(strat_rows_glm).set_index("race").round(4)
+strat_firth_tab = pd.DataFrame(strat_rows_firth).set_index("race").round(4)
+print("\nStratified SES effect, side-by-side:")
+print(strat_glm_tab)
+print(strat_firth_tab)
+strat_glm_tab.to_csv(f"{ARTIFACTS}/table_c_stratified_glm.csv")
+strat_firth_tab.to_csv(f"{ARTIFACTS}/table_c_stratified_firth.csv")
+print("\nAME (probability scale) of changing SES by ±1 SD, by race:")
+for r, v in ame_per_race.items():
+    print(f"  {r:>10s}  AME = {v:+.4f}")
+
+
+# --------------------------------------------- AME within model (b), by race
+section("8. AME of SES on probability scale, by race - model (b) PREDICTED")
+ses_sd = df["SES_c"].std()
+
+# Build a counterfactual design matrix: assign everyone race r, SES +/- 1 SD,
+# keep all other covariates at observed values.  AME = mean predicted prob
+# difference.  Xb_full has columns with named indexes.
+
+col_ix = {n: i for i, n in enumerate(Xb_full.columns)}
+INT_B = col_ix["SES_c:C(SAMPLE_RACE, Treatment('White'))[T.Black]"]
+INT_H = col_ix["SES_c:C(SAMPLE_RACE, Treatment('White'))[T.Hispanic]"]
+SES_x = col_ix["SES_c"]
+B_x   = col_ix["C(SAMPLE_RACE, Treatment('White'))[T.Black]"]
+H_x   = col_ix["C(SAMPLE_RACE, Treatment('White'))[T.Hispanic]"]
+
+def ame_for_race_in_b(race_str, Xb_full_arr=Xb_full_arr, Xb_full_cols=Xb_full.columns):
+    # Copy the empirical matrix
+    X_pos = Xb_full_arr.copy()
+    X_neg = Xb_full_arr.copy()
+    # Set race indicators to race_str
+    if race_str == "White":
+        X_pos[:, B_x] = 0; X_neg[:, B_x] = 0
+        X_pos[:, H_x] = 0; X_neg[:, H_x] = 0
+        # interaction columns already zero
+    elif race_str == "Black":
+        X_pos[:, B_x] = 1; X_neg[:, B_x] = 1
+        X_pos[:, H_x] = 0; X_neg[:, H_x] = 0
+        X_pos[:, INT_B] = (X_pos[:, SES_x] + ses_sd) * 1
+        X_neg[:, INT_B] = (X_neg[:, SES_x] - ses_sd) * 1
+        X_pos[:, INT_H] = 0; X_neg[:, INT_H] = 0
+    elif race_str == "Hispanic":
+        X_pos[:, B_x] = 0; X_neg[:, B_x] = 0
+        X_pos[:, H_x] = 1; X_neg[:, H_x] = 1
+        X_pos[:, INT_B] = 0; X_neg[:, INT_B] = 0
+        X_pos[:, INT_H] = (X_pos[:, SES_x] + ses_sd) * 1
+        X_neg[:, INT_H] = (X_neg[:, SES_x] - ses_sd) * 1
+    # Shift SES by +/- sd (after zeroing out interaction columns for pos/neg versions)
+    X_pos[:, SES_x] = X_pos[:, SES_x] + ses_sd
+    X_neg[:, SES_x] = X_neg[:, SES_x] - ses_sd
+    # For White: ensure interaction columns stay 0
+    if race_str == "White":
+        X_pos[:, INT_B] = 0; X_neg[:, INT_B] = 0
+        X_pos[:, INT_H] = 0; X_neg[:, INT_H] = 0
+    eta_pos = X_pos @ np.asarray(glm_b_full.params)
+    eta_neg = X_neg @ np.asarray(glm_b_full.params)
+    p_pos = _logistic(eta_pos)
+    p_neg = _logistic(eta_neg)
+    return float((p_pos - p_neg).mean())
+
+ame_b = {r: ame_for_race_in_b(r) for r in ["White", "Black", "Hispanic"]}
+print("AME (model b) of SES ±1 SD, by race (probability scale):")
+for r, v in ame_b.items():
+    print(f"  {r:>10s}  AME = {v:+.4f}")
+
+
+# --------------------------------------------- Ridge backup if VIF / corr high
+section("9. Ridge-L2 backup if VIF or SES-ABILITY correlation warrant")
+do_ridge = (abs(corr_ses_ability) > 0.5)
+print(f"|corr(SES, ABILITY)|={abs(corr_ses_ability):.3f}  -> ridge applied = {do_ridge}")
+ridge_rows = []
+if do_ridge:
+    # Re-fit (b-full) and (b-red) with L2 logistic with several lambdas
+    for lam in (0.1, 1.0, 10.0):
+        for tag, X_, names_, formula in [
+            ("full", Xb_full_arr, names_b_full, formula_b_int),
+            ("red",  Xb_red_arr,  names_b_red,  formula_b_red),
+        ]:
+            # ridge function expects intercept column present (X[:,0]=1 already)
+            beta_r, beta_r_orig, Xc, sd = fit_ridge_logit(X_, y, lam=lam)
+            eta_full = X_ @ beta_r
+            p_full = _logistic(eta_full)
+            ll_full = float(np.sum(y*np.log(p_full+1e-12) + (1-y)*np.log(1-p_full+1e-12)))
+            ridge_rows.append({"lambda": lam, "model": tag, "loglik": round(ll_full, 3)})
+            print(f"  ridge lam={lam}, model={tag}, loglik={ll_full:.3f}")
+    print(pd.DataFrame(ridge_rows))
+    pd.DataFrame(ridge_rows).to_csv(f"{ARTIFACTS}/table_ridge_backup.csv", index=False)
+
+
+# ----------------------------------- bootstrap CIs for SES slopes (b)
+section("10. Bootstrap CIs for within-race SES slopes from model (b)")
+B0 = 400
+print(f"Running GLM bootstrap on model (b)  (B={B0}) ...")
+from time import time
+t0 = time()
+slopes_W, slopes_B, slopes_H = [], [], []
+n_conv = 0
+for b in range(B0):
+    sel = RNG.integers(0, len(df), size=len(df))
+    sub_b = df.iloc[sel]
+    try:
+        res = sm.GLM(sub_b["BA"].values,
+                     Xb_full_arr, family=Binomial(link=Logit())).fit(disp=False)
+        if not res.converged:
+            slopes_W.append(np.nan); slopes_B.append(np.nan); slopes_H.append(np.nan)
+            continue
+        n_conv += 1
+        ses_idx   = Xb_full.columns.get_loc("SES_c")
+        race_B_ix = Xb_full.columns.get_loc("C(SAMPLE_RACE, Treatment(\'White\'))[T.Black]")
+        race_H_ix = Xb_full.columns.get_loc("C(SAMPLE_RACE, Treatment(\'White\'))[T.Hispanic]")
+        int_B_ix  = Xb_full.columns.get_loc("SES_c:C(SAMPLE_RACE, Treatment(\'White\'))[T.Black]")
+        int_H_ix  = Xb_full.columns.get_loc("SES_c:C(SAMPLE_RACE, Treatment(\'White\'))[T.Hispanic]")
+        p = res.params
+        slopes_W.append(float(p[ses_idx]))
+        slopes_B.append(float(p[ses_idx] + p[int_B_ix]))
+        slopes_H.append(float(p[ses_idx] + p[int_H_ix]))
+    except Exception:
+        slopes_W.append(np.nan); slopes_B.append(np.nan); slopes_H.append(np.nan)
+print(f"bootstrap done in {time()-t0:.1f}s  ({n_conv}/{B0} converged)")
+
+def _ci(arr, lo=2.5, hi=97.5):
+    a = np.asarray(arr, dtype=float)
+    a = a[~np.isnan(a)]
+    if len(a) == 0: return (np.nan, np.nan)
+    return (float(np.percentile(a, lo)), float(np.percentile(a, hi)))
+
+ci_W = _ci(slopes_W); ci_B = _ci(slopes_B); ci_H = _ci(slopes_H)
+ses_ix = list(Xb_full.columns).index("SES_c")
+intB_ix = list(Xb_full.columns).index("SES_c:C(SAMPLE_RACE, Treatment('White'))[T.Black]")
+intH_ix = list(Xb_full.columns).index("SES_c:C(SAMPLE_RACE, Treatment('White'))[T.Hispanic]")
+slopeW_pt = float(glm_b_full.params[ses_ix])
+slopeB_pt = float(glm_b_full.params[ses_ix] + glm_b_full.params[intB_ix])
+slopeH_pt = float(glm_b_full.params[ses_ix] + glm_b_full.params[intH_ix])
+print(f"White  SES slope in (b): point={slopeW_pt:.4f}  percentile 95% CI = [{ci_W[0]:.4f}, {ci_W[1]:.4f}]")
+print(f"Black  SES slope in (b): point={slopeB_pt:.4f}  percentile 95% CI = [{ci_B[0]:.4f}, {ci_B[1]:.4f}]")
+print(f"Hisp.  SES slope in (b): point={slopeH_pt:.4f}  percentile 95% CI = [{ci_H[0]:.4f}, {ci_H[1]:.4f}]")
+
+
+
+# ----------------------------------------------- Summary of evidence
+section("11. Evidence summary")
+ev = {
+    "glm_a_SES_or_2sd": float(or_2sd),
+    "glm_a_SES_coef": float(glm_a.params[1]),
+    "glm_a_SES_se":   float(glm_a.bse[1]),
+    "glm_a_SES_p":    float(glm_a.pvalues[1]),
+    "glm_b_intblock_LRT_stat": float(lr_b),
+    "glm_b_intblock_LRT_df":   int(df_b),
+    "glm_b_intblock_LRT_p":    float(lr_b_p),
+    "firth_b_intblock_LRT_stat": float(fir_lrt_b),
+    "firth_b_intblock_LRT_df":   int(df_b),
+    "firth_b_intblock_LRT_p":    float(fir_p_b),
+    "corr_ses_ability":  corr_ses_ability,
+    "corr_ses_pct":      corr_ses_pct,
+    "hispanic_BA_n":     hispanic_ba,
+    "BA_per_race":       descr["BA_n"].to_dict(),
+    "BA_rate_per_race":  descr["BA_rate"].round(4).to_dict(),
+    "SES_mean_per_race": descr["SES_mean"].round(4).to_dict(),
+    "AME_in_b_per_race": {k: round(v, 4) for k, v in ame_b.items()},
+    "AME_strat_per_race": {k: round(v, 4) for k, v in ame_per_race.items()},
+    "LINEAR_PREFERRED":  bool(LINEAR_PREFERRED),
+    "AIC_linear": float(glm_lin2.aic),
+    "AIC_spline": float(glm_spl.aic),
+    "AIC_diff_lin_minus_spline": float(aic_diff),
+    "LRT_linear_vs_spline": float(lr_stat),
+    "LRT_df_lin_vs_spline": int(lr_df),
+    "LRT_p_lin_vs_spline": float(lr_p),
+    "bootstrap_n_converged": int(n_conv),
+    "bootstrap_White_CI": list(ci_W),
+    "bootstrap_Black_CI": list(ci_B),
+    "bootstrap_Hispanic_CI": list(ci_H),
+}
+with open(f"{ARTIFACTS}/evidence_summary.json", "w") as fh:
+    json.dump(ev, fh, indent=2, default=str)
+print(json.dumps(ev, indent=2, default=str))

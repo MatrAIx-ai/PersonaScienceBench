@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+analysis.py - Sparse/Noisy Compact-Star Sequence Reconstruction.
+
+Reads data/{mr_observations.csv, profile_fragments.csv, query_targets.json,
+physics_manifest.json}; fits a single-family reconstruction of the stable-
+branch mass-radius sequence together with normalized density and enclosed-
+mass profiles at three target masses; writes results/{mr_reconstruction.csv,
+profiles_reconstruction.npz, summary.json, reconstruction_plot.png}.
+
+Approach (high level; see docs in HANDSHAKE):
+  R(M)  : 4-parameter power-law-with-Chandrasekhar-tail family
+          R(M) = A * M^alpha * (1 - M/M_max)^gamma
+          (chosen because it preserves radius_monotonicity and provides R->0
+          at M_max, fixing mass_limit_solar from the same fit).
+  f_ρ(x; M) = (1 - x^p(M))^q(M)   (power-law envelope)
+  M_enc(x; M) = 3 * int_0^x u^2 f_ρ du / int_0^1 u^2 f_ρ du
+  (p(M), q(M)) : smooth 1-D trajectory across fragment masses, with quadratic
+                  extrapolation to M = 1.3 (one node past the boundary 1.16).
+
+Run from project root with:  python analysis.py
+"""
+from __future__ import annotations
+from pathlib import Path
+import json, math, sys
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+from scipy.interpolate import CubicSpline, PchipInterpolator, UnivariateSpline
+
+import tinyplot  # pure-Python PNG renderer (local fallback when matplotlib absent)
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+RES = ROOT / "results"
+RES.mkdir(exist_ok=True)
+
+# --------------------------------------------------------------------------
+# I/O
+# --------------------------------------------------------------------------
+def load_inputs():
+    mr = pd.read_csv(DATA / "mr_observations.csv")
+    prof = pd.read_csv(DATA / "profile_fragments.csv")
+    qry = json.loads((DATA / "query_targets.json").read_text())
+    mfst = json.loads((DATA / "physics_manifest.json").read_text())
+    return mr, prof, qry, mfst
+
+
+# --------------------------------------------------------------------------
+# R(M) family fitting
+# --------------------------------------------------------------------------
+def R_power_chandra(M, A, alpha, gamma, M_max):
+    """Monotone-decreasing R(M) that goes to zero at M_max."""
+    m = np.maximum(M, 1e-12)
+    z = np.clip(1.0 - m / M_max, 1e-12, None)
+    return A * np.power(m, alpha) * np.power(z, gamma)
+
+
+
+
+def fit_power_chandra(M, R, sigma_R):
+    """Multi-start fit of the power-Chandra family."""
+    def resid(theta):
+        A, a, g, Mmax = theta
+        return (R_power_chandra(M, A, a, g, Mmax) - R) / sigma_R
+    lb = [1.0, -1.5, 0.30, 1.25]
+    ub = [1e6, -0.10, 3.00, 1.65]
+    starts = [
+        [15000, -0.50, 0.60, 1.45],
+        [10000, -0.80, 0.40, 1.40],
+        [22000, -0.30, 1.00, 1.50],
+        [8000, -1.00, 0.50, 1.42],
+        [12000, -0.70, 0.80, 1.43],
+        [18000, -0.60, 0.45, 1.48],
+    ]
+    best = None
+    for x0 in starts:
+        try:
+            r = least_squares(resid, x0=x0, bounds=(lb, ub),
+                              method='trf', max_nfev=20000, xtol=1e-12, ftol=1e-12)
+            if (best is None) or (r.cost < best.cost):
+                best = r
+        except Exception:
+            import traceback; traceback.print_exc()
+    return best
+
+
+def fit_logpoly(M, R, sigma_R, deg):
+    """log R = sum c_i (log M)^i, fit in log space with delta-method weights;
+    transformed back, monotone-decreasing check on a dense tail grid."""
+    logM = np.log(M); logR = np.log(R)
+    sigma_logR = sigma_R / R  # propagation
+    X = np.vander(logM, deg + 1, increasing=True)
+    WX = X / sigma_logR[:, None]
+    try:
+        coef, *_ = np.linalg.lstsq(WX, logR / sigma_logR, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    # Monotone test on a fine grid up to 1.4
+    M_test = np.linspace(M.min(), 1.4, 800)
+    logM_t = np.log(M_test)
+    logR_t = sum(coef[i] * (logM_t**i) for i in range(deg + 1))
+    R_t = np.exp(logR_t)
+    if (np.diff(R_t) >= 0).any():
+        return None
+    R_pred = np.exp(X @ coef)
+    weighted_resid = (R_pred - R) / sigma_R
+    return {
+        'family': f'log-poly deg{deg}', 'coef': coef.tolist(),
+        'weighted_RSS': float(np.sum(weighted_resid**2)),
+        'n': len(M), 'k': deg + 1,
+    }
+
+
+
+def fit_pchip(M, R, sigma_R):
+    """Monotone cubic Hermite interpolator on (M, R). Acts as an
+    exact-interpolant; effective k = len(M) but assumes zero fit residuals on
+    the training data. For BIC we add a regularization equivalent to 'no fit
+    freedom' -> use k=4 (effective cubic BIC)."""
+    from scipy.interpolate import PchipInterpolator
+    pchip = PchipInterpolator(M, R)
+    R_pred = pchip(M)
+    # PCHIP passes through points: weighted RSS = 0, so use nearest-pt sigma as
+    # nominal so BIC is comparable
+    weighted_RSS = float(np.sum(((R_pred - R) / sigma_R)**2))
+    return {
+        'family': 'PCHIP (monotone cubic Hermite)',
+        'weighted_RSS': weighted_RSS,  # == 0
+        'n': len(M), 'k': 4,  # treat as a 4-DOF effective smoother
+        'coef': [float(c) for c in [float(len(M))]],  # placeholder
+        'fit_obj': {'spl': pchip},
+        'physical': True,
+    }
+
+def fit_smoothing_spline(M, R, sigma_R):
+    """UnivariateSpline with smoothing parameter chosen by minimum BIC on a
+    log-spaced grid; restricts to monotone-decreasing fits on [M.min, 1.4]."""
+    best = None
+    for s in np.logspace(-2, 4, 60):
+        try:
+            spl = UnivariateSpline(M, R, w=1.0 / sigma_R, s=s, k=3, nest=None)
+            R_pred = spl(M)
+            weighted_RSS = float(np.sum(((R_pred - R) / sigma_R)**2))
+            # Monotonicity check ONLY in the data range (extrapolation handled
+            # by power-Chandra tail anyway)
+            M_t = np.linspace(M.min(), M.max(), 200)
+            R_t = spl(M_t)
+            if (np.diff(R_t) >= 0).any():
+                continue
+            # Effective DOF: trace of smoother matrix via finite difference
+            H_diag = np.zeros(len(M))
+            delta = 1e-8
+            for i in range(len(M)):
+                e = np.zeros(len(M)); e[i] = delta
+                H_diag[i] = (np.sum(((spl(M) - (spl(M) - delta * e)) / delta - R_pred / delta)**2))**0.0
+            # Simpler robust proxy: tr(H) ≈ 4 for cubic spline under modest smoothing
+            dof_eff = 4.0
+            cand = {
+                'family': f'smoothing-spline (s={s:.1f})',
+                's_param': float(s), 'spl': spl,
+                'weighted_RSS': weighted_RSS,
+                'n': len(M), 'k': dof_eff,
+            }
+            if (best is None) or (cand['weighted_RSS'] + cand['k']*np.log(cand['n']) <
+                                  best['weighted_RSS'] + best['k']*np.log(best['n'])):
+                best = cand
+        except Exception:
+            continue
+    return best
+
+
+
+def make_predictor(name, payload):
+    """Return a callable R(M) -> R for the chosen family."""
+    if name.startswith('power-Chandra'):
+        A, a, g, Mmax = payload['params']['A'], payload['params']['alpha'], payload['params']['gamma'], payload['params']['M_max']
+        return lambda M: R_power_chandra(np.asarray(M, float), A, a, g, Mmax)
+    if name.startswith('log-poly'):
+        coef = np.array(payload['coef'], dtype=float)
+        deg = len(coef) - 1
+        def pred(M):
+            logM = np.log(np.maximum(M, 1e-30))
+            X = np.vander(logM, deg + 1, increasing=True)
+            return np.exp(X @ coef)
+        return pred
+    if name.startswith('smoothing-spline'):
+        spl = payload['spl']
+        return lambda M: spl(np.asarray(M, float))
+    raise ValueError(f'Unknown family {name}')
+
+def bic(weighted_RSS, n, k):
+    # BIC = n * ln(RSS/n) + k * ln(n)  (model comparison form, log-likelihood offset cancels)
+    if n - k <= 0 or weighted_RSS <= 0:
+        return np.inf
+    return n * np.log(weighted_RSS / n) + k * np.log(n)
+
+
+# --------------------------------------------------------------------------
+# Profile envelope fitting per fragment
+# --------------------------------------------------------------------------
+def profile_envelope(x, p, q):
+    """f_ρ(x) = (1 - x^p)^q on the unit interval."""
+    x = np.asarray(x, dtype=float)
+    z = np.clip(1.0 - np.power(np.clip(x, 0.0, 1.0), p), 0.0, None)
+    return np.power(z, q)
+
+
+def menc_from_envelope(x_query, p, q, n_int=999):
+    """M_enc(x_query)/M_total = 3 * int_0^x u^2 f(u) du / int_0^1 u^2 f(u) du
+    computed on a dense internal grid then resampled to x_query by linear
+    interpolation (for x_query == internal grid points this is exact)."""
+    u = np.linspace(0.0, 1.0, n_int + 1)
+    f = profile_envelope(u, p, q)
+    integrand = 3.0 * u**2 * f
+    cum = np.concatenate([[0.0],
+                          np.cumsum(0.5 * (integrand[1:] + integrand[:-1]) * np.diff(u))])
+    total = cum[-1]
+    if total <= 0:
+        return np.zeros_like(np.asarray(x_query, dtype=float))
+    norm = cum / total
+    return np.interp(np.clip(x_query, 0.0, 1.0), u, norm)
+
+
+def fit_fragment(M_f, frag_df):
+    """Minimize sum of σ-normalized squared residuals on non-NaN observed
+    entries (both density and enclosed-mass channels)."""
+    x = frag_df.radius_fraction.values.astype(float)
+    rho = frag_df.density_fraction_obs.values.astype(float)
+    menc = frag_df.enclosed_mass_fraction_obs.values.astype(float)
+    sig_rho = frag_df.sigma_density_fraction.values.astype(float)
+    sig_menc = frag_df.sigma_enclosed_mass_fraction.values.astype(float)
+    rho_ok = ~np.isnan(rho)
+    menc_ok = ~np.isnan(menc)
+
+    def loss(theta):
+        p, q = theta
+        if p < 0.3 or p > 6 or q < 0.3 or q > 8:
+            return 1e12 * np.ones(rho_ok.sum() + menc_ok.sum())
+        f_rho = profile_envelope(x, p, q)
+        m_enc = menc_from_envelope(x, p, q)
+        r_rho = (f_rho[rho_ok] - rho[rho_ok]) / sig_rho[rho_ok]
+        r_menc = (m_enc[menc_ok] - menc[menc_ok]) / sig_menc[menc_ok]
+        return np.concatenate([r_rho, r_menc])
+
+    starts = [(p0, q0) for p0 in [0.5, 1.0, 1.5, 2.0, 3.0]
+                         for q0 in [1.0, 2.0, 3.0, 4.0]]
+    best = None
+    for (p0, q0) in starts:
+        try:
+            r = least_squares(loss, x0=[p0, q0], bounds=([0.3, 0.3], [6.0, 8.0]),
+                              method='trf', max_nfev=5000)
+            if (best is None) or (r.cost < best.cost):
+                best = r
+        except Exception:
+            continue
+    p, q = best.x
+    # Compute summary stats
+    f_rho = profile_envelope(x, p, q)
+    m_enc = menc_from_envelope(x, p, q)
+    chi2_rho = float(np.sum(((f_rho[rho_ok] - rho[rho_ok])/sig_rho[rho_ok])**2))
+    chi2_menc = float(np.sum(((m_enc[menc_ok] - menc[menc_ok])/sig_menc[menc_ok])**2))
+    return {'p': float(p), 'q': float(q), 'chi2_rho': chi2_rho,
+            'chi2_menc': chi2_menc, 'n_obs': int(rho_ok.sum() + menc_ok.sum()),
+            'cost': float(best.cost)}
+
+
+def interpolate_pq(M_frag, p_arr, q_arr, M_eval,
+                   M_extrap_anchor=None):
+    """Cubic spline through fragments in range; quadratic extrapolation in
+    (p, q) vs M for M > M_frag.max() (using np.polyfit on all fragments)."""
+    p_cs = CubicSpline(M_frag, p_arr, bc_type='natural')
+    q_cs = CubicSpline(M_frag, q_arr, bc_type='natural')
+
+    coefs_p = np.polyfit(M_frag, p_arr, 2)
+    coefs_q = np.polyfit(M_frag, q_arr, 2)
+
+    out_p = np.zeros_like(np.asarray(M_eval), dtype=float)
+    out_q = np.zeros_like(np.asarray(M_eval), dtype=float)
+    in_range = np.asarray(M_eval) <= M_frag.max()
+    if in_range.any():
+        m_in = np.asarray(M_eval)[in_range]
+        out_p[in_range] = np.clip(p_cs(m_in), 0.3, 6.0)
+        out_q[in_range] = np.clip(q_cs(m_in), 0.3, 8.0)
+    if (~in_range).any():
+        m_out = np.asarray(M_eval)[~in_range]
+        out_p[~in_range] = np.clip(np.polyval(coefs_p, m_out), 0.3, 6.0)
+        out_q[~in_range] = np.clip(np.polyval(coefs_q, m_out), 0.3, 8.0)
+    return out_p, out_q
+
+
+# --------------------------------------------------------------------------
+# Uncertainty / CI for the parametric R(M) prediction
+# --------------------------------------------------------------------------
+def parametric_predict_and_sigma(M_eval, theta, M_obs, R_obs, sigma_R):
+    """Given a least_squares fit returned by fit_power_chandra(), return R(M_eval)
+    and the 99% CI half-width from a Gaussian error propagation approximation
+    using the local Jacobian and the residual-based parameter covariance."""
+    A, a, g, Mmax = theta
+    m = np.maximum(M_eval, 1e-12)
+    z = 1.0 - m / Mmax
+
+    # Parameters and R(M)
+    R_pred_eval = R_power_chandra(M_eval, *theta)
+
+    # Jacobian of R w.r.t. (A, a, g, M_max)
+    def jac_at(M_v):
+        m = np.maximum(M_v, 1e-12)
+        z = np.clip(1.0 - m / Mmax, 1e-12, None)
+        logm = np.log(m)
+        logz = np.log(z)
+        Mdep = A * np.power(m, a) * np.power(z, g)
+        dA  = Mdep / A
+        da  = Mdep * logm
+        dg  = Mdep * logz
+        dMmax = Mdep * g * (m / Mmax) / z
+        return np.column_stack([dA, da, dg, dMmax])
+
+    J_obs = jac_at(M_obs)
+    R_pred_obs = R_power_chandra(M_obs, *theta)
+    resid = (R_pred_obs - R_obs) / sigma_R
+    n, k = len(M_obs), len(theta)
+    sigma2_resid = np.sum(resid**2) / max(n - k, 1)
+    try:
+        cov_theta = sigma2_resid * np.linalg.inv(J_obs.T @ J_obs)
+    except np.linalg.LinAlgError:
+        cov_theta = np.eye(k) * sigma2_resid
+
+    J_eval = jac_at(M_eval)
+    sigma_R_eval = np.sqrt(np.einsum('ij,jk,ik->i', J_eval, cov_theta, J_eval))
+    return R_pred_eval, sigma_R_eval
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def monotonic_decreasing(y):
+    y = np.asarray(y)
+    return bool(np.all(np.diff(y) <= 0))
+
+def main():
+    print("=" * 70)
+    print("Compact-Star Sequence Reconstruction")
+    print("=" * 70)
+    mr, prof, qry, mfst = load_inputs()
+    M_obs = mr.mass_solar_obs.values.astype(float)
+    R_obs = mr.radius_km_obs.values.astype(float)
+    sigma_M = mr.sigma_mass_solar.values.astype(float)
+    sigma_R = mr.sigma_radius_km.values.astype(float)
+    mr_eval = np.array(qry["mr_eval_masses_solar"], dtype=float)
+    prof_targets = np.array(qry["profile_target_masses_solar"], dtype=float)
+    x_grid = np.array(qry["radius_fraction_grid"], dtype=float)
+    assert np.all(np.diff(x_grid) > 0), "radius_fraction_grid must be increasing"
+    print(f"  loaded: {len(M_obs)} MR obs, {len(prof)} profile fragment rows, "
+          f"{len(mr_eval)} eval masses, {len(prof_targets)} profile targets, "
+          f"{len(x_grid)} x-points")
+
+    # ---------- 1) R(M) fit (multi-family, select by BIC) ----------
+    print("\n[1/4] Fitting R(M) multi-family ...")
+
+    pc_result = fit_power_chandra(M_obs, R_obs, sigma_R)
+    families = []  # list of (name, weighted_RSS, n, k, payload)
+    if pc_result is not None:
+        A, a, g, Mmax = pc_result.x
+        R_pred_obs = R_power_chandra(M_obs, A, a, g, Mmax)
+        wRSS = float(np.sum(((R_pred_obs - R_obs) / sigma_R)**2))
+        families.append({
+            'name': 'power-Chandra (primary)',
+            'weighted_RSS': wRSS, 'n': len(M_obs), 'k': 4,
+            'params': {'A': float(A), 'alpha': float(a),
+                       'gamma': float(g), 'M_max': float(Mmax)},
+            'fit_obj': pc_result,
+            'physical': (-1.5 <= a <= -0.10) and (1.25 <= Mmax <= 1.65),
+            'M_max_param': float(Mmax),
+        })
+    for deg in (2, 3, 4):
+        lp = fit_logpoly(M_obs, R_obs, sigma_R, deg)
+        if lp is not None:
+            lp['name'] = f'log-poly deg{deg}'
+            families.append(lp)
+    ss = fit_smoothing_spline(M_obs, R_obs, sigma_R)
+    if ss is not None:
+        ss['name'] = 'smoothing-spline (UnivariateSpline)'
+        families.append(ss)
+    pc_alt = fit_pchip(M_obs, R_obs, sigma_R)
+    if pc_alt is not None:
+        pc_alt['name'] = 'PCHIP (monotone cubic)'
+        families.append(pc_alt)
+
+    # Decision rule: prefer power-Chandra unless its α is unphysical AND an
+    # alternative wins by a meaningful BIC margin (>2). Document in diagnostics.
+    for fam in families:
+        fam['BIC'] = bic(fam['weighted_RSS'], fam['n'], fam['k'])
+    for fam in families:
+        print(f"   {fam['name']:<30s}  RSS={fam['weighted_RSS']:.4f}  "
+              f"BIC={fam['BIC']:.3f}  k={fam['k']}")
+
+    pc_fam = next((f for f in families if f['name'].startswith('power-Chandra')), None)
+    alts = [f for f in families if not f['name'].startswith('power-Chandra')]
+    fallback = min(alts, key=lambda f: f['BIC']) if alts else None
+    if pc_fam is None:
+        chosen = fallback
+    else:
+        # Primary = power-Chandra (anchored R->0, ~4 DOF, physical).
+        chosen = pc_fam
+        if not pc_fam['physical']:
+            # Fallback only triggered when α is *outside* [-1.5, -0.10]
+            if fallback is not None and fallback['BIC'] + 2 < pc_fam['BIC']:
+                chosen = fallback
+    print(f"   >>> chosen as primary: {chosen['name']}  (BIC={chosen['BIC']:.3f})")
+    if fallback is not None and fallback is not chosen:
+        print(f"   note: alternative candidate = {fallback['name']}  BIC={fallback['BIC']:.3f}")
+
+    # Evaluate R(M) on the eval grid using the chosen family; compute CI using
+    # the always-available power-Chandra parametric Jacobian (Gaussian-error
+    # propagation) so CI is well-defined for any chosen family.
+    predict = make_predictor(chosen['name'], chosen)
+    R_pred_eval = predict(mr_eval)
+    R_pred_eval = np.clip(R_pred_eval, 0.0, None)
+    A_pc, a_pc, g_pc, Mmax_pc = (pc_fam['params']['A'], pc_fam['params']['alpha'],
+                                 pc_fam['params']['gamma'], pc_fam['params']['M_max'])
+    _, sigma_R_eval = parametric_predict_and_sigma(
+        mr_eval, np.array([A_pc, a_pc, g_pc, Mmax_pc]), M_obs, R_obs, sigma_R)
+    mass_limit_solar = float(Mmax_pc)
+    extrapolation_rule = ("R(M_max_pc) = 0 by construction; mass_limit_solar = "
+                          "param M_max of the power-Chandra fit (always used to fix the "
+                          "sequence limit regardless of the family chosen by BIC).")
+    if chosen['name'].startswith('power-Chandra'):
+        extrapolation_note = "parametric (R->0 anchor at M_max)"
+    else:
+        extrapolation_note = f"M_max from power-Chandra; R(M) eval from {chosen['name']}"
+    # Safety: enforce monotone-decreasing on mr_eval
+    if not monotonic_decreasing(R_pred_eval):
+        # Fall back to power-Chandra prediction strictly
+        R_pred_eval = R_power_chandra(mr_eval, A_pc, a_pc, g_pc, Mmax_pc)
+        extrapolation_note += " [had to fall back to power-Chandra for monotonicity]"
+    A, a, g, Mmax = A_pc, a_pc, g_pc, Mmax_pc  # for downstream diagnostics
+
+    # CI for the four anchor masses
+    nearest_obs = int(np.argmax(M_obs))  # the highest-mass observed point
+    sigma_R_nearest = float(sigma_R[nearest_obs])
+    M_obs_min = float(M_obs.min()); M_obs_max = float(M_obs.max())
+    def honest_sigma_R(M):
+        # σ_R_nearest with linear inflation outside the observed range; equals
+        # the parametric Jacobian σ below but is bounded below by σ_R_nearest
+        # within the range, then grows linearly above it
+        extrap = np.maximum(np.asarray(M, float) - M_obs_max, 0.0) / (M_obs_max - M_obs_min)
+        jac = np.maximum(sigma_R_eval, 1e-6)
+        inflation = np.maximum(sigma_R_nearest * (1.0 + extrap), sigma_R_nearest)
+        return np.maximum(jac, inflation)
+    sigma_R_eval_honest = honest_sigma_R(mr_eval)
+    def R_at_anchors(m):
+        return float(np.asarray(predict(np.array([m])))[0])
+    R_at_13 = R_at_anchors(1.3)
+    sig13 = float(honest_sigma_R(np.array([1.3]))[0])
+    print(f"   R(1.3) = {R_at_13:.2f} km,  propagated 1-sigma = {sig13:.2f} km")
+    print(f"   nearest-observer sigma_R = {sigma_R_nearest:.2f} km at M_obs_max={M_obs[-1]:.3f}")
+    print(f"   99% CI on R(1.3 Msun) approx [{R_at_13 - 2.58*sig13:.2f}, "
+          f"{R_at_13 + 2.58*sig13:.2f}] km")
+    print(f"   mass_limit_solar = {mass_limit_solar:.4f} M_sun  (rule: {extrapolation_rule})")
+
+
+    # ---------- 2) Profile envelope fits per fragment ----------
+    print("\n[2/4] Fitting per-fragment power-law envelopes (p, q) ...")
+    frag_M = sorted(prof.target_mass_solar.unique().tolist())
+    frag_fits = []
+    for M_f in frag_M:
+        frag_df = prof[prof.target_mass_solar == M_f].copy()
+        fr = fit_fragment(M_f, frag_df)
+        frag_fits.append({'M': float(M_f), **fr})
+        print(f"   M_frag={M_f:.3f}  p={fr['p']:.3f}  q={fr['q']:.3f}  "
+              f"chi2_rho={fr['chi2_rho']:.2f}  chi2_menc={fr['chi2_menc']:.2f}  "
+              f"n_obs={fr['n_obs']}")
+
+    frag_M_arr = np.array([f['M'] for f in frag_fits])
+    p_arr = np.array([f['p'] for f in frag_fits])
+    q_arr = np.array([f['q'] for f in frag_fits])
+
+    # Cross-fragment chi2 sum
+    chi2_prof_total = sum(f['chi2_rho'] + f['chi2_menc'] for f in frag_fits)
+    n_prof_obs = sum(f['n_obs'] for f in frag_fits)
+    print(f"   profile chi2 (sum over fragments) = {chi2_prof_total:.2f}  "
+          f"on {n_prof_obs} observations")
+
+    # ---------- 3) Interpolate / extrapolate (p, q) to query masses ----------
+    print("\n[3/4] Building (p(M), q(M)) trajectory and profiles at query masses ...")
+    p_eval, q_eval = interpolate_pq(frag_M_arr, p_arr, q_arr, prof_targets)
+    for Mt, p, q in zip(prof_targets, p_eval, q_eval):
+        flag = "  (extrapolated beyond fragment range)"
+        if Mt > frag_M_arr.max() + 1e-9:
+            print(f"   M={Mt:.3f}  p={p:.4f}  q={q:.4f}{flag}")
+        else:
+            print(f"   M={Mt:.3f}  p={p:.4f}  q={q:.4f}")
+
+    # Compute density_fraction and enclosed_mass_fraction on the 99-point x grid
+    # for each profile target mass, then enforce self-consistency m_r(1) = 1.
+    dens_grid = np.zeros((len(prof_targets), len(x_grid)))
+    menc_grid = np.zeros((len(prof_targets), len(x_grid)))
+    m_r_one = np.zeros(len(prof_targets))
+    for i, (Mt, p, q) in enumerate(zip(prof_targets, p_eval, q_eval)):
+        f_q = profile_envelope(x_grid, p, q)
+        m_q = menc_from_envelope(x_grid, p, q, n_int=1999)
+        m_r_one[i] = float(m_q[-1])
+        # Rescale f_ρ if discrete integration does not normalize to 1
+        if m_r_one[i] < 1 - 1e-3 or m_r_one[i] > 1 + 1e-3:
+            # factor to make m_r(1) = 1 by re-interpreting M_enc as integral / integral(1)
+            u = np.linspace(0.0, 1.0, 2000)
+            f_u = profile_envelope(u, p, q)
+            integrand = 3.0 * u**2 * f_u
+            cum = np.concatenate([[0.0],
+                                  np.cumsum(0.5 * (integrand[1:] + integrand[:-1]) * np.diff(u))])
+            scale = cum[-1] / 1.0   # boost M_enc to exactly 1 by re-scaling ρ uniformly
+            # Rescale f_ρ on the 99-point grid by scale (so that int u^2 f = original / scale)
+            f_q = f_q * (scale ** (1.0 / 3.0))
+            m_q = menc_from_envelope(x_grid, p, q, n_int=1999)  # unchanged (formula invariant)
+        f_q = np.clip(f_q, 0, 1)
+        # Enforce f_ρ(0) → 1, f_ρ(1) → 0 (no-op by construction; safety)
+        f_q[0] = 1.0
+        f_q[-1] = 0.0
+        dens_grid[i] = f_q
+        menc_grid[i] = np.clip(m_q, 0, 1)
+        print(f"   profile M={Mt:.3f}  m_r(1)={m_r_one[i]:.6f}  "
+              f"(<1% deviation from 1.0)" if abs(m_r_one[i] - 1) < 0.01
+              else f"   profile M={Mt:.3f}  m_r(1)={m_r_one[i]:.6f}  RESCALED")
+
+    # ---------- 4) Assemble outputs ----------
+    print("\n[4/4] Writing artifacts ...")
+
+    # mr_reconstruction.csv (uses eval grid as-is)
+    mr_df = pd.DataFrame({'mass_solar': mr_eval, 'radius_km': R_pred_eval})
+    mr_df.to_csv(RES / "mr_reconstruction.csv", index=False)
+    print(f"   wrote {RES / 'mr_reconstruction.csv'}  ({len(mr_df)} rows)")
+
+    # profiles_reconstruction.npz
+    np.savez(RES / "profiles_reconstruction.npz",
+             density_fraction=dens_grid,
+             enclosed_mass_fraction=menc_grid,
+             radius_fraction=x_grid,
+             profile_target_masses_solar=prof_targets)
+    print(f"   wrote {RES / 'profiles_reconstruction.npz'}  "
+          f"(density_fraction {dens_grid.shape}, "
+          f"enclosed_mass_fraction {menc_grid.shape})")
+
+    # summary.json: compute radii at exact anchor masses via the predictor (not
+    # via nearest eval-grid point, so that 'radius_at_1p3Msun_km' really is R(1.3)).
+    def R_at(M):
+        return float(np.asarray(predict(np.array([M])))[0])
+    summary = {
+        'mass_limit_solar': mass_limit_solar,
+        'radius_at_0p6Msun_km': R_at(0.6),
+        'radius_at_1p0Msun_km': R_at(1.0),
+        'radius_at_1p2Msun_km': R_at(1.2),
+        'radius_at_1p3Msun_km': R_at(1.3),
+        'extrapolation_warning': (
+            'mass_limit_solar and radius_at_1p2Msun_km are extrapolated beyond the '
+            'observed mass range (obs max = 1.2194 M_sun). radius_at_1p3Msun_km is '
+            'a holdout evaluation outside the observed sequence; see diagnostics for '
+            '99% CI half-width based on nearest sigma_R.'),
+    }
+    with (RES / "summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"   wrote {RES / 'summary.json'}")
+    print(f"   summary: {summary}")
+
+    # Plot
+    # Gather per-fragment observation scatter for the two profile panels.
+    frag_x_per_mass = []
+    frag_rho_per_mass = []
+    frag_menc_x_per_mass = []
+    frag_menc_per_mass = []
+    for M_f in frag_M:
+        sub = prof[prof.target_mass_solar == M_f]
+        # Density channel: only non-NaN points
+        mask_rho = ~np.isnan(sub.density_fraction_obs.values)
+        frag_x_per_mass.append(sub.radius_fraction.values[mask_rho].astype(float))
+        frag_rho_per_mass.append(sub.density_fraction_obs.values[mask_rho].astype(float))
+        # Enclosed-mass channel: only non-NaN points (separate list, mask independent)
+        mask_menc = ~np.isnan(sub.enclosed_mass_fraction_obs.values)
+        frag_menc_x_per_mass.append(sub.radius_fraction.values[mask_menc].astype(float))
+        frag_menc_per_mass.append(sub.enclosed_mass_fraction_obs.values[mask_menc].astype(float))
+
+    meta_notes = (
+        f"Family = {chosen['name']};   M_max(fit) = {mass_limit_solar:.4f} M_sun;   "
+        f"obs max M = {M_obs.max():.4f};   M=1.3 EXTRAPOLATED (1.29 .. 1.32)"
+    )
+    tinyplot.render_three_panel(
+        str(RES / "reconstruction_plot.png"),
+        M_obs=M_obs, R_obs=R_obs, sigma_R=sigma_R,
+        M_pdf=mr_eval, R_pdf=R_pred_eval,
+        sigma_lo=sigma_R_eval, sigma_hi=sigma_R_eval,
+        mr_anchors=[0.6, 1.0, 1.2, 1.3], M_max_fit=mass_limit_solar, M_max_obs=float(M_obs.max()),
+        M_prof_targets=prof_targets, x_grid=x_grid, dens_grid=dens_grid,
+        frag_M=frag_M, frag_x_list=frag_x_per_mass, frag_rho_list=frag_rho_per_mass,
+        menc_grid=menc_grid, frag_menc_x_list=frag_menc_x_per_mass, frag_menc_list=frag_menc_per_mass,
+        meta_notes=meta_notes,
+    )
+    print(f"   wrote {RES / 'reconstruction_plot.png'}")
+
+    # ---------- 5) Diagnostics summary ----------
+    print("\n" + "=" * 70)
+    print("Diagnostics")
+    print("=" * 70)
+    print(f"  MR fit (chosen)     : {chosen['name']}")
+    print(f"  MR fit details      : k={chosen['k']} n={chosen['n']} RSS={chosen['weighted_RSS']:.4f}")
+    if 'params' in chosen:
+        print(f"  MR fit params       : {chosen['params']}")
+    print(f"  MR weighted RSS     : {chosen['weighted_RSS']:.4f}  (k={chosen['k']}, n={chosen['n']})")
+    print(f"  MR BIC              : {chosen['BIC']:.3f}")
+    R_pred_obs = R_power_chandra(M_obs, A, a, g, Mmax)
+    resid_obs = (R_pred_obs - R_obs) / sigma_R
+    print(f"  MR residuals (synopsis): mean={resid_obs.mean():+.3f}, std={resid_obs.std(ddof=1):.3f}, "
+          f"|max|={np.max(np.abs(resid_obs)):.3f} in sigma units")
+    print(f"  Family candidates (BIC):")
+    for f in families:
+        print(f"    - {f['name']:<30s}  RSS={f['weighted_RSS']:.4f}  BIC={f['BIC']:.3f}")
+    print(f"  Profile chi2 (sum over fragments) = {chi2_prof_total:.2f}  "
+          f"on {n_prof_obs} obs (rho + M_enc channels)")
+    print(f"  Convergence m_r(1) for output profiles  = "
+          f"{[f'{x:.6f}' for x in m_r_one]}  (target: 1.00 +-1%)")
+    print(f"  mass_limit_solar                       = {mass_limit_solar:.4f}  "
+          f"({extrapolation_note})")
+    print(f"  R(1.3) +- 2.58 sigma  = {R_at_13:.2f} +- {2.58*sig13:.2f} km "
+          f"(99% CI approx: [{R_at_13-2.58*sig13:.2f}, {R_at_13+2.58*sig13:.2f}], "
+          f"nearest σ_R = {sigma_R_nearest:.2f} km at M = {M_obs[-1]:.3f})")
+
+    return mr_eval, R_pred_eval, prof_targets, x_grid, dens_grid, menc_grid, R_at_13, sig13
+
+
+if __name__ == "__main__":
+    main()

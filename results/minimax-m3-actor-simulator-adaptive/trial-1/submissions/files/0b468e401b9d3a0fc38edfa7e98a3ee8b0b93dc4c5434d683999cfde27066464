@@ -1,0 +1,362 @@
+"""Recover the latent per-case summary (component A + component B + offset) from
+`obs_0` only, and emit component-A-only predictions for `input_2.csv` rows.
+
+Algorithm (per case):
+  1. P_B is recovered from a 5-parameter (B-fundamental sin/cos + B-1st-harmonic
+     sin/cos + offset) weighted least-squares fit, initialised from a Lomb-Scargle
+     peak and polished with bounded Brent; an extra sweep over residual-peaks
+     (and 2x / 1/2 derivatives) is also tried to escape local 5-param minima.
+  2. With that P_B locked, a 1-D weighted scan over P_A in [0.5, 60] d is performed,
+     excluding the three degenerate guards |P_A - P_B| < 0.3 d,
+     |P_A - P_B/2| < 0.3 d, |P_A - 2 P_B| < 0.3 d. The grid minimum is
+     Brent-polished; in parallel the highest-amplitude allowed LS-residual peak is
+     re-polished, and the smaller-SSR of the two wins.
+  3. Component A presence: BOTH delta-BIC >= 6 (vs the no-A model at the same P_B)
+     AND ||(A1, A2)|| > 3 sigma_resid, where
+     sigma_resid = sqrt(max(SSR_7 / (n - 7), 1e-3)).
+"""
+import json
+import numpy as np
+import pandas as pd
+from scipy.signal import lombscargle
+from scipy.optimize import minimize_scalar
+
+# ----------------- constants ----------------
+EXCLUSION_HALF  = 0.3
+DELTA_BIC_MIN   = 6.0
+AMP_SIGMA_FAC   = 3.0
+SAFETY_SSR_FLOOR = 1e-3
+MIN_PERIOD = 0.5
+MAX_PERIOD = 60.0
+LS_GRID  = np.linspace(MIN_PERIOD, MAX_PERIOD, 20001)
+LS_OMEGA = 2.0 * np.pi / LS_GRID
+
+# ----------------- helpers ------------------
+def design_B(t, PB):
+    return np.column_stack([
+        np.sin(2.0 * np.pi * t / PB),
+        np.cos(2.0 * np.pi * t / PB),
+        np.sin(4.0 * np.pi * t / PB),
+        np.cos(4.0 * np.pi * t / PB),
+        np.ones_like(t),
+    ])
+
+def design_7(t, PA, PB):
+    return np.column_stack([
+        np.sin(2.0 * np.pi * t / PA),
+        np.cos(2.0 * np.pi * t / PA),
+        np.sin(2.0 * np.pi * t / PB),
+        np.cos(2.0 * np.pi * t / PB),
+        np.sin(4.0 * np.pi * t / PB),
+        np.cos(4.0 * np.pi * t / PB),
+        np.ones_like(t),
+    ])
+
+def wfit(X, y, w):
+    sw = np.sqrt(w); Xw = X*sw[:,None]; yw = y*sw
+    beta, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+    yhat = X @ beta; resid = y - yhat
+    ssr = float(np.sum(w * resid ** 2))
+    return beta, ssr, resid
+
+def is_allowed_PA(PA, PB, half=EXCLUSION_HALF):
+    PA = np.asarray(PA, dtype=float); PB = float(PB)
+    return ~((np.abs(PA - PB)        < half) |
+             (np.abs(PA - PB / 2.0)  < half) |
+             (np.abs(PA - 2.0 * PB)  < half))
+
+def brent_min(fn, lo, hi, xatol=0.003):
+    try:
+        if not (lo < hi): return None, np.inf
+        r = minimize_scalar(fn, bounds=(lo, hi), method='bounded',
+                            options={'xatol': xatol})
+        if np.isfinite(r.fun): return float(r.x), float(r.fun)
+    except Exception:
+        pass
+    return None, np.inf
+
+# --------------- per-case processing ---------------
+def process_case(t, y, err, n_pgram_top=5):
+    n = len(t)
+    w = 1.0 / (err ** 2)
+
+    # ---- Stage 1: P_B from 5-param B-only fit (initialised by LS peaks) -----
+    pgram = lombscargle(t, y - y.mean(), LS_OMEGA)
+    top_idx = np.argsort(pgram)[::-1][:n_pgram_top]
+    pb_initials = sorted({float(LS_GRID[i]) for i in top_idx})
+
+    def ssr_5(PB):
+        X = design_B(t, float(PB))
+        _, ssr, _ = wfit(X, y, w)
+        return ssr
+
+    best_noA = (np.inf, None)
+    for P in pb_initials:
+        pb, ssr = brent_min(ssr_5,
+                            max(MIN_PERIOD, P * 0.90),
+                            min(MAX_PERIOD, P * 1.10),
+                            xatol=0.003)
+        if ssr < best_noA[0]:
+            best_noA = (ssr, pb)
+
+    # extra sweep: residual after best-so-far B-fit, plus its 2x and 1/2
+    if best_noA[1] is not None:
+        Xb = design_B(t, best_noA[1])
+        _, _, resid_b = wfit(Xb, y, w)
+        pgram_r = lombscargle(t, resid_b - resid_b.mean(), LS_OMEGA)
+        top_r = LS_GRID[np.argsort(pgram_r)[::-1][:5]]
+        extras = []
+        for p in top_r:
+            p = float(p)
+            extras += [p, p * 2.0, p / 2.0]
+        extras = [p for p in extras if MIN_PERIOD <= p <= MAX_PERIOD]
+        for P in extras:
+            pb, ssr = brent_min(ssr_5,
+                                max(MIN_PERIOD, P * 0.90),
+                                min(MAX_PERIOD, P * 1.10),
+                                xatol=0.005)
+            if ssr < best_noA[0]:
+                best_noA = (ssr, pb)
+
+    SSR_noA, P_B = best_noA
+
+    # ---- Stage 2: 1-D scan over P_A with P_B locked -----
+    def ssr_7(PA):
+        PA = float(PA)
+        if not bool(is_allowed_PA(PA, P_B)):
+            return np.inf
+        X = design_7(t, PA, P_B)
+        _, ssr, _ = wfit(X, y, w)
+        if not np.isfinite(ssr):
+            return np.inf
+        return ssr
+
+    pa_grid = LS_GRID[is_allowed_PA(LS_GRID, P_B)]
+    pa_grid_best, ssr_grid_best = None, np.inf
+    for PA in pa_grid:
+        s = ssr_7(PA)
+        if s < ssr_grid_best:
+            ssr_grid_best, pa_grid_best = s, float(PA)
+
+    if pa_grid_best is not None:
+        pa_b, ssr_b = brent_min(ssr_7,
+                                max(MIN_PERIOD, pa_grid_best * 0.93),
+                                min(MAX_PERIOD, pa_grid_best * 1.07),
+                                xatol=0.0025)
+        if ssr_b < ssr_grid_best:
+            pa_scan_best, ssr_scan_best = pa_b, ssr_b
+        else:
+            pa_scan_best, ssr_scan_best = pa_grid_best, ssr_grid_best
+    else:
+        pa_scan_best, ssr_scan_best = None, np.inf
+
+    # Fallback: highest-amplitude allowed LS-residual peak, re-polished
+    Xb = design_B(t, P_B)
+    _, _, resid_b = wfit(Xb, y, w)
+    pgram_r = lombscargle(t, resid_b - resid_b.mean(), LS_OMEGA)
+    pgram_r_masked = np.where(is_allowed_PA(LS_GRID, P_B), pgram_r, -np.inf)
+    pa_alt = float(LS_GRID[int(np.argmax(pgram_r_masked))])
+    pa_alt_b, ssr_alt_b = brent_min(ssr_7,
+                                    max(MIN_PERIOD, pa_alt * 0.93),
+                                    min(MAX_PERIOD, pa_alt * 1.07),
+                                    xatol=0.0025)
+    if ssr_alt_b < ssr_scan_best:
+        P_A, SSR_7 = pa_alt_b, ssr_alt_b
+    else:
+        P_A, SSR_7 = pa_scan_best, ssr_scan_best
+
+    # ---- 5-param and 7-param coefficients at chosen periods ----
+    X5 = design_B(t, P_B)
+    beta_5, _, _ = wfit(X5, y, w)
+    B1n, B2n, B3n, B4n, offn = (float(v) for v in beta_5)
+
+    if P_A is not None:
+        X7 = design_7(t, P_A, P_B)
+        beta_7, _, _ = wfit(X7, y, w)
+        A1, A2, B1, B2, B3, B4, offset = (float(v) for v in beta_7)
+    else:
+        A1 = A2 = offset = float('nan')
+        B1, B2, B3, B4 = B1n, B2n, B3n, B4n
+
+    # ---- Stage 3: presence tests ----
+    # NEW: sigma_resid derived from the 7-parameter residual (consistent noise
+    # scale once A has been admitted into the model); the previous definition
+    # used the no-A residual and was inflated by the A signal itself.
+    sigma_resid_old = float(np.sqrt(max(SSR_noA / max(n - 5, 1), SAFETY_SSR_FLOOR)))
+    sigma_resid     = float(np.sqrt(max((SSR_7 / max(n - 7, 1)) if (P_A is not None and np.isfinite(SSR_7)) else 0.0, SAFETY_SSR_FLOOR)))
+    amp_A = float(np.sqrt(A1 ** 2 + A2 ** 2)) if P_A is not None else 0.0
+
+    if SSR_7 > 0 and SSR_noA > 0 and SSR_7 < SSR_noA * 1.0e12:
+        delta_BIC = n * np.log(SSR_noA / SSR_7) - 2.0 * np.log(n)
+    else:
+        delta_BIC = -np.inf
+
+    present = int((delta_BIC >= DELTA_BIC_MIN) and (amp_A > AMP_SIGMA_FAC * sigma_resid))
+
+    # finalisation
+    if present == 1:
+        PA_e, A1_e, A2_e = P_A, A1, A2
+        B1_e, B2_e, B3_e, B4_e = B1, B2, B3, B4
+        off_e = offset
+    else:
+        PA_e = 0.0; A1_e = A2_e = 0.0
+        B1_e, B2_e, B3_e, B4_e = B1n, B2n, B3n, B4n
+        off_e = offn
+
+    diag = dict(
+        P_A = float(P_A) if P_A is not None else float('nan'),
+        P_B = float(P_B),
+        SSR_7_n = SSR_7 / n,
+        SSR_noA_n = SSR_noA / n,
+        sigma_resid_old = sigma_resid_old,
+        sigma_resid = sigma_resid,
+        A1 = float(A1), A2 = float(A2),
+        B1 = float(B1), B2 = float(B2),
+        B3 = float(B3), B4 = float(B4),
+        offset_7 = float(offset),
+        amp_A = amp_A,
+        delta_BIC = float(delta_BIC),
+        present = present,
+        ls_dominant = float(LS_GRID[int(np.argmax(pgram))]),
+        n_obs = n,
+        obs_err_mean = float(err.mean()),
+        obs_err_sq_mean = float((err ** 2).mean()),
+    )
+    emit = dict(
+        case_id = None,
+        component_a_present = present,
+        component_a_period_day = float(PA_e),
+        component_a_basis1_u0 = float(A1_e),
+        component_a_basis2_u0 = float(A2_e),
+        component_b_period_day = float(P_B),
+        component_b_basis1_u0 = float(B1_e),
+        component_b_basis2_u0 = float(B2_e),
+        component_b_basis3_u0 = float(B3_e),
+        component_b_basis4_u0 = float(B4_e),
+        offset_u0 = float(off_e),
+        _diag = diag,
+    )
+    return emit
+
+# ---------------------- main --------------------
+def main():
+    with open("data/input_0.json") as f:
+        info = json.load(f)
+    ref_epoch = float(info["reference_epoch_day"])
+    case_order = [str(c) for c in info["case_order"]]
+    df1 = pd.read_csv("data/input_1.csv")
+    df2 = pd.read_csv("data/input_2.csv")
+
+    summary = []
+    diagnostics = {}
+    for c in case_order:
+        sub = df1[df1.case_id == c].sort_values("time_day")
+        t = sub.time_day.values.astype(float)
+        y = sub.obs_0.values.astype(float)
+        err = sub.obs_0_err.values.astype(float)
+        rec = process_case(t, y, err, n_pgram_top=5)
+        rec["case_id"] = c
+        diagnostics[c] = rec.pop("_diag")
+        summary.append({
+            "case_id": rec["case_id"],
+            "component_a_present": rec["component_a_present"],
+            "component_a_period_day": rec["component_a_period_day"],
+            "component_a_basis1_u0": rec["component_a_basis1_u0"],
+            "component_a_basis2_u0": rec["component_a_basis2_u0"],
+            "component_b_period_day": rec["component_b_period_day"],
+            "component_b_basis1_u0": rec["component_b_basis1_u0"],
+            "component_b_basis2_u0": rec["component_b_basis2_u0"],
+            "component_b_basis3_u0": rec["component_b_basis3_u0"],
+            "component_b_basis4_u0": rec["component_b_basis4_u0"],
+            "offset_u0": rec["offset_u0"],
+        })
+
+    sum_by_case = {row["case_id"]: row for row in summary}
+    pred_rows = []
+    for _, rr in df2.iterrows():
+        c = str(rr["case_id"])
+        t_eff = float(rr["time_day"]) - ref_epoch
+        row = sum_by_case[c]
+        if row["component_a_present"] == 1:
+            PA = row["component_a_period_day"]
+            A1 = row["component_a_basis1_u0"]; A2 = row["component_a_basis2_u0"]
+            val = A1 * np.sin(2.0 * np.pi * t_eff / PA) + A2 * np.cos(2.0 * np.pi * t_eff / PA)
+        else:
+            val = 0.0
+        pred_rows.append({
+            "case_id": c,
+            "time_day": float(rr["time_day"]),
+            "component_a_value_u0": float(val),
+        })
+
+    sum_cols = ["case_id","component_a_present","component_a_period_day",
+                "component_a_basis1_u0","component_a_basis2_u0",
+                "component_b_period_day","component_b_basis1_u0",
+                "component_b_basis2_u0","component_b_basis3_u0",
+                "component_b_basis4_u0","offset_u0"]
+    pd.DataFrame(summary, columns=sum_cols).to_csv("signal_summary.csv", index=False)
+
+    pred_cols = ["case_id","time_day","component_a_value_u0"]
+    pd.DataFrame(pred_rows, columns=pred_cols).to_csv("target_predictions.csv", index=False)
+
+    np.set_printoptions(precision=6, suppress=True)
+    print("\n=========== PER-CASE DIAGNOSTICS ===========")
+    for c in case_order:
+        d = diagnostics[c]
+        s = sum_by_case[c]
+        print(f"\n{c}:")
+        print(f"  LS dominant period on obs_0 : {d['ls_dominant']:.4f} d")
+        print(f"  obs_err_mean, obs_err^2 mean: {d['obs_err_mean']:.4f}, {d['obs_err_sq_mean']:.4f}")
+        print(f"  P_B (5-param best, locked)  : {d['P_B']:.4f} d")
+        NA = d['P_A']
+        print(f"  P_A (7-param best)          : "
+              f"{('n/a' if (NA != NA) else f'{NA:.4f}')} d")
+        print(f"  present flag                : {d['present']}")
+        print(f"  SSR_noA/n                   : {d['SSR_noA_n']:.4f}")
+        print(f"  SSR_7/n                     : {d['SSR_7_n']:.4f}")
+        print(f"  sigma_resid_old (no-A)      : {d['sigma_resid_old']:.4f}\n"
+              f"  sigma_resid_new (7-param)   : {d['sigma_resid']:.4f}")
+        print(f"  amp_A = ||(A1,A2)||         : {d['amp_A']:.4f}  "
+              f"( > 3 sigma_resid_new = {3.0 * d['sigma_resid']:.4f})")
+        print(f"  delta-BIC (no-A vs with-A)  : {d['delta_BIC']:.4f}  (need >= {DELTA_BIC_MIN})")
+        print(f"  Emitted  P_A, A1, A2        : {s['component_a_period_day']:.6f},"
+              f" {s['component_a_basis1_u0']:.6f}, {s['component_a_basis2_u0']:.6f}")
+        print(f"  Emitted  P_B                : {s['component_b_period_day']:.6f}")
+        print(f"  Emitted  B1, B2, B3, B4     : {s['component_b_basis1_u0']:.6f}, "
+              f"{s['component_b_basis2_u0']:.6f}, "
+              f"{s['component_b_basis3_u0']:.6f}, "
+              f"{s['component_b_basis4_u0']:.6f}")
+        print(f"  Emitted  offset_u0          : {s['offset_u0']:.6f}")
+        sigma2 = d['obs_err_sq_mean']
+        print(f"  SSR_7/n  / obs_err^2        : {d['SSR_7_n']/sigma2:.3f}  "
+              f"(expect ~ 1 if model = noise)")
+        if d['present'] == 1:
+            print(f"  SSR_noA/n / obs_err^2       : {d['SSR_noA_n']/sigma2:.3f}  "
+                  f"({'OK' if d['SSR_noA_n']/sigma2 > 1.5 else 'borderline'})")
+        else:
+            print(f"  SSR_noA/n / obs_err^2       : {d['SSR_noA_n']/sigma2:.3f}  "
+                  f"(present=0; B-only model already at noise level)")
+
+    print("\n=========== CSV CHECK ===========")
+    for fn, expected_rows, expected_cols in [
+        ("signal_summary.csv", 4,
+         ["case_id","component_a_present","component_a_period_day",
+          "component_a_basis1_u0","component_a_basis2_u0",
+          "component_b_period_day","component_b_basis1_u0",
+          "component_b_basis2_u0","component_b_basis3_u0",
+          "component_b_basis4_u0","offset_u0"]),
+        ("target_predictions.csv", 38,
+         ["case_id","time_day","component_a_value_u0"]),
+    ]:
+        df_chk = pd.read_csv(fn)
+        with open(fn) as f: hdr = f.readline().rstrip("\n")
+        cols_match = (hdr == ",".join(expected_cols))
+        rows_ok = (len(df_chk) == expected_rows)
+        print(f"  {fn}: rows={len(df_chk)} (expected {expected_rows}, ok={rows_ok}), "
+              f"header_ok={cols_match}")
+        if not cols_match:
+            print(f"     actual header   : {hdr!r}")
+            print(f"     expected header : {','.join(expected_cols)!r}")
+
+if __name__ == "__main__":
+    main()

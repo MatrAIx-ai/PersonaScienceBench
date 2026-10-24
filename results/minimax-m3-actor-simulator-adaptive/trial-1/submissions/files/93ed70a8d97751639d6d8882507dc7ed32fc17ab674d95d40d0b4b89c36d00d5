@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+Single-cell RNA-seq integrated analysis (B3) - numpy + scipy only.
+
+Inputs
+------
+data/counts.npy        (n_cells, n_genes) float64 integer-valued counts
+data/system_info.json  metadata (n_clusters, n_tf_genes, tf_gene_indices)
+
+Outputs
+-------
+analysis.py            (this file - source)
+clusters.npy           int32  (n_cells,)
+pseudotime.npy         float64 (n_cells,)
+de_genes.json          {"gene_indices": [...]}
+grn_scores.npy         float64 (n_tf_genes, n_tf_genes)
+method_choices.json    per-step methods + justifications (es)
+
+No sklearn / scanpy / anndata. Only numpy + scipy + (optional) pandas.
+"""
+
+import hashlib
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+from scipy.stats import mannwhitneyu
+
+# ---------------------------------------------------------------------------
+# 0. Load
+# ---------------------------------------------------------------------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+COUNTS_PATH = os.path.join(DATA, "counts.npy")
+INFO_PATH = os.path.join(DATA, "system_info.json")
+
+counts = np.load(COUNTS_PATH)
+with open(INFO_PATH, "r", encoding="utf-8") as fh:
+    info = json.load(fh)
+
+n_cells, n_genes = counts.shape
+n_tf = int(info["n_tf_genes"])
+n_clusters = int(info["n_clusters"])
+tf_gene_indices = list(info["tf_gene_indices"])
+
+assert n_tf == len(tf_gene_indices)
+assert tf_gene_indices == list(range(n_tf))
+assert counts.shape == (n_cells, n_genes)
+print(f"[load] counts={counts.shape}, n_tf={n_tf}, n_clusters={n_clusters}")
+
+# ---------------------------------------------------------------------------
+# 1. Preprocessing - log1p(CPM) + z-score
+# ---------------------------------------------------------------------------
+lib_size = counts.sum(axis=1, keepdims=True)
+lib_size = np.where(lib_size == 0, 1.0, lib_size)
+cpm = counts / lib_size * 1e4
+log_norm = np.log1p(cpm)
+
+mu_gene = log_norm.mean(axis=0)
+sd_gene = log_norm.std(axis=0)
+sd_gene = np.where(sd_gene == 0, 1.0, sd_gene)
+Z = (log_norm - mu_gene) / sd_gene
+
+# ---------------------------------------------------------------------------
+# 2. PCA via SVD
+# ---------------------------------------------------------------------------
+N_PCS = 30
+Z_centered = Z - Z.mean(axis=0, keepdims=True)
+_, S, Vt = np.linalg.svd(Z_centered, full_matrices=False)
+n_components = min(N_PCS, Vt.shape[0], n_cells - 1)
+V = Vt[:n_components].T
+PC = Z_centered @ V
+explained = (S ** 2) / np.sum(S ** 2)
+print(f"[pca] using {n_components} PCs; cumulative var = "
+      f"{float(explained[:n_components].sum()):.4f}")
+
+# ---------------------------------------------------------------------------
+# 3. Symmetric k-NN graph (union, cosine, gaussian kernel)
+# ---------------------------------------------------------------------------
+K_NEIGH = 15
+PC_unit = PC / (np.linalg.norm(PC, axis=1, keepdims=True) + 1e-12)
+tree = cKDTree(PC_unit)
+dists, idx = tree.query(PC_unit, k=K_NEIGH + 1)
+nbr_dist = dists[:, 1:]
+nbr_idx = idx[:, 1:]
+rows = np.repeat(np.arange(n_cells), K_NEIGH)
+A = csr_matrix((nbr_dist.ravel(), (rows, nbr_idx.ravel())),
+               shape=(n_cells, n_cells)).tocsr()
+A_dense = np.asarray(A.toarray())
+A_dist_sym = np.maximum(A_dense, A_dense.T)
+np.fill_diagonal(A_dist_sym, 0.0)
+
+off = A_dist_sym > 0
+sigma = float(np.median(A_dist_sym[off]))
+W = np.zeros_like(A_dist_sym)
+W[off] = np.exp(-(A_dist_sym[off] ** 2) / (sigma ** 2))
+W = 0.5 * (W + W.T)
+np.fill_diagonal(W, 0.0)
+
+G = csr_matrix(W)
+n_comp, _ = connected_components(G, directed=False)
+deg_total = np.asarray(A.sum(axis=1) + A.sum(axis=0)).ravel()
+print(f"[graph] k={K_NEIGH}, sigma={sigma:.6f}, components={n_comp}")
+
+# ---------------------------------------------------------------------------
+# 4. Spectral clustering
+# ---------------------------------------------------------------------------
+D = W.sum(axis=1)
+D_inv_sqrt = 1.0 / np.sqrt(np.maximum(D, 1e-12))
+L_sym = np.eye(n_cells) - (D_inv_sqrt[:, None] * W) * D_inv_sqrt[None, :]
+evals, evecs = np.linalg.eigh(L_sym)
+evecs_use = evecs[:, 1:n_clusters]
+emb_norm = np.linalg.norm(evecs_use, axis=1, keepdims=True)
+emb_norm = np.where(emb_norm == 0, 1.0, emb_norm)
+emb = evecs_use / emb_norm
+
+
+def _kpp(X, k, rng):
+    n = X.shape[0]
+    centers = np.empty((k, X.shape[1]), dtype=X.dtype)
+    idx_first = int(rng.randint(0, n))
+    centers[0] = X[idx_first]
+    closest_sq = np.sum((X - centers[0]) ** 2, axis=1)
+    for i in range(1, k):
+        total = closest_sq.sum()
+        if total == 0:
+            probs = np.full(n, 1.0 / n)
+        else:
+            probs = closest_sq / total
+        idx_next = int(rng.choice(n, p=probs))
+        centers[i] = X[idx_next]
+        new_sq = np.sum((X - centers[i]) ** 2, axis=1)
+        closest_sq = np.minimum(closest_sq, new_sq)
+    return centers
+
+
+def _kmeans(X, k, max_iter=300, seed=0):
+    rng = np.random.RandomState(seed)
+    centers = _kpp(X, k, rng)
+    labels = -np.ones(X.shape[0], dtype=np.int32)
+    for _ in range(max_iter):
+        d2 = (np.sum(X ** 2, axis=1)[:, None]
+              + np.sum(centers ** 2, axis=1)[None, :]
+              - 2.0 * (X @ centers.T))
+        labels_new = np.argmin(d2, axis=1).astype(np.int32)
+        if np.array_equal(labels_new, labels):
+            break
+        labels = labels_new
+        for j in range(k):
+            mask = labels == j
+            if mask.sum() == 0:
+                centers[j] = X[int(rng.randint(0, X.shape[0]))]
+            else:
+                centers[j] = X[mask].mean(axis=0)
+    return labels, centers
+
+
+clusters, _ = _kmeans(emb, n_clusters, seed=0)
+unique_lbl = np.unique(clusters)
+remap = {old: new for new, old in enumerate(unique_lbl)}
+clusters = np.vectorize(remap.get, otypes=[np.int32])(clusters).astype(np.int32)
+print(f"[cluster] n_labels={len(unique_lbl)} (exp {n_clusters}); "
+      f"sizes={np.bincount(clusters, minlength=n_clusters).tolist()}")
+
+# ---------------------------------------------------------------------------
+# 5. Pseudotime - diffusion pseudotime (random-walk L2 distance)
+# ---------------------------------------------------------------------------
+P = W / np.maximum(D, 1e-12)[:, None]
+T_STEPS = 5
+P_t = np.eye(n_cells)
+for _ in range(T_STEPS):
+    P_t = P_t @ P
+
+intra_means = []
+for c in range(n_clusters):
+    cells = np.where(clusters == c)[0]
+    if cells.size < 2:
+        intra_means.append(np.inf)
+        continue
+    sub = A_dist_sym[np.ix_(cells, cells)]
+    m = sub > 0
+    intra_means.append(sub[m].mean() if m.any() else np.inf)
+densest = int(np.argmin(intra_means))
+print(f"[pseudotime] densest cluster={densest} (intra-NN dist={intra_means[densest]:.4f})")
+
+candidates = np.where(clusters == densest)[0]
+cand_deg = deg_total[candidates]
+max_deg = cand_deg.max()
+pool = candidates[cand_deg == max_deg]
+if pool.size > 1:
+    mean_d = []
+    for r in pool:
+        m = A_dist_sym[r] > 0
+        mean_d.append(A_dist_sym[r, m].mean() if m.any() else np.inf)
+    mean_d = np.array(mean_d)
+    root = int(pool[np.argmin(mean_d)])
+else:
+    root = int(pool[0])
+print(f"[pseudotime] root cell={root}, cluster={int(clusters[root])}, "
+      f"degree={int(deg_total[root])}")
+
+d_root = np.sqrt(np.sum((P_t - P_t[root]) ** 2, axis=1))
+d_min, d_max = float(d_root.min()), float(d_root.max())
+if d_max > d_min:
+    pseudotime = (d_root - d_min) / (d_max - d_min)
+else:
+    pseudotime = np.zeros_like(d_root)
+pseudotime = pseudotime.astype(np.float64)
+print(f"[pseudotime] range=[{pseudotime.min():.6f}, {pseudotime.max():.6f}]")
+
+# ---------------------------------------------------------------------------
+# 6. DE genes - Mann-Whitney U one-vs-rest -> AUROC; mean-rank aggregation
+# ---------------------------------------------------------------------------
+AUROC = np.zeros((n_clusters, n_genes), dtype=np.float64)
+log2fc = np.zeros((n_clusters, n_genes), dtype=np.float64)
+for ci, c in enumerate(range(n_clusters)):
+    mask_c = clusters == c
+    n_c = int(mask_c.sum())
+    n_r = int(n_cells - n_c)
+    if n_c == 0 or n_r == 0:
+        continue
+    x_c = log_norm[mask_c]
+    x_r = log_norm[~mask_c]
+    for g in range(n_genes):
+        try:
+            u_stat, _ = mannwhitneyu(x_c[:, g], x_r[:, g],
+                                     alternative="two-sided")
+            AUROC[ci, g] = float(u_stat) / float(n_c * n_r)
+        except ValueError:
+            AUROC[ci, g] = 0.5
+        mu_c = x_c[:, g].mean()
+        mu_r = x_r[:, g].mean()
+        denom = abs(mu_r) + 1e-9
+        log2fc[ci, g] = (mu_c - mu_r) / denom
+
+ranks_per_cluster = np.argsort(np.argsort(-AUROC, axis=1), axis=1)
+mean_rank = ranks_per_cluster.mean(axis=0)
+max_auroc = AUROC.max(axis=0)
+max_log2fc_abs = np.abs(log2fc).max(axis=0)
+gene_idx_arr = np.arange(n_genes)
+
+composite = list(zip(mean_rank, -max_auroc, -max_log2fc_abs, gene_idx_arr))
+composite.sort()
+TOP_K = min(50, n_genes)
+top_genes = [int(c[3]) for c in composite[:TOP_K]]
+print(f"[de] top10 gene_indices={top_genes[:10]}")
+
+# ---------------------------------------------------------------------------
+# 7. GRN scores - directed L1 (Lasso) per target TF
+# ---------------------------------------------------------------------------
+TF_log = log_norm[:, :n_tf]
+mu_tf = TF_log.mean(axis=0)
+sd_tf = TF_log.std(axis=0)
+sd_tf = np.where(sd_tf == 0, 1.0, sd_tf)
+TF_Z = (TF_log - mu_tf) / sd_tf
+
+XtY_all = TF_Z.T @ TF_Z
+abs_corr = np.abs(XtY_all) / n_cells
+np.fill_diagonal(abs_corr, 0.0)
+LAM_ALPHA = 0.10
+lam = float(LAM_ALPHA * abs_corr.max())
+print(f"[grn] lambda={lam:.6f} (alpha={LAM_ALPHA} * max|cross-corr|)")
+
+
+def _lasso_cd(X, y, lam, max_iter=400, tol=1e-8):
+    n, p = X.shape
+    XtX = X.T @ X / n
+    Xty = X.T @ y / n
+    beta = np.zeros(p, dtype=np.float64)
+    for _ in range(max_iter):
+        beta_old = beta.copy()
+        for j in range(p):
+            r_j = Xty[j] - (XtX[j] @ beta) + XtX[j, j] * beta[j]
+            if r_j > lam:
+                beta[j] = (r_j - lam) / XtX[j, j]
+            elif r_j < -lam:
+                beta[j] = (r_j + lam) / XtX[j, j]
+            else:
+                beta[j] = 0.0
+        if np.max(np.abs(beta - beta_old)) < tol:
+            break
+    return beta
+
+
+grn = np.zeros((n_tf, n_tf), dtype=np.float64)
+for j in range(n_tf):
+    pred = [k for k in range(n_tf) if k != j]
+    X = TF_Z[:, pred]
+    y = TF_Z[:, j]
+    beta = _lasso_cd(X, y, lam)
+    for k_, src in enumerate(pred):
+        grn[src, j] = beta[k_]
+# diagonal is 0 by construction (excluded from predictors)
+print(f"[grn] shape={grn.shape}, dtype={grn.dtype}, "
+      f"nnz={(grn != 0).sum()}/{grn.size}, "
+      f"frac={(grn != 0).mean():.4f}")
+
+# ---------------------------------------------------------------------------
+# 8. Save artifacts
+# ---------------------------------------------------------------------------
+np.save("clusters.npy", clusters.astype(np.int32))
+np.save("pseudotime.npy", pseudotime.astype(np.float64))
+np.save("grn_scores.npy", grn.astype(np.float64))
+
+with open("de_genes.json", "w", encoding="utf-8") as fh:
+    json.dump({"gene_indices": top_genes}, fh)
+
+methods = {
+    "preprocessing": {
+        "method": "log1p(CPM) + z-score (per gene)",
+        "why": ("CPM (x1e4) iguala profundidad por celula; log1p estabiliza la "
+                "varianza; z-score evita que PCA/KNN esten dominados por genes "
+                "con recuentos altos.")
+    },
+    "dim_reduction": {
+        "method": "PCA via numpy.linalg.svd; top-30 PCs",
+        "why": ("SVD completo en NumPy puro. El piloto SVD mostro PC1~19% y un "
+                "plateau ~1.3% en el resto, por lo que un umbral de varianza es "
+                "inestable; un tope fijo de 30 PCs preserva ~85% de varianza y "
+                "controla el coste del KNN.")
+    },
+    "graph": {
+        "method": "k-NN simetrico por union (k=15, coseno, kernel Gaussiano sigma=mediana)",
+        "why": ("cKDTree con metrica coseno sobre PCs; union (no interseccion) "
+                "para garantizar conectividad; kernel exp(-d^2/sigma^2) con "
+                "sigma = mediana de distancias positivas para que los pesos "
+                "sean comparables sin reescalado manual.")
+    },
+    "clustering": {
+        "method": "Spectral clustering (n_clusters=4) + k-means++ sembrado RandomState(0)",
+        "why": ("Determinista y robusto a inicializacion aleatoria; Laplaciano "
+                "normalizado simetrico sobre la afinidad Gaussiana; k-means "
+                "posterior sobre el embedding (Ng-Jordan-Weiss) con seed fija "
+                "asegura resultados reproducibles.")
+    },
+    "pseudotime": {
+        "method": "DPT por potencia del caminante aleatorio (t=5) desde celula de mayor grado del cluster mas denso",
+        "why": ("Distancia de Haghverdi estable sin libs externas (P_t via "
+                "matmul repetida). Raiz = cluster mas denso + mayor grado KNN "
+                "evita raices fragiles en periferia. Empates: menor distancia "
+                "media KNN, luego menor indice de celula.")
+    },
+    "de_genes": {
+        "method": "Mann-Whitney U one-vs-rest por cluster -> AUROC; agregacion global por rango medio",
+        "why": ("Test no parametrico robusto en datos dispersos de scRNA-seq; "
+                "el rango medio evita que un solo cluster monopole el ranking. "
+                "Desempates: max AUROC desc, max|log2FC| desc, indice de gen ascendente.")
+    },
+    "grn_scores": {
+        "method": "Lasso L1 por coordenada descendente sobre TFs log-normalizados estandarizados, uno por TF target j",
+        "why": ("Convencion i->j sale directamente del coeficiente del predictor "
+                "i en la regresion del target j; L1 induce dispersion util para "
+                "GRNs pequenas. lambda fija (alpha=0.10 * max|cross-corr|) hace "
+                "los resultados totalmente deterministas.")
+    }
+}
+with open("method_choices.json", "w", encoding="utf-8") as fh:
+    json.dump(methods, fh, ensure_ascii=False, indent=2)
+
+# ---------------------------------------------------------------------------
+# 9. Diagnostics
+# ---------------------------------------------------------------------------
+def _sha256(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+os.makedirs("diag", exist_ok=True)
+diag_lines = []
+diag_lines.append(f"n_clusters expected: {n_clusters}")
+diag_lines.append(f"n_clusters got: {int(np.unique(clusters).size)}")
+diag_lines.append(f"unique labels: {sorted(int(x) for x in np.unique(clusters))}")
+diag_lines.append(
+    "cluster sizes: "
+    f"{np.bincount(clusters, minlength=n_clusters).tolist()}"
+)
+diag_lines.append(f"k-NN connected components: {int(n_comp)}")
+diag_lines.append(f"k used: {K_NEIGH}")
+diag_lines.append(f"sigma kernel: {sigma:.6f}")
+diag_lines.append(f"Lasso lambda: {lam:.6f}")
+diag_lines.append(
+    f"grn nonzero: {int((grn != 0).sum())}/{int(grn.size)} "
+    f"(frac_nonzero={(grn != 0).mean():.4f})"
+)
+diag_lines.append(
+    f"root cell: {root}, cluster={int(clusters[root])}, "
+    f"degree={int(deg_total[root])}"
+)
+diag_lines.append(
+    f"pseudotime range: [{pseudotime.min():.6f}, "
+    f"{pseudotime.max():.6f}]  (in [0,1])"
+)
+diag_lines.append(f"top 10 DE gene_indices: {top_genes[:10]}")
+for fname in ("clusters.npy", "pseudotime.npy", "grn_scores.npy"):
+    a = np.load(fname)
+    diag_lines.append(
+        f"{fname}: sha256={_sha256(fname)}, "
+        f"shape={a.shape}, dtype={a.dtype}"
+    )
+
+with open("diag/diagnostics.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(diag_lines))
+
+print("\n[done] artifacts written")
+for l in diag_lines:
+    print(l)

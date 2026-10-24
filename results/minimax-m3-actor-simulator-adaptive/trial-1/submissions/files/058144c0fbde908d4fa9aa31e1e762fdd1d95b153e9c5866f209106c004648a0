@@ -1,0 +1,721 @@
+"""
+analysis.py — VTST/CVT/SCT analysis of the 2D reaction-energy dataset.
+
+Inputs (data/):
+  surface_samples.csv, curve_samples.csv, tube_scan.csv, kinetic_metric.csv,
+  temperature_grid.csv, isotope_cases.csv, system_manifest.json
+
+Outputs (results/):
+  free_energy_profile.csv, rate_constants.csv, transmission_profile.csv,
+  path_samples.csv, isotope_effects.csv, isotope_transmission_profile.csv,
+  diagnostics.json, rate_plot.png
+
+Reads only files in the workspace and inlines all constants from
+system_manifest.json.  matplotlib is unavailable in this sandbox; the
+rate_plot.png is rendered with a stdlib-only PNG writer.
+"""
+
+import json
+import pathlib
+import struct
+import zlib
+import numpy as np
+import pandas as pd
+from scipy.interpolate import RectBivariateSpline, interp1d
+
+DATA = pathlib.Path("data")
+RES = pathlib.Path("results")
+RES.mkdir(exist_ok=True)
+
+# ---------------------------- Manifest constants ----------------------------
+MAN = json.loads((DATA / "system_manifest.json").read_text())
+R = MAN["public_constants"]["R_kJ_mol_K"]
+HC_OVER_KB = MAN["public_constants"]["hc_over_kB_K_cm"]
+KB_OVER_H = MAN["public_constants"]["kB_over_h_s_per_K"]
+HC = MAN["public_constants"]["hc_kJ_mol_per_cm"]
+FS = MAN["public_constants"]["frequency_scale_cm1_per_sqrt_kj_mol_coord2"]
+ACT_SCALE = MAN["public_constants"]["semiclassical_action_scale"]
+
+# ----------------------------- Load input tables -----------------------------
+surf = pd.read_csv(DATA / "surface_samples.csv")
+curve = pd.read_csv(DATA / "curve_samples.csv").sort_values("point_id").reset_index(drop=True)
+tube = pd.read_csv(DATA / "tube_scan.csv")
+kin = pd.read_csv(DATA / "kinetic_metric.csv").sort_values("point_id").reset_index(drop=True)
+temperatures = pd.read_csv(DATA / "temperature_grid.csv")
+isotopes = pd.read_csv(DATA / "isotope_cases.csv")
+
+# ---------------------------- 2D surface interpolation -----------------------
+xi = np.sort(surf.x.unique())
+yi = np.sort(surf.y.unique())
+V2D = surf.pivot_table(values="potential_kj_mol",
+                      index="y", columns="x").reindex(index=yi, columns=xi).values
+V_interp = RectBivariateSpline(yi, xi, V2D, kx=3, ky=3)
+
+# ---------------------------- Along-corridor quantities ----------------------
+s_coord = curve.s_coord.values
+x_pts = curve.x.values
+y_pts = curve.y.values
+V_along = V_interp(y_pts, x_pts, grid=False)
+m_long_base = kin.longitudinal_reduced_mass_amu.values
+m_perp_base = kin.transverse_reduced_mass_amu.values
+
+# ----------------------- Transverse frequency along the corridor -------------
+kappa_perp = np.zeros(len(curve))
+for i in range(len(curve)):
+    sub = tube[tube.point_id == i].sort_values("q_id")
+    coef = np.polyfit(sub.q_offset.values, sub.potential_kj_mol.values, 2)
+    kappa_perp[i] = 2.0 * coef[0]
+kappa_perp = np.maximum(kappa_perp, 0.0)
+nu_perp_cm_base = FS * np.sqrt(kappa_perp) / np.sqrt(m_perp_base)
+
+V_of_s = interp1d(s_coord, V_along, kind="linear", fill_value="extrapolate")
+nu_of_s = interp1d(s_coord, nu_perp_cm_base, kind="linear", fill_value="extrapolate")
+
+idx_saddle = int(np.argmax(V_along))
+s_saddle = float(s_coord[idx_saddle])
+V_saddle = float(V_along[idx_saddle])
+V_react = float(V_along[0])
+V_prod = float(V_along[-1])
+dV_fwd = V_saddle - V_react
+dV_rev = V_saddle - V_prod
+
+print(f"Conventional saddle at point_id={idx_saddle}  s={s_saddle:.4f}  "
+      f"V={V_saddle:.4f}  ΔV_fwd={dV_fwd:.4f}  V_react={V_react:.4f}  "
+      f"V_prod={V_prod:.4f}")
+
+# ----------------------- WKB actions on a regular E grid ---------------------
+N_E = 64
+S_FINE = np.linspace(s_coord[0], s_coord[-1], 4001)
+V_FINE = V_of_s(S_FINE)
+NU_FINE = nu_of_s(S_FINE)
+
+
+def action_corridor_at_E(E, m_long_val):
+    """Dimensionless 1D-WKB action:
+    ξ_corridor = ACT_SCALE · ∫_{s_left}^{s_right} √(2·m_long·(V-E)) ds."""
+    integrand = np.sqrt(np.maximum(2.0 * m_long_val * (V_FINE - E), 0.0))
+    forbidden = V_FINE > E
+    if not np.any(forbidden):
+        return 0.0
+    contrib = np.where(forbidden, integrand, 0.0)
+    return ACT_SCALE * np.trapezoid(contrib, S_FINE)
+
+
+def action_perp_reduction_at_E(E, m_perp_val):
+    """Perpendicular-curvature reduction Δξ = ACT_SCALE · ∫ ℏω_⊥/(V-E) ds
+    over the classically-forbidden region (Skodje–Truhlar form)."""
+    nu_f = NU_FINE / np.sqrt(m_perp_val)
+    hnu_f = HC * nu_f
+    forbidden = V_FINE > E
+    if not np.any(forbidden):
+        return 0.0
+    contrib = np.where(forbidden, hnu_f / np.maximum(V_FINE - E, 1e-9), 0.0)
+    return ACT_SCALE * np.trapezoid(contrib, S_FINE)
+
+
+def transmission(act):
+    """P(E) = 1/(1 + exp(2 ξ))."""
+    if act <= 0.0:
+        return 1.0
+    arg = 2.0 * act
+    if arg > 100.0:
+        return np.exp(-arg)
+    return 1.0 / (1.0 + np.exp(arg))
+
+
+def compute_actions(m_long_val, m_perp_val):
+    """Returns (act_corridor, act_2d) arrays of length N_E.
+
+    action_2d(E) = action_corridor(E) − 0.5·(perpendicular-curvature
+    reduction ∝ ℏ·ν_⊥/(V−E)) clipped to the interval [0, action_corridor(E)]
+    so that the 2D effective transmission never exceeds (corridor) and
+    never turns un-physically negative in the deep-tunneling limit where
+    the Skodje–Truhlar 1/(V−E) weighting diverges.
+    """
+    act_c = np.zeros(N_E)
+    act_2 = np.zeros(N_E)
+    for iE, E in enumerate(energy_grid):
+        c = action_corridor_at_E(E, m_long_val)
+        per = action_perp_reduction_at_E(E, m_perp_val)
+        s2 = c - 0.5 * per
+        if s2 < 0.0:
+            s2 = 0.0
+        if s2 > c:
+            s2 = c
+        act_c[iE] = c
+        act_2[iE] = s2
+    return act_c, act_2
+
+
+energy_grid = np.linspace(0.0, dV_fwd, N_E)   # 0..V_fwd, 64 rows incl endpoints
+
+m_long_ref = 1.0
+m_perp_ref = 1.0
+
+print("Computing 1D corridor actions on regular energy grid 0..V_fwd (light ref)…")
+act_corridor_base, act_2d_base = compute_actions(m_long_ref, m_perp_ref)
+with np.errstate(invalid="ignore", divide="ignore"):
+    ratio_base = np.where(
+        act_corridor_base > 0,
+        act_2d_base / np.where(act_corridor_base > 0, act_corridor_base, 1.0),
+        1.0,
+    )
+P_corridor_base = np.array([transmission(a) for a in act_corridor_base])
+P_2d_base = np.array([transmission(a) for a in act_2d_base])
+
+
+# ---------------------------- Three-rate functions ---------------------------
+def G_along_corridor(T, m_perp_val):
+    """G(s, T) - G(s_min, T) along all 121 corridor points."""
+    RT = R * T
+    nu_min = nu_perp_cm_base[0] / np.sqrt(m_perp_val)
+    hnu_min = HC * nu_min
+    F1 = RT * np.log(1.0 - np.exp(-hnu_min / RT)) if hnu_min / RT < 50 else 0.0
+    G = np.zeros(len(curve))
+    for i in range(len(curve)):
+        nu = nu_perp_cm_base[i] / np.sqrt(m_perp_val)
+        hnu = HC * nu
+        F2 = RT * np.log(1.0 - np.exp(-hnu / RT)) if hnu / RT < 50 else 0.0
+        G[i] = (V_along[i] - V_react) + 0.5 * (hnu - hnu_min) + (F2 - F1)
+    return G
+
+
+def thermal_kappa_corridor(act_corridor, dV_ref, T):
+    """κ_corridor(T) = total-P(E) rate-normalized to classical over-the-barrier rate.
+
+    Construction:
+      P_tot(E) = P(E)  for 0 ≤ E ≤ V_fwd, P_tot(E) = 1 for E > V_fwd.
+      Num = ∫_0^V_fwd P(E)·exp(-E/RT) dE + ∫_V_fwd^∞ 1·exp(-E/RT) dE
+          = ∫_0^V_fwd P(E)·exp(-E/RT) dE + RT·exp(-V_fwd/RT)
+      Denom = RT·exp(-V_fwd/RT)    (classical over-the-barrier thermal average)
+    so κ(T) = Num/Denom = 1 + ∫_0^V_fwd P·exp(-E/RT) dE / (RT·exp(-V_fwd/RT)).
+    κ ≥ 1 by construction, but for our grid P(V_fwd)=1 exactly so it smoothly
+    approaches 1 from above as T → ∞ (where the tunneling correction term
+    becomes negligible compared with the RT term dominating the integral).
+    """
+    RT = R * T
+    P = np.array([transmission(a) for a in act_corridor])
+    tunnel_part = np.trapezoid(P * np.exp(-energy_grid / RT), energy_grid)
+    classical_part = RT * np.exp(-dV_fwd / RT)
+    Num = tunnel_part + classical_part
+    Denom = classical_part
+    return Num / Denom if Denom > 0 else np.nan
+
+
+def three_rates(T, m_long_val, m_perp_val, act_corridor, act_2d):
+    """Compute the three rate variants and κ at one temperature."""
+    RT = R * T
+    pre = KB_OVER_H * T
+    nu_R = nu_perp_cm_base[0] / np.sqrt(m_perp_val)
+    nu_local = nu_perp_cm_base[idx_saddle] / np.sqrt(m_perp_val)
+    k_local = pre * (nu_R / nu_local) * np.exp(-dV_fwd / RT)
+    G = G_along_corridor(T, m_perp_val)
+    idx_opt = int(np.argmax(G))
+    dG_max = float(G[idx_opt])
+    k_optimized = pre * np.exp(-dG_max / RT)
+    kappa_c = thermal_kappa_corridor(act_corridor, dG_max, T)
+    k_enhanced = kappa_c * k_optimized
+    return dict(
+        k_local=k_local, k_optimized=k_optimized, k_enhanced=k_enhanced,
+        kappa_corridor=kappa_c, dG_max=dG_max, idx_opt=idx_opt,
+    )
+
+
+# ----------------------- Light-case rates for the temperature grid -----------
+T_list = temperatures.T_K.values
+
+rate_rows = []
+klight_local = np.zeros(len(T_list))
+klight_optimized = np.zeros(len(T_list))
+klight_enhanced = np.zeros(len(T_list))
+sopt_light = np.zeros(len(T_list), dtype=int)
+dGmax_light = np.zeros(len(T_list))
+
+for iT, T in enumerate(T_list):
+    rs = three_rates(T, m_long_ref, m_perp_ref,
+                     act_corridor_base, act_2d_base)
+    klight_local[iT] = rs["k_local"]
+    klight_optimized[iT] = rs["k_optimized"]
+    klight_enhanced[iT] = rs["k_enhanced"]
+    sopt_light[iT] = rs["idx_opt"]
+    dGmax_light[iT] = rs["dG_max"]
+    rate_rows.append(dict(
+        T_K=T,
+        log10_k_local_s_inv=float(np.log10(rs["k_local"])),
+        log10_k_optimized_s_inv=float(np.log10(rs["k_optimized"])),
+        log10_k_enhanced_s_inv=float(np.log10(rs["k_enhanced"])),
+        kappa_corridor=float(rs["kappa_corridor"]),
+        enhancement_factor=float(rs["kappa_corridor"]),
+        s_optimized=int(rs["idx_opt"]),
+        barrier_local_kj_mol=float(dV_fwd),
+        barrier_optimized_kj_mol=float(rs["dG_max"]),
+        crossover_T_K=np.nan,
+    ))
+
+
+def find_crossover(k_a, k_b, T_grid):
+    """Linearly interpolated T where k_a equals k_b."""
+    da = np.log10(k_a) - np.log10(k_b)
+    for j in range(len(T_grid) - 1):
+        if da[j] * da[j + 1] < 0:
+            return T_grid[j] - da[j] * (T_grid[j + 1] - T_grid[j]) / (da[j + 1] - da[j])
+    return np.nan
+
+
+crossover_light = find_crossover(klight_enhanced, klight_local, T_list)
+for row in rate_rows:
+    row["crossover_T_K"] = crossover_light
+
+print(f"Light-case crossover T_K = {crossover_light:.3f}")
+
+# ---------------------------- free_energy_profile.csv ------------------------
+print("Building free_energy_profile.csv (12 T × 121 points)…")
+fep_rows = []
+for T in T_list:
+    G = G_along_corridor(T, m_perp_ref)
+    sidx = int(sopt_light[np.where(T_list == T)[0][0]])
+    for i in range(len(curve)):
+        nu = nu_perp_cm_base[i] / np.sqrt(m_perp_ref)
+        fep_rows.append((T, i, s_coord[i], x_pts[i], y_pts[i],
+                         float(nu), float(G[i]),
+                         (i == sidx)))
+fep_df = pd.DataFrame(fep_rows, columns=[
+    "T_K", "point_id", "s_coord", "x", "y",
+    "transverse_frequency_cm1", "free_energy_kj_mol",
+    "optimized_crossing_flag",
+])
+fep_df.to_csv(RES / "free_energy_profile.csv", index=False)
+
+# ---------------------------- rate_constants.csv -----------------------------
+print("Building rate_constants.csv…")
+pd.DataFrame(rate_rows).to_csv(RES / "rate_constants.csv", index=False)
+
+# ---------------------------- transmission_profile.csv ------------------------
+print("Building transmission_profile.csv (light, 64 grid points)…")
+tp = pd.DataFrame(dict(
+    energy_id=np.arange(N_E),
+    energy_kj_mol=energy_grid,
+    action_corridor=act_corridor_base,
+    action_2d=act_2d_base,
+    transmission_corridor=P_corridor_base,
+    transmission_2d=P_2d_base,
+    action_ratio_2d_over_corridor=ratio_base,
+))
+tp.to_csv(RES / "transmission_profile.csv", index=False)
+
+# ---------------------------- path_samples.csv --------------------------------
+print("Building path_samples.csv (64 energies × 60 steps)…")
+Nsteps = 60
+rps_rows = []
+for iE, E in enumerate(energy_grid):
+    forbidden = V_FINE > E
+    if forbidden.any():
+        idx_first = int(np.argmax(forbidden))
+        s_left = float(S_FINE[max(idx_first - 1, 0)])
+        idx_last = len(forbidden) - 1 - int(np.argmax(forbidden[::-1]))
+        s_right = float(S_FINE[min(idx_last + 1, len(S_FINE) - 1)])
+    else:
+        s_left = float(s_coord[0])
+        s_right = float(s_coord[-1])
+    seg1 = np.linspace(s_coord[0], s_left, 30, endpoint=True)
+    seg2 = np.linspace(s_right, s_coord[-1], 30, endpoint=True)
+    if len(seg1) and len(seg2) and seg1[-1] >= seg2[0]:
+        seg2 = seg2[1:]
+    s_samples = np.concatenate([seg1, seg2])
+    s_use = np.linspace(s_samples[0], s_samples[-1], Nsteps)
+    x_use = np.interp(s_use, s_coord, x_pts)
+    y_use = np.interp(s_use, s_coord, y_pts)
+    Vpoti = V_interp(y_use, x_use, grid=False)
+    for k in range(Nsteps):
+        rps_rows.append((iE, k, float(energy_grid[iE]),
+                         float(x_use[k]), float(y_use[k]), float(Vpoti[k])))
+
+pd.DataFrame(rps_rows, columns=[
+    "energy_id", "path_step", "energy_kj_mol", "x", "y", "potential_kj_mol"
+]).to_csv(RES / "path_samples.csv", index=False)
+
+
+# ------------------- Isotope effects + isotope transmission -----------------
+print("Computing isotope effects and per-isotope transmission profiles…")
+iso_rows = []
+iso_tp_rows = []
+log_k_light_enh = np.log10(klight_enhanced)
+
+for _, irow in isotopes.iterrows():
+    case_id = irow.case_id
+    iso = irow.isotopologue
+    mL_scale = float(irow.longitudinal_mass_scale)
+    mT_scale = float(irow.transverse_mass_scale)
+    act_c_iso, act_2_iso = compute_actions(m_long_ref * mL_scale, m_perp_ref * mT_scale)
+    P_c_iso = np.array([transmission(a) for a in act_c_iso])
+    P_2d_iso = np.array([transmission(a) for a in act_2_iso])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio_iso = np.where(
+            act_c_iso > 0,
+            act_2_iso / np.where(act_c_iso > 0, act_c_iso, 1.0),
+            1.0,
+        )
+    for iE in range(N_E):
+        iso_tp_rows.append((
+            case_id, iso, mL_scale, mT_scale, iE,
+            float(energy_grid[iE]),
+            float(act_c_iso[iE]),
+            float(act_2_iso[iE]),
+            float(P_c_iso[iE]),
+            float(P_2d_iso[iE]),
+            float(ratio_iso[iE]),
+        ))
+
+    k_enh_iso = np.zeros(len(T_list))
+    k_loc_iso = np.zeros(len(T_list))
+    iso_rate_block = []
+    for iT, T in enumerate(T_list):
+        rs = three_rates(T, m_long_ref * mL_scale, m_perp_ref * mT_scale,
+                         act_c_iso, act_2_iso)
+        k_loc_iso[iT] = rs["k_local"]
+        k_enh_iso[iT] = rs["k_enhanced"]
+        log_k_enh_iso = float(np.log10(k_enh_iso[iT]))
+        iso_rate_block.append(dict(
+            case_id=case_id, isotopologue=iso,
+            longitudinal_mass_scale=mL_scale,
+            transverse_mass_scale=mT_scale,
+            T_K=T,
+            log10_k_local_s_inv=float(np.log10(rs["k_local"])),
+            log10_k_optimized_s_inv=float(np.log10(rs["k_optimized"])),
+            log10_k_enhanced_s_inv=log_k_enh_iso,
+            enhancement_factor=float(rs["kappa_corridor"]),
+            s_optimized=int(rs["idx_opt"]),
+            crossover_T_K=np.nan,
+            log10_KIE_sct_vs_light=float(log_k_light_enh[iT] - log_k_enh_iso),
+        ))
+    crv_iso = find_crossover(k_enh_iso, k_loc_iso, T_list)
+    for r in iso_rate_block:
+        r["crossover_T_K"] = crv_iso
+    iso_rows.extend(iso_rate_block)
+
+iso_df = pd.DataFrame(iso_rows)
+iso_df.to_csv(RES / "isotope_effects.csv", index=False)
+iso_tp_df = pd.DataFrame(iso_tp_rows, columns=[
+    "case_id", "isotopologue", "longitudinal_mass_scale", "transverse_mass_scale",
+    "energy_id", "energy_kj_mol", "action_corridor", "action_2d",
+    "transmission_corridor", "transmission_2d", "action_ratio_2d_over_corridor",
+])
+iso_tp_df.to_csv(RES / "isotope_transmission_profile.csv", index=False)
+
+# ---------------------------- diagnostics.json --------------------------------
+print("Building diagnostics.json…")
+mean_action_reduction = float(np.mean(1.0 - ratio_base))
+
+
+def diag_block(case_id, isotopologue, mL, mT, crv, k_loc, k_enh, k_opt, T):
+    return {
+        "case_id": case_id,
+        "isotopologue": isotopologue,
+        "longitudinal_mass_scale": mL,
+        "transverse_mass_scale": mT,
+        "crossover_T_K": float(crv),
+        "rate_ordering_at_T_min": {
+            "T_K": float(T[0]),
+            "log10_k_local": float(np.log10(k_loc[0])),
+            "log10_k_optimized": float(np.log10(k_opt[0])),
+            "log10_k_enhanced": float(np.log10(k_enh[0])),
+        },
+        "rate_ordering_at_T_max": {
+            "T_K": float(T[-1]),
+            "log10_k_local": float(np.log10(k_loc[-1])),
+            "log10_k_optimized": float(np.log10(k_opt[-1])),
+            "log10_k_enhanced": float(np.log10(k_enh[-1])),
+        },
+    }
+
+
+diag = {
+    "basin_x_range": {
+        "A_reactant_lower_x": [float(x_pts[0]), float(x_pts[10])],
+        "B_product_higher_x": [float(x_pts[110]), float(x_pts[-1])],
+        "reactant_endpoint_value_kj_mol": float(V_react),
+        "product_endpoint_value_kj_mol": float(V_prod),
+    },
+    "conventional_saddle": {
+        "point_id": int(idx_saddle),
+        "s_coord": float(s_saddle),
+        "x": float(x_pts[idx_saddle]),
+        "y": float(y_pts[idx_saddle]),
+        "V_kj_mol": float(V_saddle),
+        "delta_V_kj_mol_relative_to_reactant": float(dV_fwd),
+        "delta_V_kj_mol_relative_to_product": float(dV_rev),
+    },
+    "transverse_frequency_at_baseline": {
+        "nu_perp_reactant_cm1": float(nu_perp_cm_base[0]),
+        "nu_perp_saddle_cm1": float(nu_perp_cm_base[idx_saddle]),
+        "nu_perp_product_cm1": float(nu_perp_cm_base[-1]),
+    },
+    "kappa_corridor_exponents_reference": {
+        "action_corridor_at_E0": float(act_corridor_base[0]),
+        "action_corridor_at_E_V_fwd": float(act_corridor_base[-1]),
+        "action_2d_at_E0": float(act_2d_base[0]),
+        "action_2d_at_E_V_fwd": float(act_2d_base[-1]),
+    },
+    "mean_action_reduction_fraction": mean_action_reduction,
+    "transmission_at_E_bottom_and_top_reference": {
+        "P_corridor_at_E0": float(P_corridor_base[0]),
+        "P_corridor_at_E_V_fwd": float(P_corridor_base[-1]),
+        "P_2d_at_E0": float(P_2d_base[0]),
+        "P_2d_at_E_V_fwd": float(P_2d_base[-1]),
+    },
+    "rate_diagnostics_per_case": [
+        diag_block("light", "H_reference", 1.0, 1.0,
+                   crossover_light, klight_local, klight_enhanced,
+                   klight_optimized, T_list)
+    ],
+    "cross_over_T_K_reference": float(crossover_light),
+    "manifest_constants": {
+        "R_kJ_mol_K": R,
+        "hc_kJ_mol_per_cm": HC,
+        "hc_over_kB_K_cm": HC_OVER_KB,
+        "kB_over_h_s_per_K": KB_OVER_H,
+        "frequency_scale_cm1_per_sqrt_kj_mol_coord2": FS,
+        "semiclassical_action_scale": ACT_SCALE,
+    },
+    "definitions": {
+        "free_energy_G_s_T": "G(s,T) = V(s)-V_min + 0.5(hν(s)-hν_min) + RT[ln(1-exp(-hν/RT))-ln(1-exp(-hν_min/RT))]",
+        "k_local": "k = (kB·T/h)·(ν_R/ν_‡)·exp(-ΔV_fwd/RT) at conventional saddle",
+        "k_optimized": "k = (kB·T/h)·exp(-ΔG_max(T)/RT) (CVT)",
+        "kappa_corridor": "κ(T) = ∫_0^V_fwd P(E)·exp(-E/RT) dE / (RT·exp(-ΔG_max(T)/RT))",
+        "crossover_T_K": "T at which log10(k_enhanced) = log10(k_local); NaN if no flip",
+        "action_ratio_2d_over_corridor": "ξ_2d(E) / ξ_corridor(E) per row; diagnostics JSON reports 1 − ⟨ξ_2d/ξ_corridor⟩_E",
+    },
+}
+
+def _clean_for_json(obj):
+    """Recursively replace NaN floats with None so the produced JSON is valid."""
+    if isinstance(obj, float):
+        if obj != obj:  # NaN check
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_for_json(v) for v in obj]
+    return obj
+
+
+iso_done = (iso_df[["case_id", "isotopologue",
+                    "longitudinal_mass_scale", "transverse_mass_scale"]]
+            .drop_duplicates())
+already_added = {entry["case_id"] for entry in diag["rate_diagnostics_per_case"]}
+for _, irow in iso_done.iterrows():
+    case_id = irow.case_id
+    if case_id in already_added:
+        continue
+    sub = iso_df[iso_df.case_id == case_id]
+    T_iso = sub.T_K.values
+    k_l_iso = 10 ** sub.log10_k_local_s_inv.values
+    k_o_iso = 10 ** sub.log10_k_optimized_s_inv.values
+    k_e_iso = 10 ** sub.log10_k_enhanced_s_inv.values
+    crv = sub.crossover_T_K.iloc[0]
+    diag["rate_diagnostics_per_case"].append(diag_block(
+        case_id, irow.isotopologue,
+        float(irow.longitudinal_mass_scale), float(irow.transverse_mass_scale),
+        crv, k_l_iso, k_e_iso, k_o_iso, T_iso,
+    ))
+# Update the cross_over_T_K_reference light entry with NaN-safe form now
+diag["cross_over_T_K_reference"] = crossover_light if not np.isnan(crossover_light) else None
+diag = _clean_for_json(diag)
+with open(RES / "diagnostics.json", "w") as f:
+    json.dump(diag, f, indent=2, default=float)
+
+
+# ----------------------- rate_plot.png (stdlib PNG renderer) ------------------
+print("Rendering rate_plot.png…")
+
+_FONT = {
+    'A': [0x0E,0x11,0x11,0x1F,0x11,0x11,0x11], 'B': [0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E],
+    'C': [0x0E,0x11,0x10,0x10,0x10,0x11,0x0E], 'D': [0x1E,0x11,0x11,0x11,0x11,0x11,0x1E],
+    'E': [0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F], 'F': [0x1F,0x10,0x10,0x1E,0x10,0x10,0x10],
+    'G': [0x0E,0x11,0x10,0x17,0x11,0x11,0x0F], 'H': [0x11,0x11,0x11,0x1F,0x11,0x11,0x11],
+    'I': [0x1F,0x04,0x04,0x04,0x04,0x04,0x1F], 'J': [0x07,0x02,0x02,0x02,0x02,0x12,0x0C],
+    'K': [0x11,0x12,0x14,0x18,0x14,0x12,0x11], 'L': [0x10,0x10,0x10,0x10,0x10,0x10,0x1F],
+    'M': [0x11,0x1B,0x15,0x11,0x11,0x11,0x11], 'N': [0x11,0x19,0x15,0x15,0x13,0x11,0x11],
+    'O': [0x0E,0x11,0x11,0x11,0x11,0x11,0x0E], 'P': [0x1E,0x11,0x11,0x1E,0x10,0x10,0x10],
+    'Q': [0x0E,0x11,0x11,0x11,0x15,0x12,0x0D], 'R': [0x1E,0x11,0x11,0x1E,0x14,0x12,0x11],
+    'S': [0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E], 'T': [0x1F,0x04,0x04,0x04,0x04,0x04,0x04],
+    'U': [0x11,0x11,0x11,0x11,0x11,0x11,0x0E], 'V': [0x11,0x11,0x11,0x11,0x11,0x0A,0x04],
+    'W': [0x11,0x11,0x11,0x11,0x15,0x15,0x0A], 'X': [0x11,0x11,0x0A,0x04,0x0A,0x11,0x11],
+    'Y': [0x11,0x11,0x11,0x0A,0x04,0x04,0x04], 'Z': [0x1F,0x01,0x02,0x04,0x08,0x10,0x1F],
+    '0': [0x0E,0x11,0x13,0x15,0x19,0x11,0x0E], '1': [0x04,0x0C,0x04,0x04,0x04,0x04,0x0E],
+    '2': [0x0E,0x11,0x01,0x02,0x04,0x08,0x1F], '3': [0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E],
+    '4': [0x02,0x06,0x0A,0x12,0x1F,0x02,0x02], '5': [0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E],
+    '6': [0x06,0x08,0x10,0x1E,0x11,0x11,0x0E], '7': [0x1F,0x01,0x02,0x04,0x08,0x08,0x08],
+    '8': [0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E], '9': [0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C],
+    '.': [0x00,0x00,0x00,0x00,0x00,0x04,0x04], '-': [0x00,0x00,0x00,0x1F,0x00,0x00,0x00],
+    '+': [0x00,0x04,0x04,0x1F,0x04,0x04,0x00], ' ': [0x00]*7,
+    ':': [0x00,0x04,0x00,0x00,0x00,0x04,0x00], '/': [0x01,0x02,0x02,0x04,0x08,0x08,0x10],
+    '_': [0x00]*6 + [0x1F], ',': [0x00,0x00,0x00,0x00,0x04,0x04,0x08],
+    'k': [0x10,0x10,0x10,0x1E,0x14,0x14,0x1E], 'i': [0x04,0x00,0x0C,0x04,0x04,0x04,0x0E],
+    'l': [0x0C,0x04,0x04,0x04,0x04,0x04,0x0E], 'n': [0x00,0x00,0x1E,0x11,0x11,0x11,0x11],
+    't': [0x08,0x08,0x1E,0x08,0x08,0x09,0x06], 'o': [0x00,0x00,0x0E,0x11,0x11,0x11,0x0E],
+    'p': [0x00,0x00,0x1E,0x11,0x11,0x1E,0x10], 'g': [0x00,0x0E,0x11,0x11,0x0F,0x01,0x0E],
+    'r': [0x00,0x00,0x16,0x19,0x10,0x10,0x10], 'a': [0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F],
+    'c': [0x00,0x00,0x0F,0x10,0x10,0x10,0x0F], 'e': [0x00,0x00,0x0E,0x11,0x1F,0x10,0x0F],
+    'h': [0x10,0x10,0x1E,0x11,0x11,0x11,0x11], 's': [0x00,0x00,0x0E,0x10,0x0E,0x01,0x0E],
+    'u': [0x00,0x00,0x11,0x11,0x11,0x13,0x0D], 'm': [0x00,0x00,0x1A,0x15,0x15,0x11,0x11],
+    'd': [0x01,0x01,0x0F,0x11,0x11,0x11,0x0F], 'f': [0x06,0x09,0x08,0x1E,0x08,0x08,0x08],
+    'x': [0x00,0x00,0x11,0x0A,0x04,0x0A,0x11], '*': [0x04,0x15,0x0E,0x1F,0x0E,0x15,0x04],
+    '(': [0x04,0x08,0x10,0x10,0x10,0x08,0x04], ')': [0x04,0x02,0x01,0x01,0x01,0x02,0x04],
+}
+
+
+def draw_text(canvas, x0, y0, text, color=(0, 0, 0, 255), scale=1):
+    for ch in text:
+        glyph = _FONT.get(ch.upper(), _FONT.get(ch, _FONT[' ']))
+        for ry in range(7):
+            bits = glyph[ry]
+            for rx in range(5):
+                if bits & (1 << (4 - rx)):
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            xx = x0 + rx * scale + dx
+                            yy = y0 + ry * scale + dy
+                            if 0 <= xx < canvas.shape[1] and 0 <= yy < canvas.shape[0]:
+                                canvas[yy, xx] = color
+        x0 += 6 * scale
+    return x0
+
+
+def write_png(path, width, height, px):
+    sig = b"\x89PNG\r\n\x1a\n"
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    raw = b"".join(b"\x00" + px[row].tobytes() for row in range(height))
+    idat = zlib.compress(raw, 6)
+    with open(path, "wb") as f:
+        f.write(sig)
+        f.write(chunk(b"IHDR", ihdr))
+        f.write(chunk(b"IDAT", idat))
+        f.write(chunk(b"IEND", b""))
+
+
+def make_rate_plot(path, T_list, k_local, k_opt, k_enh, kappa):
+    W, H = 1024, 640
+    canvas = np.full((H, W, 4), 255, dtype=np.uint8)
+    margin_l, margin_r = 90, 90
+    margin_t, margin_b = 100, 90
+    plot_w = W - margin_l - margin_r
+    plot_h = H - margin_t - margin_b
+    x0p, y0p = margin_l, margin_t
+    log_k_min, log_k_max = -28, 16
+    kappa_max = max(2.0, float(np.nanmax(kappa)) * 1.2)
+    kappa_min = 0.0
+    T_min, T_max = float(T_list[0]), float(T_list[-1])
+
+    def X(t): return int(x0p + (t - T_min) / (T_max - T_min) * plot_w)
+    def YL(v): return int(y0p + plot_h - (v - log_k_min) / (log_k_max - log_k_min) * plot_h)
+    def YR(v): return int(y0p + plot_h - (v - kappa_min) / (kappa_max - kappa_min) * plot_h)
+
+    for x in range(x0p, x0p + plot_w + 1):
+        canvas[y0p + plot_h, x] = (0, 0, 0, 255)
+        canvas[y0p, x] = (0, 0, 0, 255)
+    for y in range(y0p, y0p + plot_h + 1):
+        canvas[y, x0p] = (0, 0, 0, 255)
+        canvas[y, x0p + plot_w] = (0, 0, 0, 255)
+    grid_color = (220, 220, 220, 255)
+    for v in range(log_k_min, log_k_max + 1, 4):
+        y = YL(v)
+        if y0p <= y <= y0p + plot_h:
+            for x in range(x0p, x0p + plot_w + 1):
+                canvas[y, x] = grid_color
+    for tick in np.linspace(T_min, T_max, num=8):
+        x = X(tick)
+        if x0p <= x <= x0p + plot_w:
+            for y in range(y0p, y0p + plot_h + 1):
+                canvas[y, x] = grid_color
+
+    log_k_loc = np.log10(k_local)
+    log_k_opt = np.log10(k_opt)
+    log_k_enh = np.log10(k_enh)
+    color_local = (220, 30, 30, 255)
+    color_opt = (255, 140, 0, 255)
+    color_enh = (30, 60, 220, 255)
+    color_kappa = (30, 160, 60, 255)
+    thick = 2
+
+    def draw_line(values, Yfun, color):
+        last = None
+        for iT, T in enumerate(T_list):
+            v_clip = float(np.clip(values[iT],
+                                   min(log_k_min, float(np.nanmin(values))),
+                                   max(log_k_max, float(np.nanmax(values)))))
+            x = X(T)
+            y = int(np.clip(Yfun(v_clip), y0p, y0p + plot_h))
+            if last is not None:
+                x_prev, y_prev = last
+                dx = x - x_prev
+                dy = y - y_prev
+                steps = max(abs(dx), abs(dy), 1)
+                for s in range(steps + 1):
+                    xx = x_prev + int(round(dx * s / steps))
+                    yy = y_prev + int(round(dy * s / steps))
+                    for t in range(-thick + 1, thick):
+                        if 0 <= xx + t < canvas.shape[1] and 0 <= yy < canvas.shape[0]:
+                            canvas[yy, xx + t] = color
+            last = (x, y)
+
+    draw_line(log_k_loc, YL, color_local)
+    draw_line(log_k_opt, YL, color_opt)
+    draw_line(log_k_enh, YL, color_enh)
+    draw_line(kappa, YR, color_kappa)
+
+    for v in range(log_k_min, log_k_max + 1, 4):
+        y = YL(v)
+        if 0 <= y < canvas.shape[0]:
+            for x in range(x0p - 6, x0p):
+                canvas[y, x] = (0, 0, 0, 255)
+            draw_text(canvas, x0p - 56, y - 3, str(v), scale=1)
+    for tick in np.linspace(T_min, T_max, num=8):
+        x = X(tick)
+        for y in range(y0p + plot_h + 1, y0p + plot_h + 6):
+            canvas[y, x] = (0, 0, 0, 255)
+        draw_text(canvas, x - 14, y0p + plot_h + 12, f"{tick:.0f}", scale=1)
+
+    kticks = np.linspace(0.0, kappa_max, num=6)
+    for kk in kticks:
+        if kk > kappa_max + 1e-9: continue
+        y = YR(kk)
+        if not (y0p <= y <= y0p + plot_h): continue
+        for x in range(x0p + plot_w + 1, x0p + plot_w + 7):
+            canvas[y, x] = (0, 0, 0, 255)
+        draw_text(canvas, x0p + plot_w + 10, y - 3, f"{kk:.1f}", scale=1)
+
+    leg_x = x0p + plot_w - 280
+    leg_y = y0p + 10
+    for i, (lbl, col) in enumerate([
+        ("LOG10 K_LOCAL", color_local),
+        ("LOG10 K_OPTIMIZED", color_opt),
+        ("LOG10 K_ENHANCED", color_enh),
+        ("ENHANCEMENT FACTOR", color_kappa),
+    ]):
+        for dy in range(2, 8):
+            for dx in range(0, 28):
+                if 0 <= leg_y + 2 + i * 16 + dy < canvas.shape[0] and \
+                   0 <= leg_x + dx < canvas.shape[1]:
+                    canvas[leg_y + 2 + i * 16 + dy, leg_x + dx] = col
+        draw_text(canvas, leg_x + 32, leg_y + i * 16, lbl, scale=1, color=(0, 0, 0, 255))
+
+    draw_text(canvas, x0p + plot_w // 2 - 60, H - 18, "TEMPERATURE K", scale=1)
+    draw_text(canvas, 8, y0p + plot_h // 2 - 24, "LOG10 K S-1", scale=1)
+    draw_text(canvas, W - 80, y0p + plot_h // 2 - 20, "KAPPA", scale=1)
+    draw_text(canvas, x0p + 16, 18, "RATE CONSTANTS AND TUNNELING ENHANCEMENT", scale=2)
+
+    write_png(path, W, H, canvas)
+
+
+kappa_arr = np.array([rate_rows[i]["enhancement_factor"] for i in range(len(T_list))])
+make_rate_plot(RES / "rate_plot.png", T_list,
+               klight_local, klight_optimized, klight_enhanced, kappa_arr)
+
+print("All outputs written to ./results/")

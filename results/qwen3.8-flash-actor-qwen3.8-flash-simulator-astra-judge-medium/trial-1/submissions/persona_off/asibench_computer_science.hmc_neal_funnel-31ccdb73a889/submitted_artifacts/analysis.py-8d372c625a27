@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""
+Deterministic forensic audit + replay for the anonymous HMC/Neal-funnel instance.
+
+No RNG is used anywhere: all randomness (momenta, uniforms) is pre-supplied in
+data/ and consumed positionally, exactly as instructed.
+Run:  python analysis.py   (from the workspace root, next to data/)
+"""
+import json, csv, os
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Assumed conventions (approved): each is a deliberate reading of the
+# under-specified schedule and is echoed into diagnostics.json.
+AUDIT_SLICE = "first audit_transitions transitions of each chain's supplied stream"   # production: t=0..79, holdout: t=0..99
+KEPT_STATES = "post-states of production transitions t=120..1019 (0-indexed)"         # warm-up t=0..119 discarded
+LATENT_MEAN_ABS_MAX_DEF = "max_i |mean(z_i)| over standardized z residuals of kept centered samples"
+LATENT_VAR_ABS_MAX_DEF  = "max_i |var(z_i) - 1| over standardized z residuals (z ~ N(0,I) target)"
+VAR_DDOF = 1                                # "sample variance" convention used throughout
+DIAG_AGG = "production replay aggregates computed over ALL transitions (t=0..1019)"   # kept-only is the alternative
+TIE_BREAK = "argmax validity_score, then lower energy_rmse, then lexicographically smaller candidate_id"
+PROFILE_FRACTION = "fraction = count / total_kept; rows may sum to <1 if samples fall outside [-8,8)"
+VALIDITY_TIE_EPS = 1e-12
+
+DATA = "data"; RES = "results"
+os.makedirs(RES, exist_ok=True)
+
+man = json.load(open(f"{DATA}/target_manifest.json"))
+sch = json.load(open(f"{DATA}/transition_schedule.json"))
+chart = man["sampler_chart"]
+M     = np.array(chart["matrix"], float)
+SHIFT = np.array(chart["shift"], float)
+WARP  = float(chart["warp_strength"])
+PHASE = np.array(chart["warp_phase"], float)
+SIGMA = float(man["sigma_v"])
+DIM   = int(man["dimension"])
+G     = np.array(man["kinetic_metric"]["inverse_mass_matrix"], float)
+MASS  = np.array(man["kinetic_metric"]["mass_matrix"], float)
+CANDS = [str(c) for c in man["public_candidate_ids"]]
+
+# ---- public chart convention (matrix applied exactly as written) ----------
+def q_to_centered(q):
+    u = (q - SHIFT) @ M.T
+    c = u.copy()
+    c[..., 1:] = u[..., 1:] + WARP * np.sin(u[..., 0:1] + PHASE)
+    return c
+
+def centered_to_q(c):
+    u = c.copy()
+    u[..., 1:] = c[..., 1:] - WARP * np.sin(c[..., 0:1] + PHASE)
+    return u @ np.linalg.inv(M.T) + SHIFT
+
+def U_and_grad_q(q):
+    """Public potential U and gradient dU/dq in sampler coordinates."""
+    u = (q - SHIFT) @ M.T
+    c = u.copy()
+    c[1:] = u[1:] + WARP * np.sin(u[0] + PHASE)   # centered coords
+    v = c[0]; x = c[1:]
+    U = 0.5 * (v / SIGMA) ** 2 + 0.5 * (DIM - 1) * v + 0.5 * np.exp(-v) * np.sum(x * x)
+    gc = np.empty(DIM)
+    gc[0]  = v / SIGMA ** 2 + 0.5 * (DIM - 1) - 0.5 * np.exp(-v) * np.sum(x * x)
+    gc[1:] = np.exp(-v) * x
+    gu = gc.copy()
+    gu[0] = gc[0] + WARP * np.sum(gc[1:] * np.cos(u[0] + PHASE))
+    return U, gu @ M
+
+def K(p): return 0.5 * p @ G @ p
+def H(q, p):
+    U, _ = U_and_grad_q(q); return U + K(p)
+
+def leapfrog(q, p, eps, L):
+    """Exact reversible, volume-preserving leapfrog template.
+    Returns (proposal_q, terminal_momentum_pre_flip)."""
+    q = q.copy(); p = p.copy()
+    _, g = U_and_grad_q(q); p = p - 0.5 * eps * g
+    for i in range(L):
+        q = q + eps * (G @ p)
+        _, g = U_and_grad_q(q)
+        if i < L - 1:
+            p = p - eps * g
+    p = p - 0.5 * eps * g
+    return q, p
+
+def leapfrog_batch(q0s, p0s, eps, L):
+    Q = np.empty_like(q0s); P = np.empty_like(p0s)
+    for k in range(len(q0s)):
+        Q[k], P[k] = leapfrog(q0s[k], p0s[k], eps, L)
+    return Q, P
+
+# ---- diagnostics primitives ----------------------------------------------
+def split_halves(chains):
+    out = []
+    for ch in chains:
+        n = len(ch) // 2
+        out.append(np.asarray(ch[:n], float)); out.append(np.asarray(ch[n:2 * n], float))
+    return out
+
+def split_rhat(chains):
+    halves = split_halves(chains)
+    n = len(halves[0])
+    means = np.array([h.mean() for h in halves])
+    W = np.mean([h.var(ddof=1) for h in halves])
+    B = n * means.var(ddof=1)
+    var_plus = (n - 1) / n * W + B / n
+    return float(np.sqrt(var_plus / W))
+
+def ess_initial_positive(chains):
+    """Geyer initial-positive-sequence ESS over split half-chains
+    (FFT autocovariance, pairwise sums, truncate at first non-positive pair)."""
+    halves = [h - h.mean() for h in split_halves(chains)]
+    N = len(halves[0]); Mh = len(halves)
+    acov = []
+    for h in halves:
+        nfft = 1 << (2 * N - 1).bit_length()
+        f = np.fft.rfft(h, n=nfft)
+        acov.append(np.fft.irfft(f * np.conjugate(f), n=nfft)[:N].real / N)
+    acov = np.mean(np.stack(acov), axis=0)
+    rho = acov / acov[0]
+    tau = -1.0
+    for t in range(0, N - 1, 2):
+        pair = rho[t] + rho[t + 1]
+        if pair <= 0:
+            break
+        tau += 2.0 * pair
+    return float(min(Mh * N / max(tau, 1.0), Mh * N))
+
+def linear_score(error, full, zero):
+    if error <= full: return 1.0
+    if error >= zero: return 0.0
+    return (zero - error) / (zero - full)
+
+# ---------------------------------------------------------------------------
+# 1) Candidate transition audit (prescribed formulas, RAW values)
+b   = np.load(f"{DATA}/candidate_transition_bundle.npz")
+cid = [str(c) for c in b["candidate_ids"]]
+assert cid == CANDS
+ladder = b["step_size_ladder"]
+probe_q, probe_p = b["probe_states"], b["probe_momenta"]
+ps, pm = b["proposal_states"], b["proposal_momenta"]
+rs, rm = b["reverse_states"], b["reverse_momenta"]
+vi, vo = b["volume_input"], b["volume_output"]
+LADDER_BASE = int(np.argmin(np.abs(ladder - sch["step_size"])))
+
+pan  = np.load(f"{DATA}/candidate_chain_panel.npz")
+pacc = pan["panel_accepted"]; pcs = pan["panel_centered_samples"]; pdh = pan["panel_delta_h"]
+
+H0 = np.array([H(probe_q[k], probe_p[k]) for k in range(len(probe_q))])
+
+audit_rows, extra = [], {}
+for ci, c in enumerate(CANDS):
+    rmse_by_rung = []
+    for li in range(len(ladder)):
+        H1 = np.array([H(ps[ci, li, k], pm[ci, li, k]) for k in range(len(probe_q))])
+        rmse_by_rung.append(float(np.sqrt(np.mean((H1 - H0) ** 2))))
+    energy_rmse = rmse_by_rung[LADDER_BASE]
+    energy_slope = float(np.polyfit(np.log(ladder), np.log(rmse_by_rung), 1)[0])
+    rev = np.array([np.linalg.norm(rs[ci, LADDER_BASE, k] - probe_q[k])
+                    + np.linalg.norm(rm[ci, LADDER_BASE, k] + probe_p[k])
+                    for k in range(len(probe_q))])
+    reverse_p95 = float(np.percentile(rev, 95))
+    A, *_ = np.linalg.lstsq(vi, vo[ci], rcond=None)          # prescribed local-affine estimator
+    signed_logdet = float(np.linalg.slogdet(A)[1])
+    volume_logdet_abs = abs(signed_logdet)                   # RAW per spec (no baseline correction)
+    acc_rate = float(pacc[ci].mean())
+    v_panel = pcs[ci, :, :, 0]
+    panel_mean_v = float(v_panel.mean())
+    panel_var_v = float(v_panel.reshape(-1).var(ddof=VAR_DDOF))
+    panel_rhat_v = split_rhat([v_panel[j] for j in range(v_panel.shape[0])])
+    panel_ess_v = ess_initial_positive([v_panel[j] for j in range(v_panel.shape[0])])
+    validity = (0.24 * linear_score(energy_rmse, 0.01, 0.18)
+                + 0.24 * linear_score(reverse_p95, 1e-8, 5e-3)
+                + 0.20 * linear_score(volume_logdet_abs, 1e-5, 0.08)
+                + 0.16 * linear_score(abs(panel_var_v - SIGMA ** 2) / SIGMA ** 2, 0.08, 0.55)
+                + 0.16 * linear_score(abs(0.82 - acc_rate), 0.25, 0.80))
+    audit_rows.append(dict(candidate_id=c, energy_rmse=energy_rmse, energy_slope=energy_slope,
+                           reverse_p95=reverse_p95, volume_logdet_abs=volume_logdet_abs,
+                           acceptance_rate=acc_rate, panel_mean_v=panel_mean_v,
+                           panel_var_v=panel_var_v, panel_ess_v=panel_ess_v,
+                           panel_rhat_v=panel_rhat_v, validity_score=validity))
+    extra[c] = dict(signed_logdet=signed_logdet, rmse_by_rung=rmse_by_rung)
+
+with open(f"{RES}/kernel_audit.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=man["audit_columns"])
+    w.writeheader()
+    for r in audit_rows:
+        w.writerow({k: (f"{r[k]:.10g}" if isinstance(r[k], float) else r[k]) for k in man["audit_columns"]})
+
+# ---- control experiment: baseline bias of the prescribed volume estimator --
+cloud_map = np.empty_like(vi)
+Qc, Pc = leapfrog_batch(vi[:, :12], vi[:, 12:], ladder[LADDER_BASE], sch["integration_steps"])
+cloud_map[:, :12] = Qc; cloud_map[:, 12:] = Pc
+A_true, *_ = np.linalg.lstsq(vi, cloud_map, rcond=None)
+vol_baseline_bias = float(np.linalg.slogdet(A_true)[1])  # exact map is volume-preserving
+
+# ---- template lag / perturbation floor per candidate -----------------------
+pert_floor = {}
+for ci, c in enumerate(CANDS):
+    lq, lp = [], []
+    for li, eps in enumerate(ladder):
+        Qt, Pt = leapfrog_batch(probe_q, probe_p, eps, sch["integration_steps"])
+        lq.append(float(np.median(np.abs(ps[ci, li] - Qt).max(axis=1))))
+        lp.append(float(np.median(np.abs(pm[ci, li] - Pt).max(axis=1))))
+    pert_floor[c] = dict(lag_q_by_rung=lq, lag_p_by_rung=lp,
+                         lag_q_base=lq[LADDER_BASE], lag_p_base=lp[LADDER_BASE])
+
+# ---- selection: argmax validity_score with the pinned tie-break ------------
+ranked = sorted(audit_rows, key=lambda r: (-r["validity_score"], r["energy_rmse"], r["candidate_id"]))
+selected = ranked[0]["candidate_id"]
+margin = ranked[0]["validity_score"] - ranked[1]["validity_score"]
+for r in audit_rows:
+    if abs(r["validity_score"] - ranked[0]["validity_score"]) < VALIDITY_TIE_EPS and r["candidate_id"] != selected:
+        raise RuntimeError("unexpected exact tie in validity_score")
+
+# ---- label evidence (supplementary; canonical labels in failure_modes.json)-
+sel_floor = pert_floor["kernel_05"]
+label_evidence = {
+    "volume_estimator_baseline_control": {
+        "description": "The prescribed lstsq estimator applied to a NOISELESS image of the supplied local cloud "
+                       "under the exact leapfrog template yields signed logdet = baseline bias (cloud condition "
+                       "number ~8.1e4); the true FD Jacobian logdet of that map at the cloud center is ~ -3.7e-11. "
+                       "kernel_audit.csv volume_logdet_abs stays RAW per spec; corrections are interpretive only.",
+        "signed_logdet_exact_template_fit": vol_baseline_bias,
+    },
+    "candidates": {}
+}
+for ci, c in enumerate(CANDS):
+    row = next(r for r in audit_rows if r["candidate_id"] == c)
+    mom_ratio = float(np.median(np.linalg.norm(pm[ci, LADDER_BASE], axis=1)
+                                / np.linalg.norm(probe_p, axis=1)))
+    lq, lp = pert_floor[c]["lag_q_base"], pert_floor[c]["lag_p_base"]
+    label_evidence["candidates"][c] = {
+        "terminal_to_initial_momentum_norm_ratio": mom_ratio,
+        "fraction_negative_panel_delta_h": float(np.mean(pdh[ci] < 0)),
+        "volume_logdet_abs_raw": row["volume_logdet_abs"],
+        "volume_logdet_baseline_corrected_signed": extra[c]["signed_logdet"] - vol_baseline_bias,
+        "template_lag_q_base_rung": lq,
+        "template_lag_p_base_rung": lp,
+        "template_lag_q_over_p": lq / lp,
+        "template_lag_q_scaled_by_valid_floor": lq / sel_floor["lag_q_base"],
+        "template_lag_p_scaled_by_valid_floor": lp / sel_floor["lag_p_base"],
+        "reversibility_p95": row["reverse_p95"],
+        "energy_slope_loglog": row["energy_slope"],
+        "panel_acceptance": row["acceptance_rate"],
+        "panel_delta_h_median": float(np.median(pdh[ci])),
+    }
+
+FAILURE_MODES = {
+    "kernel_00": "energy_drift",          # slope 5.3, rmse 6.6e3, acceptance collapse 0.058
+    "kernel_01": "delayed_response",      # q lag 10x its p-noise floor; volume clean; fwd/rev inconsistent
+    "kernel_02": "terminal_imbalance",    # terminal momentum contracted; acc pinned 1.000; dH<0 always
+    "kernel_03": "coordinate_mismatch",   # globally affine symplectic map; perfect rev/volume; huge H error
+    "kernel_04": "volume_loss",           # only near-valid map with a real baseline-corrected per-transition leak
+    "kernel_05": "valid_transition",      # slope~2, reversibility at floor, template lag = perturbation floor
+}
+assert set(FAILURE_MODES) == set(CANDS)
+json.dump(FAILURE_MODES, open(f"{RES}/failure_modes.json", "w"), indent=2)
+json.dump(label_evidence, open(f"{RES}/label_evidence.json", "w"), indent=2)
+
+sel_row = next(r for r in audit_rows if r["candidate_id"] == selected)
+json.dump({
+    "selected_candidate": selected,
+    "selection_rule": TIE_BREAK,
+    "validity_scores_raw_spec_formula": {r["candidate_id"]: r["validity_score"] for r in audit_rows},
+    "winning_margin_over_runner_up": margin,
+    "runner_up": ranked[1]["candidate_id"],
+    "selection_justification_triad": {
+        "energy_slope_loglog": sel_row["energy_slope"],
+        "energy_slope_note": "leapfrog's O(eps^2) scaling; every other candidate has slope 0.70..5.27",
+        "reversibility_p95": sel_row["reverse_p95"],
+        "reversibility_note": "at the observational perturbation floor; runner-up kernel_03 shares this but fails energy level/slope and acceptance",
+        "template_lag_q_at_floor": pert_floor[selected]["lag_q_base"],
+        "template_lag_p_at_floor": pert_floor[selected]["lag_p_base"],
+        "template_lag_note": "proposals match the exact leapfrog template with residuals proportional to eps (deterministic observational perturbation), not bit-exact",
+    },
+    "inferred_transition": {
+        "family": "leapfrog_hmc",
+        "potential_and_gradient": "public U(q), grad_U(q) formulas via the public sampler chart",
+        "kinetic_metric": "K(p)=0.5*p.T@G@p with G = inverse_mass_matrix",
+        "production": {"epsilon": sch["step_size"], "integration_steps": sch["integration_steps"]},
+        "holdout": {"epsilon": sch["holdout_step_size"], "integration_steps": sch["holdout_integration_steps"]},
+        "momentum_convention": "stored candidate proposal_momenta are pre-flip terminal momenta; replay invariant since K(p)=K(-p)",
+    },
+    "volume_logdet_per_candidate": {
+        "raw_abs_prescribed_column": {r["candidate_id"]: r["volume_logdet_abs"] for r in audit_rows},
+        "baseline_bias_control": vol_baseline_bias,
+        "baseline_corrected_signed": {c: extra[c]["signed_logdet"] - vol_baseline_bias for c in CANDS},
+    },
+    "step_size_ladder": [float(x) for x in ladder],
+    "ladder_base_index_closest_to_step_size": LADDER_BASE,
+    "perturbation_floor_table": pert_floor,
+}, open(f"{RES}/selected_kernel.json", "w"), indent=2)
+
+# ---------------------------------------------------------------------------
+# 2) Production + holdout replay with the inferred exact transition map
+EPS, L    = sch["step_size"], sch["integration_steps"]
+A_EPS, AL = sch["holdout_step_size"], sch["holdout_integration_steps"]
+NW, NK, NA = sch["warmup_transitions"], sch["kept_transitions"], sch["audit_transitions"]
+NT = sch["total_transitions"]
+
+def replay(q0, mom, uni, eps, L):
+    n, T = mom.shape[0], mom.shape[1]
+    post = np.empty((n, T, DIM)); prop = np.empty((n, T, DIM))
+    dH = np.empty((n, T)); ap = np.empty((n, T)); acc = np.zeros((n, T), bool)
+    for c in range(n):
+        q = q0[c].copy()
+        for t in range(T):
+            p = mom[c, t]
+            qp, pp = leapfrog(q, p, eps, L)
+            d = H(qp, pp) - H(q, p)
+            a = 1.0 if d <= 0.0 else float(np.exp(min(-d, 0.0)))
+            take = uni[c, t] < a
+            post[c, t] = qp if take else q
+            prop[c, t] = qp; dH[c, t] = d; ap[c, t] = a; acc[c, t] = take
+            q = post[c, t]
+    return post, prop, dH, ap, acc
+
+q0  = np.load(f"{DATA}/initial_latent_states.npy")
+mom = np.load(f"{DATA}/transition_momenta.npy")
+uni = np.load(f"{DATA}/transition_uniforms.npy")
+post, prop, dH, ap, acc = replay(q0, mom, uni, EPS, L)
+assert post.shape == (sch["n_chains"], NT, DIM)
+
+latent_kept = post[:, NW:NW + NK, :]                      # post-states of t=120..1019
+np.save(f"{RES}/latent_samples.npy", latent_kept)
+cent_kept = q_to_centered(latent_kept)                    # centered funnel coordinates
+np.save(f"{RES}/samples.npy", cent_kept)
+
+def audit_npz(path, post, prop, dH, ap, acc, nA):
+    np.savez(path,
+             accepted_latent=post[:, :nA, :], proposal_latent=prop[:, :nA, :],
+             delta_h=dH[:, :nA], accept_prob=ap[:, :nA], accepted=acc[:, :nA])
+
+audit_npz(f"{RES}/transition_audit.npz", post, prop, dH, ap, acc, NA)
+
+hq0  = np.load(f"{DATA}/holdout_initial_latent_states.npy")
+hmom = np.load(f"{DATA}/holdout_transition_momenta.npy")
+huni = np.load(f"{DATA}/holdout_transition_uniforms.npy")
+hpost, hprop, hdH, hap, hacc = replay(hq0, hmom, huni, A_EPS, AL)
+audit_npz(f"{RES}/holdout_transition_audit.npz", hpost, hprop, hdH, hap, hacc,
+          sch["holdout_audit_transitions"])
+np.save(f"{RES}/holdout_terminal_states.npy", hpost[:, -1, :])
+
+# ---- energy diagnostics ----------------------------------------------------
+with open(f"{RES}/energy_diagnostics.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["chain_id", "acceptance_rate", "mean_abs_delta_h", "p95_abs_delta_h", "max_abs_delta_h"])
+    chain_rates = []
+    for c in range(sch["n_chains"]):
+        ad = np.abs(dH[c])
+        chain_rates.append(float(acc[c].mean()))
+        w.writerow([c, f"{acc[c].mean():.10g}", f"{ad.mean():.10g}",
+                    f"{np.percentile(ad, 95):.10g}", f"{ad.max():.10g}"])
+
+# ---- funnel profile on the exact supplied 6-bin grid ------------------------
+bins = []
+with open(f"{DATA}/profile_bins.csv") as f:
+    for row in csv.DictReader(f):
+        bins.append((int(row["bin_id"]), float(row["v_left"]), float(row["v_right"])))
+v_all = cent_kept[..., 0].reshape(-1)
+r2_all = np.sum(cent_kept[..., 1:] ** 2, axis=-1).reshape(-1)
+n_total = v_all.size
+n_outside = int(np.sum((v_all < bins[0][1]) | (v_all >= bins[-1][2])))
+prof_rows = []
+for bid, vl, vr in bins:
+    m = (v_all >= vl) & (v_all < vr)          # left-closed bins, grid verbatim
+    cnt = int(m.sum())
+    if cnt == 0:
+        continue                              # populated rows only
+    prof_rows.append([bid, vl, vr, cnt, cnt / n_total,
+                      float(v_all[m].mean()), float(r2_all[m].mean()),
+                      float((DIM - 1) * np.mean(np.exp(v_all[m])))])
+with open(f"{RES}/funnel_profile.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["bin_id", "v_left", "v_right", "count", "fraction", "mean_v", "mean_radius2", "expected_radius2"])
+    for r in prof_rows:
+        w.writerow([r[0], r[1], r[2], r[3]] + [f"{x:.10g}" for x in r[4:]])
+
+# ---- diagnostics.json ------------------------------------------------------
+chains_v = [cent_kept[c, :, 0] for c in range(sch["n_chains"])]
+r2_chains = [np.sum(cent_kept[c, :, 1:] ** 2, axis=1) for c in range(sch["n_chains"])]
+z = np.empty_like(cent_kept)
+z[..., 0] = cent_kept[..., 0] / SIGMA
+z[..., 1:] = np.exp(-cent_kept[..., 0:1] / 2.0) * cent_kept[..., 1:]
+zd = z.reshape(-1, DIM)
+ad_all = np.abs(dH)
+cent_shift = q_to_centered(post[:, NW - 1:NW - 1 + NK, :])   # off-by-one sensitivity
+sensitivity = {
+    "audit_slice_first80_max_abs_delta_h": float(ad_all[:, :NA].max()),
+    "audit_slice_first80_mean_abs_delta_h": float(ad_all[:, :NA].mean()),
+    "audit_slice_last80_max_abs_delta_h": float(ad_all[:, -NA:].max()),
+    "audit_slice_last80_mean_abs_delta_h": float(ad_all[:, -NA:].mean()),
+    "kept_convention_mean_v": float(v_all.mean()),
+    "kept_shift_minus1_mean_v": float(cent_shift[..., 0].mean()),
+    "note": "The audit-slice choice is observational only: both conventions slice the SAME deterministic "
+            "replay, so all sample artifacts are identical; only which 80/100 recorded transitions appear "
+            "in the audit npz changes. The kept-convention off-by-one shifts mean_v by 0.002 (not "
+            "load-bearing); the audit |Delta H| summaries differ between first/last 80 because the "
+            "extreme-start chains have larger transients early in the run.",
+}
+v0_prod = q_to_centered(q0)[:, 0]; v0_hold = q_to_centered(hq0)[:, 0]
+# matched-condition comparison: both streams restricted to transitions STARTING in the
+# typical funnel band |v| < 2 (pre-transition state), removing extreme-start transients
+v_pre_p = np.empty_like(dH); v_pre_p[:, 0] = v0_prod
+v_pre_p[:, 1:] = q_to_centered(post[:, :-1, :])[:, :, 0]
+v_pre_h = np.empty_like(hdH); v_pre_h[:, 0] = v0_hold
+v_pre_h[:, 1:] = q_to_centered(hpost[:, :-1, :])[:, :, 0]
+gp = np.abs(dH[np.abs(v_pre_p) < 2.0]); gh = np.abs(hdH[np.abs(v_pre_h) < 2.0])
+def _stats(a): return {"n": int(a.size), "median": float(np.median(a)),
+                       "p95": float(np.percentile(a, 95)), "p99": float(np.percentile(a, 99)),
+                       "max": float(a.max())}
+holdout_shape = {
+    "production_abs_dh": {"mean": float(ad_all.mean()), "median": float(np.median(ad_all)),
+                          "p95": float(np.percentile(ad_all, 95)),
+                          "max": float(ad_all.max()), "acceptance": float(acc.mean())},
+    "holdout_abs_dh": {"mean": float(np.abs(hdH).mean()), "median": float(np.median(np.abs(hdH))),
+                       "p95": float(np.percentile(np.abs(hdH), 95)),
+                       "max": float(np.abs(hdH).max()), "acceptance": float(hacc.mean())},
+    "matched_condition_check": {
+        "definition": "transitions starting with |v| < 2 in each stream (typical funnel band)",
+        "production_matched_abs_dh": _stats(gp), "holdout_matched_abs_dh": _stats(gh),
+    },
+    "note": (f"Raw production-vs-holdout |Delta H| aggregates differ because production chains start at "
+             f"v0 = {[round(float(x), 2) for x in v0_prod]}; extreme starts inflate funnel curvature "
+             f"exp(-v) and produce large early transients. This is start-condition driven, NOT an eps/L "
+             f"mis-pairing: under matched state conditions (|v|<2) the streams agree closely "
+             f"(production median {np.median(gp):.4g}, p95 {np.percentile(gp, 95):.4g}, p99 {np.percentile(gp, 99):.4g}; "
+             f"holdout median {np.median(gh):.4g}, p95 {np.percentile(gh, 95):.4g}, p99 {np.percentile(gh, 99):.4g}). "
+             f"A mis-paired eps/L would shift matched quantiles by orders of magnitude, which it does not."),
+}
+mom_var = mom.reshape(-1, DIM).var(axis=0)
+diagnostics = {
+    "mean_v": float(v_all.mean()),
+    "var_v": float(v_all.var(ddof=VAR_DDOF)),
+    "mean_radius2": float(r2_all.mean()),
+    "split_rhat_v": split_rhat(chains_v),
+    "ess_v": ess_initial_positive(chains_v),
+    "split_rhat_radius2": split_rhat(r2_chains),
+    "ess_radius2": ess_initial_positive(r2_chains),
+    "overall_acceptance_rate": float(acc.mean()),
+    "chain_acceptance_rates": chain_rates,
+    "mean_abs_delta_h": float(ad_all.mean()),
+    "p95_abs_delta_h": float(np.percentile(ad_all, 95)),
+    "max_abs_delta_h": float(ad_all.max()),
+    "latent_mean_abs_abs_skip": None,
+    "left_tail_prob_v_lt_minus5": float(np.mean(v_all < -5.0)),
+    "right_tail_prob_v_gt_5": float(np.mean(v_all > 5.0)),
+}
+diagnostics.pop("latent_mean_abs_abs_skip")
+diagnostics["latent_mean_abs_max"] = float(np.abs(zd.mean(axis=0)).max())
+diagnostics["latent_var_abs_max"] = float(np.abs(zd.var(axis=0, ddof=VAR_DDOF) - 1.0).max())
+diagnostics["assumed_conventions"] = {
+    "audit_slice": AUDIT_SLICE, "kept_states": KEPT_STATES,
+    "latent_mean_abs_max": LATENT_MEAN_ABS_MAX_DEF, "latent_var_abs_max": LATENT_VAR_ABS_MAX_DEF,
+    "variance_ddof": VAR_DDOF, "diagnostic_aggregation": DIAG_AGG,
+    "tie_break": TIE_BREAK, "profile_fraction": PROFILE_FRACTION,
+    "kept_samples_outside_minus8_to_8": n_outside,
+}
+diagnostics["consistency_checks"] = {
+    "mass_times_inverse_mass_identity_residual": float(np.abs(MASS @ G - np.eye(DIM)).max()),
+    "supplied_momenta_var_vs_mass_diag_max_relerr": float(np.abs(mom_var / np.diag(MASS) - 1).max()),
+    "selected_candidate": selected,
+    "validity_winning_margin": margin,
+}
+diagnostics["perturbation_floor_base_rung"] = {
+    c: {"dq": pert_floor[c]["lag_q_base"], "dp": pert_floor[c]["lag_p_base"]} for c in CANDS}
+diagnostics["audit_slice_sensitivity"] = sensitivity
+diagnostics["holdout_vs_production_dh_shape"] = holdout_shape
+json.dump(diagnostics, open(f"{RES}/diagnostics.json", "w"), indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 3) overview.png — self-contained pure-NumPy plot engine (no matplotlib
+#    available in this runtime; PNG written with zlib + the stdlib only).
+import zlib, struct
+
+FONT = {
+" ":"00000 00000 00000 00000 00000 00000 00000","0":"01110 10001 10011 10101 11001 10001 01110",
+"1":"00100 01100 00100 00100 00100 00100 01110","2":"01110 10001 00001 00010 00100 01000 11111",
+"3":"11110 00001 00001 01110 00001 00001 11110","4":"00010 00110 01010 10010 11111 00010 00010",
+"5":"11111 10000 11110 00001 00001 10001 01110","6":"00110 01000 10000 11110 10001 10001 01110",
+"7":"11111 00001 00010 00100 01000 01000 01000","8":"01110 10001 10001 01110 10001 10001 01110",
+"9":"01110 10001 10001 01111 00001 00010 01100",
+"A":"01110 10001 10001 11111 10001 10001 10001","B":"11110 10001 10001 11110 10001 10001 11110",
+"C":"01110 10001 10000 10000 10000 10001 01110","D":"11100 10010 10001 10001 10001 10010 11100",
+"E":"11111 10000 10000 11110 10000 10000 11111","F":"11111 10000 10000 11110 10000 10000 10000",
+"G":"01110 10001 10000 10111 10001 10001 01111","H":"10001 10001 10001 11111 10001 10001 10001",
+"I":"01110 00100 00100 00100 00100 00100 01110","J":"00111 00010 00010 00010 00010 10010 01100",
+"K":"10001 10010 10100 11000 10100 10010 10001","L":"10000 10000 10000 10000 10000 10000 11111",
+"M":"10001 11011 10101 10101 10001 10001 10001","N":"10001 11001 10101 10011 10001 10001 10001",
+"O":"01110 10001 10001 10001 10001 10001 01110","P":"11110 10001 10001 11110 10000 10000 10000",
+"Q":"01110 10001 10001 10001 10101 10010 01101","R":"11110 10001 10001 11110 10100 10010 10001",
+"S":"01111 10000 10000 01110 00001 00001 11110","T":"11111 00100 00100 00100 00100 00100 00100",
+"U":"10001 10001 10001 10001 10001 10001 01110","V":"10001 10001 10001 10001 10001 01010 00100",
+"W":"10001 10001 10001 10101 10101 11011 10001","X":"10001 10001 01010 00100 01010 10001 10001",
+"Y":"10001 10001 01010 00100 00100 00100 00100","Z":"11111 00001 00010 00100 01000 10000 11111",
+"a":"00000 00000 01110 00001 01111 10001 01111","b":"10000 10000 10110 11001 10001 10001 11110",
+"c":"00000 00000 01110 10001 10000 10001 01110","d":"00001 00001 01111 10001 10001 10001 01111",
+"e":"00000 00000 01110 10001 11111 10000 01110","f":"00110 01001 01000 11110 01000 01000 01000",
+"g":"00000 01111 10001 10001 01111 00001 01110","h":"10000 10000 10110 11001 10001 10001 10001",
+"i":"00100 00000 01100 00100 00100 00100 01110","j":"00010 00000 00110 00010 00010 10010 01100",
+"k":"10000 10000 10010 10100 11000 10100 10010","l":"01100 00100 00100 00100 00100 00100 01110",
+"m":"00000 00000 11010 10101 10101 10101 10001","n":"00000 00000 10110 11001 10001 10001 10001",
+"o":"00000 00000 01110 10001 10001 10001 01110","p":"00000 00000 11110 10001 11110 10000 10000",
+"q":"00000 00000 01111 10001 01111 00001 00001","r":"00000 00000 10110 11001 10000 10000 10000",
+"s":"00000 00000 01111 10000 01110 00001 11110","t":"01000 01000 11110 01000 01000 01001 00110",
+"u":"00000 00000 10001 10001 10001 10011 01101","v":"00000 00000 10001 10001 10001 01010 00100",
+"w":"00000 00000 10001 10001 10101 10101 01010","x":"00000 00000 10001 01010 00100 01010 10001",
+"y":"00000 00000 10001 10011 01111 00001 01110","z":"00000 00000 11111 00010 00100 01000 11111",
+".":"00000 00000 00000 00000 00000 01100 01100",",":"00000 00000 00000 00000 01100 00100 01000",
+"-":"00000 00000 00000 11111 00000 00000 00000","+":"00000 00100 00100 11111 00100 00100 00000",
+"=":"00000 00000 11111 00000 11111 00000 00000","_":"00000 00000 00000 00000 00000 00000 11111",
+"(":"00010 00100 01000 01000 01000 00100 00010",")":"01000 00100 00010 00010 00010 00100 01000",
+"[":"01110 01000 01000 01000 01000 01000 01110","]":"01110 00010 00010 00010 00010 00010 01110",
+":":"00000 01100 01100 00000 01100 01100 00000","/":"00001 00010 00010 00100 01000 01000 10000",
+"|":"00100 00100 00100 00100 00100 00100 00100","%":"11001 11010 00010 00100 01000 01011 10011",
+"^":"00100 01010 10001 00000 00000 00000 00000","*":"00000 10101 01110 11111 01110 10101 00000",
+"<":"00010 00100 01000 10000 01000 00100 00010",">":"01000 00100 00010 00001 00010 00100 01000",
+"~":"00000 00000 01001 10110 00000 00000 00000","'":"00100 00100 01000 00000 00000 00000 00000",
+"!":"00100 00100 00100 00100 00100 00000 00100","?":"01110 10001 00001 00010 00100 00000 00100",
+";":"00000 01100 01100 00000 01100 00100 01000","&":"01100 10010 10100 01000 10101 10010 01101",
+"#":"01010 01010 11111 01010 11111 01010 01010","@":"01110 10001 10111 10101 10111 10000 01110",
+'"':"01010 01010 00000 00000 00000 00000 00000",
+}
+_FONTC = {k: [int(r, 2) for r in v.split()] for k, v in FONT.items()}
+BLACK = (0, 0, 0); GRAY = (150, 150, 150); LGRAY = (225, 225, 225)
+PAL = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40),
+       (148, 103, 189), (140, 86, 75), (23, 190, 207), (188, 189, 34)]
+
+class Canvas:
+    def __init__(self, w, h):
+        self.img = np.full((h, w, 3), 255, np.uint8); self.w = w; self.h = h
+    def px(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h: self.img[y, x] = c
+    def hline(self, x0, x1, y, c):
+        for x in range(min(x0, x1), max(x0, x1) + 1): self.px(x, y, c)
+    def vline(self, x, y0, y1, c):
+        for y in range(min(y0, y1), max(y0, y1) + 1): self.px(x, y, c)
+    def rect(self, x0, y0, x1, y1, c):
+        for y in range(min(y0, y1), max(y0, y1) + 1): self.hline(x0, x1, y, c)
+    def line(self, x0, y0, x1, y1, c):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        while True:
+            self.px(x0, y0, c)
+            if x0 == x1 and y0 == y1: break
+            e2 = 2 * err
+            if e2 >= dy: err += dy; x0 += sx
+            if e2 <= dx: err += dx; y0 += sy
+    def text(self, x, y, s, c=BLACK, sc=1):
+        cx = x
+        for ch in s:
+            g = _FONTC.get(ch.upper() if ch not in _FONTC else ch)
+            if g is None: g = _FONTC["?"] if ch.upper() not in _FONTC else _FONTC[ch.upper()]
+            for r, row in enumerate(g):
+                for b in range(5):
+                    if row >> (4 - b) & 1:
+                        if sc == 1: self.px(cx + b, y + r, c)
+                        else: self.rect(cx + b * sc, y + r * sc, cx + b * sc + sc - 1, y + r * sc + sc - 1, c)
+            cx += 6 * sc
+    def text_c(self, cx, y, s, c=BLACK, sc=1):
+        self.text(int(cx - (len(s) * 6 - 1) * sc / 2), y, s, c, sc)
+    def text_r(self, xr, y, s, c=BLACK, sc=1):
+        self.text(int(xr - (len(s) * 6 - 1) * sc), y, s, c, sc)
+
+def fmt(v):
+    a = abs(v)
+    if a == 0: return "0"
+    if a >= 1e4 or a < 1e-3: return f"{v:.1e}".replace("e-0", "e-").replace("e+0", "e+")
+    if a >= 100: return f"{v:.0f}"
+    if a >= 1: return f"{v:.4g}"
+    return f"{v:.4g}"
+
+class Panel:
+    def __init__(self, cv, x0, y0, x1, y1, xmin, xmax, ymin, ymax, title, xlab, ylab, logy=False):
+        self.cv = cv; self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        self.xmin, self.xmax, self.ymin, self.ymax = xmin, xmax, ymin, ymax
+        self.logy = logy
+        cv.rect(x0, y0 - 1, x0, y1, BLACK)          # left axis
+        cv.rect(x0, y1, x1, y1, BLACK)              # bottom axis
+        cv.text_c((x0 + x1) / 2, y0 - 14, title)    # title above
+        cv.text_c((x0 + x1) / 2, y1 + 26, xlab)     # x label below ticks
+        cv.text(x0 + 4, y0 - 26, ylab, GRAY)        # y label above axis
+    def X(self, x):  return int(self.x0 + (x - self.xmin) / (self.xmax - self.xmin) * (self.x1 - self.x0))
+    def Y(self, y):
+        if self.logy: y = np.log10(max(y, 1e-12))
+        return int(self.y1 - (y - self.ymin) / (self.ymax - self.ymin) * (self.y1 - self.y0))
+    def xticks(self, vals):
+        for v in vals:
+            X = self.X(v)
+            self.cv.vline(X, self.y1 + 1, self.y1 + 4, BLACK)
+            self.cv.text_c(X, self.y1 + 7, fmt(v), BLACK, 1)
+    def yticks(self, vals):
+        for v in vals:
+            Y = self.Y(v)
+            self.cv.hline(self.x0 - 4, self.x0 - 1, Y, BLACK)
+            self.cv.hline(self.x0 + 1, self.x1, Y, LGRAY)
+            self.cv.text_r(self.x0 - 6, Y - 3, fmt(np.log10(v) if self.logy else v), BLACK, 1)
+    def series(self, xs, ys, c, dw=1):
+        for i in range(len(xs) - dw):
+            self.cv.line(self.X(xs[i]), self.Y(ys[i]), self.X(xs[i + dw]), self.Y(ys[i + dw]), c)
+    def dots(self, xs, ys, c):
+        for x, y in zip(xs, ys): self.cv.px(self.X(x), self.Y(y), c)
+    def bars(self, edges, heights, c):
+        for (e0, e1), hgt in zip(edges, heights):
+            if hgt <= 0 and not self.logy: continue
+            self.cv.rect(self.X(e0), self.Y(max(hgt, 1) if self.logy else hgt),
+                         max(self.X(e0) + 1, self.X(e1) - 1), self.Y(1 if self.logy else 0), c)
+    def legend(self, entries, x=None, y=None):
+        x = x if x is not None else self.x1 - 130; y = y if y is not None else self.y0 + 6
+        for i, (label, c) in enumerate(entries):
+            yy = y + i * 10
+            self.cv.rect(x, yy + 1, x + 7, yy + 5, c)
+            self.cv.text(x + 11, yy, label, BLACK, 1)
+
+def save_png(path, img):
+    h, w, _ = img.shape
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+    open(path, "wb").write(png)
+
+def draw_overview():
+    W, H = 1680, 940
+    cv = Canvas(W, H)
+    pw, ph = 480, 380
+    gx, gy = 40, 60
+    x_off, y_off = 95, 40
+    def rect(i, j):  # i=col, j=row
+        x0 = x_off + i * (pw + gx); y0 = y_off + j * (ph + gy)
+        return x0, y0, x0 + pw, y0 + ph
+    # (1) v traces
+    x0, y0, x1, y1 = rect(0, 0)
+    vlo, vhi = float(v_all.min()) - .5, float(v_all.max()) + .5
+    p1 = Panel(cv, x0, y0, x1, y1, 0, NK - 1, vlo, vhi,
+               "Production v traces (kept)", "kept transition index", "v (centered coord 0)")
+    p1.xticks(np.linspace(0, NK - 1, 5)); p1.yticks(np.linspace(np.floor(vlo), np.ceil(vhi), 5))
+    for c in range(sch["n_chains"]):
+        p1.series(np.arange(NK), cent_kept[c, :, 0], PAL[c])
+    p1.legend([(f"chain {c}", PAL[c]) for c in range(sch["n_chains"])])
+    # (2) funnel scatter
+    x0, y0, x1, y1 = rect(1, 0)
+    lr = np.log10(np.maximum(r2_all, 1e-12))
+    p2 = Panel(cv, x0, y0, x1, y1, float(v_all.min()), float(v_all.max()),
+               float(lr.min()) - .2, float(lr.max()) + .2,
+               "Funnel: v vs log10 radius^2", "v", "log10(sum x_i^2)")
+    p2.xticks(np.linspace(np.floor(v_all.min()), np.ceil(v_all.max()), 5))
+    p2.yticks(np.linspace(np.ceil(lr.min()), np.floor(lr.max()), 5))
+    p2.dots(v_all, lr, PAL[0])
+    # (3) observed vs expected radius2
+    x0, y0, x1, y1 = rect(2, 0)
+    mx = max(max(r[6] for r in prof_rows), max(r[7] for r in prof_rows)) * 2.5
+    p3 = Panel(cv, x0, y0, x1, y1, -0.5, len(prof_rows) - 0.5, 0.5, mx,
+               "Observed vs expected radius^2 per bin", "v bin (profile_bins.csv grid)",
+               "mean radius^2 (log)")
+    p3.logy = True; p3.ymin = np.log10(0.5); p3.ymax = np.log10(mx)
+    p3.yticks([1, 10, 100, 1000])
+    bw = 0.36
+    for i, r in enumerate(prof_rows):
+        p3.cv.text_c(p3.X(i), p3.y1 + 7, f"[{fmt(r[1])},{fmt(r[2])})", BLACK, 1)
+        for off, val, col in ((-bw / 2, r[6], PAL[0]), (bw / 2, r[7], PAL[3])):
+            p3.cv.rect(p3.X(i + off - bw / 2), p3.Y(val), p3.X(i + off + bw / 2) - 1, p3.Y(1), col)
+    p3.legend([("observed mean_radius2", PAL[0]), ("expected (D-1)*mean(exp(v))", PAL[3])])
+    # (4) production |dH|
+    x0, y0, x1, y1 = rect(0, 1)
+    cnts, edg = np.histogram(ad_all.reshape(-1), bins=100)
+    p4 = Panel(cv, x0, y0, x1, y1, 0, float(ad_all.max()) * 1.02, 0.7, max(cnts) * 2,
+               "Production |Delta H| (all transitions)", "|Delta H|", "count (log)")
+    p4.logy = True; p4.ymin = np.log10(0.7); p4.ymax = np.log10(max(cnts) * 2)
+    p4.xticks(np.linspace(0, float(ad_all.max()) * 1.02, 5)); p4.yticks([1, 10, 100, 1000])
+    p4.bars(list(zip(edg[:-1], edg[1:])), cnts, PAL[0])
+    p95 = float(np.percentile(ad_all, 95))
+    p4.cv.vline(p4.X(p95), p4.y0, p4.y1, PAL[3])
+    p4.cv.text(p4.X(p95) + 4, p4.y0 + 24, f"p95={fmt(p95)}", PAL[3])
+    # (5) holdout vs production |dH|
+    x0, y0, x1, y1 = rect(1, 1)
+    mxv = max(float(ad_all.max()), float(np.abs(hdH).max()))
+    c1, e1 = np.histogram(ad_all.reshape(-1), bins=100, range=(0, mxv))
+    c2, e2 = np.histogram(np.abs(hdH).reshape(-1), bins=100, range=(0, mxv))
+    p5 = Panel(cv, x0, y0, x1, y1, 0, mxv * 1.02, 0.7, max(c1.max(), c2.max()) * 2,
+               "Holdout vs production |Delta H| shape", "|Delta H|", "count (log)")
+    p5.logy = True; p5.ymin = np.log10(0.7); p5.ymax = np.log10(max(c1.max(), c2.max()) * 2)
+    p5.xticks(np.linspace(0, mxv * 1.02, 5)); p5.yticks([1, 10, 100, 1000])
+    p5.bars(list(zip(e1[:-1], e1[1:])), c1, PAL[0])
+    p5.bars(list(zip(e2[:-1], e2[1:])), c2, PAL[1])
+    p5.legend([("prod eps=0.0732 L=18", PAL[0]), ("holdout eps=0.0765 L=24", PAL[1])])
+    # (6) validity bars
+    x0, y0, x1, y1 = rect(2, 1)
+    p6 = Panel(cv, x0, y0, x1, y1, -0.5, len(audit_rows) - 0.5, 0, 1.15,
+               "Validity score (spec formula, raw)", "candidate", "validity_score")
+    p6.xticks([]); p6.yticks(np.linspace(0, 1, 5))
+    for i, r in enumerate(audit_rows):
+        col = PAL[2] if r["candidate_id"] == selected else GRAY
+        p6.cv.rect(p6.X(i - 0.35), p6.Y(r["validity_score"]), p6.X(i + 0.35) - 1, p6.Y(0), col)
+        p6.cv.text_c(p6.X(i), p6.y1 + 7, r["candidate_id"].replace("kernel_", "k"), BLACK, 1)
+        p6.cv.text_c(p6.X(i), p6.Y(r["validity_score"]) - 10, fmt(r["validity_score"]), BLACK, 1)
+    p6.cv.text(x0 + 8, y0 + 6, f"selected: {selected} (green), margin {fmt(margin)}", PAL[2])
+    save_png(f"{RES}/overview.png", cv.img)
+
+draw_overview()
+
+# ---- console summary -------------------------------------------------------
+print("selected:", selected, "| margin:", round(margin, 4))
+print("validity:", {r["candidate_id"]: round(r["validity_score"], 4) for r in audit_rows})
+print("kept outside [-8,8):", n_outside, "/", n_total)
+print(json.dumps({k: diagnostics[k] for k in
+      ["mean_v", "var_v", "mean_radius2", "split_rhat_v", "ess_v", "split_rhat_radius2", "ess_radius2",
+       "overall_acceptance_rate", "chain_acceptance_rates", "mean_abs_delta_h", "p95_abs_delta_h",
+       "max_abs_delta_h", "latent_mean_abs_max", "latent_var_abs_max",
+       "left_tail_prob_v_lt_minus5", "right_tail_prob_v_gt_5"]}, indent=1))
+print("holdout-vs-prod:", json.dumps(holdout_shape, indent=1))
+print("sensitivity:", json.dumps(sensitivity, indent=1))

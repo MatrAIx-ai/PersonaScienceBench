@@ -1,0 +1,196 @@
+"""DESeq2-equivalent NB2 engine (numpy/scipy only; no R, no pydeseq2 available).
+
+Mirrors the DESeq2 steps that matter here, in DESeq2's order:
+ 1. median-of-ratios size factors                     (estimateSizeFactors)
+    (orientation throughout: rows = samples, cols = genes)
+ 2. NB2 GLM coefficients, design = group indicators   (log link, offset log SF)
+ 3. gene-wise dispersion by profile MLE of NB2 size t = 1/alpha (Newton)
+ 4. parametric dispersion trend f(m) = a0 + a1/m      (m = min normalized count)
+ 5. shrinkage disp_shrunk = mean(clip(gene-wise,floor), trend)
+ 6. Wald test of linear contrasts on the fixed-dispersion refit
+baseMean = rowMeans(counts / sizeFactor) == DESeq2's definition.
+The design is a pure cell-means model (one column per group), so Fisher
+information is block-diagonal over groups and per-group Newton is exact.
+"""
+import numpy as np
+from scipy.special import digamma, polygamma, gammaln
+from scipy.stats import norm
+from scipy.optimize import curve_fit
+
+LOG2 = np.log(2.0)
+FLOOR = 1e-8
+
+
+def size_factors(counts):
+    """counts: (S samples x G genes). DESeq2 median-of-ratios -> (S,) size factors."""
+    c = np.asarray(counts, float)          # (S, G)
+    keep = (c > 0).all(axis=0)             # genes nonzero in every sample
+    lg = np.log(c[:, keep])                # (S, n_kept)
+    ref = lg.mean(axis=0)                  # per-gene geometric mean
+    sf = np.exp(np.median(lg - ref[None, :], axis=1))   # per sample, median over genes
+    return np.maximum(sf, 1e-12)
+
+
+class CellMeansNB:
+    def __init__(self, counts, sf, gidx, n_groups):
+        self.y = np.asarray(counts, float)
+        self.sf = np.asarray(sf, float)
+        self.gidx = np.asarray(gidx, int)
+        self.S, self.G = self.y.shape
+        self.K = n_groups
+        self.groups = [np.where(self.gidx == k)[0] for k in range(self.K)]
+        self.B = np.zeros((self.K, self.G))
+        nc = self.y / self.sf[:, None]
+        for k, idx in enumerate(self.groups):
+            self.B[k] = np.log(np.maximum(nc[idx].mean(axis=0), 1e-3))
+        self.alpha = np.full(self.G, 0.05)
+
+    def mu(self):
+        return np.exp(self.B)[self.gidx] * self.sf[:, None]
+
+    def fit_coefs(self, alpha, n_iter=100, tol=1e-10):
+        a = np.asarray(alpha, float)[None, :]
+        y = self.y
+        for _ in range(n_iter):
+            mu = np.clip(self.mu(), 1e-12, 1e15)
+            den = 1.0 + a * mu
+            score = np.zeros((self.K, self.G))
+            hess = np.zeros((self.K, self.G))
+            for k, idx in enumerate(self.groups):
+                score[k] = ((y[idx] - mu[idx]) / den[idx]).sum(axis=0)
+                hess[k] = -(mu[idx] * (1.0 + a * y[idx]) / den[idx] ** 2).sum(axis=0)
+            step = score / np.where(np.abs(hess) < 1e-300, 1e-300, hess)
+            newB = np.clip(self.B - np.clip(step, -5, 5), -25, 25)
+            md = np.max(np.abs(newB - self.B))
+            self.B = newB
+            if md < tol:
+                break
+
+    def dispersion_mom(self):
+        """DESeq2/DESeq gene-wise dispersion, df-corrected method of moments
+        (DESeq2 geneEstimator="moment").  Unbiased for the cell-means design:
+        E[(y-mu)^2] = mu (1+alpha mu)(1-h) with leverage h = 1/n_group."""
+        mu = np.clip(self.mu(), 1e-12, 1e15)
+        y = self.y
+        h = np.array([1.0 / len(g) for g in self.groups])[self.gidx][:, None]
+        num = ((y - mu) ** 2 - mu * (1.0 - h)).sum(axis=0)
+        den = (mu ** 2 * (1.0 - h)).sum(axis=0)
+        return np.clip(num / np.maximum(den, 1e-12), FLOOR, 1e4)
+
+    def _nb_ll(self, t, y, mu):
+        """Vectorised NB2 log-likelihood, t = size = 1/alpha (scalar or (1,G))."""
+        t = np.asarray(t, float)
+        if t.ndim == 0:
+            t = float(t)
+        else:
+            t = t.reshape(1, -1)
+        return (gammaln(y + t) - gammaln(t) - gammaln(y + 1.0)
+                + t * np.log(t / (t + mu)) + y * np.log(mu / (t + mu))).sum(axis=0)
+
+    def dispersion_mle(self, n_iter=60, tol=1e-8):
+        """Profile MLE of NB2 dispersion alpha per gene (log-space Newton +
+        monotone fallback), matching DESeq2's gene-wise dispersion step."""
+        mu = np.clip(self.mu(), 1e-12, 1e15)
+        y = self.y
+        mom = np.clip(((y - mu) ** 2 - mu).sum(axis=0)
+                      / np.maximum((mu ** 2).sum(axis=0), 1e-12), 1e-4, 100.0)
+        u = np.full(self.G, np.log(2.0))                      # u = log(size)
+        ll_cur = self._nb_ll(np.exp(u), y, mu)
+        for _ in range(n_iter):
+            t = np.exp(u).reshape(1, -1)
+            d1 = (digamma(y + t) - digamma(t) + np.log(t / (t + mu))
+                  + (mu - y) / (t + mu)).sum(axis=0)          # dll/dt
+            d2 = (polygamma(1, y + t) - polygamma(1, t) + 1.0 / t - 1.0 / (t + mu)
+                  + (y - mu) / (t + mu) ** 2).sum(axis=0)     # d2ll/dt2
+            g = t.ravel() * d1                                  # dll/du
+            h = np.minimum(t.ravel() * d1 + (t.ravel() ** 2) * d2, -1e-12)
+            step = np.clip(-g / h, -1.0, 1.0)
+            moved = False
+            for lam in (1.0, 0.5, 0.25, 0.1, 0.02):
+                cand = np.clip(u + lam * step, np.log(1e-8), np.log(1e9))
+                ll_new = self._nb_ll(np.exp(cand), y, mu)
+                if np.all(ll_new >= ll_cur - 1e-9):
+                    u, ll_cur, moved = cand, ll_new, True
+                    break
+            if not moved:
+                u = np.clip(u + 0.02 * step, np.log(1e-8), np.log(1e9))
+                ll_cur = self._nb_ll(np.exp(u), y, mu)
+            if np.max(np.abs(step)) < tol:
+                break
+        disp = np.clip(1.0 / np.exp(u), FLOOR, 1e4)
+        return disp, mom
+
+    def wald(self, contrast):
+        c = np.asarray(contrast, float)
+        lfc = c @ self.B
+        mu = np.clip(self.mu(), 1e-12, 1e15)
+        a = self.alpha[None, :]
+        den = 1.0 + a * mu
+        var = np.zeros(self.G)
+        for k in range(self.K):
+            if c[k] == 0:
+                continue
+            idx = self.groups[k]
+            var += c[k] ** 2 / np.maximum((mu[idx] / den[idx]).sum(axis=0), 1e-300)
+        se = np.sqrt(var)
+        z = lfc / se
+        return lfc / LOG2, se / LOG2, z, 2 * norm.sf(np.abs(z))
+
+
+def fit_trend(disp, m, baseMean, min_expr=5.0, n_bins=120):
+    """Monotone mean-dispersion trend a0 + a1/x.
+
+    DESeq2 fits this shape against the minimum normalised count; here x is the
+    *mean* normalised count (baseMean), clamped, because unfiltered matrices
+    contain genes with a zero in some sample, which makes min-based x explode
+    the 1/x term to the clip ceiling (observed: trend -> 1e4).  Shape and role
+    are identical; documented deviation.  Binned medians (not a lower envelope)
+    keep the trend an unbiased central estimate of the gene-wise cloud.
+    """
+    ok = np.isfinite(disp) & (disp >= 0) & (baseMean >= min_expr)
+    x, d = np.maximum(baseMean[ok], 1.0), disp[ok]
+    o = np.argsort(x)
+    x, d = x[o], d[o]
+    q = max(len(x) // n_bins, 1)
+    xs, ds = [], []
+    for i in range(0, max(len(x) - q + 1, 1), q):
+        xs.append(x[i:i + q].mean())
+        ds.append(np.median(d[i:i + q]))
+    xs, ds = np.array(xs), np.array(ds)
+    f = lambda mm, a0, a1: a0 + a1 / np.maximum(mm, 1e-6)
+    try:
+        popt, _ = curve_fit(f, xs, ds, p0=[max(np.min(ds), 1e-6), max(np.median(xs * ds), 1e-6)],
+                            maxfev=400000, bounds=([1e-10, 1e-10], [10, 1e4]))
+    except Exception:
+        popt = [1e-3, 1.0]
+    trend = f(np.maximum(baseMean, 1.0), *popt)
+    return np.clip(trend, 1e-8, 25.0), popt
+
+
+def run_deseq(counts, gidx, n_groups, disp_mode="shrunk", gene_estimator="moment"):
+    """counts: (S samples x G genes); gidx: (S,) group index per sample.
+
+    Steps: size factors -> NB GLM coefs -> gene-wise dispersion (moment, with
+    MLE optional) -> parametric trend -> shrinkage -> coef refit at fixed disp.
+    """
+    counts = np.asarray(counts, np.int64)
+    assert counts.shape[0] == len(gidx), "counts must be samples x genes"
+    sf = size_factors(counts)
+    nc = counts / sf[:, None]
+    baseMean, mmin = nc.mean(axis=0), nc.min(axis=0)   # (G,) DESeq2 baseMean / min norm count
+    obj = CellMeansNB(counts, sf, gidx, n_groups)
+    est = obj.dispersion_mom() if gene_estimator == "moment" else obj.dispersion_mle()[0]
+    for _ in range(4):
+        obj.fit_coefs(est)
+        d2 = obj.dispersion_mom() if gene_estimator == "moment" else obj.dispersion_mle()[0]
+        done = np.max(np.abs(np.log((d2 + 1e-12) / (est + 1e-12)))) < 1e-4
+        est = d2
+        if done:
+            break
+    trend, trend_par = fit_trend(est, mmin, baseMean)
+    floor = max(float(np.min(trend[trend > 0])) * 0.01, 1e-8)
+    shrunk = 0.5 * (np.clip(est, floor, None) + trend)      # DESeq2-style average
+    obj.alpha = {"shrunk": shrunk, "gene_wise": est, "trend": trend}[disp_mode]
+    obj.fit_coefs(obj.alpha)
+    return dict(sf=sf, baseMean=baseMean, mmin=mmin, obj=obj, gene_wise=est,
+                trend=trend, shrunk=shrunk, alpha=obj.alpha, trend_par=trend_par)

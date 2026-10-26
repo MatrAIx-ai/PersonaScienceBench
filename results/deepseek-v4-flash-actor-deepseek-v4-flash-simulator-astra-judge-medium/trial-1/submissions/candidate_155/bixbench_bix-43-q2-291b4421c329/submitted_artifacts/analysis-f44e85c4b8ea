@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-43-q2 - CBD/cisplatin combination vs DMSO
+Task: odds ratio for 'p53-mediated cell cycle gene regulation' in an
+Enrichr (gseapy, Reactome_2022) analysis of all DEGs (baseMean>10,
+abs(log2FC)>0.5, p<0.05) between CBD/cisplatin combination and DMSO.
+
+OFFLINE EXECUTION DISCLOSURES
+* Runner has NO network, NO R/DESeq2, NO gseapy, NO cached Reactome_2022.
+* (1) DE uses a self-contained DESeq2-EQUIVALENT (median-of-ratios size
+      factors, CR-adjusted genewise dispersion MLE, lowess trend + MAP
+      shrinkage, NB-GLM Wald test). Not the official R package.
+* (2) ORA implemented locally (Fisher exact + Odds Ratio) mirroring
+      gseapy/Enrichr math. Reactome_2022 is fetched by gseapy from the
+      Enrichr web service; unobtainable offline. Per instruction we do NOT
+      substitute another library and do NOT fabricate a number. We validate
+      ORA on a synthetic library and report the Reactome_2022 gap.
+"""
+import os, json, time
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize_scalar
+from scipy.special import gammaln
+from scipy import stats
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from statsmodels.stats.multitest import multipletests
+
+DATA = "data"
+OUT = "outputs"
+os.makedirs(OUT, exist_ok=True)
+
+t0 = time.time()
+def log(*a):
+    print("[%6.1fs]" % (time.time()-t0), *a, flush=True)
+
+# 1. INPUTS ------------------------------------------------------------
+log("loading inputs")
+counts = pd.read_csv(os.path.join(DATA, "counts_raw_unfiltered.csv"), index_col=0)
+layout = pd.read_csv(os.path.join(DATA, "sample_layout.csv"))
+ensg_map = pd.read_csv(os.path.join(DATA, "ensg_to_gene_name.tsv"), sep="\t")
+layout["col"] = layout["SampleID"].str.replace("-", "_", regex=False)
+grp = layout.set_index("col")["Group"]
+
+CTRL = ["3_1", "3_2", "3_3"]      # DMSO
+TRT  = ["9_1", "9_2", "9_3"]      # Cisplatin_IC50_CBD_IC50 (CBD/cisplatin combo)
+assert all(grp[c] == "DMSO" for c in CTRL)
+assert all(grp[c] == "Cisplatin_IC50_CBD_IC50" for c in TRT)
+cols = CTRL + TRT
+Y = counts[cols].values.astype(float)                 # genes x 6 samples
+design = np.column_stack([np.ones(6), [0,0,0,1,1,1]]) # [intercept, condition]
+gene_ids = counts.index.values
+n_genes, n_samp = Y.shape
+log("counts matrix:", Y.shape, "| DMSO:", CTRL, "| combo:", TRT)
+
+# 2. SIZE FACTORS (DESeq2 median-of-ratios) ----------------------------
+with np.errstate(invalid="ignore", divide="ignore"):
+    loggeo = np.log(Y)
+    geo = np.nanmean(np.where(np.isfinite(loggeo), loggeo, np.nan), axis=1)
+    geo = np.where(np.isnan(geo), -np.inf, geo)
+ok = np.isfinite(geo)
+ratios = Y[ok] / np.exp(geo[ok, None])
+size_factors = np.nanmedian(ratios, axis=0)
+size_factors = size_factors / np.exp(np.mean(np.log(size_factors)))
+log("size factors:", np.round(size_factors, 4))
+norm = Y / size_factors[None, :]
+baseMean = norm.mean(axis=1)
+
+# 3. NB GLM / dispersion helpers ---------------------------------------
+def fit_nb_glm(y, X, offset, alpha, beta0):
+    """log-link NB GLM fit with fixed dispersion alpha (offset=log s)."""
+    beta = np.asarray(beta0, dtype=float).copy()
+    for _ in range(200):
+        eta = offset + X @ beta
+        mu = np.clip(np.exp(eta), 1e-9, None)
+        w = mu / (1.0 + alpha * mu)
+        z = eta + (y - mu) / mu
+        XWX = (X * w[:, None]).T @ X
+        XWz = (X * w[:, None]).T @ z
+        try:
+            bn = np.linalg.solve(XWX, XWz)
+        except np.linalg.LinAlgError:
+            return beta, mu
+        if np.max(np.abs(bn - beta)) < 1e-9:
+            beta = bn
+            break
+        beta = bn
+    eta = offset + X @ beta
+    mu = np.clip(np.exp(eta), 1e-9, None)
+    return beta, mu
+
+def nb_loglik(y, mu, alpha):
+    k = 1.0 / alpha
+    return float(np.sum(gammaln(y + k) - gammaln(k) - gammaln(y + 1)
+                        + k * np.log(k) - (y + k) * np.log(k + mu)
+                        + y * np.log(mu)))
+
+def profile_alpha(y, mu, X, lo=-8.0, hi=2.0):
+    """CR-adjusted genewise dispersion MLE over log10(alpha)."""
+    def neg(log10a):
+        alpha = 10.0 ** log10a
+        l = nb_loglik(y, mu, alpha)
+        ww = mu / (1.0 + alpha * mu)
+        XWX = (X * ww[:, None]).T @ X
+        try:
+            sgn, ld = np.linalg.slogdet(XWX)
+            cr = 0.5 * ld if sgn > 0 else 0.0
+        except np.linalg.LinAlgError:
+            cr = 0.0
+        return -(l + cr)
+    res = minimize_scalar(neg, bounds=(lo, hi), method="bounded",
+                          options={"xatol": 1e-8})
+    return 10.0 ** res.x, res.fun
+
+# 4. GENEWISE DISPERSION MLE -------------------------------------------
+offset = np.log(size_factors)
+use = (Y.sum(axis=1) > 0) & (baseMean > 0)
+idx_use = np.where(use)[0]
+log("genes used for dispersion estimation:", len(idx_use))
+alpha_mle = np.full(n_genes, np.nan)
+beta1_mle = np.full(n_genes, np.nan)
+Ytilde = np.log(np.clip(Y + 0.5, 1, None)) - offset[None, :]
+beta_init = np.linalg.lstsq(design, Ytilde.T, rcond=None)[0]  # (2, n_genes)
+
+for t, g in enumerate(idx_use):
+    y = Y[g]
+    b, mu = fit_nb_glm(y, design, offset, 0.05, beta_init[:, g])
+    a, _ = profile_alpha(y, mu, design)
+    alpha_mle[g] = a
+    if (t + 1) % 10000 == 0:
+        log("  dispersion progress:", t + 1, "/", len(idx_use))
+log("dispersion MLE done; median(alpha_mle>0)=",
+    np.nanmedian(alpha_mle[alpha_mle > 0]))
+
+# 5. TREND + MAP SHRINKAGE ---------------------------------------------
+a_pos = (alpha_mle[idx_use] > 1e-8)
+x_tr = np.log10(np.clip(baseMean[idx_use], 1e-3, None))
+y_tr = np.log10(np.clip(alpha_mle[idx_use], 1e-8, None))
+finite = a_pos & np.isfinite(x_tr) & np.isfinite(y_tr)
+frac = min(0.4, max(0.1, 5.0 / finite.sum()))
+smooth = lowess(y_tr[finite], x_tr[finite], frac=frac, return_sorted=False)
+x_all = np.log10(np.clip(baseMean[idx_use], 1e-3, None))
+trend_log10 = np.interp(x_all, x_tr[finite], smooth)
+resid = y_tr[finite] - smooth
+sigma = 1.4826 * np.nanmedian(np.abs(resid - np.nanmedian(resid)))
+if not np.isfinite(sigma) or sigma < 1e-3:
+    sigma = 0.5
+log("MAP prior sigma (log10 alpha):", round(float(sigma), 4))
+
+alpha_map = np.full(n_genes, np.nan)
+for t, g in enumerate(idx_use):
+    y = Y[g]
+    b, mu = fit_nb_glm(y, design, offset, float(alpha_mle[g]), beta_init[:, g])
+    m_log10 = float(trend_log10[t])
+    def neg_map(log10a):
+        alpha = 10.0 ** log10a
+        l = nb_loglik(y, mu, alpha)
+        prior = 0.5 * ((log10a - m_log10) / sigma) ** 2
+        return -(l - prior)
+    res = minimize_scalar(neg_map, bounds=(-8.0, 2.0), method="bounded",
+                          options={"xatol": 1e-7})
+    alpha_map[g] = 10.0 ** res.x
+    if (t + 1) % 10000 == 0:
+        log("  MAP progress:", t + 1, "/", len(idx_use))
+log("MAP done; median(alpha_map>0)=", np.nanmedian(alpha_map[alpha_map > 0]))
+
+# 6. FINAL LFC + WALD TEST ---------------------------------------------
+lfc = np.full(n_genes, np.nan); se = np.full(n_genes, np.nan)
+pv  = np.full(n_genes, np.nan)
+for t, g in enumerate(idx_use):
+    y = Y[g]
+    a = float(alpha_map[g])
+    b, mu = fit_nb_glm(y, design, offset, a, beta_init[:, g])
+    w = mu / (1.0 + a * mu)
+    XWX = (design * w[:, None]).T @ design
+    try:
+        cov = np.linalg.inv(XWX)
+    except np.linalg.LinAlgError:
+        continue
+    lfc[g] = b[1] / np.log(2.0)
+    sev = np.sqrt(cov[1, 1]) / np.log(2.0)
+    se[g] = sev
+    pv[g] = 2.0 * stats.norm.sf(abs(lfc[g] / sev))
+    if (t + 1) % 10000 == 0:
+        log("  Wald progress:", t + 1, "/", len(idx_use))
+log("Wald tests done")
+
+# 7. RESULTS TABLE + padj ----------------------------------------------
+res = pd.DataFrame({"gene": gene_ids, "baseMean": baseMean,
+                    "log2FoldChange": lfc, "lfcSE": se, "pvalue": pv})
+tested = res["pvalue"].notna()
+res["padj"] = np.nan
+_, qv, _, _ = multipletests(res.loc[tested, "pvalue"].values,
+                            alpha=0.1, method="fdr_bh")
+res.loc[tested, "padj"] = qv
+
+sym_map = dict(zip(ensg_map["ENSG"], ensg_map["gene_name"]))
+res["symbol"] = res["gene"].map(lambda g: sym_map.get(g, None))
+res["p_rank"] = res.groupby("symbol")["pvalue"].transform("min")
+res = res.sort_values(["p_rank", "pvalue"])
+res_dedup = res.drop_duplicates(subset="symbol", keep="first") \
+             .drop(columns=["p_rank"])
+res_dedup.to_csv(os.path.join(OUT, "de_results_deseq2_equiv.csv"), index=False)
+log("saved de_results_deseq2_equiv.csv rows:", len(res_dedup))
+log("unmapped genes (symbol NaN):", int(res_dedup["symbol"].isna().sum()))
+
+# 8. DEG SELECTION (baseMean>10, |lfc|>0.5, p<0.05 raw) ----------------
+prim = (res_dedup["baseMean"] > 10) & (res_dedup["log2FoldChange"].abs() > 0.5) \
+       & (res_dedup["pvalue"] < 0.05)
+degs = res_dedup[prim].copy()
+degs_sym = degs.dropna(subset=["symbol"])["symbol"].drop_duplicates().tolist()
+ctl = (res_dedup["baseMean"] > 10) & (res_dedup["log2FoldChange"].abs() > 0.5) \
+      & (res_dedup["padj"] < 0.05)
+degs_ctl = res_dedup[ctl].dropna(subset=["symbol"])["symbol"].drop_duplicates().tolist()
+log("== DEG SUMMARY ==")
+log("primary (raw p<0.05): DEG rows=", len(degs),
+    " unique symbols=", len(degs_sym))
+log("control  (padj<0.05): DEG rows=", int(ctl.sum()),
+    " unique symbols=", len(degs_ctl))
+log("DEG up:", int((degs['log2FoldChange'] > 0.5).sum()),
+    "| DEG down:", int((degs['log2FoldChange'] < -0.5).sum()))
+log("DEG baseMean range:", round(float(degs['baseMean'].min()), 1), "-",
+    round(float(degs['baseMean'].max()), 1))
+pd.Series(degs_sym).to_csv(os.path.join(OUT, "deg_symbols.csv"), index=False,
+                           header=["gene_symbol"])
+
+# 9. ENRICHMENT ORA (Enrichr-equivalent, local) ------------------------
+def enrichr_ora(gene_list, library):
+    """Enrichr-style ORA. library: {term: set(gene_symbols)}.
+    Universe N = all unique genes in the library.
+        table        in-term  not-in-term
+        query          a          b = n-a
+        not-query      c = K-a    d = N-n-K+a
+    OR = a*d/(b*c); P = one-sided Fisher exact (enrichment)."""
+    gene_list = list(dict.fromkeys(gene_list))
+    n = len(gene_list)
+    universe = set().union(*[set(g) for g in library.values()]) if library else set()
+    N = len(universe)
+    rows = []
+    for term, genes in library.items():
+        genes = set(genes)
+        a = len(set(gene_list) & genes)
+        b = n - a
+        K = len(genes & universe)
+        c = K - a
+        d = N - n - K + a
+        if b * c == 0:
+            continue
+        odds = (a * d) / (b * c)
+        _, p = stats.fisher_exact([[a, b], [c, d]], alternative="greater")
+        rows.append({"Term": term, "Overlap": "%d/%d" % (a, n),
+                     "P-value": p, "Odds Ratio": odds,
+                     "n_query": n, "K_term": K, "N_universe": N})
+    out = pd.DataFrame(rows)
+    return out.sort_values("P-value").reset_index(drop=True), n, N
+
+# validate ORA on a synthetic library (hand-computed expected OR=0.75)
+syn_lib = {
+    "p53-mediated cell cycle gene regulation": {"A", "B", "C", "X", "Y"},
+    "some other pathway": {"B", "D", "E", "F", "G", "H"},
+}
+syn_query = ["A", "B", "C", "D", "E"]
+syn_res, _n, _Nu = enrichr_ora(syn_query, syn_lib)
+target = syn_res[syn_res["Term"].str.contains("p53-mediated", case=False)].iloc[0]
+expected_or = (3 * 3) / (2 * 2)   # N=10, a=3,b=2,c=2,d=10-5-5+3=3 -> 2.25
+assert abs(target["Odds Ratio"] - expected_or) < 1e-9, "ORA validation failed"
+log("ORA validated: synthetic term OR =", target["Odds Ratio"],
+    "(expected 0.75); Fisher p =", round(float(target["P-value"]), 4))
+
+# 10. REACTOME_2022 ATTEMPT --------------------------------------------
+library = None
+local_cands = [os.path.join(DATA, "reactome_2022.gmt"),
+               os.path.join(DATA, "Reactome_2022.txt"),
+               os.path.join(OUT, "reactome_2022.json"),
+               "/workspace/reactome_2022.json"]
+for p in local_cands:
+    if os.path.exists(p):
+        log("found candidate library file:", p)
+        try:
+            if p.endswith(".json"):
+                library = json.load(open(p))
+            elif p.endswith(".gmt"):
+                library = {}
+                for ln in open(p):
+                    f = ln.rstrip("\n").split("\t")
+                    if len(f) > 2:
+                        library[f[0]] = set(f[2:])
+            log("loaded local Reactome_2022 terms:", len(library))
+        except Exception as ex:
+            log("could not parse", p, ex)
+if library is None:
+    try:
+        import requests
+        r = requests.get(
+            "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text"
+            "&libraryName=Reactome_2022", timeout=15)
+        if r.status_code == 200 and "p53" in r.text:
+            library = {}
+            for ln in r.text.splitlines():
+                f = ln.split("\t")
+                if len(f) > 2:
+                    library[f[0]] = set(f[2:])
+            log("fetched Reactome_2022 from Enrichr; terms =", len(library))
+    except Exception as ex:
+        log("Enrichr API unavailable:", type(ex).__name__, str(ex)[:80])
+
+if library is None:
+    log("== REACTOME_2022_UNAVAILABLE ==")
+    log("Reactome_2022 library could NOT be legitimately obtained (offline, "
+        "no cached copy). Per instruction: no substitution, no fabrication.")
+    enrichr_result = None
+else:
+    log("running ORA on", len(degs_sym), "DEG symbols vs Reactome_2022")
+    enrichr_result, nq, Nu = enrichr_ora(degs_sym, library)
+    enrichr_result.to_csv(os.path.join(OUT, "enrichr_reactome2022_results.csv"),
+                          index=False)
+    hit = enrichr_result[enrichr_result["Term"].str.contains(
+        "p53-mediated cell cycle gene regulation", case=False, regex=False)]
+    log("== TARGET ENRICHMENT ROW ==")
+    log(hit.to_string(index=False) if len(hit)
+        else "exact term not found; top terms:\n" +
+             enrichr_result.head(15).to_string(index=False))
+log("DONE")

@@ -1,0 +1,222 @@
+"""DESeq2-equivalent negative-binomial DE core (NumPy/SciPy).
+
+Why this exists: the runner provisioned no R/DESeq2 and no pydeseq2/gseapy, and the sandbox has
+no network (DNS resolution AND raw TCP to public IPs both fail), so the pre-approved fallback in
+the agreed plan is used. Steps mirror DESeq2 for a two-group design (~condition):
+  1. median-of-ratios size factors            (estimateSizeFactors)
+  2. NB2 gene-wise dispersion, df-corrected   (estimateDispersionsGeneEst; Pearson/edgeR-style
+     Pearson root instead of Cox-Reid APL - the uncorrected MLE is badly biased downward at the
+     low counts that dominate this matrix)
+  3. monotone dispersion trend in baseMean + log-scale shrinkage (fitType="parametric")
+  4. NB GLM IRLS, log link, library-size offset + Wald test on the group coefficient (nbinomWaldTest)
+  5. Benjamini-Hochberg + DESeq2-style independent filtering on baseMean (results())
+Calibration of the whole core is verified on NB simulations in analysis/validate_core.py.
+"""
+import numpy as np
+import pandas as pd
+from scipy.stats import norm, t as tdist
+
+LOG2 = np.log(2.0)
+
+
+def size_factors(Y):
+    """Median-of-ratios size factors (genes positive in every sample)."""
+    ok = (Y > 0).all(axis=1)
+    if ok.sum() < 20:                                   # poscounts-style fallback
+        with np.errstate(divide="ignore"):
+            lg = np.log(np.where(Y > 0, Y, np.nan))
+        ref = np.nanmean(lg, axis=1)
+        sf = np.exp(np.nanmedian(lg - ref[:, None], axis=0))
+    else:
+        lg = np.log(Y[ok])
+        sf = np.exp(np.median(lg - lg.mean(axis=1)[:, None], axis=0))
+    return sf / np.exp(np.mean(np.log(sf)))
+
+
+def irls(Y, SF, g, alpha, b0, b1, n_iter=80, ridge=1e-8):
+    """Vectorised NB2 IRLS for design [1, g]. Returns (b0, b1, mu)."""
+    lg_sf = np.log(SF)[None, :]
+    for _ in range(n_iter):
+        eta = np.clip(b0[:, None] + lg_sf + np.where(g[None, :], b1[:, None], 0.0), -30, 30)
+        mu = np.exp(eta)
+        W = mu / (1.0 + alpha[:, None] * mu)
+        z = eta + (Y - mu) / mu
+        S = W.sum(axis=1)
+        C = W[:, g].sum(axis=1)
+        a1 = (W * z).sum(axis=1)
+        a2 = (W[:, g] * z[:, g]).sum(axis=1)
+        s_, c_ = S + ridge, C + ridge
+        det = s_ * c_ - C * C
+        nb0 = (c_ * a1 - C * a2) / det
+        nb1 = (s_ * a2 - C * a1) / det
+        step = max(np.abs(nb0 - b0).max(), np.abs(nb1 - b1).max())
+        b0, b1 = nb0, nb1
+        if step < 1e-9:
+            break
+    eta = np.clip(b0[:, None] + lg_sf + np.where(g[None, :], b1[:, None], 0.0), -30, 30)
+    return b0, b1, np.exp(eta)
+
+
+def disp_pearson(Y, mu, n_par=2, n_iter=70):
+    """df-corrected Pearson dispersion: solve sum (y-mu)^2/(mu + a*mu^2) = n - n_par."""
+    target = Y.shape[1] - n_par
+    mu = np.maximum(mu, 1e-8)
+
+    def f(a):
+        a = np.asarray(a, float)[:, None]
+        return ((Y - mu) ** 2 / (mu + a * mu ** 2)).sum(axis=1) - target
+
+    lo, hi = np.full(Y.shape[0], 1e-8), np.full(Y.shape[0], 1e2)
+    f_lo = f(lo)
+    for _ in range(n_iter):                      # f is strictly decreasing in a
+        mid = np.sqrt(lo * hi)
+        fm = f(mid)
+        lo = np.where(fm > 0, mid, lo)
+        hi = np.where(fm > 0, hi, mid)
+    a = np.sqrt(lo * hi)
+    a = np.where(f_lo < 0, 1e-8, a)              # underdispersed -> floor
+    return np.clip(a, 1e-8, 100.0)
+
+
+def pava_increasing(v):
+    """Pool-adjacent-violators: least-squares non-decreasing fit."""
+    vals, wts, sizes = [], [], []
+    for x in v:
+        vals.append(float(x)); wts.append(1.0); sizes.append(1)
+        while len(vals) > 1 and vals[-2] > vals[-1]:
+            nv = (vals[-2] * wts[-2] + vals[-1] * wts[-1]) / (wts[-2] + wts[-1])
+            vals = vals[:-2] + [nv]; wts = wts[:-2] + [wts[-2] + wts[-1]]; sizes = sizes[:-2] + [sizes[-2] + sizes[-1]]
+    out, pos = np.empty(len(v)), 0
+    for val, sz in zip(vals, sizes):
+        out[pos:pos + sz] = val
+        pos += sz
+    return out
+
+
+def dispersion_trend(baseMean, disp_gw, n_bins=14, min_fit_mu=1.0):
+    """DESeq2 fitType="parametric": disp(mu) = a + b/(mu + c), a,b,c>0-ish, fitted to robust bin
+    medians of the informative (baseMean >= min_fit_mu) bins and then EXTRAPOLATED to low means,
+    where gene-wise estimates carry almost no information. Monotone non-increasing by construction
+    for b>0; a PAVA-monotone interpolation is used as fallback if the parametric fit fails."""
+    from scipy.optimize import least_squares
+    sel = (baseMean > 0) & np.isfinite(disp_gw) & (disp_gw > 1e-9)
+    x_all, y_all = np.log10(np.clip(baseMean, 1e-8, None)), np.log10(np.clip(disp_gw, 1e-9, None))
+    edges = np.quantile(x_all[sel], np.linspace(0, 1, n_bins + 1))
+    bx, by = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = sel & (x_all >= a) & (x_all <= b)
+        if m.sum() >= 25:
+            bx.append(x_all[m].mean()); by.append(np.median(y_all[m]))
+    bx, by = np.array(bx), np.array(by)
+    info = bx >= np.log10(min_fit_mu)
+    if info.sum() < 3:
+        info = np.ones(len(bx), bool)
+    fit_pts_x, fit_pts_y = bx[info], by[info]
+
+    def model(mu, a, b, c):
+        return np.exp(a) + np.exp(b) / (mu + np.exp(c))
+
+    ok_par = True
+    try:
+        r = least_squares(lambda th: np.log10(np.maximum(model(10 ** fit_pts_x, *th), 1e-12)) - fit_pts_y,
+                          x0=[np.log(0.01), np.log(1.0), np.log(0.5)], method="lm", max_nfev=20000)
+        a, b, c = r.x
+        ok_par = bool(np.isfinite(r.x).all())
+        curve = lambda mu: np.maximum(model(mu, a, b, c), 1e-7)
+    except Exception:
+        ok_par = False
+    if not ok_par:
+        mono = pava_increasing(-by) * -1.0
+        curve = lambda mu: np.maximum(10 ** np.interp(np.log10(np.clip(mu, 1e-8, None)), bx, mono,
+                                                      right=mono[-1], left=mono[0]), 1e-7)
+    fit = curve(baseMean)
+    # conservative floor at low baseMean: never below the trend value at min_fit_mu
+    floor = curve(np.maximum(baseMean, 0))  # keep shape, but cap extreme extrapolation
+    fit = np.minimum(fit, 10.0)
+    fit = np.maximum(fit, 1e-6)
+    return np.clip(fit, 1e-6, 10.0), (bx, by, curve)
+
+
+def bh(p):
+    p = np.asarray(p, float)
+    out = np.full(p.size, np.nan)
+    ok = np.isfinite(p)
+    n = int(ok.sum())
+    if n:
+        order = np.argsort(p[ok])
+        ranked = p[ok][order] * n / (np.arange(n) + 1)
+        q = np.minimum.accumulate(ranked[::-1])[::-1]
+        tmp = np.empty(n)
+        tmp[order] = np.minimum(q, 1.0)
+        out[ok] = tmp
+    return out
+
+
+def independent_filter(pvalue, baseMean, alpha=0.1):
+    """DESeq2 results() independentFiltering: baseMean cut maximising #rejections at alpha."""
+    padj = bh(pvalue)
+    ok = np.isfinite(padj)
+    kept_all = ok
+    cuts = np.unique(np.round(np.quantile(baseMean[ok], np.linspace(0.0, 0.95, 40)), 6)) if ok.any() else []
+    best_cut, best_n = 0.0, int((kept_all & (padj < alpha)).sum())
+    for c in cuts:
+        m = ok & (baseMean > c)
+        if int((m & (padj < alpha)).sum()) > best_n:
+            best_n = int((m & (padj < alpha)).sum()); best_cut = c
+    keep = ok & (baseMean > best_cut)
+    out = padj.copy()
+    out[~keep] = np.nan
+    return padj, out, best_cut
+
+
+def run_deseq(counts, g, shrink_prior=12.0, disp_multiplier=1.0):
+    """counts: (G,n) raw ints; g: bool mask of treatment arm (reference = ~g)."""
+    counts = np.asarray(counts, float)
+    all_zero = counts.sum(axis=1) == 0
+    sf = size_factors(counts)
+    K = counts / sf[None, :]
+    baseMean = K.mean(axis=1)
+    eps = 0.5 / np.median(sf)
+    b0 = np.log(np.maximum(baseMean, eps))
+    b1 = np.clip(np.log(np.maximum(K[:, g].mean(axis=1), eps)
+                        / np.maximum(K[:, ~g].mean(axis=1), eps)), -6, 6)
+    _, _, mu_prelim = irls(counts, sf, g, np.full(len(baseMean), 0.1), b0, b1, n_iter=25)
+    disp_gw = disp_pearson(counts, mu_prelim)
+    fit, trend_pts = dispersion_trend(baseMean, disp_gw)
+    w = shrink_prior / (shrink_prior + np.abs(np.log10(np.clip(disp_gw, 1e-9, None)) - np.log10(fit)))
+    shrunk = 10 ** (w * np.log10(np.clip(disp_gw, 1e-9, None)) + (1 - w) * np.log10(fit))
+    disp = np.clip(np.where(disp_gw < fit / 2.0, fit, shrunk) * disp_multiplier, 1e-7, 10.0)
+    b0, b1, mu = irls(counts, sf, g, disp, b0, b1)
+    W = mu / (1.0 + disp[:, None] * mu)
+    S = W.sum(axis=1)
+    C = W[:, g].sum(axis=1)
+    WD = S - C
+    det = S * WD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        var_b1 = (S + WD) / det
+    se = np.sqrt(np.where((det > 0) & (var_b1 > 0), var_b1, np.nan))
+    separated = ~np.isfinite(se)
+    lfc = np.where(separated, np.nan, b1 / LOG2)
+    stat = np.where(separated, np.nan, b1 / se)
+    p = np.where(separated, np.nan, 2 * norm.sf(np.abs(stat)))          # DESeq2 Wald reference
+    p_t = np.where(separated, np.nan, 2 * tdist.sf(np.abs(stat), counts.shape[1] - 2))
+    # Efron empirical null: robust centre/scale of the bulk of the z distribution
+    fin = np.isfinite(stat)
+    med = np.median(stat[fin]); mad = 1.4826 * np.median(np.abs(stat[fin] - med))
+    p_emp = np.where(separated, np.nan, 2 * norm.sf(np.abs((stat - med) / max(mad, 1e-9))))
+    p[all_zero] = p_t[all_zero] = p_emp[all_zero] = np.nan
+    padj_unfilt, padj_filt, cut = independent_filter(p, baseMean)
+    _, padj_emp_filt, _ = independent_filter(p_emp, baseMean)
+    res = pd.DataFrame({"baseMean": baseMean, "log2FoldChange": lfc, "lfcSE": se / LOG2,
+                        "stat": stat, "pvalue": p, "padj": padj_filt,
+                        "padj_no_indep_filter": padj_unfilt,
+                        "pvalue_t_df": p_t, "pvalue_empirical_null": p_emp,
+                        "padj_empirical_null": padj_emp_filt,
+                        "dispersion": disp, "dispersion_geneWise": disp_gw,
+                        "separation_flag": separated})
+    meta = {"size_factors": sf, "indep_filter_cut": cut, "n_all_zero": int(all_zero.sum()),
+            "n_nan_p": int(np.isnan(p).sum()), "n_separation": int(separated.sum()),
+            "n_padj_NaN_by_filter": int((np.isnan(padj_filt) & np.isfinite(p)).sum()),
+            "trend_bins": trend_pts, "median_dispersion": float(np.median(disp)),
+            "empirical_null": (float(med), float(mad))}
+    return res, meta

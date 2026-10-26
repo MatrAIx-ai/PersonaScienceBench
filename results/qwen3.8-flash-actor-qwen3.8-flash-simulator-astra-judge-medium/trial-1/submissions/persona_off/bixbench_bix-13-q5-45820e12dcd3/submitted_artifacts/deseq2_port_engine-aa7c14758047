@@ -1,0 +1,303 @@
+"""Pure-Python DESeq2-equivalent differential expression engine (bix-13-q5).
+
+Implements, per the approved plan:
+  (a) median-of-ratios size factors (DESeq2 default estimator)
+  (b) gene-wise NB dispersion estimates (Cox-Snell style ML) with
+      empirical-Bayes MAP shrinkage toward the fitted parametric trend
+      disp(mu) = a1 + a2/mu + a3/mu^2
+  (c) negative-binomial Wald tests per contrast on the fitted log-link GLM
+  (d) Benjamini-Hochberg adjustment over all tested genes
+Only numpy/scipy/pandas are used: the runner has no R, no pydeseq2, no network.
+"""
+import numpy as np
+import pandas as pd
+from scipy.special import gammaln
+from scipy.stats import norm
+from scipy.optimize import least_squares
+
+TINY = 1e-8
+
+
+def build_design(coldata, terms, ref_strain="1"):
+    """Treatment-coded model matrix with intercept.
+    Strain reference level is ref_strain; other terms use the alphabetically
+    first level as reference."""
+    n = len(coldata)
+    cols = [("Intercept", np.ones(n))]
+    for term in terms:
+        vals = coldata[term].astype(str).values
+        levels = sorted(set(vals))
+        if term == "Strain":
+            levels = [l for l in levels if l != ref_strain]
+        else:
+            levels = levels[1:]
+        for lev in levels:
+            cols.append((f"{term}_{lev}", (vals == lev).astype(float)))
+    names = [c[0] for c in cols]
+    X = np.column_stack([c[1] for c in cols])
+    return X, names
+
+
+def design_rank(X):
+    s = np.linalg.svd(X, compute_uv=False)
+    return int(np.linalg.matrix_rank(X, tol=s.max() * 1e-8)), X.shape[1], float(s.min() / s.max())
+
+
+def median_of_ratios(counts):
+    """DESeq2 median-of-ratios size factors from genes with all counts > 0."""
+    with np.errstate(divide="ignore"):
+        logc = np.log(counts)
+    keep = np.isfinite(logc).all(axis=1)
+    gm = logc[keep].mean(axis=1, keepdims=True)
+    return np.exp(np.median(logc[keep] - gm, axis=0)), int(keep.sum())
+
+
+# ---------------------------------------------------------------- NB GLM ---
+def nb_loglik(Y, mu, alpha):
+    """NB2 log-likelihood, mean parametrised by mu and dispersion alpha
+    (size r = 1/alpha).  alpha may be a scalar, a (G,) or a broadcastable
+    (...,1) array.  Poisson limit used when alpha <= 0."""
+    a = np.asarray(alpha, float)
+    r = np.where(a <= 0, np.inf, 1.0 / np.maximum(a, TINY))
+    if r.ndim == Y.ndim - 1:
+        r = r[..., None]
+    if np.all(np.isinf(r)):
+        return (Y * np.log(mu) - mu - gammaln(Y + 1)).sum(axis=-1)
+    return (gammaln(Y + r) - gammaln(r) - gammaln(Y + 1)
+            + r * np.log(r / (r + mu)) + Y * np.log(mu / (r + mu))).sum(axis=-1)
+
+
+def _nb_ll_grid(Yc, muc, r_grid):
+    """NB loglik for a chunk of genes (chunk,n) against a grid of NB size
+    parameters r_grid (1,a) -> (chunk,a)."""
+    Y3, m3 = Yc[..., None], muc[..., None]
+    return (gammaln(Y3 + r_grid) - gammaln(r_grid) - gammaln(Y3 + 1)
+            + r_grid * np.log(r_grid / (r_grid + m3))
+            + Y3 * np.log(m3 / (r_grid + m3))).sum(axis=1)
+
+
+def glm_fit(Y, logsf, X, alpha=None, beta=None, iters=60, tol=1e-9, cap=0.75):
+    """Batched IRLS for NB GLMs (log link, offset = log size factor).
+    alpha=None -> Poisson.  Returns beta (G,p), mu (G,n)."""
+    G, n = Y.shape
+    p = X.shape[1]
+    a = np.zeros(G) if alpha is None else np.maximum(alpha, TINY)
+    if beta is None:
+        beta = np.zeros((G, p))
+        beta[:, 0] = np.log(np.maximum(Y.mean(axis=1), 1e-3)) - logsf[0]
+    prev = None
+    for _ in range(iters):
+        lin = np.clip(beta @ X.T, -30, 30)
+        mu = np.clip(np.exp(lin + logsf[None, :]), 1e-10, None)
+        w = mu / (1.0 + a[:, None] * mu)            # NB IRLS weights
+        score = (Y - mu) / (1.0 + a[:, None] * mu)  # NB score / dmu/deta
+        A = np.einsum("ji,gj,jk->gik", X, w, X) + np.eye(p)[None] * 1e-10
+        b = np.einsum("ji,gj->gi", X, score)
+        delta = np.linalg.solve(A, b[..., None])[..., 0]
+        mx = np.abs(delta).max(axis=1, keepdims=True)
+        beta = beta + delta * np.minimum(1.0, cap / np.maximum(mx, 1e-12))
+        ll = nb_loglik(Y, np.exp(np.clip(beta @ X.T + logsf[None, :], -30, 30)), a)
+        if prev is not None and np.max(np.abs(ll - prev)) < tol:
+            break
+        prev = ll
+    mu = np.exp(np.clip(beta @ X.T + logsf[None, :], -30, 30))
+    return beta, mu
+
+
+def gene_dispersion_ml(Y, mu, n_params):
+    """Gene-wise NB dispersion by profile ML over a log grid of the NB size
+    parameter r = 1/alpha, then the Cox-Snell first-order small-sample
+    correction alpha*(n-1)/(n-p), which removes the downward bias coming from
+    fitting p group means (same intent as DESeq2's Cox-Snell gene estimates)."""
+    G, n = Y.shape
+    a_grid = np.exp(np.linspace(np.log(1e-6), np.log(20.0), 80))
+    r_grid = (1.0 / a_grid)[None, None, :]
+    out = np.empty(G)
+    for lo in range(0, G, 200):
+        hi = min(lo + 200, G)
+        ll = _nb_ll_grid(Y[lo:hi], mu[lo:hi], r_grid)
+        out[lo:hi] = a_grid[ll.argmax(axis=1)]
+    cs = (n - 1) / (n - n_params)
+    return np.clip(out * cs, TINY, 50.0), float(cs)
+
+
+# ------------------------------------------- dispersion trend + shrinkage ---
+def dispersion_trend(mean_norm, disp, n_bins=15, quantile=0.25):
+    """DESeq2 parametric trend disp = a1 + a2/mu + a3/mu^2, fitted by weighted
+    least squares on log scale to the per-mean-bin lower quantile of the
+    gene-wise estimates (DESeq2 fits a lower envelope, not the cloud centre)."""
+    ok = (mean_norm > 0) & np.isfinite(disp)
+    mu, d = mean_norm[ok], disp[ok]
+    lg = np.log10(mu)
+    edges = np.quantile(lg, np.linspace(0, 1, n_bins + 1))
+    edges[0] -= 1e-9
+    bx, by, bw = [], [], []
+    for i in range(n_bins):
+        sel = (lg > edges[i]) & (lg <= edges[i + 1])
+        if sel.sum() >= 10:
+            bx.append(np.median(mu[sel])); by.append(np.quantile(d[sel], quantile)); bw.append(int(sel.sum()))
+    bx, by, bw = np.array(bx), np.array(by), np.array(bw, float)
+
+    def resid(par):
+        f = par[0] + par[1] / bx + par[2] / bx ** 2
+        return np.sqrt(bw) * (np.log(np.maximum(f, 1e-9)) - np.log(by))
+
+    p0 = np.array([max(by.min(), 1e-4), np.median(by) * np.median(bx), 1e-3])
+    sol = least_squares(resid, p0, method="lm", max_nfev=50000)
+    a1, a2, a3 = sol.x
+    m = np.maximum(mean_norm, 1e-9)
+    trend = np.maximum(a1 + a2 / m + a3 / m ** 2, 1e-8)
+    return trend, dict(a1=float(a1), a2=float(a2), a3=float(a3)), (bx, by, bw)
+
+
+def shrink_dispersions(Y, mu, disp_raw, trend, tau2_floor=0.01, tau2_cap=1.0):
+    """Empirical-Bayes MAP shrinkage: maximise over a
+        -(log a - log trend)^2 / (2 tau2) + NB loglik(y | mu fixed, size 1/a).
+    tau2 = robust (MAD) variance of log(disp_raw/trend): DESeq2 prior-variance
+    proxy.  Sharp NB likelihood (deep counts) -> stays near gene-wise value;
+    flat likelihood (low counts) -> pulled to the trend."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.log(np.maximum(disp_raw, TINY) / trend)
+    tau2 = float(np.clip((1.4826 * np.median(np.abs(ratio - np.median(ratio)))) ** 2,
+                         tau2_floor, tau2_cap))
+    a_grid = np.exp(np.linspace(np.log(1e-7), np.log(30.0), 160))
+    r_grid = (1.0 / a_grid)[None, None, :]
+    lt = np.log(trend)
+    shrunk = np.empty(len(trend))
+    for lo in range(0, len(trend), 200):
+        hi = min(lo + 200, len(trend))
+        ll = _nb_ll_grid(Y[lo:hi], mu[lo:hi], r_grid)
+        obj = ll - 0.5 * (np.log(a_grid)[None, :] - lt[lo:hi, None]) ** 2 / tau2
+        shrunk[lo:hi] = a_grid[obj.argmax(axis=1)]
+    return np.clip(shrunk, TINY, 100.0), tau2
+
+
+# ------------------------------------------------------- Wald tests and BH ---
+def wald_tests(mu, X, beta, alpha, contrasts):
+    """Wald test per contrast; covariance = (X' W X)^-1 at shrunken dispersions."""
+    G, n = mu.shape
+    p = X.shape[1]
+    w = mu / (1.0 + np.maximum(alpha, TINY)[:, None] * mu)
+    A = np.einsum("ji,gj,jk->gik", X, w, X) + np.eye(p)[None] * 1e-10
+    Ainv = np.linalg.inv(A)
+    out = {}
+    for name, fi in contrasts.items():
+        cvec = np.zeros(p); cvec[fi] = 1.0
+        cv = np.broadcast_to(cvec, (Ainv.shape[0], p))
+        var = np.maximum(np.einsum("gi,gij,gj->g", cv, Ainv, cv), 1e-12)
+        se = np.sqrt(var)
+        coef = beta[:, fi]
+        z = coef / se
+        out[name] = dict(log2FC=coef / np.log(2.0), se=se, z=z, p=2 * norm.sf(np.abs(z)))
+    return out
+
+
+def bh_adjust(p):
+    p = np.asarray(p, float)
+    n = p.size
+    o = np.argsort(p)
+    q = p[o] * n / (np.arange(n) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out = np.empty(n)
+    out[o] = np.minimum(q, 1.0)
+    return out
+
+
+def independent_filter_threshold(mean_norm, p, alpha=0.05):
+    """DESeq2-style independent filtering: choose the mean-normalised-count
+    threshold maximising the number of padj<alpha rejections."""
+    cands = np.unique(mean_norm[mean_norm <= np.quantile(mean_norm, 0.5)])
+    if cands.size > 300:
+        cands = np.quantile(cands, np.linspace(0, 1, 300))
+        cands = np.unique(cands)
+    best_thr, best_n = 0.0, int((bh_adjust(p) < alpha).sum())
+    for thr in cands:
+        m = mean_norm >= thr
+        if m.sum() < 100:
+            continue
+        nrej = int((bh_adjust(p[m]) < alpha).sum())
+        if nrej > best_n:
+            best_n, best_thr = nrej, float(thr)
+    return best_thr, best_n
+
+
+# --------------------------------------------------------------- pipeline ---
+def deseq2_run(counts, coldata, terms, ref_strain="1", strains=("97", "98", "99"),
+               filter_mean_ge=None, independent_filter=False):
+    samples = list(coldata["AzentaName"])
+    Y = counts[samples].astype(float).values
+    genes = np.array(list(counts.index))
+    nz = Y.sum(axis=1) > 0                       # drop all-zero rows
+    Y, genes = Y[nz], genes[nz]
+
+    sf, n_pos_genes = median_of_ratios(Y)
+    Yn = Y / sf[None, :]
+    logsf = np.log(sf)
+    X, names = build_design(coldata, terms, ref_strain)
+    rank, ncol, condr = design_rank(X)
+    mean_norm = Yn.mean(axis=1)
+
+    prefiltered = 0
+    if filter_mean_ge is not None:
+        k = mean_norm >= filter_mean_ge
+        prefiltered = int((~k).sum())
+        Y, Yn, mean_norm, genes = Y[k], Yn[k], mean_norm[k], genes[k]
+
+    beta0, mu0 = glm_fit(Y, logsf, X)                       # Poisson warm start
+    disp_raw, cs = gene_dispersion_ml(Y, mu0, X.shape[1])   # Cox-Snell / ML
+    trend, trend_par, tbins = dispersion_trend(mean_norm, disp_raw)
+    disp_map, tau2 = shrink_dispersions(Y, mu0, disp_raw, trend)
+    beta, mu = glm_fit(Y, logsf, X, alpha=disp_map, beta=beta0)   # NB coefficients
+    disp_raw2, _ = gene_dispersion_ml(Y, mu, X.shape[1])          # 2nd iteration
+    disp_map2, tau2b = shrink_dispersions(Y, mu, disp_raw2, trend)
+    beta, mu = glm_fit(Y, logsf, X, alpha=disp_map2, beta=beta)   # final coefficients
+
+    contrasts = {f"strain{s}_vs_{ref_strain}": names.index(f"Strain_{s}") for s in strains}
+    res = wald_tests(mu, X, beta, disp_map2, contrasts)
+
+    tab = {"gene": genes, "mean_norm": mean_norm}
+    filt = {}
+    for name, r in res.items():
+        padj = bh_adjust(r["p"])
+        if independent_filter:
+            thr, nrej = independent_filter_threshold(mean_norm, r["p"])
+            padj = np.where(mean_norm < thr, np.nan, padj)
+            filt[name] = dict(threshold=thr, n_rejected=nrej)
+        tab[f"{name}_log2FC"] = r["log2FC"]
+        tab[f"{name}_se"] = r["se"]
+        tab[f"{name}_p"] = r["p"]
+        tab[f"{name}_padj"] = padj
+
+    return dict(table=tab, size_factors=sf, n_pos_genes=n_pos_genes, samples=samples,
+                disp_raw=disp_raw2, disp_map=disp_map2, trend=trend, trend_par=trend_par,
+                trend_bins=tbins, tau2=tau2b, cs_factor=cs, design_names=names, X=X,
+               Y=Y, logsf=logsf, sf=sf,
+                rank=rank, ncol=ncol, cond=condr, n_genes=int(len(genes)),
+                prefiltered=prefiltered, filt=filt, mu=mu, beta=beta)
+
+
+def headline(tab, strains=("97", "98", "99"), ref="1", alpha=0.05):
+    m = {x: np.nan_to_num(tab[f"strain{x}_vs_{ref}_padj"], nan=1.0) < alpha for x in strains}
+    a, b, d = m[strains[0]], m[strains[1]], m[strains[2]]
+    union = (a | b) & ~d
+    return dict(sig_single1=int(a.sum()), sig_single2=int(b.sum()), sig_double=int(d.sum()),
+                N_union_minus_double=int(union.sum()),
+                lasI_only=int((a & ~b & ~d).sum()), rhlI_only=int((b & ~a & ~d).sum()),
+                shared_singles=int((a & b & ~d).sum()),
+                exactly_one_single=int((a & ~b & ~d).sum() + (b & ~a & ~d).sum()),
+                masks=m, union_mask=union)
+
+
+def refit_with_dispersions(out, disp):
+    """Refit coefficients and Wald tests for an existing run using a different
+    dispersion vector (used for dispersion-shrinkage sensitivity checks)."""
+    beta, mu = glm_fit(out["Y"], out["logsf"], out["X"], alpha=disp, beta=out["beta"])
+    names = out["design_names"]
+    strains = [n.split("_")[1] for n in names if n.startswith("Strain_")]
+    contrasts = {f"strain{s}_vs_1": names.index(f"Strain_{s}") for s in strains}
+    res = wald_tests(mu, out["X"], beta, disp, contrasts)
+    tab = {"gene": out["table"]["gene"], "mean_norm": out["table"]["mean_norm"]}
+    for k, r in res.items():
+        tab[k + "_log2FC"] = r["log2FC"]
+        tab[k + "_padj"] = bh_adjust(r["p"])
+    return pd.DataFrame(tab)

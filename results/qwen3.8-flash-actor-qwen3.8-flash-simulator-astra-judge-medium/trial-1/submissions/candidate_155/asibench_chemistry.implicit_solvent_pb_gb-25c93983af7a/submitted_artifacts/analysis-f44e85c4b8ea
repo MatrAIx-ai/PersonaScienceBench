@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+Continuum-electrostatics binding-response analysis (8-case PB/GB comparison).
+
+Primary route : finite-volume Poisson-Boltzmann (linearized or sinh-nonlinear)
+                on the disclosed 35^3 grid, reaction field = medium - vacuum,
+                entity energies 0.5*sum(q*u_rxn), binding = asm - a - b.
+Secondary     : Born-style part_a/part_b interaction cross term with
+                f_ij = sqrt(r^2 + a_i a_j exp(-r^2/(4 a_i a_j))), 6.5 A skip.
+
+Conventions fixed with the researcher (plan review):
+  * grid node(i) = box_center + (i-17)*spacing, arrays indexed [x,y,z].
+  * volume_a = SES signed distance, volume_b = SAS (mask-level evidence).
+  * sharp surface : solvent_fraction xi = 1 on {sd >= 0} (outside SES).
+    smooth surface: xi = 0.5*(1+tanh(sd/w)) -- manifest leaves the tanh
+                    coefficient free; unit coefficient = minimal assumption.
+  * nonlinear: -div(eps grad u) + kappa^2*xi*kT*sinh(u/kT) = 4pi*332.06371*rho,
+    kT = 1.9872e-3*T kcal/mol/e; u->0 limit is exactly the linear scheme.
+  * field outputs: assembly reaction field (medium - vacuum).
+  * zero-radius atoms: no VDW mask volume, SAS sphere r+probe, charge kept.
+matplotlib is unavailable (all interpreters probed; pip has no network), so
+overview.png is written by the self-contained numpy+zlib writer below.
+"""
+import json, csv, zlib, struct, math, os
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.ndimage import distance_transform_edt
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import spsolve, cg, splu
+import pandas as pd
+
+KB_KCAL = 1.98720425864083e-3   # kcal/mol/K
+COULOMB = 332.06371             # kcal*A/mol/e^2
+N = 35
+HALF = (N - 1) // 2
+DATA, OUT = "data", "results"
+
+man = json.load(open(f"{DATA}/manifest.json"))
+plane_spec = {p["case_id"]: p for p in json.load(open(f"{DATA}/plane_spec.json"))["planes"]}
+va = np.load(f"{DATA}/volume_a.npy")      # SES signed distance [case,x,y,z]
+vb = np.load(f"{DATA}/volume_b.npy")      # SAS signed distance (convention check)
+queries = np.load(f"{DATA}/queries.npy")  # (8,24,3)
+sites = pd.read_csv(f"{DATA}/sites.csv")
+
+diag = []
+def log(msg):
+    diag.append(msg); print(msg, flush=True)
+
+def axes_of(case):
+    ctr = np.array(case["grid"]["box_center_angstrom"], float)
+    sp = float(case["grid"]["spacing_angstrom"])
+    return [ctr[k] + (np.arange(N) - HALF) * sp for k in range(3)], ctr, sp
+
+def entity_rows(case_id, ent):
+    d = sites[(sites.case_id == case_id) & (sites.entity_id == ent)]
+    return (d[["x_angstrom", "y_angstrom", "z_angstrom"]].values.astype(np.float64),
+            d["charge_e"].values.astype(np.float64),
+            d["radius_angstrom"].values.astype(np.float64))
+
+def sdf_union(P, radii, ax, k=24):
+    tree = cKDTree(P)
+    X, Y, Z = np.meshgrid(*ax, indexing="ij")
+    pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    kk = min(k, len(P))
+    d, idx = tree.query(pts, k=kk, workers=-1)
+    if kk == 1:
+        d = d[:, None]; idx = idx[:, None]
+    return (d - radii[idx][:, :kk]).min(axis=1).reshape(N, N, N)
+
+def edt_signed(mask, sp):
+    return (distance_transform_edt(~mask, sampling=sp)
+            - distance_transform_edt(mask, sampling=sp)).astype(np.float64)
+
+def reconstruct_ses(P, r, probe, ax, sp):
+    """Task recipe: VDW mask; SAS = radius+probe union;
+    SES = erode(dilate) & SAS union VDW; sd = EDT(outside - inside)."""
+    m_vdw = sdf_union(P, r, ax) < 0
+    m_sas = sdf_union(P, r + probe, ax) < 0
+    ero = (distance_transform_edt(~m_sas, sampling=sp) > probe) & m_sas if probe > 0 else m_sas
+    m_ses = ero | m_vdw
+    return edt_signed(m_ses, sp), m_ses
+
+def solvent_fraction(sd, surf):
+    w = surf["smoothing_window_angstrom"]
+    if w > 0:
+        return 0.5 * (1.0 + np.tanh(sd / w))     # minimal tanh choice (see header)
+    return (sd >= 0).astype(np.float64)
+
+def cic_density(P, q, ctr, sp):
+    origin = ctr - HALF * sp
+    g = (P - origin) / sp
+    assert (g >= -1e-12).all() and (g <= N - 1 - 1e-9).all(), "charge outside box"
+    g = np.clip(g, 0, N - 1 - 1e-12)
+    b = np.floor(g).astype(int); f = g - b
+    b0 = np.clip(b, 0, N - 2); f = np.where(b == b0, f, 0.0)
+    vals = np.zeros((N, N, N))
+    wx = [1 - f[:, 0], f[:, 0]]; wy = [1 - f[:, 1], f[:, 1]]; wz = [1 - f[:, 2], f[:, 2]]
+    ix = [b0[:, 0], b0[:, 0] + 1]; iy = [b0[:, 1], b0[:, 1] + 1]; iz = [b0[:, 2], b0[:, 2] + 1]
+    for a in (0, 1):
+        for c in (0, 1):
+            for e in (0, 1):
+                np.add.at(vals, (ix[a], iy[c], iz[e]), q * wx[a] * wy[c] * wz[e])
+    return vals / sp**3
+
+def build_operator(eps_nodes, sp):
+    """7-point FV operator, interior nodes only, zero Dirichlet on boundary.
+    row_i: sum_dirs eps_face*(u_i-u_nb)/h^2 (+ kappa2xi diag added by caller)."""
+    idx = -np.ones((N, N, N), dtype=np.int64)
+    m = N - 2
+    idx[1:-1, 1:-1, 1:-1] = np.arange(m**3).reshape(m, m, m)
+    eps = eps_nodes
+    h2 = sp * sp
+    center = idx[1:-1, 1:-1, 1:-1].ravel()
+    rows, cols, data, diagv = [], [], [], np.zeros(center.size)
+    for d in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
+        e_nb = eps[1+d[0]:N-1+d[0], 1+d[1]:N-1+d[1], 1+d[2]:N-1+d[2]]
+        e_c = eps[1:-1, 1:-1, 1:-1]
+        ef = (2.0 * e_c * e_nb / np.maximum(e_c + e_nb, 1e-300) / h2).ravel()
+        diagv += ef
+        nb = idx[1+d[0]:N-1+d[0], 1+d[1]:N-1+d[1], 1+d[2]:N-1+d[2]].ravel()
+        keep = nb >= 0
+        rows.append(center[keep]); cols.append(nb[keep]); data.append(-ef[keep])
+    rows.append(center); cols.append(center); data.append(diagv)
+    A = coo_matrix((np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+                   shape=(m**3, m**3)).tocsr()
+    return A, idx
+
+def solve_linear(A, b, label):
+    M = diags(A.diagonal()).tocsc()
+    x, info = cg(A, b, rtol=1e-13, atol=0.0, maxiter=20000, M=M)
+    nb = float(np.linalg.norm(b))
+    res = float(np.linalg.norm(A @ x - b)) / max(nb, 1e-300)
+    method = "PCG(rtol=1e-13,maxiter=20000)"
+    if info != 0 or res > 1e-9:
+        x = spsolve(A.tocsc(), b); info = -999
+        res = float(np.linalg.norm(A @ x - b)) / max(nb, 1e-300)
+        method += "+spsolve_fallback"
+    log(f"[solve] {label}: {method} cg_info={info} rel_residual={res:.3e}")
+    return x, res
+
+def solve_newton(A_lin, k2xi, kT, b, label, maxit=60, tol=1e-10):
+    """damped Newton for A_lin u + k2xi*kT*sinh(u/kT) = b (u in kcal/mol/e)."""
+    k2 = (k2xi[1:-1, 1:-1, 1:-1].ravel() if np.ndim(k2xi) == 3 else k2xi.ravel())
+    u = np.zeros_like(b)
+    def F(u):
+        return A_lin @ u + k2 * kT * np.sinh(np.clip(u / kT, -100, 100)) - b
+    Fu = F(u); nb = np.linalg.norm(b); nF = np.linalg.norm(Fu)
+    it = 0; damped = 0; clip_events = 0
+    while nF > tol * nb and it < maxit:
+        arg = np.clip(u / kT, -100, 100)
+        clip_events = max(clip_events, int((np.abs(u / kT) > 100).sum()))
+        J = (A_lin + diags(k2 * np.cosh(arg))).tocsr()
+        du = spsolve(J.tocsc(), -Fu)
+        t = 1.0; ok = False
+        for _ in range(25):
+            un = u + t * du; Fn = F(un)
+            if np.isfinite(Fn).all() and np.linalg.norm(Fn) < nF:
+                ok = True; break
+            t *= 0.5
+        if not ok:
+            log(f"[solve] {label}: NEWTON LINE-SEARCH FAILURE it={it} |F|={nF:.3e}")
+            break
+        if t < 1.0: damped += 1
+        u = un; Fu = Fn; nF = np.linalg.norm(Fu); it += 1
+    log(f"[solve] {label}: damped-Newton iters={it}/{maxit} hit_cap={it >= maxit} "
+        f"damped_steps={damped} rel_residual={nF/nb:.3e} sinh_clip_events={clip_events}")
+    return u, nF / nb
+
+def embed(u_int, idx):
+    U = np.zeros((N, N, N))
+    U[1:-1, 1:-1, 1:-1] = u_int.reshape(N-2, N-2, N-2)
+    return U
+
+def trilinear(U, P, ctr, sp):
+    g = (P - (ctr - HALF * sp)) / sp
+    g = np.clip(g, 0, N - 1 - 1e-12)
+    b = np.floor(g).astype(int); f = g - b
+    b0 = np.clip(b, 0, N - 2)
+    wx = [1 - f[:, 0], f[:, 0]]; wy = [1 - f[:, 1], f[:, 1]]; wz = [1 - f[:, 2], f[:, 2]]
+    ix = [b0[:, 0], b0[:, 0] + 1]; iy = [b0[:, 1], b0[:, 1] + 1]; iz = [b0[:, 2], b0[:, 2] + 1]
+    out = np.zeros(len(P))
+    for a in (0, 1):
+        for c in (0, 1):
+            for e in (0, 1):
+                out += wx[a] * wy[c] * wz[e] * U[ix[a], iy[c], iz[e]]
+    return out
+
+# --------------------------------------------------------------- main loop ---
+ENT = ["assembly", "part_a", "part_b"]
+rows_out, samples_out, slices_out, rxn_full = [], [], [], []
+born_cache = {}
+import pickle
+os.makedirs("cache", exist_ok=True)
+diag_cache = []   # diagnostics carried across resumed runs
+
+for ci, case in enumerate(man["cases"]):
+    cid = case["case_id"]
+    cpath = f"cache/{cid}.pkl"
+    if os.path.exists(cpath):
+        with open(cpath, "rb") as fh:
+            ck = pickle.load(fh)
+        rows_out.append(ck["row"]); samples_out.append(ck["sample"])
+        slices_out.append(ck["slice"]); rxn_full.append(ck["rxn"])
+        diag_cache.extend(ck["diag"])
+        log(f"[cache] {cid}: loaded cached results ({len(ck['diag'])} diagnostic lines)")
+        continue
+    nlog = len(diag)
+    diag.append(f"[case] {cid}: (computed this run)")
+    del diag[-1]
+    ax, ctr, sp = axes_of(case)
+    rp, surf = case["response_parameters"], case["surface_parameters"]
+    e_in, e_out = rp["inner_dielectric"], rp["outer_dielectric"]
+    kappa = rp["screening_kappa_per_angstrom"]; kT = KB_KCAL * rp["temperature_kelvin"]
+    nonlinear = rp["response_regime"] == "nonlinear_screening"
+    probe = surf["probe_radius_angstrom"]
+
+    sd = {"assembly": va[ci].astype(np.float64)}     # authoritative SES tensor
+    for ent in ("part_a", "part_b"):
+        P, q, r = entity_rows(cid, ent)
+        sd[ent], _ = reconstruct_ses(P, r, probe, ax, sp)
+    # consistency check: same recipe on assembly atoms should reproduce volume_a mask
+    Pa, _, ra = entity_rows(cid, "assembly")
+    m_chk, _ = reconstruct_ses(Pa, ra, probe, ax, sp)
+    same = bool(((m_chk < 0) == (va[ci] < 0)).all())
+    extra = int(((m_chk < 0) & ~(va[ci] < 0)).sum())
+    log(f"[geom] {cid}: recipe-vs-volume_a mask identical={same} extra_voxels={extra}")
+
+    # vacuum operator: uniform eps_in, kappa=0, xi=0 -> shared by all entities
+    A_vac, idxmap = build_operator(np.full((N, N, N), float(e_in)), sp)
+    lu_vac = splu(A_vac.tocsc())
+
+    u_rxn = {}
+    for ent in ENT:
+        P, q, r = entity_rows(cid, ent)
+        rho = cic_density(P, q, ctr, sp)
+        b = (4.0 * np.pi * COULOMB * rho)[1:-1, 1:-1, 1:-1].ravel()
+        xi = solvent_fraction(sd[ent], surf)
+        epsn = e_in + (e_out - e_in) * xi
+        A_med, _ = build_operator(epsn, sp)
+        k2xi = (kappa ** 2) * xi
+        if nonlinear:
+            u_m, _ = solve_newton(A_med, k2xi, kT, b, f"{cid}/{ent}/medium-nonlinear")
+        else:
+            A_lin = (A_med + diags(k2xi[1:-1, 1:-1, 1:-1].ravel())).tocsr()
+            u_m, _ = solve_linear(A_lin, b, f"{cid}/{ent}/medium-linear")
+        u_v = lu_vac.solve(b)
+        rv = float(np.linalg.norm(A_vac @ u_v - b) / np.linalg.norm(b))
+        log(f"[solve] {cid}/{ent}/vacuum: SuperLU(factor reused per case) "
+            f"rel_residual={rv:.3e}")
+        U_m, U_v = embed(u_m, idxmap), embed(u_v, idxmap)
+        u_rxn[ent] = U_m - U_v
+        if ent in ("part_a", "part_b"):
+            a_born = np.maximum(r, np.abs(trilinear(sd[ent], P, ctr, sp)))
+            born_cache[(cid, ent)] = (P, q, r, a_born)
+        else:
+            U_rxn = u_rxn[ent]
+            samples_out.append(trilinear(U_rxn, queries[ci], ctr, sp).astype(np.float32))
+            pl = plane_spec[cid]
+            axi = {"x": 0, "y": 1, "z": 2}[pl["axis"]]
+            slices_out.append(np.take(U_rxn, pl["plane_index"], axis=axi).astype(np.float32))
+            rxn_full.append(U_rxn.copy())
+
+    E = {}
+    for ent in ENT:
+        P, q, r = entity_rows(cid, ent)
+        E[ent] = 0.5 * float(np.dot(q, trilinear(u_rxn[ent], P, ctr, sp)))
+    E_bind = E["assembly"] - E["part_a"] - E["part_b"]
+
+    # secondary: part_a x part_b cross term only (no self-energy differences)
+    Pa_, qa_, _, aa_ = born_cache[(cid, "part_a")]
+    Pb_, qb_, _, ab_ = born_cache[(cid, "part_b")]
+    D = np.linalg.norm(Pa_[:, None, :] - Pb_[None, :, :], axis=2)
+    keep = D.min(axis=1) <= 6.5          # strict: skip part_a site if nearest > 6.5 A
+    rij = D[keep]
+    ai = aa_[keep][:, None]; aj = ab_[None, :]
+    qi = qa_[keep][:, None]; qj = qb_[None, :]
+    fij = np.sqrt(rij**2 + ai * aj * np.exp(-rij**2 / (4.0 * ai * aj)))
+    gij = (1.0 / e_in) - np.exp(-kappa * fij) / e_out
+    sec = -COULOMB * float(np.sum(qi * qj * gij / fij))
+    log(f"[case] {cid}: E_asm={E['assembly']:.4f} E_a={E['part_a']:.4f} "
+        f"E_b={E['part_b']:.4f} primary={E_bind:.4f} secondary={sec:.4f} "
+        f"gap={E_bind - sec:.4f} secondary_kept={int(keep.sum())}/{len(keep)}")
+    rows_out.append((cid, E_bind, sec, E_bind - sec))
+    with open(cpath, "wb") as fh:
+        pickle.dump({"row": rows_out[-1], "sample": samples_out[-1],
+                     "slice": slices_out[-1], "rxn": rxn_full[-1],
+                     "diag": diag[nlog:]}, fh)
+    log(f"[cache] {cid}: cached to {cpath}")
+
+# ---------------------------------------------------------------- outputs ----
+os.makedirs(OUT, exist_ok=True)
+with open(f"{OUT}/summary_metrics.csv", "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(["case_id", "metric_primary_kcal_mol", "metric_secondary_kcal_mol",
+                "metric_gap_kcal_mol"])
+    for cid, p_, s_, g_ in rows_out:
+        w.writerow([cid, f"{p_:.10f}", f"{s_:.10f}", f"{g_:.10f}"])
+np.save(f"{OUT}/field_samples.npy", np.stack(samples_out).astype(np.float32))
+np.save(f"{OUT}/field_slice.npy", np.stack(slices_out).astype(np.float32))
+
+# ------------------------------------------------- PNG writer (no mpl) ------
+FONT = {
+ 'A':"01110 10001 10001 11111 10001 10001 10001",'B':"11110 10001 10001 11110 10001 10001 11110",
+ 'C':"01110 10001 10000 10000 10000 10001 01110",'D':"11110 10001 10001 10001 10001 10001 11110",
+ 'E':"11111 10000 10000 11110 10000 10000 11111",'F':"11111 10000 10000 11110 10000 10000 10000",
+ 'G':"01110 10001 10000 10111 10001 10001 01111",'H':"10001 10001 10001 11111 10001 10001 10001",
+ 'I':"11111 00100 00100 00100 00100 00100 11111",'J':"00111 00010 00010 00010 00010 10010 01100",
+ 'K':"10001 10010 10100 11000 10100 10010 10001",'L':"10000 10000 10000 10000 10000 10000 11111",
+ 'M':"10001 11011 10101 10101 10001 10001 10001",'N':"10001 11001 11001 10101 10011 10011 10001",
+ 'O':"01110 10001 10001 10001 10001 10001 01110",'P':"11110 10001 10001 11110 10000 10000 10000",
+ 'Q':"01110 10001 10001 10001 10101 10010 01101",'R':"11110 10001 10001 11110 10100 10010 10001",
+ 'S':"01111 10000 10000 01110 00001 00001 11110",'T':"11111 00100 00100 00100 00100 00100 00100",
+ 'U':"10001 10001 10001 10001 10001 10001 01110",'V':"10001 10001 10001 10001 10001 01010 00100",
+ 'W':"10001 10001 10001 10101 10101 11011 10001",'X':"10001 10001 01010 00100 01010 10001 10001",
+ 'Y':"10001 10001 01010 00100 00100 00100 00100",'Z':"11111 00001 00010 00100 01000 10000 11111",
+ '0':"01110 10001 10011 10101 11001 10001 01110",'1':"00100 01100 00100 00100 00100 00100 01110",
+ '2':"01110 10001 00001 00010 00100 01000 11111",'3':"11111 00010 00100 00010 00001 10001 01110",
+ '4':"00010 00110 01010 10010 11111 00010 00010",'5':"11111 10000 11110 00001 00001 10001 01110",
+ '6':"00110 01000 10000 11110 10001 10001 01110",'7':"11111 00001 00010 00100 01000 01000 01000",
+ '8':"01110 10001 10001 01110 10001 10001 01110",'9':"01110 10001 10001 01111 00001 00010 01100",
+ '.':"00000 00000 00000 00000 00000 01100 01100",'-':"00000 00000 00000 11111 00000 00000 00000",
+ '+':"00000 00100 00100 11111 00100 00100 00000",'=':"00000 00000 11111 00000 11111 00000 00000",
+ '/':"00001 00010 00010 00100 01000 01000 10000",'(':"00010 00100 01000 01000 01000 00100 00010",
+ ')':"01000 00100 00010 00010 00010 00100 01000",':':"00000 01100 01100 00000 01100 01100 00000",
+ '*':"00000 10101 01110 11111 01110 10101 00000",'?':"01110 10001 00001 00110 00100 00000 00100",
+ ' ':"00000 00000 00000 00000 00000 00000 00000",
+}
+
+W, H = 1260, 900
+img = np.full((H, W, 3), 255, np.uint8)
+def rect(x0, y0, x1, y1, color, fill=True):
+    x0, x1 = sorted((int(x0), int(x1))); y0, y1 = sorted((int(y0), int(y1)))
+    x0, x1 = max(x0, 0), min(x1, W-1); y0, y1 = max(y0, 0), min(y1, H-1)
+    if fill: img[y0:y1+1, x0:x1+1] = color
+    else:
+        img[y0, x0:x1+1] = color; img[y1, x0:x1+1] = color
+        img[y0:y1+1, x0] = color; img[y0:y1+1, x1] = color
+def text(x, y, s, color=(20, 20, 20), scale=2):
+    x = int(x); y = int(y)
+    for ch in str(s).upper():
+        g = FONT.get(ch, FONT['?']).split()
+        for ri, row in enumerate(g):
+            for c_i, bit in enumerate(row):
+                if bit == '1':
+                    img[y+ri*scale:y+(ri+1)*scale, x+c_i*scale:x+(c_i+1)*scale] = color
+        x += 6 * scale
+def nice_ticks(vmin, vmax, n=5):
+    span = max(vmax - vmin, 1e-9); raw = span / n
+    mag = 10 ** math.floor(math.log10(raw))
+    m = 10 * mag
+    for cand in (mag, 2*mag, 5*mag, 10*mag):
+        if span / cand <= n + 0.5:
+            m = cand; break
+    lo = math.floor(vmin / m) * m
+    return lo, m
+def fmt(v):
+    s = f"{v:.10g}"
+    return s
+
+def fmt_tick(v, m):
+    dec = max(0, -int(math.floor(math.log10(m))) ) if m < 1 else 0
+    return f"{v:.{dec}f}"
+
+prim = np.array([r[1] for r in rows_out]); seco = np.array([r[2] for r in rows_out])
+gap = np.array([r[3] for r in rows_out])
+C1, C2, C3 = (31, 119, 180), (255, 127, 14), (44, 160, 44)
+CG, CR = (140, 140, 140), (214, 39, 40)
+
+def bar_panel(x0, y0, x1, y1, series, colors, title, labels):
+    vals = np.concatenate([s for s in series] + [np.zeros(1)])
+    lo, m = nice_ticks(min(vals.min(), 0.0), max(vals.max(), 0.0))
+    hi = math.ceil(vals.max() / m) * m; hi = max(hi, m)
+    def Y(v): return y1 - (v - lo) / (hi - lo) * (y1 - y0)
+    t = lo
+    while t <= hi + 1e-9:
+        rect(x0, Y(t), x1, Y(t), (228, 228, 228)); text(x0 - 62, Y(t) - 6, fmt_tick(t, m), scale=1)
+        t += m
+    rect(x0, Y(0) - 1, x1, Y(0) + 1, (90, 90, 90))
+    n = len(labels); k = len(series)
+    slot = (x1 - x0) / n; bw = slot * 0.72 / k
+    for i in range(n):
+        cx = x0 + slot * (i + 0.5)
+        for s_i, ser in enumerate(series):
+            bx = cx - slot * 0.36 + bw * s_i
+            rect(bx + 1, Y(ser[i]), bx + bw - 1, Y(0), colors[s_i])
+        text(cx - 10, y1 + 6, labels[i], scale=1)
+    text(x0 + 20, y0 - 28, title, scale=2)
+
+LBL = [f"C{i}" for i in range(8)]
+bar_panel(90, 70, 610, 380, [prim, seco], [C1, C2],
+          "PRIMARY VS SECONDARY KCAL/MOL", LBL)
+rect(110, 402, 122, 414, C1); text(128, 403, "PRIMARY", scale=1)
+rect(210, 402, 222, 414, C2); text(228, 403, "SECONDARY", scale=1)
+bar_panel(780, 70, 1200, 380, [gap], [C3], "GAP = PRIMARY - SECONDARY KCAL/MOL", LBL)
+
+slices = np.stack(slices_out)
+vmax = float(np.abs(slices).max())
+def cmap(a):
+    tv = np.clip(a / vmax, -1, 1)
+    base = np.array([235.0, 235.0, 245.0])
+    tgt = np.where(tv[..., None] < 0, np.array([40.0, 70.0, 210.0]),
+                   np.array([210.0, 45.0, 30.0]))
+    c = base + (tgt - base) * np.abs(tv)[..., None]
+    return np.clip(c, 0, 255).astype(np.uint8)
+text(90, 448, "REACTION FIELD SLICES KCAL/MOL/E", scale=2)
+text(640, 452, f"SYMMETRIC SCALE +-{vmax:.2f}", scale=1)
+sc = 4
+for i in range(8):
+    px = 90 + (i % 4) * (35 * sc + 45); py = 490 + (i // 4) * (35 * sc + 45)
+    arr = np.fliplr(slices[i].T)                    # x -> right, y -> up
+    big = np.repeat(np.repeat(cmap(arr), sc, axis=0), sc, axis=1)
+    h_px = min(35 * sc, H - py - 4); w_px = min(35 * sc, W - px - 4)
+    img[py:py + h_px, px:px + w_px] = big[:h_px, :w_px]
+    rect(px - 1, py - 1, px + w_px, py + h_px, (70, 70, 70), fill=False)
+    text(px, py + 35*sc + 4, f"C{i}", scale=1)
+
+
+x0, y0, x1, y1 = 1005, 490, 1215, 800
+kappas = np.array([c["response_parameters"]["screening_kappa_per_angstrom"] for c in man["cases"]])
+klo, khi = kappas.min() * 0.95, kappas.max() * 1.05
+plo, m = nice_ticks(min(prim.min(), 0.0), max(prim.max(), 0.0))
+phi = math.ceil(prim.max() / m) * m if prim.max() > 0 else m
+def KX(k): return x0 + (k - klo) / (khi - klo) * (x1 - x0)
+def KY(p): return y1 - (p - plo) / (phi - plo) * (y1 - y0)
+rect(x0, y0, x1, y1, (248, 248, 248))
+t = plo
+while t <= phi + 1e-9:
+    rect(x0, KY(t), x1, KY(t), (228,228,228)); text(x0 - 62, KY(t) - 6, fmt_tick(t, m), scale=1); t += m
+for i in range(8):
+    col = CG if man["cases"][i]["response_parameters"]["response_regime"] == "linearized_screening" else C1
+    cx, cy = int(KX(kappas[i])), int(KY(prim[i]))
+    rect(cx - 4, cy - 4, cx + 4, cy + 4, col)
+    text(cx + 6, cy - 12, str(i), scale=1)
+rect(x0, y0, x1, y1, (120, 120, 120), fill=False)
+text(x0 - 62, y0 - 26, "PRIMARY VS KAPPA", scale=2)
+text(x0 - 62, y1 + 6, "GRAY=LIN BLUE=NONLIN", scale=1)
+text(90, 860, "KAPPA AXIS " + f"{klo:.3f} TO {khi:.3f} 1/A   " +
+     "GAPS: " + " ".join(f"C{i}:{gap[i]:.1f}" for i in range(8)), scale=1)
+
+def write_png(path, arr):
+    h, w, _ = arr.shape
+    raw = b"".join(b"\x00" + arr[r].tobytes() for r in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+write_png(f"{OUT}/overview.png", img)
+
+# ------------------------------------------------------------ self checks ----
+log("[selfcheck] artifacts: summary_metrics.csv, field_samples.npy, field_slice.npy, overview.png")
+with open(f"{OUT}/summary_metrics.csv") as fh:
+    rr = list(csv.DictReader(fh))
+order_ok = [r["case_id"] for r in rr] == [c["case_id"] for c in man["cases"]]
+gmax = max(abs(float(r["metric_gap_kcal_mol"])
+               - (float(r["metric_primary_kcal_mol"]) - float(r["metric_secondary_kcal_mol"])))
+           for r in rr)
+fs = np.load(f"{OUT}/field_samples.npy"); fl = np.load(f"{OUT}/field_slice.npy")
+log(f"[selfcheck] csv case order == manifest order: {order_ok}; "
+    f"max |gap-(primary-secondary)| = {gmax:.2e}")
+log(f"[selfcheck] field_samples: shape={fs.shape} dtype={fs.dtype}; "
+    f"field_slice: shape={fl.shape} dtype={fl.dtype}")
+# slice-axis consistency: compare each stored slice with the recomputed plane
+for ci, case in enumerate(man["cases"]):
+    pl = plane_spec[case["case_id"]]
+    p = pl["plane_index"]; a = pl["axis"]
+    if a == "z":
+        chk = np.array([[rxn_full[ci][i, j, p] for j in range(N)] for i in range(N)])
+    elif a == "y":
+        chk = np.array([[rxn_full[ci][i, p, j] for j in range(N)] for i in range(N)])
+    else:
+        chk = np.array([[rxn_full[ci][p, i, j] for j in range(N)] for i in range(N)])
+    err = np.abs(chk.astype(np.float32) - fl[ci]).max()
+    axl, ctr_, sp_ = axes_of(case)
+    qs = queries[ci]; ref = np.empty(len(qs))
+    for t, pt in enumerate(qs):
+        g = (pt - (ctr_ - HALF * sp_)) / sp_
+        g = np.clip(g, 0, N - 1 - 1e-12)
+        f0 = np.floor(g).astype(int); fr = g - f0
+        i0, j0, k0 = (min(v, N - 2) for v in f0)
+        acc = 0.0
+        for a_ in (0, 1):
+            for b_ in (0, 1):
+                for c_ in (0, 1):
+                    acc += ((1 - fr[0]) * (1 - a_) + fr[0] * a_) * ((1 - fr[1]) * (1 - b_) + fr[1] * b_) * ((1 - fr[2]) * (1 - c_) + fr[2] * c_) * rxn_full[ci][i0 + a_, j0 + b_, k0 + c_]
+        ref[t] = acc
+    serr = np.abs(ref.astype(np.float32) - fs[ci]).max()
+    log(f"[selfcheck] {case['case_id']}: slice axis={pl['axis']} idx={pl['plane_index']} "
+        f"storage={pl['storage_order']} slice_reextract_maxdiff={err:.3e} "
+        f"sample_reinterp_maxdiff={serr:.3e} slice_range=[{fl[ci].min():.3f},"
+        f"{fl[ci].max():.3f}] samples_range=[{fs[ci].min():.3f},{fs[ci].max():.3f}]")
+with open("solver_diagnostics.txt", "w") as fh:
+    fh.write("\n".join(diag_cache + diag) + "\n")
+print("DONE")

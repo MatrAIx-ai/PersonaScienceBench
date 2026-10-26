@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""
+Shared-mode recovery from complex response curves.
+
+Model (per curve m, shared modes k=1..K):
+    R(x) = a0 + sum_k a_k / (1 + (i*x*tau_k)^phi_k)
+with tau_k>0, 0<phi_k<=1 shared; a0, a_k real, curve-specific, >=0.
+
+Method (VarPro):
+  - Nonlinear shared params: log10(tau_k), phi_k -> differential evolution +
+    Nelder-Mead polish + random restarts, fixed seed.
+  - Linear per-curve params (a0, a_k): EXACT nonnegative least squares given
+    (tau, phi). Single real coefficient vector per curve: design matrix is
+    [Re(B); Im(B)] stacked with B = [1, b_1..b_K],
+    b_k = 1/(1+(i x tau_k)^phi_k), rhs = [re; im].
+    Im(b_k)<0 for phi>0 => im<0 arises naturally from a_k>=0.
+  - phi bounds closed at exactly 1.0 (Debye allowed, no 1-eps canting).
+  - K chosen by BIC (formula below) + chi2/N noise-floor check; PRIMARY
+    stability criterion: leave-one-curve-out (LOCO) BIC.
+  - Stability: multistart consistency, perturbed restarts (tau x 1.3^+-1),
+    residual bootstrap CIs, degeneracy flags (close taus, phi=1 edge).
+
+BIC: N = M*n*2 stacked observations. p(K) = 2K shared nonlinear (counted ONCE)
+     + M*(K+1) curve-specific linear. BIC = N*ln(RSS/N) + p*ln(N).
+
+Outputs: results/modes.csv (tau, a_0..a_{M-1}, tau ascending, native scale)
+         results/report.txt
+"""
+import json, os, warnings
+import numpy as np
+import pandas as pd
+from scipy.optimize import nnls, differential_evolution, minimize
+
+warnings.filterwarnings("ignore")
+SEED = 12345
+rng = np.random.default_rng(SEED)
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "results")
+os.makedirs(OUT, exist_ok=True)
+LOG = []
+def log(s=""):
+    print(s); LOG.append(str(s))
+
+df = pd.read_csv(os.path.join(HERE, "data", "curves.csv"))
+curves = sorted(df.curve.unique()); M = len(curves)
+X  = np.stack([df[df.curve == m].x.values  for m in curves])
+RE = np.stack([df[df.curve == m].re.values for m in curves])
+IM = np.stack([df[df.curve == m].im.values for m in curves])
+M, n = X.shape
+N_OBS = M * n * 2
+SIGMA = np.sqrt(np.mean([(np.std(np.diff(RE[m], 2))**2 +
+                          np.std(np.diff(IM[m], 2))**2) / 2 / 6 for m in range(M)]))
+
+LTAU_LO, LTAU_HI = -3.5, 4.0
+PHI_LO, PHI_HI   = 1e-3, 1.0   # closed at exactly 1.0
+
+def basis(x, taus, phis):
+    s = np.power(np.outer(x, taus), np.asarray(phis))
+    return 1.0 / (1.0 + s * np.exp(1j * np.pi / 2 * np.asarray(phis))[None, :])
+
+def design(x, taus, phis):
+    return np.hstack([np.ones((len(x), 1)), basis(x, taus, phis)])
+
+def solve_curve(x, re, im, D, nonneg=True):
+    A = np.vstack([D.real, D.imag]); y = np.concatenate([re, im])
+    if nonneg:
+        try: c, _ = nnls(A, y)
+        except Exception: return np.inf, None
+    else:
+        c = np.linalg.lstsq(A, y, rcond=None)[0]
+    r = A @ c - y
+    return float(r @ r), c
+
+def objective(p, K, Xm=X, REm=RE, IMm=IM):
+    lt, ph = np.clip(p[:K], LTAU_LO, LTAU_HI), np.clip(p[K:], PHI_LO, PHI_HI)
+    taus = 10.0 ** lt; rss = 0.0
+    for m in range(Xm.shape[0]):
+        r, _ = solve_curve(Xm[m], REm[m], IMm[m], design(Xm[m], taus, ph))
+        if not np.isfinite(r): return 1e18
+        rss += r
+    return rss
+
+def fit_full(p, K):
+    lt, ph = np.clip(p[:K], LTAU_LO, LTAU_HI), np.clip(p[K:], PHI_LO, PHI_HI)
+    o = np.argsort(lt); lt, ph = lt[o], ph[o]; taus = 10.0 ** lt
+    rss, coefs = 0.0, []
+    for m in range(M):
+        r, c = solve_curve(X[m], RE[m], IM[m], design(X[m], taus, ph))
+        rss += r; coefs.append(c)
+    return rss, taus, ph, np.array(coefs)
+
+def local_min(p0, K, restarts=1):
+    best = (objective(p0, K), np.array(p0, float))
+    for it in range(restarts):
+        res = minimize(objective, best[1] if it else p0, args=(K,),
+                       method="Nelder-Mead",
+                       options=dict(maxiter=20000, xatol=1e-7, fatol=1e-10))
+        if res.fun < best[0]: best = (res.fun, res.x)
+    return best
+
+# ================= cached, reentrant main (runs end-to-end across calls) ====
+import pickle, time, signal
+CACHE = os.path.join(OUT, "_cache.pkl")
+TIME_BUDGET = float(os.environ.get("ANALYSIS_TIME_BUDGET", "1e12"))
+class Budget(Exception): pass
+def tick(t0):
+    if time.time() - t0 > TIME_BUDGET: raise Budget()
+
+st = {"fits": {}, "loco": [], "K_final": None, "sols": None, "pert": None,
+      "boot": None, "done": False}
+if os.path.exists(CACHE):
+    st.update(pickle.load(open(CACHE, "rb")))
+
+def bic(rss, K, N, Mc):
+    return N * np.log(rss / N) + (2 * K + Mc * (K + 1)) * np.log(N)
+
+def global_fit_K(K, seed, maxiter=250, popsize=18, n_rs=25):
+    bounds = [(LTAU_LO, LTAU_HI)] * K + [(PHI_LO, PHI_HI)] * K
+    best = None
+    for so in range(2):
+        de = differential_evolution(objective, bounds, args=(K,), seed=seed + 13 * so,
+                                    maxiter=maxiter, popsize=popsize, tol=1e-10,
+                                    polish=True, init="sobol")
+        for p0 in [de.x]:
+            v, p = local_min(p0, K, restarts=1)
+            if best is None or v < best[0]: best = (v, p)
+        tick(T0)
+    rs = np.random.default_rng(seed + 1)
+    for _ in range(n_rs):
+        p0 = np.concatenate([rs.uniform(LTAU_LO, LTAU_HI, K), rs.uniform(0.2, 1.0, K)])
+        v, p = local_min(p0, K, restarts=1)
+        if v < best[0]: best = (v, p)
+        tick(T0)
+    return best
+
+def save():
+    pickle.dump(st, open(CACHE, "wb"))
+
+T0 = time.time()
+log("=" * 78)
+log(f"Data: {M} curves x {n} pts; x in [{X.min():.3e}, {X.max():.3e}]; sigma_hat={SIGMA:.4f}")
+log("=" * 78)
+try:
+    # ---- phase 1: global fits K=1..6 ----
+    for K in range(1, 7):
+        if K not in st["fits"]:
+            st["fits"][K] = global_fit_K(K, SEED); save()
+    log("\nK   RSS        chi2/N(s.hat)  chi2/N(0.05)   BIC")
+    sel = [(K, v, bic(v, K, N_OBS, M)) for K, (v, p) in sorted(st["fits"].items())]
+    for K, v, b in sel:
+        log(f"{K}   {v:9.3f}   {v/(N_OBS*SIGMA**2):8.3f}      {v/(N_OBS*0.05**2):8.3f}   {b:9.1f}")
+    K_BIC = min(sel, key=lambda t: t[2])[0]
+    K_noise = min(K for K, v, _ in sel if v / (N_OBS * SIGMA ** 2) <= 1.15)
+    log(f"\nK by BIC: {K_BIC}; smallest K at noise floor (chi2/N<=1.15): {K_noise}")
+
+    # ---- phase 2: LOCO (primary K-stability criterion) ----
+    if len(st["loco"]) < M:
+        log("\n--- Leave-one-curve-out: BIC on 4 remaining curves (primary) ---")
+    while len(st["loco"]) < 5 * M:
+        m_out = len(st["loco"]) // 5
+        mask = np.array([i != m_out for i in range(M)])
+        Xs, RES, IMS = X[mask], RE[mask], IM[mask]
+        Ms = int(mask.sum()); Ns = Ms * n * 2
+        def obj_s(p, K): return objective(p, K, Xs, RES, IMS)
+        rows = []
+        for K in range(1, 6):
+            if any(r[0] == m_out and r[1] == K for r in st["loco"]):
+                rows.append((K, bic([r[2] for r in st["loco"]
+                                    if r[0] == m_out and r[1] == K][0],
+                                    K, Ns, Ms)))
+                continue
+            bounds = [(LTAU_LO, LTAU_HI)] * K + [(PHI_LO, PHI_HI)] * K
+            de = differential_evolution(obj_s, bounds, args=(K,), seed=SEED + 7 * m_out,
+                                        maxiter=140, popsize=14, tol=1e-10, init="sobol")
+            bv, bp = local_min(de.x, K, restarts=1)
+            rs = np.random.default_rng(SEED + 991 + 37 * m_out)
+            for _ in range(8):
+                p0 = np.concatenate([rs.uniform(LTAU_LO, LTAU_HI, K), rs.uniform(0.2, 1.0, K)])
+                v, p = local_min(p0, K, restarts=1)
+                if v < bv: bv, bp = v, p
+                tick(T0)
+            st["loco"].append((m_out, K, bv)); save()
+            rows.append((K, bic(bv, K, Ns, Ms)))
+        rows = [(K, bic(v, K, Ns, Ms)) for (mo, K, v) in st["loco"] if mo == m_out]
+        Km = min(rows, key=lambda t: t[1])[0]
+        log(f" hold out curve {m_out}: BIC-best K on 4 curves = {Km}")
+    loco_K = []
+    for mo in range(M):
+        rows = [(K, bic(v, K, 4 * n * 2, 4)) for (m2, K, v) in st["loco"] if m2 == mo]
+        loco_K.append(min(rows, key=lambda t: t[1])[0])
+    # held-out predictive chi2/N at candidate K (modes from 4 curves, amps by NNLS)
+    log(f" LOCO BIC-best K per fold: {loco_K}")
+    for mo in range(M):
+        mask = np.array([i != mo for i in range(M)])
+        Xs, RES, IMS = X[mask], RE[mask], IM[mask]
+        def obj_s(p, K): return objective(p, K, Xs, RES, IMS)
+        bounds = [(LTAU_LO, LTAU_HI)] * K_BIC + [(PHI_LO, PHI_HI)] * K_BIC
+        de = differential_evolution(obj_s, bounds, args=(K_BIC,), seed=SEED + 7 * mo,
+                                    maxiter=140, popsize=14, tol=1e-10, init="sobol")
+        vv, pp = local_min(de.x, K_BIC, restarts=1); tick(T0)
+        lt = np.clip(pp[:K_BIC], LTAU_LO, LTAU_HI); ph = np.clip(pp[K_BIC:], PHI_LO, PHI_HI)
+        r_ho, _ = solve_curve(X[mo], RE[mo], IM[mo], design(X[mo], 10.0 ** lt, ph))
+        log(f"   curve {mo}: held-out chi2/N at K={K_BIC} = {r_ho/(2*n*SIGMA**2):.2f}")
+
+    if len(set(loco_K)) == 1 and loco_K[0] == K_BIC:
+        K_final = K_BIC
+        log(f" LOCO consistent with global BIC -> FINAL K = {K_final}")
+    else:
+        K_final = min(set(loco_K))
+        log(f" !! LOCO K = {loco_K} not all equal to BIC K={K_BIC}"
+            f" -> most parsimonious LOCO K = {K_final}")
+
+    # ---- phase 3: final fit + stability checks ----
+    if st["K_final"] is None: st["K_final"] = K_final
+    rss, taus, phis, COEFS = fit_full(st["fits"][K_final][1], K_final)
+    lt0 = np.log10(taus)
+    if st["sols"] is None:
+        log("\n--- Multistart consistency (distinct local optima) ---")
+        bounds = [(LTAU_LO, LTAU_HI)] * K_final + [(PHI_LO, PHI_HI)] * K_final
+        sols = []
+        for s2 in range(2):
+            de = differential_evolution(objective, bounds, args=(K_final,),
+                                        seed=SEED + 100 * s2, maxiter=220, popsize=18,
+                                        tol=1e-10, init="sobol")
+            sols.append(local_min(de.x, K_final, restarts=1)); tick(T0)
+        rs = np.random.default_rng(SEED)
+        for _ in range(40):
+            p0 = np.concatenate([rs.uniform(LTAU_LO, LTAU_HI, K_final),
+                                 rs.uniform(0.2, 1.0, K_final)])
+            sols.append(local_min(p0, K_final, restarts=1)); tick(T0)
+        sols = [(float(v), np.asarray(p)) for v, p in sols]
+        sols.sort(key=lambda t: t[0])
+        ded = []
+        for v, p in sols:
+            o = np.argsort(p[:K_final])
+            lt = np.clip(p[:K_final], LTAU_LO, LTAU_HI)[o]
+            ph = np.clip(p[K_final:], PHI_LO, PHI_HI)[o]
+            if all(np.max(np.abs(lt - l2)) > 0.02 or np.max(np.abs(ph - p2)) > 0.02
+                   for l2, p2, _ in ded):
+                ded.append((lt.tolist(), ph.tolist(), float(v)))
+        st["sols"] = ded; save()
+    for lt, ph, v in st["sols"][:6]:
+        log(f"  RSS={v:9.3f}  log10tau={np.round(lt,3)}  phi={np.round(ph,3)}")
+
+    if st["pert"] is None:
+        log("\n--- Perturbed-restart check (taus x 1.3^+-1 -> converge back?) ---")
+        per = []
+        for t in range(10):
+            p0 = np.concatenate([lt0 + rng.choice([-1, 1], K_final) * np.log10(1.3), phis.copy()])
+            v, p = local_min(p0, K_final, restarts=1)
+            ltp = np.sort(np.clip(p[:K_final], LTAU_LO, LTAU_HI))
+            d = float(np.max(np.abs(ltp - lt0))); per.append(d)
+            log(f"  restart {t}: RSS={v:9.3f}  max|dlog10tau|={d:.4f}"); tick(T0)
+        st["pert"] = per; save()
+    worst = max(st["pert"])
+    log(f"  worst drift: {worst:.4f} ({'stable' if worst < 0.05 else 'SUSPECT degeneracy'})")
+
+    # ---- phase 4: residual bootstrap ----
+    if st["boot"] is None:
+        log("\n--- Residual bootstrap (B=150): CI(2.5,97.5) ---")
+        RESI = []
+        for m in range(M):
+            D = design(X[m], taus, phis)
+            RESI.append(np.vstack([D.real, D.imag]) @ COEFS[m]
+                        - np.concatenate([RE[m], IM[m]]))
+        blt, bph, bc = [], [], []
+        for b in range(150):
+            REb, IMb = np.empty_like(RE), np.empty_like(IM)
+            for m in range(M):
+                D = design(X[m], taus, phis); A = np.vstack([D.real, D.imag])
+                r = A @ COEFS[m] + RESI[m][rng.integers(0, 2 * n, 2 * n)]
+                REb[m], IMb[m] = r[:n], r[n:]
+            def objb(p): return objective(p, K_final, X, REb, IMb)
+            resb = minimize(objb, np.concatenate([lt0, phis]), method="Nelder-Mead",
+                            options=dict(maxiter=6000, xatol=1e-6, fatol=1e-9))
+            p = np.clip(resb.x, [LTAU_LO] * K_final + [PHI_LO] * K_final,
+                                  [LTAU_HI] * K_final + [PHI_HI] * K_final)
+            o = np.argsort(p[:K_final])
+            ltb, phb = p[:K_final][o], p[K_final:][o]
+            blt.append(ltb); bph.append(phb)
+            bc.append(np.array([solve_curve(X[m], REb[m], IMb[m],
+                           design(X[m], 10.0 ** ltb, phb))[1] for m in range(M)]))
+            if b % 10 == 9: save()
+            tick(T0)
+        st["boot"] = (np.array(blt), np.array(bph), np.array(bc)); save()
+    blt, bph, bc = st["boot"]
+    lo = lambda a: np.percentile(a, 2.5, axis=0)
+    hi = lambda a: np.percentile(a, 97.5, axis=0)
+
+    # ---- phase 5: a0 control, flags, report ----
+    log("\n--- a0 >= 0 control (unconstrained lstsq) ---")
+    a0u = []
+    for m in range(M):
+        D = design(X[m], taus, phis); A = np.vstack([D.real, D.imag])
+        a0u.append(np.linalg.lstsq(A, np.concatenate([RE[m], IM[m]]),
+                                   rcond=None)[0][0])
+    log(f" a0 (NNLS >=0): {np.round(COEFS[:, 0], 4)}")
+    log(f" a0 (uncons.) : {np.round(np.array(a0u), 4)}")
+
+    flags = []
+    for k in range(K_final):
+        if phis[k] >= 0.995: flags.append(f"mode {k} (tau={taus[k]:.3g}): phi pinned at Debye 1.0")
+    for k in range(K_final - 1):
+        if taus[k + 1] / taus[k] < 3.0:
+            flags.append(f"modes {k},{k+1}: tau ratio {taus[k+1]/taus[k]:.2f} < 3 -> possible degeneracy")
+    if worst >= 0.05: flags.append(f"perturbed-restart drift dlog10tau={worst:.3f}")
+
+    log("\n" + "=" * 22 + f" FINAL MODEL  K={K_final} " + "=" * 22)
+    log(f"RSS={rss:.4f}  chi2/N (sigma_hat={SIGMA:.4f}) = {rss/(N_OBS*SIGMA**2):.3f}"
+        f"   chi2/N (sigma=0.05) = {rss/(N_OBS*0.05**2):.3f}")
+    for k in range(K_final):
+        lo_k, hi_k = 10 ** lo(blt)[k], 10 ** hi(blt)[k]
+        log(f" mode {k}: tau={taus[k]:10.4g} CI[{lo_k:.3g}, {hi_k:.3g}]"
+            f"   phi={phis[k]:.3f} CI[{lo(bph)[k]:.3f}, {hi(bph)[k]:.3f}]"
+            f"   amps={np.round(COEFS[:, k+1], 3)}")
+        for m in range(M):
+            al, ah = lo(bc[:, :, k + 1])[m], hi(bc[:, :, k + 1])[m]
+            log(f"     a_{m}={COEFS[m, k+1]:.3f} CI[{al:.3f}, {ah:.3f}]")
+    log(" a0 per curve: " + str(np.round(COEFS[:, 0], 4)))
+    log(" Flags: " + ("; ".join(flags) if flags else "none"))
+
+    # one row per mode; a_m = amplitude of that mode in curve m (curves 0..M-1)
+    rows_out = [{"tau": taus[k], **{f"a_{m}": COEFS[m, k + 1] for m in range(M)}}
+                for k in range(K_final)]
+    outdf = pd.DataFrame(rows_out).sort_values("tau").reset_index(drop=True)
+    outdf.to_csv(os.path.join(OUT, "modes.csv"), index=False, float_format="%.6g")
+    st["done"] = True
+    with open(os.path.join(OUT, "report.txt"), "w") as f:
+        f.write("\n".join(LOG) + "\n")
+    log("\nWrote results/modes.csv and results/report.txt")
+except Budget:
+    save()
+    log("[time budget hit -> state cached; rerun analysis.py to continue]")
+    with open(os.path.join(OUT, "report.txt"), "w") as f:
+        f.write("\n".join(LOG) + "\n")
+    raise SystemExit(0)

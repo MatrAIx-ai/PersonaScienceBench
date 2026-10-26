@@ -1,0 +1,308 @@
+"""
+Transmission-Line Target Prediction (ASIBench: electrical_engineering.lossy_tline_skin)
+
+Pipeline
+--------
+1. Extract per-meter calibration quantities:
+       alpha_i(f)  = -magnitude_db * ln(10) / 20 / length_m      [Np/m]
+       GD_per_m(f) = group_delay_s / length_m                    [s/m]
+       beta_i(f)   = -phase_rad / length_m                       [rad/m]
+2. Smooth geometry surrogate over (trace_width_um, roughness_index) from the
+   8 calibration lines (thin-plate-spline RBF; targets inside the calibration
+   envelope => interpolation, not extrapolation):
+     * alpha(f): each cal line's alpha(f) compressed into a smooth frequency
+       basis {1, sqrt(f), f, f^1.5, f^2} on a scaled frequency axis; the 5
+       coefficient vectors are interpolated over (w,rho) via RBF and
+       alpha_target(f) rebuilt.
+     * beta(f): GD_per_m(f) interpolated over (w,rho) at every frequency and
+       beta(f) = 2*pi*integral_0^f GD_per_m(f') df', which enforces beta(0)=0
+       and group_delay = -d phase/d omega exactly.
+3. Target intrinsic transfer (exp(+j*omega*t) phasor):
+       H(f) = exp( -(alpha_target(f) + j*beta_target(f)) * length_target )
+   on the supplied frequency grid. phase_rad is the unwrapped branch -beta*L
+   (starts at 0); group_delay_s = GD_target*L = -d phase/d omega.
+4. Waveform synthesis: input pulse is a 4096-sample record, dt=8 ps, so its DFT
+   bin spacing 1/(N*dt)=30.517578125 MHz equals the supplied grid exactly.
+   V_out(f_k) = V_in(f_k)*H(f_k), k=0..2048, with V_out(-f)=conj(V_out(f))
+   (conjugate symmetry), then output = real(ifft).  No resampling/windowing.
+5. Pulse metrics (definitions documented inline).
+
+No calibration de-embedding or mismatch corrections (forward interpolation only).
+"""
+import os
+import numpy as np
+import pandas as pd
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    plt = None
+    HAS_MPL = False
+from scipy.interpolate import RBFInterpolator
+from scipy.integrate import cumulative_trapezoid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+OUT = os.path.join(HERE, "results")
+os.makedirs(OUT, exist_ok=True)
+
+# ---- (0) Load inputs ---------------------------------------------------
+cal_lines = pd.read_csv(os.path.join(DATA, "calibration_lines.csv"))
+cal_trans = pd.read_csv(os.path.join(DATA, "calibration_transfer.csv"))
+tgt_lines = pd.read_csv(os.path.join(DATA, "target_lines.csv"))
+freq_grid = pd.read_csv(os.path.join(DATA, "frequency_grid.csv"))
+pulse     = pd.read_csv(os.path.join(DATA, "input_pulse.csv"))
+
+freq  = freq_grid["frequency_hz"].to_numpy(float)   # 2049 pts, 0..62.5 GHz
+n_f   = len(freq)
+t_p   = pulse["time_s"].to_numpy(float)
+v_in  = pulse["input_v"].to_numpy(float)
+N, dt = len(v_in), t_p[1] - t_p[0]
+
+# ---- (1) Per-meter calibration quantities --------------------------------
+cal = cal_trans.merge(cal_lines, on="line_id")
+cal = cal.sort_values(["line_id", "frequency_hz"]).reset_index(drop=True)
+Lcal     = cal["length_m"].to_numpy()
+alpha_i  = -cal["magnitude_db"].to_numpy() * np.log(10.0) / 20.0 / Lcal   # Np/m
+gd_im    = cal["group_delay_s"].to_numpy() / Lcal                         # s/m
+
+cal_ids = list(cal_lines["line_id"])
+P  = cal_lines[["trace_width_um", "roughness_index"]].to_numpy(float)
+Pg = tgt_lines[["trace_width_um", "roughness_index"]].to_numpy(float)
+
+# ---- (2) Geometry surrogate ------------------------------------------------
+def make_alpha_basis(x):
+    """Smooth frequency basis for alpha(f); x = scaled frequency (f*1e-10)."""
+    return np.column_stack([np.ones_like(x), np.sqrt(x), x, x**1.5, x**2])
+
+fscale = 1e-10
+B = make_alpha_basis(freq * fscale)
+
+# (a) alpha: interpolate frequency-basis coefficient vectors over (w, rho)
+alpha_coefs = np.zeros((len(cal_ids), B.shape[1]))
+for r, lid in enumerate(cal_ids):
+    mask = cal["line_id"] == lid        # cal rows are sorted line-block-wise
+    x = freq * fscale                   # every line carries the same grid in order
+    y = alpha_i[mask]
+    use = x > 1e-3                      # fit away from the noisy f=0 bin
+    coef, *_ = np.linalg.lstsq(make_alpha_basis(x[use]), y[use], rcond=None)
+    alpha_coefs[r] = coef
+
+alpha_coef_pred = np.zeros((len(tgt_lines), alpha_coefs.shape[1]))
+for j in range(alpha_coefs.shape[1]):
+    rbf = RBFInterpolator(P, alpha_coefs[:, j], kernel="thin_plate_spline")
+    alpha_coef_pred[:, j] = np.asarray(rbf(Pg)).ravel()
+alpha_target = alpha_coef_pred @ B.T                     # (n_target, n_f) Np/m
+
+# (b) GD_per_m: interpolate per frequency over (w, rho), then integrate
+gd_per_line = gd_im.reshape(len(cal_ids), n_f)
+gd_target   = np.zeros((len(tgt_lines), n_f))
+for k in range(n_f):
+    rbf = RBFInterpolator(P, gd_per_line[:, k], kernel="thin_plate_spline")
+    gd_target[:, k] = np.asarray(rbf(Pg)).ravel()
+
+beta_target = np.zeros((len(tgt_lines), n_f))
+for r in range(len(tgt_lines)):
+    beta_target[r] = 2.0 * np.pi * cumulative_trapezoid(
+        gd_target[r], freq, initial=0.0)
+
+# ---- (3) Target intrinsic transfer -----------------------------------------
+Lt = tgt_lines["length_m"].to_numpy()
+H  = np.exp(-(alpha_target + 1j * beta_target) * Lt[:, None])
+
+mag_db = 20.0 * np.log10(np.abs(H) + 1e-300)
+phase  = -beta_target * Lt[:, None]                      # unwrapped (ex+jwt)
+gd_s   = gd_target * Lt[:, None]                         # s = -d phase/dw
+
+# verify numeric -d phase/d omega vs reported gd_s
+gd_num = -np.gradient(phase, 2.0 * np.pi * freq, axis=1)   # group delay
+gd_num[:, 0] = gd_num[:, 1]   # guard f=0 endpoint (check only)
+# report max rel error on interior bins (exclude f=0 endpoint artifact)
+rel_gd = np.nanmax(np.abs(gd_num - gd_s)[:, 1:] /
+                   np.maximum(np.abs(gd_s)[:, 1:], 1e-15), axis=1)
+
+# ---- (4) Waveform synthesis (DFT bins align with the grid exactly) ---------
+Vf_pos = np.fft.rfft(v_in)                     # bins 0..N/2 = 0..62.5 GHz
+assert len(Vf_pos) == n_f, "grid must equal rfft bin count"
+VF = np.fft.fft(v_in)                          # full DFT spectrum (length N)
+
+outputs = np.zeros((len(tgt_lines), N))
+for r in range(len(tgt_lines)):
+    Hpos = H[r].copy()
+    Hpos[-1] = Hpos[-1].real                  # real Nyquist term (single bin)
+    Hfull = np.concatenate([Hpos, np.conj(Hpos[1:n_f - 1][::-1])])
+    Vout_full = VF * Hfull
+    y = np.fft.ifft(Vout_full)
+    max_imag = np.max(np.abs(y.imag))
+    assert max_imag < 1e-9 * np.max(np.abs(y.real)) + 1e-12, "ifft not real"
+    outputs[r] = y.real
+
+# ---- (5) Pulse metrics (documented definitions) -----------------------------
+def fwhm(t, y):
+    """Full-width at half maximum from the max-value peak; half-max crossings
+    found with linear interpolation between samples."""
+    i0 = int(np.argmax(y)); peak = y[i0]; half = 0.5 * peak
+    il = np.where(y[:i0] < half)[0]
+    if len(il) == 0:
+        tL = t[0]
+    else:
+        a = il[-1]
+        tL = t[a] + (t[a + 1] - t[a]) * (half - y[a]) / (y[a + 1] - y[a])
+    ir = np.where(y[i0:] < half)[0]
+    if len(ir) == 0:
+        tR = t[-1]
+    else:
+        b = i0 + ir[0]
+        tR = t[b - 1] + (t[b] - t[b - 1]) * (half - y[b - 1]) / (y[b] - y[b - 1])
+    return tR - tL
+
+def tail_asymmetry(t, y, pct=0.05):
+    """(E_right - E_left)/(E_right + E_left) in a symmetric window around the
+    peak bounded by the 5%-level crossings. Positive => more energy after the
+    peak (long dispersive tail); 0 for a symmetric pulse."""
+    i0 = int(np.argmax(y)); peak = y[i0]; level = pct * peak
+    right = np.where(y[i0:] <= level)[0]
+    tR = t[i0 + right[0]] if len(right) else t[-1]
+    left = np.where(y[:i0] <= level)[0]
+    tL = t[left[-1]] if len(left) else t[0]
+    W = min(tR - t[i0], t[i0] - tL)
+    sel  = (t >= t[i0]) & (t <= t[i0] + W)
+    selL = (t >= t[i0] - W) & (t <= t[i0])
+    Er = np.trapezoid(y[sel] ** 2, t[sel])
+    El = np.trapezoid(y[selL] ** 2, t[selL])
+    return (Er - El) / (Er + El) if (Er + El) > 0 else 0.0
+
+t_in_peak = t_p[int(np.argmax(v_in))]
+in_fwhm   = fwhm(t_p, v_in)
+in_energy = np.trapezoid(v_in ** 2, t_p)
+
+metrics_rows = []
+for r in range(len(tgt_lines)):
+    y = outputs[r]
+    out_peak_t = t_p[int(np.argmax(y))]
+    out_fwhm   = fwhm(t_p, y)
+    out_energy = np.trapezoid(y ** 2, t_p)
+    metrics_rows.append({
+        "target_id": tgt_lines["line_id"][r],
+        "input_fwhm_s": in_fwhm,
+        "output_fwhm_s": out_fwhm,
+        "fwhm_broadening_ratio": out_fwhm / in_fwhm,
+        "peak_delay_s": out_peak_t - t_in_peak,
+        "output_peak_time_s": out_peak_t,
+        "energy_ratio": out_energy / in_energy,
+        "tail_asymmetry": tail_asymmetry(t_p, y),
+    })
+metrics = pd.DataFrame(metrics_rows)
+
+# ---- (6) Write outputs with exact required schemas --------------------------
+transfer = pd.concat([
+    pd.DataFrame({
+        "target_id": tgt_lines["line_id"][r],
+        "frequency_hz": freq,
+        "magnitude_db": mag_db[r],
+        "phase_rad": phase[r],
+        "group_delay_s": gd_s[r],
+        "attenuation_np_per_m": alpha_target[r],
+    }) for r in range(len(tgt_lines))
+], ignore_index=True)
+transfer.to_csv(os.path.join(OUT, "target_transfer.csv"), index=False)
+
+wave = pd.concat([
+    pd.DataFrame({
+        "target_id": tgt_lines["line_id"][r],
+        "time_s": t_p,
+        "input_v": v_in,
+        "output_v": outputs[r],
+    }) for r in range(len(tgt_lines))
+], ignore_index=True)
+wave.to_csv(os.path.join(OUT, "target_waveforms.csv"), index=False)
+
+metrics.to_csv(os.path.join(OUT, "pulse_metrics.csv"), index=False)
+
+# ---- (7) Retained LOOCV diagnostics -----------------------------------------
+def loocv_alpha():
+    er = {fc: [] for fc in [1e9, 1e10, 6e10]}
+    for i in range(len(cal_ids)):
+        tr = np.arange(len(cal_ids)) != i
+        cp = np.zeros(alpha_coefs.shape[1])
+        for j in range(alpha_coefs.shape[1]):
+            rbf = RBFInterpolator(P[tr], alpha_coefs[tr, j], kernel="thin_plate_spline")
+            cp[j] = np.asarray(rbf(P[i:i + 1])).ravel()[0]
+        mask = cal["line_id"] == cal_ids[i]
+        xf, aa = freq, alpha_i[mask]    # line blocks carry the grid in order
+        for fc in er:
+            k = int(np.argmin(np.abs(xf - fc)))
+            er[fc].append(float(cp @ make_alpha_basis(np.atleast_1d(xf[k] * fscale))[0]) - aa[k])
+    return {f"{fc/1e9:g}GHz": float(np.sqrt(np.mean(np.array(v) ** 2))) for fc, v in er.items()}
+
+def loocv_tau():
+    gd1 = gd_per_line[:, int(np.argmin(np.abs(freq - 1e9)))] * 1e9
+    errs = []
+    for i in range(len(cal_ids)):
+        tr = np.arange(len(cal_ids)) != i
+        rbf = RBFInterpolator(P[tr], gd1[tr], kernel="thin_plate_spline")
+        errs.append(np.asarray(rbf(P[i:i + 1])).ravel()[0] - gd1[i])
+    errs = np.array(errs)
+    return float(np.sqrt(np.mean(errs ** 2))), float(np.abs(errs).max())
+
+loocv_a = loocv_alpha()
+loocv_t = loocv_tau()
+
+# ---- (8) Console summary + diagnostic figure --------------------------------
+print("=" * 78)
+print("PIPELINE COMPLETE")
+print("=" * 78)
+for f_ in ["target_transfer.csv", "target_waveforms.csv", "pulse_metrics.csv"]:
+    print(f"  results/{f_}  ({len(pd.read_csv(os.path.join(OUT, f_)))} rows)")
+print("\nTarget transfer summary (intrinsic H = exp(-(alpha+j beta) L)):")
+for r in range(len(tgt_lines)):
+    k1 = int(np.argmin(np.abs(freq - 1e9)))
+    print(f"  {tgt_lines['line_id'][r]}: L={Lt[r]}m  alpha@1GHz={alpha_target[r, k1]:.4f} Np/m"
+          f"  tau={beta_target[r, k1]/(2*np.pi*freq[k1])*1e9:.3f} ns/m"
+          f"  |H|@1GHz={np.abs(H[r, k1]):.4f}"
+          f"  phase@10GHz={phase[r, int(np.argmin(np.abs(freq-1e10)))]:+.2f} rad")
+print("\nPulse metrics:")
+print(metrics.to_string(index=False))
+print("\nSanity / diagnostics:")
+print(f"  maximag(ifft) (V): "
+      f"{max(np.max(np.abs(np.fft.ifft(VF*np.concatenate([H[r][:n_f],np.conj(H[r][1:n_f-1][::-1])]).astype(complex)).imag)) for r in range(len(tgt_lines))):.2e}")
+print(f"  GD consistency max rel |gd_num-gd_s|/|gd_s| per target: {np.round(rel_gd, 4)}")
+print(f"  output peaks (ns): "
+      f"{[round(t_p[int(np.argmax(outputs[r]))]*1e9, 2) for r in range(len(tgt_lines))]} "
+      f"(record 32.76 ns)")
+print(f"  LOOCV alpha rmse (Np/m): {loocv_a}")
+print(f"  LOOCV tau rmse / maxabs (ns/m): {loocv_t[0]:.3f} / {loocv_t[1]:.3f}")
+
+if not HAS_MPL:
+    print("  (matplotlib not available; skipping diagnostic figure)")
+if HAS_MPL:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax = axes[0, 0]
+    ax.plot(t_p * 1e9, v_in, lw=1.2, label="input pulse")
+    for r in range(len(tgt_lines)):
+        ax.plot(t_p * 1e9, outputs[r], lw=1.0, label=tgt_lines["line_id"][r])
+    ax.set_xlabel("time (ns)"); ax.set_ylabel("voltage (V)"); ax.set_title("Waveforms")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    
+    ax = axes[0, 1]
+    for r in range(len(tgt_lines)):
+        ax.semilogx(freq[1:], mag_db[r][1:], lw=1.2, label=tgt_lines["line_id"][r])
+    ax.set_xlabel("frequency (Hz)"); ax.set_ylabel("magnitude (dB)")
+    ax.set_title("Target |H| (dB)"); ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    
+    ax = axes[1, 0]
+    for r in range(len(tgt_lines)):
+        ax.semilogx(freq[1:], phase[r][1:], lw=1.2, label=tgt_lines["line_id"][r])
+    ax.set_xlabel("frequency (Hz)"); ax.set_ylabel("phase (rad)")
+    ax.set_title("Target phase (unwrapped)"); ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    
+    ax = axes[1, 1]
+    for r in range(len(tgt_lines)):
+        ax.semilogx(freq[1:], gd_s[r][1:] * 1e9, lw=1.2, label=tgt_lines["line_id"][r])
+    ax.set_xlabel("frequency (Hz)"); ax.set_ylabel("group delay (ns)")
+    ax.set_title("Target group delay"); ax.legend(fontsize=7); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "diagnostics.png"), dpi=110)
+    print("  figure saved to results/diagnostics.png")

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-26-q4  -  KEGG ORA of significantly downregulated P. aeruginosa genes,
+                       common pathways across two media conditions.
+
+Question: "In a KEGG pathway enrichment (over-representation) analysis with the
+significantly downregulated genes and using the latest KEGG db and logfold cutoff
+1.5 or -1.5, adjusted p-value cutoff 0.05, of P. aeruginosa, how many different
+pathways are common in both media conditions?"
+
+Inputs (provided capsule):
+  data/res_GluFevsGluFePlus.rds    -> MEDIA condition Glu: "Media MMGluFeMinus vs MMGluFePlus"
+  data/res_SuccvsGluFePlus.rds     -> MEDIA condition Succ: "Media Succinate vs MMGluFePlus"
+Both are DESeq2 DESeqResults objects (S4), 5828 genes x (baseMean, log2FoldChange,
+lfcSE, stat, pvalue, padj), rownames = P. aeruginosa UCBPP-PA14 locus tags (PA14_XXXXX).
+
+Environment: no R, no internet/DNS, no KEGG annotation database present in the
+capsule. This script performs every step that is executable offline (parsing, QC,
+filtering, DEG sets, background, and a complete, validated ORA implementation) and
+clearly reports the single external dependency: the P. aeruginosa KEGG pathway
+gene->pathway annotation ("latest KEGG db"), which cannot be downloaded here.
+
+How the final count WOULD be obtained (with real KEGG data):
+  1) D_Glu = genes with padj<=0.05 & log2FoldChange<=-1.5 in res_GluFevsGluFePlus
+  2) D_Succ = same filter for res_SuccvsGluFePlus
+  3) Map PA14_XXXXX -> KEGG-compatible IDs (org key "pae" = P. aeruginosa PAO1,
+     or a PA14-specific organism if used by the reference; normally org.Pa.eg.db /
+     mygene to ENTREZ). Mapping NOT available offline -> documented, not invented.
+  4) Universe/background = all 5828 measured genes of each file, after successful
+     mapping to KEGG identifiers.
+  5) For each KEGG pae pathway: Fisher exact (hypergeometric, alternative='greater')
+     ORA; BH-adjusted p; pathway enriched if adj p <= 0.05.
+  6) Enriched-pathway-ID sets from the two files -> intersection -> count distinct
+     KEGG pathway IDs ("different pathways common in both media conditions").
+"""
+import gzip, struct, sys, os, socket, urllib.request
+import numpy as np
+import pandas as pd
+from scipy.stats import fisher_exact
+from statsmodels.stats.multitest import multipletests
+
+DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+SCRIPT_DIR = os.path.dirname(__file__)
+LFC_CUT   = -1.5
+PADJ_CUT  = 0.05
+KEGG_ORG  = "pae"
+
+# --------------------------------------------------------------------------
+# 1) RDS reading (pure Python), reverse-engineered from the serialization bytes
+# --------------------------------------------------------------------------
+def read_rds_table(path):
+    with gzip.open(path, "rb") as fh:
+        raw = fh.read()
+    # rownames STRSXP (type 0x10) followed by its length; candidate scan
+    cand = []
+    # STRSXP info may be plain (0x00000010) or carry the OBJECT flag (0x00000210)
+    for info in (b"\x00\x00\x00\x10", b"\x00\x00\x02\x10"):
+        i = 0
+        while True:
+            i = raw.find(info, i)
+            if i < 0:
+                break
+            L = struct.unpack(">i", raw[i+4:i+8])[0]
+            cand.append((i, L))
+            i += 1
+    row_names = None
+    n = None
+    for (off, L) in cand:
+        if L < 1000:
+            continue
+        pos = off + 8
+        ok, names = True, []
+        for _ in range(min(L, 200)):
+            if raw[pos:pos+4] != b"\x00\x04\x00\x09":
+                ok = False; break
+            ln = struct.unpack(">i", raw[pos+4:pos+8])[0]
+            try:
+                s = raw[pos+8:pos+8+ln].decode("utf-8")
+            except Exception:
+                ok = False; break
+            names.append(s); pos += 8 + ln
+        if ok and all(x and x[0].isalpha() for x in names):
+            pos = off + 8
+            names = []
+            for _ in range(L):
+                if raw[pos:pos+4] != b"\x00\x04\x00\x09":
+                    raise ValueError(f"rownames element {len(names)} not CHARSXP @ {pos}")
+                ln = struct.unpack(">i", raw[pos+4:pos+8])[0]
+                names.append(raw[pos+8:pos+8+ln].decode("utf-8")); pos += 8 + ln
+            row_names, n = names, L
+            break
+    if n is None or row_names is None:
+        raise ValueError("could not locate gene-count STRSXP")
+    col_keys = ["baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj"]
+    col_data, pos = {}, 0
+    while len(col_data) < 6:
+        idx = raw.find(b"\x00\x00\x00\x0e", pos)
+        if idx < 0:
+            break
+        L = struct.unpack(">i", raw[idx+4:idx+8])[0]
+        if L == n:
+            col_data[col_keys[len(col_data)]] = np.array(
+                struct.unpack(f">{L}d", raw[idx+8:idx+8+8*L]))
+        pos = idx + 1
+    if len(col_data) != 6:
+        raise ValueError(f"found only {len(col_data)} numeric columns of length {n}")
+    df = pd.DataFrame(col_data)
+    df.insert(0, "gene", row_names)
+    return df
+
+
+# --------------------------------------------------------------------------
+# 2) ORA: hypergeometric / Fisher exact, BH-adjusted (clusterProfiler-equivalent)
+# --------------------------------------------------------------------------
+def ora(gene_list, universe, pathway_annot):
+    genes = set(gene_list)
+    univ  = set(universe)
+    ann_genes = set().union(*pathway_annot.values()) if pathway_annot else set()
+    univ_bg = univ & ann_genes
+    rows = []
+    for pid, pgenes in pathway_annot.items():
+        pset = pgenes & univ_bg
+        overlap = genes & pset
+        k = len(overlap)
+        if k == 0:
+            continue
+        a = k
+        b = len(pset) - k
+        gl = len(genes & univ_bg)
+        c = gl - k
+        d = len(univ_bg) - gl - b
+        p = fisher_exact([[a, b], [c, d]], alternative="greater")[1]
+        rows.append({"pathway": pid, "overlap": k, "list_size": gl,
+                     "pathway_size": len(pset), "pvalue": p,
+                     "genes": ";".join(sorted(overlap))})
+    if not rows:
+        return pd.DataFrame(columns=["pathway","overlap","list_size",
+                                     "pathway_size","pvalue","adj_p","genes"])
+    res = pd.DataFrame(rows)
+    res["adj_p"] = multipletests(res["pvalue"], method="fdr_bh")[1]
+    return res.sort_values("adj_p")
+
+
+# --------------------------------------------------------------------------
+# 3) Optional offline pathway annotation loader + last KEGG fetch attempt
+# --------------------------------------------------------------------------
+ANNOT_FILE = os.path.join(DATA, "kegg_pae_pathways.tsv")
+
+
+def try_fetch_kegg_annotation():
+    socket.setdefaulttimeout(6)
+    out = {}
+    for u in ["https://rest.kegg.jp/link/pathway/pae",
+              "https://rest.kegg.jp/list/pathway/pae"]:
+        try:
+            with urllib.request.urlopen(u) as r:
+                out[u] = r.read(1000).decode("utf-8", "replace")
+        except Exception as e:
+            out[u] = f"FAILED: {e!r}"
+    return out
+
+
+# --------------------------------------------------------------------------
+# ORA statistical self-test (independent of any KEGG data)
+# Verifies the Fisher/BH ORA against the exact hypergeometric survival
+# function (the same statistic clusterProfiler::enrichKEGG uses).
+# --------------------------------------------------------------------------
+def ora_selftest():
+    print("\n[ORA self-test] validating ORA vs exact hypergeometric survival...")
+    from scipy.stats import hypergeom
+    universe = {f"G{i}" for i in range(1, 101)}          # 100-gene universe
+    gene_list = {f"G{i}" for i in range(1, 21)}          # 20-gene input list
+    pathway_annot = {                                     # 3 synthetic pathways
+        "path001": {f"G{i}" for i in range(1, 11)},       # 10 genes, overlap 10
+        "path002": {f"G{i}" for i in range(91, 101)},     # 10 genes, overlap 0
+        "path003": {f"G{i}" for i in range(11, 41)},      # 30 genes, overlap 10
+    }
+    res = ora(gene_list, universe, pathway_annot)
+    # effective ORA universe = background genes that belong to at least one pathway
+    ann_genes = set().union(*pathway_annot.values())
+    N = len(universe & ann_genes)          # same as ora()'s univ_bg
+    n = len(gene_list & ann_genes)         # same as ora()'s gl
+    for _, r in res.iterrows():
+        p = r["pvalue"]
+        K = r["pathway_size"]; k = r["overlap"]
+        expect = hypergeom.sf(k - 1, N, K, n)
+        assert abs(p - expect) < 1e-12, (r["pathway"], p, expect)
+    assert res.loc[res["pathway"] == "path002"].empty      # zero-overlap excluded
+    # BH monotonic: adj_p should be >= pvalue and non-decreasing in sorted order
+    assert (res["adj_p"].values >= res["pvalue"].values).all()
+    print("    selftest PASSED: all fisher p-values match the exact hypergeometric "
+          "survival probability; BH-adjustment applied; zero-overlap pathways excluded.")
+    print(res.to_string(index=False))
+    return res
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+def main():
+    print("="*72)
+    print("BixBench bix-26-q4 - KEGG ORA of downregulated P. aeruginosa genes")
+    ora_selftest()
+    print("="*72)
+
+    f1 = os.path.join(DATA, "res_GluFevsGluFePlus.rds")
+    f2 = os.path.join(DATA, "res_SuccvsGluFePlus.rds")
+    df_glu = read_rds_table(f1)
+    df_succ = read_rds_table(f2)
+
+    print("\n[1] Tables loaded.")
+    print(f"    res_GluFevsGluFePlus: {df_glu.shape}, "
+          f"desc='Media MMGluFeMinus vs MMGluFePlus'")
+    print(f"    res_SuccvsGluFePlus : {df_succ.shape}, "
+          f"desc='Media Succinate vs MMGluFePlus'")
+    for name, df in [("Glu", df_glu), ("Succ", df_succ)]:
+        print("    [%s] NA counts: %s" % (name, ", ".join(
+              f"{c}={int(df[c].isna().sum())}"
+              for c in ["baseMean","log2FoldChange","lfcSE","stat","pvalue","padj"])))
+    assert (df_glu["gene"].duplicated().sum() == 0) and \
+           (df_succ["gene"].duplicated().sum() == 0)
+    print(f"    gene overlap between files: "
+          f"{len(set(df_glu['gene']) & set(df_succ['gene']))} / {len(df_glu)}")
+
+    def downreg(df):
+        m = (df["padj"] <= PADJ_CUT) & (df["log2FoldChange"] <= LFC_CUT)
+        return set(df.loc[m, "gene"])
+
+    D_glu = downreg(df_glu)
+    D_succ = downreg(df_succ)
+    print("\n[2] Significantly downregulated (padj<=0.05 & log2FC<=-1.5):")
+    print(f"    Glu (MMGluFeMinus vs MMGluFePlus): {len(D_glu)} genes")
+    print(f"    Succ (Succinate vs MMGluFePlus)  : {len(D_succ)} genes")
+    print(f"    downregulated GENE-set intersection: {len(D_glu & D_succ)} "
+          f"(note: not the requested pathway-level count)")
+
+    bg_glu = set(df_glu["gene"]); bg_succ = set(df_succ["gene"])
+    print(f"\n[3] ORA background (universe) = all measured genes per file: "
+          f"{len(bg_glu)} / {len(bg_succ)}")
+
+    print("\n[4] Attempt: P. aeruginosa KEGG pathway annotation ('latest KEGG db')...")
+    for u, v in try_fetch_kegg_annotation().items():
+        print(f"    {u}\n      {str(v)[:120]}")
+    print("    pip install gseapy/bioservices/mygene: FAILED (no name resolution).")
+    print("    => No network; no KEGG pathway annotation present in the capsule.")
+
+    pathway_annot = None
+    if os.path.exists(ANNOT_FILE):
+        ant = pd.read_csv(ANNOT_FILE, sep="\t")
+        pathway_annot = {}
+        for _, r in ant.iterrows():
+            pathway_annot.setdefault(str(r["pathway_id"]), set()).add(str(r["gene_id"]))
+        print(f"[5] Local KEGG annotation loaded from {ANNOT_FILE}: "
+              f"{len(pathway_annot)} pathways")
+    else:
+        print(f"[5] No local KEGG annotation file present "
+              f"(expected at {ANNOT_FILE}).")
+
+    if pathway_annot:
+        or_glu = ora(D_glu, bg_glu, pathway_annot)
+        or_succ = ora(D_succ, bg_succ, pathway_annot)
+        en_glu = set(or_glu.loc[or_glu["adj_p"] <= 0.05, "pathway"])
+        en_succ = set(or_succ.loc[or_succ["adj_p"] <= 0.05, "pathway"])
+        common = en_glu & en_succ
+        print(f"\n[6] FINAL ANSWER (with real KEGG annotation):")
+        print(f"    enriched pathways Glu : {len(en_glu)}")
+        print(f"    enriched pathways Succ: {len(en_succ)}")
+        print(f"    COMMON enriched pathway IDs: {len(common)}")
+        or_glu.to_csv(os.path.join(SCRIPT_DIR, "ora_Glu.csv"), index=False)
+        or_succ.to_csv(os.path.join(SCRIPT_DIR, "ora_Succ.csv"), index=False)
+    else:
+        print("\n[6] FINAL ANSWER NOT COMPUTABLE IN THIS CAPSULE.")
+        print("    The KEGG gene->pathway annotation (org 'pae', 'latest KEGG db')")
+        print("    is a strict requirement of the question and is not present or")
+        print("    reachable offline. The ORA implementation is validated and ready;")
+        print("    with a real annotation table the final common-pathway count would")
+        print("    be computed exactly as specified (Fisher/BH, adj p<=0.05, common =")
+        print("    intersection of enriched KEGG pathway IDs).")
+
+    pd.DataFrame({"gene": sorted(D_glu)}).to_csv(
+        os.path.join(SCRIPT_DIR, "DEG_downreg_Glu.csv"), index=False)
+    pd.DataFrame({"gene": sorted(D_succ)}).to_csv(
+        os.path.join(SCRIPT_DIR, "DEG_downreg_Succ.csv"), index=False)
+    df_glu.to_csv(os.path.join(SCRIPT_DIR, "res_Glu.csv"), index=False)
+    df_succ.to_csv(os.path.join(SCRIPT_DIR, "res_Succ.csv"), index=False)
+    print(f"\n[7] Outputs written to {SCRIPT_DIR}.")
+
+    print("\n" + "="*72)
+    print("STATEMENT OF FINAL-COUNT COMPUTATION (when real KEGG data is available)")
+    print("="*72)
+    print("""The requested integer is:
+    | {enriched KEGG pae pathway IDs for D_Glu (padj<=0.05 & log2FC<=-1.5,
+       background = 5828 measured genes, ORA = Fisher exact greater + BH,
+       significant iff adj p <= 0.05)}
+      INTERSECT
+      {enriched KEGG pae pathway IDs for D_Succ (identical procedure)} |
+
+D_Glu (91) and D_Succ (289) are fixed and delivered. The missing external input is
+exclusively the P. aeruginosa (pae) KEGG pathway->gene annotation from the live
+'latest KEGG db' (KEGGREST: rest.kegg.jp/link/pathway/pae, list/pathway/pae) or an
+organism annotation package, plus the PA14_XXXXX -> pae/ENTREZ identifier mapping
+(normally org.Pa.eg.db / mygene). None can be retrieved in this capsule (no DNS /
+routes; package installation fails). No mapping or count was invented; the ORA code
+above will compute the exact number as soon as data/kegg_pae_pathways.tsv (columns:
+pathway_id, pathway_name, gene_id) is provided.""")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

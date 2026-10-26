@@ -1,0 +1,752 @@
+"""
+analysis.py - Deployment prediction sets under label-weighted miss risk (ASI benchmark).
+
+Approach (as approved):
+  - Risk spec: R = E[ c(Y) * 1{Y notin S(X)} ] (unnormalized), target_risk = 0.1084,
+    empty prediction sets disallowed.
+  - Public grouping: k-means (k=4) on z-scored anonymous features, fit on calibration,
+    deployment assigned by nearest centroid -> proxy_stratum s0..s3.
+  - Policy: per (proxy_stratum, label) inclusion thresholds t_{g,l}, calibrated on the
+    labeled calibration set with a cost-aware greedy threshold sweep and a conservative
+    per-group risk budget (~0.08), so each stratum's empirical weighted-miss risk stays
+    well below target.  Every set always includes the argmax-score label (non-empty).
+  - Deployment risk audit: importance-weighted transfer, R_hat_dep = sum_g w_g^dep * R_g^cal,
+    and two-stage transfer for recovered groups (argmax-label groups of public scores).
+  - All outputs written under results/; PNG diagnostics rendered with a pure-stdlib
+    numpy+zlib raster encoder (matplotlib unavailable, no network).
+
+No reference/ files are read; deployment labels are intentionally hidden and never used.
+"""
+import os, json, math, struct, zlib, heapq
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+RNG = np.random.default_rng(0)
+PD_VER_ROUND = True  # pandas 3.x: use axis= as keyword
+
+# ----------------------------------------------------------------------------
+# configuration & data loading
+# ----------------------------------------------------------------------------
+DATA = "data"
+LABELS = [f"label_{i:02d}" for i in range(9)]
+FEATURES = [f"v{i:03d}" for i in range(10)]
+K_GROUPS = 4
+GROUP_BUDGET = 0.076            # per-proxy-stratum calibration risk budget (empir+UB<=target)
+DELTA = 0.1366                 # failure probability for confidence bounds (risk spec)
+K_BINS_CALDIAG = 10            # bins per group in calibration_diagnostics
+SEED = 0
+
+
+def load_all():
+    cal_f = pd.read_csv(f"{DATA}/calibration_features.csv")
+    cal_l = pd.read_csv(f"{DATA}/calibration_labels.csv")
+    cal_s = pd.read_csv(f"{DATA}/calibration_scores.csv")
+    dep_f = pd.read_csv(f"{DATA}/deployment_features.csv")
+    dep_s = pd.read_csv(f"{DATA}/deployment_scores.csv")
+    with open(f"{DATA}/risk_spec.json") as fh:
+        risk_spec = json.load(fh)
+    with open(f"{DATA}/metadata.json") as fh:
+        meta = json.load(fh)
+    return cal_f, cal_l, cal_s, dep_f, dep_s, risk_spec, meta
+
+
+cal_f, cal_l, cal_s, dep_f, dep_s, RISK, META = load_all()
+TARGET_RISK = float(RISK["target_risk"])
+COSTS = {k: float(v) for k, v in RISK["label_costs"].items()}
+COST = np.array([COSTS[l] for l in LABELS])
+LABEL_SET = set(LABELS)
+
+cal = cal_s.merge(cal_l, on="record_id").merge(cal_f, on="record_id")
+dep = dep_s.merge(dep_f, on="record_id")
+assert not cal["true_label"].isna().any()
+assert cal["record_id"].duplicated().sum() == 0
+assert dep["record_id"].duplicated().sum() == 0
+
+os.makedirs("results", exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# proxy strata: k-means k=4 on z-scored features (cal-fit + nearest centroid)
+# ----------------------------------------------------------------------------
+def kmeans_fit(X, k, seed=SEED, iters=300):
+    rng = np.random.default_rng(seed)
+    cent = X[rng.choice(len(X), k, replace=False)]
+    for _ in range(iters):
+        d2 = ((X[:, None, :] - cent[None, :, :]) ** 2).sum(2)
+        a = d2.argmin(1)
+        newc = np.array([X[a == j].mean(0) if (a == j).sum() > 0 else cent[j]
+                         for j in range(k)])
+        if np.abs(newc - cent).max() < 1e-9:
+            break
+        cent = newc
+    return cent
+
+
+def assign_groups(X, cent):
+    return ((X[:, None, :] - cent[None, :, :]) ** 2).sum(2).argmin(1)
+
+
+zmean = cal[FEATURES].values.mean(0)
+zstd = cal[FEATURES].values.std(0)
+Z_cal = (cal[FEATURES].values - zmean) / zstd
+Z_dep = (dep[FEATURES].values - zmean) / zstd
+
+centroids = kmeans_fit(Z_cal, K_GROUPS)
+cal["stratum"] = assign_groups(Z_cal, centroids)
+dep["stratum"] = assign_groups(Z_dep, centroids)
+
+STRATA = [f"s{i}" for i in range(K_GROUPS)]
+
+# ----------------------------------------------------------------------------
+# risk / set-size helpers
+# ----------------------------------------------------------------------------
+def weighted_miss_risk(Smat, yidx, mask):
+    """mean over masked calibration records of cost[true]*1[true not included]."""
+    n = mask.sum()
+    if n == 0:
+        return 0.0
+    miss = ~Smat[mask, yidx[mask]]
+    return float((COST[yidx[mask]] * miss).sum() / n)
+
+
+def build_sets(score_mat, thr_mat):
+    """Return boolean (n,9) inclusion matrix:
+    include l if score>=threshold OR l is the argmax label (non-empty guarantee)."""
+    inc = score_mat >= thr_mat
+    am = np.argmax(score_mat, axis=1)
+    inc[np.arange(len(score_mat)), am] = True
+    return inc
+
+
+# ----------------------------------------------------------------------------
+# cost-aware greedy threshold calibration per proxy stratum
+# ----------------------------------------------------------------------------
+def calibrate_group(S, yidx, budget, n_g, cost_arr):
+    """Greedy: start include-everything (risk 0, size 9), raise per-label thresholds,
+    each step drops the highest-benefit / lowest-risk-increase slice of records.
+    A record's label-l score can only affect set membership if l is NOT its argmax
+    (argmax is always included -> non-empty guarantee). Returns thresholds (9,)."""
+    am = np.argmax(S, axis=1)
+    # eligible indicator: y==l and not argmax  -> contributes risk when dropped
+    # droppable indicator: not argmax           -> contributes set-size benefit when dropped
+    eligible = np.zeros((9, n_g), dtype=bool)   # records with true label l and l != argmax
+    droppable = np.zeros((9, n_g), dtype=bool)
+    for l in range(9):
+        yl = (yidx == l)
+        eligible[l] = yl & (am != l)
+        droppable[l] = am != l
+
+    thr = np.zeros(9)
+    risk = 0.0
+    # per label, candidate thresholds = observed score values of its eligible records, ascending
+    steps_heap = []  # (-efficiency, seq, l, t)
+    cur = np.zeros(9, dtype=int)  # index pointer into sorted candidate thresholds per label
+    cand = []
+    for l in range(9):
+        vals = np.unique(S[eligible[l], l])
+        cand.append(vals)
+    seq = 0
+    for l in range(9):
+        if len(cand[l]) > 0:
+            t = cand[l][0]
+            # step risk/benefit raising threshold from thr[l]=0 to just-above t
+            add_risk = COST[l] * int((eligible[l] & (S[:, l] < t)).sum()) / n_g
+            benefit = int((droppable[l] & (S[:, l] < t)).sum()) / n_g
+            eff = benefit / max(add_risk, 1e-12)
+            heapq.heappush(steps_heap, (-eff, seq, l, t))
+            seq += 1
+    while steps_heap:
+        neg_eff, _, l, t = heapq.heappop(steps_heap)
+        if t <= thr[l]:
+            continue
+        add_risk = COST[l] * int((eligible[l] & (S[:, l] >= thr[l]) & (S[:, l] < t)).sum()) / n_g
+        if risk + add_risk > budget:
+            # try next higher candidate for this label later (skip this one)
+            cur[l] += 1
+            while cur[l] < len(cand[l]) and cand[l][cur[l]] <= thr[l]:
+                cur[l] += 1
+            if cur[l] < len(cand[l]):
+                t2 = cand[l][cur[l]]
+                add_risk2 = COST[l] * int((eligible[l] & (S[:, l] >= thr[l]) & (S[:, l] < t2)).sum()) / n_g
+                benefit2 = int((droppable[l] & (S[:, l] >= thr[l]) & (S[:, l] < t2)).sum()) / n_g
+                heapq.heappush(steps_heap, (-benefit2 / max(add_risk2, 1e-12), seq, l, t2))
+                seq += 1
+            continue
+        thr[l] = t
+        risk += add_risk
+        # push next candidate step for this label
+        cur[l] += 1
+        while cur[l] < len(cand[l]) and cand[l][cur[l]] <= thr[l]:
+            cur[l] += 1
+        if cur[l] < len(cand[l]):
+            t2 = cand[l][cur[l]]
+            add_risk2 = COST[l] * int((eligible[l] & (S[:, l] >= thr[l]) & (S[:, l] < t2)).sum()) / n_g
+            benefit2 = int((droppable[l] & (S[:, l] >= thr[l]) & (S[:, l] < t2)).sum()) / n_g
+            heapq.heappush(steps_heap, (-benefit2 / max(add_risk2, 1e-12), seq, l, t2))
+            seq += 1
+    return thr
+
+# ----------------------------------------------------------------------------
+# apply calibrated policy to calibration (for diagnostics) and deployment (output)
+# ----------------------------------------------------------------------------
+def apply_policy(df, strata_col):
+    """df needs score columns + stratum. Returns inc matrix, thr per stratum."""
+    S = df[LABELS].values
+    n = len(df)
+    thr = np.zeros((K_GROUPS, 9))
+    for g in range(K_GROUPS):
+        idx = np.where(df[strata_col].values == g)[0]
+        Sg = S[idx]
+        yg = np.array([LABELS.index(y) for y in df["true_label"].values[idx]]) \
+            if "true_label" in df.columns else None
+        if yg is not None:
+            thr[g] = calibrate_group(Sg, yg, GROUP_BUDGET, len(idx), COST)
+        else:
+            thr[g] = THRESHOLDS[g]  # carry over calibration thresholds
+    inc = np.zeros((n, 9), dtype=bool)
+    for g in range(K_GROUPS):
+        idx = np.where(df[strata_col].values == g)[0]
+        inc[idx] = build_sets(S[idx], thr[g])
+    return inc, thr
+
+
+# calibration: calibrate thresholds on the calibration set
+S_cal = cal[LABELS].values
+yidx_cal = np.array([LABELS.index(y) for y in cal["true_label"]])
+inc_cal = np.zeros((len(cal), 9), dtype=bool)
+THRESHOLDS = np.zeros((K_GROUPS, 9))
+for g in range(K_GROUPS):
+    idx = np.where(cal["stratum"].values == g)[0]
+    Sg = S_cal[idx]
+    yg = yidx_cal[idx]
+    THRESHOLDS[g] = calibrate_group(Sg, yg, GROUP_BUDGET, len(idx), COST)
+    inc_cal[idx] = build_sets(Sg, THRESHOLDS[g])
+
+# deployment: apply calibration thresholds
+S_dep = dep[LABELS].values
+inc_dep = np.zeros((len(dep), 9), dtype=bool)
+for g in range(K_GROUPS):
+    idx = np.where(dep["stratum"].values == g)[0]
+    inc_dep[idx] = build_sets(S_dep[idx], THRESHOLDS[g])
+
+# set-size stats
+size_cal = inc_cal.sum(1)
+size_dep = inc_dep.sum(1)
+dep["set_size"] = size_dep
+
+# --- per-stratum calibration risk (transferred deployment estimate) ---
+cal_risk_g = np.zeros(K_GROUPS)
+cal_size_g = np.zeros(K_GROUPS)
+for g in range(K_GROUPS):
+    m = cal["stratum"].values == g
+    cal_risk_g[g] = weighted_miss_risk(inc_cal, yidx_cal, m)
+    cal_size_g[g] = size_cal[m].mean()
+
+w_cal = np.bincount(cal["stratum"].values, minlength=K_GROUPS) / len(cal)
+w_dep = np.bincount(dep["stratum"].values, minlength=K_GROUPS) / len(dep)
+
+dep_risk_g = cal_risk_g                      # transfer: conditional risk per stratum
+dep_risk_overall = float((w_dep * dep_risk_g).sum())   # importance re-weighted
+mean_size_dep_g = np.array([size_dep[dep["stratum"].values == g].mean()
+                            for g in range(K_GROUPS)])
+p90_size_dep_g = np.array([np.percentile(size_dep[dep["stratum"].values == g], 90)
+                           for g in range(K_GROUPS)])
+mean_size_overall = float(size_dep.mean())
+p90_size_overall = float(np.percentile(size_dep, 90))
+
+# --- recovered groups (argmax-label from public scores) ---
+dep["argmax"] = S_dep.argmax(1)
+cal["argmax"] = S_cal.argmax(1)
+rec_ids = {i: f"rl_{i:02d}" for i, l in enumerate(LABELS)}
+rec_risk = {}   # deployment estimate via two-stage transfer
+rec_n_dep = {}
+rec_mean_size = {}
+rec_p90_size = {}
+# joint prevalence of (recovered group, proxy stratum) for transfer
+joint_dep = np.zeros((9, K_GROUPS))
+for l in range(9):
+    for g in range(K_GROUPS):
+        joint_dep[l, g] = ((dep["argmax"].values == l) & (dep["stratum"].values == g)).sum()
+for l in range(9):
+    n_dep = int(joint_dep[l].sum())
+    rec_n_dep[l] = n_dep
+    if n_dep > 0:
+        w = joint_dep[l] / n_dep
+        rec_risk[l] = float((w * dep_risk_g).sum())
+    else:
+        rec_risk[l] = 0.0
+    mm = dep["argmax"].values == l
+    rec_mean_size[l] = size_dep[mm].mean() if n_dep else 0.0
+    rec_p90_size[l] = np.percentile(size_dep[mm], 90) if n_dep else 0.0
+
+# calibration risk for recovered groups (for calibration_diagnostics coverage)
+rec_risk_cal = {}
+for l in range(9):
+    mm = cal["argmax"].values == l
+    rec_risk_cal[l] = weighted_miss_risk(inc_cal, yidx_cal, mm)
+
+# ----------------------------------------------------------------------------
+# 1) prediction_sets.csv
+# ----------------------------------------------------------------------------
+pred_labels = np.where(inc_dep, np.array(LABELS)[None, :], "")
+pred_sets = [" ".join(pred_labels[i][pred_labels[i] != ""]) for i in range(len(dep))]
+# safety: never empty (argmax always included, but double check)
+for i in range(len(dep)):
+    if pred_sets[i] == "":
+        pred_sets[i] = LABELS[int(S_dep[i].argmax())]
+prediction_sets = pd.DataFrame({"record_id": dep["record_id"], "prediction_set": pred_sets})
+assert len(prediction_sets) == len(dep)
+assert prediction_sets["prediction_set"].str.strip().str.len().min() > 0
+prediction_sets.to_csv("results/prediction_sets.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 2) policy_parameters.csv
+# ----------------------------------------------------------------------------
+def hoeffding_ub(risk_est, n):
+    return min(1.0, risk_est + math.sqrt(math.log(1.0 / DELTA) / (2.0 * max(n, 1))))
+
+rows = []
+for g in range(K_GROUPS):
+    m = cal["stratum"].values == g
+    n_g = int(m.sum())
+    n_lab = np.array([int((cal["true_label"] == l).values[m].sum()) for l in LABELS])
+    ub = hoeffding_ub(dep_risk_g[g], n_g)
+    for j, l in enumerate(LABELS):
+        rows.append({
+            "proxy_stratum": STRATA[g],
+            "label": l,
+            "n_calibration": n_g,
+            "n_calibration_label": int(n_lab[j]),
+            "threshold": float(THRESHOLDS[g, j]),
+            "group_empirical_weighted_miss_risk": float(dep_risk_g[g]),
+            "group_upper_confidence_risk": float(ub),
+            "group_expected_set_size": float(cal_size_g[g]),
+            "calibration_target_risk": GROUP_BUDGET,
+            "target_risk": TARGET_RISK,
+        })
+policy_parameters = pd.DataFrame(rows, columns=[
+    "proxy_stratum", "label", "n_calibration", "n_calibration_label", "threshold",
+    "group_empirical_weighted_miss_risk", "group_upper_confidence_risk",
+    "group_expected_set_size", "calibration_target_risk", "target_risk"])
+policy_parameters.to_csv("results/policy_parameters.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 3) audit_summary.csv
+# ----------------------------------------------------------------------------
+def audit_row(scope, sid, n, risk, msz, p90, target):
+    return {"scope": scope, "stratum_id": sid, "n_records": int(n),
+            "empirical_risk": float(risk), "mean_set_size": float(msz),
+            "p90_set_size": float(p90), "target_risk": float(target),
+            "risk_violation": float(risk) - float(target)}
+
+audit_rows = [audit_row("overall", "all", len(dep), dep_risk_overall,
+                        mean_size_overall, p90_size_overall, TARGET_RISK)]
+for g in range(K_GROUPS):
+    n_g_dep = int((dep["stratum"].values == g).sum())
+    audit_rows.append(audit_row("proxy_stratum", STRATA[g], n_g_dep,
+                                dep_risk_g[g], mean_size_dep_g[g], p90_size_dep_g[g],
+                                TARGET_RISK))
+for l in range(9):
+    audit_rows.append(audit_row("recovered_group", rec_ids[l], rec_n_dep[l],
+                                rec_risk[l], rec_mean_size[l], rec_p90_size[l],
+                                TARGET_RISK))
+audit_summary = pd.DataFrame(audit_rows, columns=[
+    "scope", "stratum_id", "n_records", "empirical_risk", "mean_set_size",
+    "p90_set_size", "target_risk", "risk_violation"])
+audit_summary.to_csv("results/audit_summary.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 4) set_size_summary.csv
+# ----------------------------------------------------------------------------
+set_size_summary = pd.DataFrame({
+    "record_id": dep["record_id"],
+    "set_size": size_dep,
+    "proxy_stratum": [STRATA[g] for g in dep["stratum"].values]})
+set_size_summary.to_csv("results/set_size_summary.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 5) partition_diagnostics.csv (proxy_stratum + recovered_group scopes)
+# ----------------------------------------------------------------------------
+prows = []
+for g in range(K_GROUPS):
+    n_g_dep = int((dep["stratum"].values == g).sum())
+    prows.append({"scope": "proxy_stratum", "stratum_id": STRATA[g],
+                  "n_records": n_g_dep, "empirical_risk": dep_risk_g[g],
+                  "mean_set_size": mean_size_dep_g[g], "p90_set_size": p90_size_dep_g[g],
+                  "target_risk": TARGET_RISK,
+                  "risk_margin": TARGET_RISK - dep_risk_g[g]})
+for l in range(9):
+    prows.append({"scope": "recovered_group", "stratum_id": rec_ids[l],
+                  "n_records": rec_n_dep[l], "empirical_risk": rec_risk[l],
+                  "mean_set_size": rec_mean_size[l], "p90_set_size": rec_p90_size[l],
+                  "target_risk": TARGET_RISK,
+                  "risk_margin": TARGET_RISK - rec_risk[l]})
+partition_diagnostics = pd.DataFrame(prows, columns=[
+    "scope", "stratum_id", "n_records", "empirical_risk", "mean_set_size",
+    "p90_set_size", "target_risk", "risk_margin"])
+partition_diagnostics.to_csv("results/partition_diagnostics.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 6) distribution_diagnostics.csv
+# ----------------------------------------------------------------------------
+frac_cal = np.bincount(cal["stratum"].values, minlength=K_GROUPS) / len(cal)
+frac_dep = np.bincount(dep["stratum"].values, minlength=K_GROUPS) / len(dep)
+drows = []
+for g in range(K_GROUPS):
+    dr = float(frac_dep[g] / frac_cal[g]) if frac_cal[g] > 1e-9 else float("nan")
+    drows.append({"proxy_stratum": STRATA[g],
+                  "calibration_fraction": float(frac_cal[g]),
+                  "deployment_fraction": float(frac_dep[g]),
+                  "density_ratio_estimate": dr,
+                  "absolute_fraction_shift": float(abs(frac_dep[g] - frac_cal[g]))})
+distribution_diagnostics = pd.DataFrame(drows, columns=[
+    "proxy_stratum", "calibration_fraction", "deployment_fraction",
+    "density_ratio_estimate", "absolute_fraction_shift"])
+distribution_diagnostics.to_csv("results/distribution_diagnostics.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 7) calibration_diagnostics.csv (score bins within each proxy stratum;
+#    mean_true_label_score = mean score of the true calibration label in the bin)
+# ----------------------------------------------------------------------------
+cal_ts = S_cal[np.arange(len(cal)), yidx_cal]
+cbins = np.linspace(0.0, 1.0, K_BINS_CALDIAG + 1)
+crows = []
+for g in range(K_GROUPS):
+    m = cal["stratum"].values == g
+    for b in range(K_BINS_CALDIAG):
+        lo, hi = cbins[b], cbins[b + 1]
+        # bin over the record's max score (confidence axis)
+        inbin = m & (cal_ts >= lo) & (cal_ts <= hi)
+        n_rec = int(inbin.sum())
+        if n_rec > 0:
+            mts = float(cal_ts[inbin].mean())
+        else:
+            mts = float("nan")
+        crows.append({"proxy_stratum": STRATA[g], "bin_id": f"bin_{b:02d}",
+                      "score_left": float(lo), "score_right": float(hi),
+                      "n_records": n_rec, "mean_true_label_score": mts})
+calibration_diagnostics = pd.DataFrame(crows, columns=[
+    "proxy_stratum", "bin_id", "score_left", "score_right", "n_records",
+    "mean_true_label_score"])
+calibration_diagnostics.to_csv("results/calibration_diagnostics.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# 8) constraint_audit.csv (same scopes as audit_summary)
+# ----------------------------------------------------------------------------
+crows = []
+for _, r in audit_summary.iterrows():
+    risk = float(r["empirical_risk"])
+    tgt = float(r["target_risk"])
+    crows.append({"scope": r["scope"], "stratum_id": r["stratum_id"],
+                  "empirical_risk": risk, "target_risk": tgt,
+                  "risk_violation": risk - tgt,
+                  "violates": bool(risk > tgt)})
+constraint_audit = pd.DataFrame(crows, columns=[
+    "scope", "stratum_id", "empirical_risk", "target_risk", "risk_violation",
+    "violates"])
+constraint_audit.to_csv("results/constraint_audit.csv", index=False)
+
+# ----------------------------------------------------------------------------
+# print summary for the handoff
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("CALIBRATION-TRANSFER DEPLOYMENT RISK ESTIMATES (unnormalized E[c(Y)*miss])")
+overall = dep_risk_overall
+print(f"overall      : R={overall:.4f}  | mean_set_size={mean_size_overall:.3f}  p90={p90_size_overall:.1f}  n={len(dep)}")
+for g in range(K_GROUPS):
+    print(f"proxy_stratum {STRATA[g]}: R={dep_risk_g[g]:.4f}  | mean_set_size={mean_size_dep_g[g]:.3f}  p90={p90_size_dep_g[g]:.1f}  n={(dep['stratum'].values==g).sum()}  w_dep={w_dep[g]:.3f}")
+print("recovered_group (argmax label) deployment estimates:")
+for l in range(9):
+    print(f"  {rec_ids[l]} ({LABELS[l]}): R={rec_risk[l]:.4f} n={rec_n_dep[l]} mean_size={rec_mean_size[l]:.2f}")
+print("target_risk =", TARGET_RISK, " budget/group =", GROUP_BUDGET)
+print("calibration group risks:", np.round(dep_risk_g, 4))
+print("Hoeffding UBs (delta=%.4f):" % DELTA, np.round([hoeffding_ub(dep_risk_g[g], (cal['stratum'].values==g).sum()) for g in range(K_GROUPS)], 4))
+print("thr matrix:"); print(np.round(THRESHOLDS, 3))
+print("distribution:"); print(distribution_diagnostics.to_string(index=False))
+
+# ============================================================================
+# Pure-stdlib PNG renderer (numpy raster + zlib) - matplotlib unavailable
+# ============================================================================
+_FONT = {
+ "A":[0x0E,0x11,0x11,0x1F,0x11,0x11,0x11],"B":[0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E],
+ "C":[0x0E,0x11,0x10,0x10,0x10,0x11,0x0E],"D":[0x1E,0x11,0x11,0x11,0x11,0x11,0x1E],
+ "E":[0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F],"F":[0x1F,0x10,0x10,0x1E,0x10,0x10,0x10],
+ "G":[0x0E,0x11,0x10,0x17,0x11,0x11,0x0F],"H":[0x11,0x11,0x11,0x1F,0x11,0x11,0x11],
+ "I":[0x0E,0x04,0x04,0x04,0x04,0x04,0x0E],"J":[0x07,0x02,0x02,0x02,0x02,0x12,0x0C],
+ "K":[0x11,0x12,0x14,0x18,0x14,0x12,0x11],"L":[0x10,0x10,0x10,0x10,0x10,0x10,0x1F],
+ "M":[0x11,0x1B,0x15,0x15,0x11,0x11,0x11],"N":[0x11,0x19,0x15,0x13,0x11,0x11,0x11],
+ "O":[0x0E,0x11,0x11,0x11,0x11,0x11,0x0E],"P":[0x1E,0x11,0x11,0x1E,0x10,0x10,0x10],
+ "Q":[0x0E,0x11,0x11,0x11,0x15,0x12,0x0D],"R":[0x1E,0x11,0x11,0x1E,0x14,0x12,0x11],
+ "S":[0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E],"T":[0x1F,0x04,0x04,0x04,0x04,0x04,0x04],
+ "U":[0x11,0x11,0x11,0x11,0x11,0x11,0x0E],"V":[0x11,0x11,0x11,0x11,0x11,0x0A,0x04],
+ "W":[0x11,0x11,0x11,0x15,0x15,0x1B,0x11],"X":[0x11,0x11,0x0A,0x04,0x0A,0x11,0x11],
+ "Y":[0x11,0x11,0x0A,0x04,0x04,0x04,0x04],"Z":[0x1F,0x01,0x02,0x04,0x08,0x10,0x1F],
+ "0":[0x0E,0x11,0x13,0x15,0x19,0x11,0x0E],"1":[0x04,0x0C,0x04,0x04,0x04,0x04,0x0E],
+ "2":[0x0E,0x11,0x01,0x02,0x04,0x08,0x1F],"3":[0x1F,0x02,0x04,0x02,0x01,0x11,0x0E],
+ "4":[0x02,0x06,0x0A,0x12,0x1F,0x02,0x02],"5":[0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E],
+ "6":[0x06,0x08,0x10,0x1E,0x11,0x11,0x0E],"7":[0x1F,0x01,0x02,0x04,0x08,0x08,0x08],
+ "8":[0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E],"9":[0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C],
+ " ":[0,0,0,0,0,0,0],".":[0,0,0,0,0,0,0x04],"-":[0,0,0,0x1F,0,0,0],
+ "_":[0,0,0,0,0,0,0x1F],":":[0,0,0x04,0,0x04,0,0],"/":[0x01,0x02,0x02,0x04,0x08,0x08,0x10],
+ "(":[0x02,0x04,0x08,0x08,0x08,0x04,0x02],")":[0x08,0x04,0x02,0x02,0x02,0x04,0x08],
+ "%":[0x11,0x12,0x02,0x04,0x08,0x09,0x11],"=":[0,0,0x1F,0,0x1F,0,0],
+ "<":[0,0x02,0x04,0x08,0x04,0x02,0],">":[0,0x08,0x04,0x02,0x04,0x08,0],
+ "+":[0,0x04,0x04,0x1F,0x04,0x04,0],",":[0,0,0,0,0,0x0C,0x04],
+}
+def _glyph(c):
+    c = c.upper()
+    return _FONT.get(c, [0]*7)
+
+def put_text(img, x, y, text, color, scale=1):
+    h, w = img.shape[:2]
+    cx = x
+    for ch in text:
+        g = _glyph(ch)
+        for r in range(7):
+            row = g[r]
+            for cbit in range(5):
+                if row & (0x10 >> cbit):
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            px, py = cx + cbit*scale + dx, y + r*scale + dy
+                            if 0 <= px < w and 0 <= py < h:
+                                img[py, px] = color
+        cx += 6 * scale
+    return cx
+
+def draw_line(img, x0, y0, x1, y1, color, thick=1):
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    dx, dy = abs(x1-x0), abs(y1-y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        for ox in range(thick):
+            for oy in range(thick):
+                px, py = x0-ox//2, y0-oy//2
+                if 0 <= px < w and 0 <= py < h:
+                    img[py, px] = color
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2*err
+        if e2 > -dy: err -= dy; x0 += sx
+        if e2 < dx:  err += dx; y0 += sy
+
+def fill_rect(img, x0, y0, x1, y1, color):
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    if x0 > x1:
+        x0, x1 = x1, x0
+    if y0 > y1:
+        y0, y1 = y1, y0
+    x0, x1 = max(0, x0), min(w - 1, x1)
+    y0, y1 = max(0, y0), min(h - 1, y1)
+    if x1 < x0 or y1 < y0:
+        return
+    img[y0:y1+1, x0:x1+1] = color
+
+def write_png(path, img):
+    h, w = img.shape[:2]
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    raw = b"".join(b"\x00" + img[y].tobytes() for y in range(h))
+    data = zlib.compress(raw, 6)
+    def chunk(typ, dat):
+        return (struct.pack(">I", len(dat)) + typ + dat +
+                struct.pack(">I", zlib.crc32(typ + dat) & 0xffffffff))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", data))
+        f.write(chunk(b"IEND", b""))
+
+# ============================================================================
+# Chart helpers + the three diagnostic figures
+# ============================================================================
+def draw_axes(img, ml, mt, mr, mb, lo, hi):
+    """Cartesian axes mapping data [lo,hi] x [lo,hi] into image; draws frame & ticks.
+    Returns fx(v), fy(v) pixel mappers (y inverted)."""
+    H, W = img.shape[:2]
+    X0, X1 = ml, W - mr - 1
+    Y0, Y1 = mt, H - mb - 1
+    def fx(v): return X0 + (v - lo[0]) / (hi[0] - lo[0] + 1e-12) * (X1 - X0)
+    def fy(v): return Y1 - (v - lo[1]) / (hi[1] - lo[1] + 1e-12) * (Y1 - Y0)
+    c = np.array([40, 40, 40], dtype=np.uint8)
+    draw_line(img, X0, Y0, X0, Y1, c, 1)
+    draw_line(img, X0, Y1, X1, Y1, c, 1)
+    # x ticks
+    for i in range(6):
+        v = lo[0] + (hi[0] - lo[0]) * i / 5.0
+        px = int(fx(v))
+        draw_line(img, px, Y1, px, Y1 + 4, c, 1)
+        put_text(img, px - 10, Y1 + 6, f"{v:.2f}", (40, 40, 40), 1)
+    # y ticks
+    for i in range(5):
+        v = lo[1] + (hi[1] - lo[1]) * i / 4.0
+        py = int(fy(v))
+        draw_line(img, X0 - 4, py, X0, py, c, 1)
+        put_text(img, ml - 32, py - 3, f"{v:.2f}", (40, 40, 40), 1)
+    return fx, fy
+
+
+def run_budget(b):
+    """Recalibrate thresholds at budget b; return (overall transfer risk,
+    deployment mean set size, per-group cal risk)."""
+    thr_b = np.zeros((K_GROUPS, 9))
+    inc_b = np.zeros((len(cal), 9), dtype=bool)
+    for g in range(K_GROUPS):
+        idx = np.where(cal["stratum"].values == g)[0]
+        Sg = S_cal[idx]; yg = yidx_cal[idx]
+        thr_b[g] = calibrate_group(Sg, yg, b, len(idx), COST)
+        inc_b[idx] = build_sets(Sg, thr_b[g])
+    rg = np.array([weighted_miss_risk(inc_b, yidx_cal, cal["stratum"].values == g)
+                   for g in range(K_GROUPS)])
+    risk = float((w_dep * rg).sum())
+    inc_d_b = np.zeros((len(dep), 9), dtype=bool)
+    for g in range(K_GROUPS):
+        idx = np.where(dep["stratum"].values == g)[0]
+        inc_d_b[idx] = build_sets(S_dep[idx], thr_b[g])
+    msz = float(inc_d_b.sum(1).mean())
+    return risk, msz
+
+
+def fig_set_size_tradeoff(path):
+    W, H = 740, 480
+    img = np.full((H, W, 3), 255, np.uint8)
+    budgets = [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.1084, 0.12]
+    pts = [run_budget(b) for b in budgets]
+    risks = [p[0] for p in pts]; sizes = [p[1] for p in pts]
+    lo = [min(sizes) - 0.3, 0.0]; hi = [max(sizes) + 0.3, 0.13]
+    fx, fy = draw_axes(img, 70, 24, 30, 42, lo, hi)
+    # target line
+    ty = fy(TARGET_RISK)
+    draw_line(img, fx(lo[0]), ty, fx(hi[0]), ty, (200, 60, 60), 1)
+    put_text(img, int(fx(lo[0])) + 6, int(ty) - 14, "target_risk=0.1084", (200, 60, 60), 1)
+    # tradeoff curve (x = mean deployment set size, y = transfer risk)
+    cblue = (40, 80, 190)
+    for j in range(len(pts) - 1):
+        draw_line(img, fx(sizes[j]), fy(risks[j]), fx(sizes[j+1]), fy(risks[j+1]), cblue, 2)
+    for j, b in enumerate(budgets):
+        rx, ry = int(fx(sizes[j])), int(fy(risks[j]))
+        fill_rect(img, rx-3, ry-3, rx+3, ry+3, cblue)
+    # chosen point (budget 0.08)
+    ch = min(range(len(budgets)), key=lambda j: abs(budgets[j] - GROUP_BUDGET))
+    rx, ry = int(fx(sizes[ch])), int(fy(risks[ch]))
+    fill_rect(img, rx-6, ry-6, rx+6, ry+6, (220, 120, 30))
+    put_text(img, rx + 8, ry - 4, f"budget={GROUP_BUDGET}", (220, 120, 30), 1)
+    put_text(img, 24, 12, "set-size / risk tradeoff (calibration-transfer estimate)", (20, 20, 20), 1)
+    put_text(img, 24, H - 20, "mean deployment set size", (20, 20, 20), 1)
+    put_text(img, 14, 210, "weighted miss risk", (20, 20, 20), 1)
+    write_png(path, img)
+    print("  tradeoff points (budget, risk, mean_size):",
+          [(b, round(r, 4), round(s, 3)) for b, r, s in zip(budgets, risks, sizes)])
+
+
+def bar_series(img, fx, fy, labels, values, color):
+    n = len(labels)
+    bw = 1.0 / n * 0.7
+    for i, v in enumerate(values):
+        cx = fx((i + 0.5) / n)
+        x0 = fx((i + 0.5) / n - bw / 2.0)
+        x1 = fx((i + 0.5) / n + bw / 2.0)
+        y0 = fy(0.0)
+        y1 = fy(v)
+        fill_rect(img, x0, min(y0, y1), x1, max(y0, y1), color)
+        put_text(img, int(cx) - 8, int(fy(0.0)) + 6, str(labels[i])[:5], (30, 30, 30), 1)
+
+
+def fig_partition_audit(path):
+    W, H = 780, 520
+    img = np.full((H, W, 3), 255, np.uint8)
+    # Panel 1: overall + proxy strata
+    labels1 = ["all"] + STRATA
+    vals1 = [dep_risk_overall] + [dep_risk_g[g] for g in range(K_GROUPS)]
+    ml, mt, mr, mb = 60, 30, 30, 34
+    X1 = (W - mr - 1 - ml) // 2
+    lo = [0, 0.0]; hi = [1, 0.13]
+    fx, fy = draw_axes_on(img, ml, mt, ml + X1, H - mb, lo, hi)
+    ty = fy(TARGET_RISK)
+    draw_line(img, fx(0), ty, fx(1), ty, (200, 60, 60), 1)
+    put_text(img, ml + 6, int(ty) - 14, "target", (200, 60, 60), 1)
+    bar_series(img, fx, fy, labels1, vals1, (60, 120, 200))
+    put_text(img, ml, 12, "proxy stratum: empirical risk (deployment est.)", (20, 20, 20), 1)
+    # Panel 2: recovered groups
+    labels2 = [rec_ids[l][3:] for l in range(9)]   # 00..08
+    vals2 = [rec_risk[l] for l in range(9)]
+    ml2 = ml + X1
+    fx2, fy2 = draw_axes_on(img, ml2, mt, W - mr - 1, H - mb, lo, hi)
+    ty = fy2(TARGET_RISK)
+    draw_line(img, fx2(0), ty, fx2(1), ty, (200, 60, 60), 1)
+    put_text(img, ml2 + 6, int(ty) - 14, "target", (200, 60, 60), 1)
+    bar_series(img, fx2, fy2, labels2, vals2, (120, 170, 80))
+    put_text(img, ml2, 12, "recovered group (argmax label): empirical risk", (20, 20, 20), 1)
+    write_png(path, img)
+
+
+def draw_axes_on(img, x0, y0, x1, y1, lo, hi):
+    """axes within pixel box; returns mappers."""
+    def fx(v): return x0 + (v - lo[0]) / (hi[0] - lo[0] + 1e-12) * (x1 - x0)
+    def fy(v): return y1 - (v - lo[1]) / (hi[1] - lo[1] + 1e-12) * (y1 - y0)
+    c = np.array([40, 40, 40], dtype=np.uint8)
+    draw_line(img, x0, y0, x0, y1, c, 1)
+    draw_line(img, x0, y1, x1, y1, c, 1)
+    for i in range(3):
+        v = lo[1] + (hi[1] - lo[1]) * i / 2.0
+        py = int(fy(v))
+        draw_line(img, x0 - 3, py, x0, py, c, 1)
+        put_text(img, x0 - 28, py - 3, f"{v:.2f}", (40, 40, 40), 1)
+    return fx, fy
+
+
+def fig_score_diagnostics(path):
+    W, H = 780, 520
+    img = np.full((H, W, 3), 255, np.uint8)
+    ml, mt, mr, mb = 60, 30, 30, 34
+    X1 = (W - mr - 1 - ml) // 2
+    Nb = 16
+    edges = np.linspace(0, 1, Nb + 1)
+    # panel A: histogram of calibration true-label score (proportion)
+    hist, _ = np.histogram(cal_ts, bins=edges)
+    hist = hist / len(cal_ts)
+    lo = [0, 0.0]; hi = [1, max(hist.max() * 1.1, 0.1)]
+    fx, fy = draw_axes_on(img, ml, mt, ml + X1, H - mb, lo, hi)
+    bw = 0.4
+    for i in range(Nb):
+        x0 = fx(edges[i] + 0.0) + 2
+        x1 = fx(edges[i + 1]) - 2
+        yy = fy(0); y1 = fy(hist[i])
+        fill_rect(img, x0, min(yy, y1), x1, max(yy, y1), (90, 140, 220))
+    put_text(img, ml, 12, "calibration true-label score (proportion)", (20, 20, 20), 1)
+    # panel B: max-score hist cal vs dep
+    hc, _ = np.histogram(S_cal.max(1), bins=edges); hc = hc / len(S_cal)
+    hd, _ = np.histogram(S_dep.max(1), bins=edges); hd = hd / len(S_dep)
+    lo = [0, 0.0]; hi = [1, max(hc.max(), hd.max()) * 1.12]
+    ml2 = ml + X1
+    fx2, fy2 = draw_axes_on(img, ml2, mt, W - mr - 1, H - mb, lo, hi)
+    for i in range(Nb):
+        left = fx2(edges[i]); right = fx2(edges[i + 1]); mid = (left + right) / 2.0
+        y0 = fy2(0)
+        fill_rect(img, left + 1, y0, mid - 1, fy2(hc[i]), (90, 140, 220))
+        fill_rect(img, mid + 1, y0, right - 1, fy2(hd[i]), (220, 120, 60))
+    put_text(img, ml2, 12, "max score: calibration vs deployment", (20, 20, 20), 1)
+    put_text(img, ml2 + 4, H - 16, "cal", (90, 140, 220), 1)
+    put_text(img, ml2 + 40, H - 16, "dep", (220, 120, 60), 1)
+    write_png(path, img)
+
+
+print("building figures ...")
+fig_set_size_tradeoff("results/set_size_tradeoff.png")
+fig_partition_audit("results/partition_audit.png")
+fig_score_diagnostics("results/score_diagnostics.png")
+print("done.")
+
+print()
+print("scope summary for result handoff:")
+print(audit_summary[["scope", "stratum_id", "n_records", "empirical_risk",
+                     "mean_set_size", "p90_set_size", "target_risk", "risk_violation"]]
+      .to_string(index=False))
+print()
+print("constraint audit (violates flags):")
+print(constraint_audit[["scope", "stratum_id", "empirical_risk", "target_risk", "violates"]]
+      .to_string(index=False))

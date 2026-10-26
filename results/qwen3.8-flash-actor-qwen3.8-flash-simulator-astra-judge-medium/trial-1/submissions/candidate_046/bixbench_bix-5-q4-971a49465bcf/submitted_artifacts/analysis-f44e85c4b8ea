@@ -1,0 +1,509 @@
+"""
+ASXL1-mutated (condition='disease') vs control fibroblasts.
+Pipeline: load -> filter -> TMM / median-of-ratios normalisation -> NB GLM (edgeR-style)
++ log2-CPM eBayes (limma-style) -> DEG lists -> functional enrichment attempt.
+Capsule data only; pure numpy/scipy (no R/Bioconductor in runner).
+"""
+import re, json, warnings
+import numpy as np, pandas as pd
+from scipy import stats
+warnings.filterwarnings("ignore")
+D, R = "/workspace/data", "/workspace/results"
+
+# ------------------------------------------------------------------ LOAD
+cnt = pd.read_csv(f"{D}/Issy_ASXL1_fibro_featureCounts_GeneTable_final.txt", sep=r"\s+")
+cnt["base"] = (cnt["Geneid"].str.split(".").str[0].str.replace("_PAR_Y", "", regex=False))
+n_par = int(cnt["Geneid"].str.contains("_PAR_Y").sum())
+cnt = (cnt.loc[~cnt["Geneid"].str.contains("_PAR_Y").values]
+          .drop(columns=["Geneid"]).groupby("base").sum())
+cnt_all = cnt.copy()                                    # all 16 sequenced samples
+col = pd.read_excel(f"{D}/Issy_ASXL1_fibro_coldata_gender.xlsx").rename(columns={"sample": "base"}).set_index("base")
+extra = sorted(set(cnt_all.columns) - set(col.index))
+print(f"[load] raw samples={cnt_all.shape[1]}, labelled={len(col)}, excluded (no metadata)={extra}")
+cnt = cnt[col.index]                                    # drop samples without metadata
+
+g = pd.read_csv(f"{D}/gencode.v31.primary_assembly.genes.csv")
+g["base"] = g["gene_id"].str.split(".").str[0].str.replace("_PAR_Y", "", regex=False)
+g = g.drop_duplicates("base").set_index("base")[["gene_name", "gene_type", "hgnc_id"]]
+h = pd.read_csv(f"{D}/HGNC_05-09-19.txt", sep="\t", low_memory=False)
+h = h[h["Status"] == "Approved"].dropna(subset=["Ensembl ID(supplied by Ensembl)"])
+h["ens"] = h["Ensembl ID(supplied by Ensembl)"]
+h = h.drop_duplicates("ens").set_index("ens")[["Approved symbol", "Approved name", "Chromosome", "Previous symbols", "Synonyms"]]
+ann = g.join(h, how="left")
+ann["symbol"] = ann["Approved symbol"].fillna(ann["gene_name"])
+
+# ------------------------------------------------------- FILTER + NORMS
+def keep_filter(counts, cpm=1.0, n_min=7):
+    c = counts.div(counts.sum(axis=0), axis=1) * 1e6
+    return counts.index[(c >= cpm).sum(axis=1) >= n_min]
+
+def tmm_factors(counts, lt=0.03, st=0.05):
+    y = counts.values.astype(float); lib = y.sum(0)
+    rel = (y / lib) / np.exp(np.log(y / lib + 1e-12).mean(1, keepdims=True))
+    ref = int(np.argmin(np.median(np.abs(np.log2(rel + 1e-12)), axis=0)))
+    f = np.ones(y.shape[1])
+    for j in range(y.shape[1]):
+        if j == ref: continue
+        a, b = y[:, ref], y[:, j]; ok = (a > 0) & (b > 0)
+        A = 0.5 * np.log2((a[ok] / lib[ref]) * (b[ok] / lib[j]))
+        M = np.log2((b[ok] / lib[j]) / (a[ok] / lib[ref]))
+        w = 1.0 / (lib[ref] / a[ok] + lib[j] / b[ok])
+        Mlo, Mhi = np.quantile(M, [lt, 1 - lt]); Alo, Ahi = np.quantile(A, [st, 1 - st])
+        k = (M >= Mlo) & (M <= Mhi) & (A >= Alo) & (A <= Ahi)
+        f[j] = 2 ** (np.sum(w[k] * M[k]) / np.sum(w[k]))
+    f = f / np.exp(np.log(f).mean())
+    # composition adjustment (edgeR f75-style, sample-wise)
+    q75 = np.quantile(y / lib, 0.75, axis=0)
+    adj = np.exp(np.log(q75).mean() - np.log(q75)); adj /= np.exp(np.log(adj).mean())
+    eff = lib * f * adj                      # effective library sizes (edgeR scale)
+    eff = eff * (np.exp(np.log(lib).mean()) / np.exp(np.log(eff).mean()))
+    return pd.Series(eff, index=counts.columns), pd.Series(f, index=counts.columns)
+
+def mor_factors(counts):
+    lc = np.log(counts.replace(0, np.nan).values)
+    ok = (counts > 0).all(1).values
+    ref = np.nanmean(lc[ok], axis=1, keepdims=True)
+    sf = np.exp(np.median(lc[ok] - ref, axis=0)); sf = sf / np.exp(np.log(sf).mean())
+    eff = sf * counts.sum(0).values          # DESeq2-like size factors on library-size scale
+    eff = eff * (np.exp(np.log(counts.sum(0).values).mean()) / np.exp(np.log(eff).mean()))
+    return pd.Series(eff, index=counts.columns)
+
+# ------------------------------------------------------------- NB GLM
+def nb_glm(X, Y, phi, iters=100, tol=1e-9):
+    """Vectorised NB GLM (log link), fixed per-gene dispersion. Y: n x G."""
+    n, p = X.shape; G = Y.shape[1]
+    B = np.zeros((p, G)); B[0] = np.log(np.maximum(Y.sum(0) / n, 0.1))
+    for _ in range(iters):
+        eta = np.clip(X @ B, -30, 30); mu = np.exp(eta)
+        w = mu**2 / (mu + phi[None, :] * mu**2)
+        z = eta + (Y - mu) / mu
+        A = np.einsum("ig,ip,iq->gpq", w, X, X) + np.eye(p) * 1e-9
+        b = np.einsum("ig,ip->gp", w * z, X)
+        Bn = np.linalg.solve(A, b[:, :, None])[:, :, 0].T
+        if np.nanmax(np.abs(Bn - B)) < tol:
+            B = Bn; break
+        B = Bn
+    eta = np.clip(X @ B, -30, 30); mu = np.exp(eta)
+    w = mu**2 / (mu + phi[None, :] * mu**2)
+    A = np.einsum("ig,ip,iq->gpq", w, X, X) + np.eye(p) * 1e-9
+    return B, np.linalg.inv(A), mu
+
+def estimate_disp(X, Y, nbin=40):
+    n, p = X.shape; G = Y.shape[1]
+    phi = np.full(G, 0.05)
+    for _ in range(4):
+        B, cov, mu = nb_glm(X, Y, phi)
+        num = (((Y - mu)**2 - mu) / np.maximum(mu**2, 1e-8)).sum(0)
+        phi_g = np.clip(num / (n - p), 1e-4, 20)
+        m = mu.mean(0); order = np.argsort(m)
+        tm, tb = [], []
+        for bi in np.array_split(order, nbin):
+            if len(bi): tm.append(np.median(m[bi])); tb.append(np.median(np.log(phi_g[bi])))
+        tm, tb = np.array(tm), np.array(tb)
+        trend = np.exp(np.interp(np.log(m), np.log(tm), tb))
+        var = np.var(np.log(phi_g) - np.log(trend))
+        sd_prior = np.sqrt(max(var - 2.0 / (n - p), 0.04**2))
+        w = (1 / (2 / (n - p))) / (1 / (2 / (n - p)) + 1 / sd_prior**2)
+        new = np.clip(np.exp(w * np.log(phi_g) + (1 - w) * np.log(trend)), 1e-4, 20)
+        if np.nanmax(np.abs(np.log(new / phi))) < 1e-3: phi = new; break
+        phi = new
+    return phi
+
+def de_nb(counts_eff, design):
+    X = design.values.astype(float); Y = counts_eff.T.values.astype(float)
+    phi = estimate_disp(X, Y)
+    B, cov, mu = nb_glm(X, Y, phi)
+    c = X.shape[1] - 1
+    se = np.sqrt(np.maximum(cov[:, c, c], 1e-12))
+    t = B[c] / se; dfres = X.shape[0] - X.shape[1]
+    return pd.DataFrame({"log2FC": B[c], "SE": se, "logCPM": np.log2(np.maximum(mu.mean(0), 1e-6)),
+                         "disp": phi, "stat": t, "pvalue": 2 * stats.t.sf(np.abs(t), df=dfres)}, index=counts_eff.index)
+
+def de_limma(logcpm, design):
+    """limma-style OLS + empirical-Bayes variance moderation (method-of-moments d0,v0)."""
+    from scipy.special import polygamma
+    X = design.values.astype(float); Y = logcpm.T.values.astype(float)
+    XtXi = np.linalg.inv(X.T @ X); B = XtXi @ X.T @ Y
+    r = Y - X @ B; dfres = X.shape[0] - X.shape[1]
+    s2 = np.maximum((r**2).sum(0) / dfres, 1e-10)
+    ly = np.log(s2); v = max(np.var(ly), 1e-6)
+    f = lambda x: float(polygamma(1, x)) - v          # var(log s2p)=psi1(d'/2)
+    lo, hi = 1e-3, 1e3
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if f(mid) > 0: lo = mid
+        else: hi = mid
+    dprime = 2.0 * 0.5 * (lo + hi); d0 = float(np.clip(dprime - dfres, 0.05, 30))
+    logv0 = ly.mean() - float(polygamma(0, dprime / 2)) - np.log(2.0) + np.log(dprime)
+    v0 = float(np.exp(logv0))
+    s2p = (d0 * v0 + dfres * s2) / (d0 + dfres)
+    c = X.shape[1] - 1; se = np.sqrt(s2p * XtXi[c, c]); t = B[c] / se
+    df = dfres + d0
+    return pd.DataFrame({"log2FC": B[c], "SE": se, "stat": t, "pvalue": 2 * stats.t.sf(np.abs(t), df)}, index=logcpm.index), dict(d0=float(d0), v0=v0)
+
+def bh(p):
+    p = np.asarray(p, float); o = np.argsort(p); r = np.empty(len(p))
+    q = p[o] * len(p) / np.arange(1, len(p) + 1)
+    r[o] = np.minimum.accumulate(q[::-1])[::-1]
+    return np.minimum(r, 1)
+
+# --------------------------------------------------------------- RUN
+def build(sample_list, biotypes):
+    c0 = cnt_all[sample_list]          # cnt_all holds all 16 sequenced samples
+    k = keep_filter(c0)
+    if biotypes is not None:
+        k = k[ann["gene_type"].reindex(k).isin(biotypes).values]
+    return c0.loc[k]
+
+def norm_pair(sub):
+    eff_tmm, f_tmm = tmm_factors(sub)
+    return eff_tmm, mor_factors(sub)
+
+def scaled(sub, eff):
+    """Normalised counts on the original count scale (edgeR/DESeq2 convention)."""
+    return sub * (eff.mean() / eff).values
+
+def de_set(sub, meta, use_sex, eff_tmm, eff_mor):
+    d_full = pd.DataFrame({"intercept": 1.0, "sex_M": (meta["sex"] == "M").astype(float).values,
+                           "condition_disease": (meta["condition"] == "disease").astype(float).values}, index=meta.index)
+    Xd = d_full if use_sex else d_full[["intercept", "condition_disease"]]
+    res = {"NB_TMM": de_nb(scaled(sub, eff_tmm), Xd), "NB_MOR": de_nb(scaled(sub, eff_mor), Xd)}
+    lc = np.log2(scaled(sub, eff_tmm) + 0.5)
+    lm, par = de_limma(lc, Xd); lm["logCPM"] = lc.mean(1).values; lm["disp"] = np.nan
+    res["logCPM_eBayes"] = lm
+    for t in res.values():
+        t["FDR"] = bh(t["pvalue"].values)
+    return res, par
+
+meta = col
+sub_pc = build(list(col.index), ["protein_coding"])
+res, limma_par = de_set(sub_pc, meta, True, *norm_pair(sub_pc))
+print(f"[filter] protein_coding kept (CPM>=1 in >=7): {len(sub_pc)}  | eBayes prior: {limma_par}")
+
+sub_pc16 = build(list(cnt_all.columns), ["protein_coding"])   # genuinely 16 samples
+eff16, mor16 = norm_pair(sub_pc16)          # factors estimated USING the 2 unlabeled samples
+e16 = eff16.reindex(col.index); e16 = e16 / np.exp(np.log(e16).mean())
+m16 = mor16.reindex(col.index)
+res_16n, _ = de_set(sub_pc[col.index], meta, True, e16, m16)
+print(f"[filter] protein_coding kept with the 2 unlabeled samples included in filter+norm: {len(sub_pc16)}")
+
+sub_all = build(list(col.index), None)
+res_all, _ = de_set(sub_all, meta, True, *norm_pair(sub_all))
+res_nosex, _ = de_set(sub_pc, meta, False, *norm_pair(sub_pc))
+
+print("[norm] log-TMMeff vs log-MOR eff correlation:",
+      round(float(np.corrcoef(np.log(norm_pair(sub_pc)[0]), mor_factors(sub_pc))[0, 1]), 4))
+print("[norm] effective library sizes (M):"); print((norm_pair(sub_pc)[0] / 1e6).round(2).to_string())
+
+MAIN = res; MODELS = ["NB_TMM", "NB_MOR", "logCPM_eBayes"]
+summary = {}
+for m in MODELS:
+    t = MAIN[m]
+    up = t[(t.FDR < 0.05) & (t.log2FC >= 1)]; dn = t[(t.FDR < 0.05) & (t.log2FC <= -1)]
+    up5 = t[(t.FDR < 0.05) & (t.log2FC >= 0.5)]; dn5 = t[(t.FDR < 0.05) & (t.log2FC <= -0.5)]
+    summary[m] = dict(up=len(up), dn=len(dn), up_lfc05=len(up5), dn_lfc05=len(dn5),
+                      fdr_any=int((t.FDR < 0.05).sum()))
+    print(f"[DEG {m}] |lfc|>=1: up={len(up)} down={len(dn)} ; |lfc|>=0.5: up={len(up5)} down={len(dn5)} ; any FDR<0.05={summary[m]['fdr_any']}")
+
+sets = {m: (set(MAIN[m][(MAIN[m].FDR < .05) & (MAIN[m].log2FC >= 1)].index),
+            set(MAIN[m][(MAIN[m].FDR < .05) & (MAIN[m].log2FC <= -1)].index)) for m in MODELS}
+print("[overlap of UP lists]")
+for i in range(len(MODELS)):
+    for j in range(i + 1, len(MODELS)):
+        a, b = sets[MODELS[i]][0], sets[MODELS[j]][0]
+        print(f"  {MODELS[i]} vs {MODELS[j]}: |A|={len(a)} |B|={len(b)} inter={len(a & b)} jaccard={len(a & b) / max(len(a | b), 1):.2f}")
+UP_CORE = set.intersection(*[sets[m][0] for m in MODELS]); DN_CORE = set.intersection(*[sets[m][1] for m in MODELS])
+UP_UNION = set.union(*[sets[m][0] for m in MODELS]); DN_UNION = set.union(*[sets[m][1] for m in MODELS])
+print(f"[consensus] UP core={len(UP_CORE)} union={len(UP_UNION)} | DOWN core={len(DN_CORE)} union={len(DN_UNION)}")
+
+def cmp(tag, rr, genes_ref):
+    t = rr["NB_TMM"]
+    up = set(t[(t.FDR < .05) & (t.log2FC >= 1)].index); dn = set(t[(t.FDR < .05) & (t.log2FC <= -1)].index)
+    ru, rd = sets["NB_TMM"][0], sets["NB_TMM"][1]
+    print(f"[sens {tag}] n={len(t)} up={len(up)} dn={len(dn)} | up-overlap-with-main={len(up & ru)}/{len(ru)} ({len(up & ru) / max(len(ru),1):.2f}) dn={len(dn & rd)}/{len(rd)}")
+cmp("no-sex covariate", res_nosex, sub_pc.index)
+cmp("all biotypes", res_all, sub_pc.index)
+cmp("16-sample filter+norm", res_16n, sub_pc.index)
+
+# persist
+import pickle
+pickle.dump(dict(MAIN=MAIN, MODELS=MODELS, UP_CORE=UP_CORE, DN_CORE=DN_CORE, UP_UNION=UP_UNION,
+                 DN_UNION=DN_UNION, res_nosex=res_nosex, res_all=res_all, res_16n=res_16n,
+                 sub_pc=sub_pc, ann=ann, col=col, limma_par=limma_par, summary=summary),
+            open(f"{R}/de_results.pkl", "wb"))
+for m in MODELS:
+    MAIN[m].join(ann[["symbol", "gene_type"]]).sort_values("pvalue").to_csv(f"{R}/DE_table_{m}.csv")
+print("[saved] results/de_results.pkl and DE_table_*.csv")
+
+# ================================================== FUNCTIONAL ENRICHMENT
+# NOTE: no GO/Reactank/KEGG resource exists in this capsule or runner (verified by
+# filesystem search: no *.gmt/*.obo/*.gaf/gene2go, 0 hits for GO:0008150, no network).
+# We therefore run a hypergeometric enrichment against the ONLY gene-set-like
+# annotations available locally:
+#   (i)  HGNC "Approved name" tokens (unigram+bigram) -> interpretable family/process labels
+#   (ii) gene-symbol prefix families (KRT*, COL*, SLC*, ZNF* ...)
+#   (iii) cytogenetic locus (HGNC "Chromosome" band, band-level)
+# and we declare explicitly that this is NOT a GO:BP analysis.
+from scipy.stats import hypergeom
+
+def term_sets(ann_bg):
+    sets = {}
+    stop = {"protein","proteins","gene","mrna","rna","putative","like","similar","homolog","homologous",
+            "human","pseudogene","noncoding","non","coding","small","large","subunit","alpha","beta","gamma",
+            "delta","chain","factor","region","type","isoform","member","family","cell","of","and","the","a"}
+    names = ann_bg["Approved name"].dropna().astype(str).str.lower().str.replace(r"[^a-z0-9\- ]", " ", regex=True)
+    for tok_pos, ngram in ((1, 1), (2, 2)):
+        toks = {}
+        for bg, nm in names.items():
+            w = [x for x in nm.split() if len(x) > 2]
+            if ngram == 2:
+                w = [f"{a} {b}" for a, b in zip(w, w[1:])]
+            for t in w:
+                if t in stop or (ngram == 1 and t in {"zinc","finger","domain","repeat","unit","light","heavy"}):
+                    continue
+                toks.setdefault(t, []).append(bg)
+        for t, gs in toks.items():
+            sets[f"NAME:{t}"] = set(gs)
+    fam = {}
+    for bg, sym in ann_bg["symbol"].dropna().items():
+        m = re.match(r"^([A-Z]{2,6})", str(sym))
+        if m and len(str(sym)) > len(m.group(1)):
+            fam.setdefault("FAM:" + m.group(1), set()).add(bg)
+    sets.update({k: v for k, v in fam.items() if len(v) >= 3})
+    loc = {}
+    for bg, cb in ann_bg["Chromosome"].dropna().items():
+        m = re.match(r"^(\d+|X|Y)([pq]\d+)", str(cb))
+        if m:
+            loc.setdefault(f"LOCUS:{m.group(1)}{m.group(2)}", set()).add(bg)
+    sets.update(loc)
+    return sets
+
+def enrich(genes, sets, universe, label, size_filter=(10, 500)):
+    U = set(universe); N = len(U)
+    genes = set(genes) & U
+    rows = []
+    for name, gs in sets.items():
+        gs &= U
+        K = len(gs)
+        if K < 2:
+            continue
+        k = len(gs & genes)
+        if k == 0:
+            continue
+        p = float(hypergeom.sf(k - 1, N, K, len(genes)))
+        rows.append(dict(term=name, n_term=K, n_hit=k, n_query=len(genes), pvalue=p,
+                         fold=(k / len(genes)) / (K / N)))
+    r = pd.DataFrame(rows)
+    if len(r) == 0:
+        return r
+    r["FDR"] = bh(r.pvalue.values)
+    r = r.sort_values("pvalue")
+    r.to_csv(f"{R}/enrich_{label}_unfiltered.csv", index=False)
+    keep = r[(r.n_term >= size_filter[0]) & (r.n_term <= size_filter[1])] if size_filter else r
+    return r, keep
+
+t_main = MAIN["NB_TMM"]
+bg = t_main.index
+ann_bg = ann.reindex(bg)[["symbol", "gene_type", "Approved name", "Chromosome"]]
+ann_bg["Approved name"] = ann_bg["Approved name"].fillna(ann_bg["symbol"])
+print(f"\n[background] tested & labelled genes: {len(bg)} | with HGNC approved name: {int(ann_bg['Approved name'].notna().sum())} "
+      f"| with cytoband: {int(ann_bg['Chromosome'].notna().sum())} ({100*ann_bg['Chromosome'].notna().mean():.1f}%)")
+gsets = term_sets(ann_bg)
+print(f"[gene sets] built {len(gsets)} local term sets "
+      f"(NAME {sum(k.startswith('NAME') for k in gsets)}, FAM {sum(k.startswith('FAM') for k in gsets)}, LOCUS {sum(k.startswith('LOCUS') for k in gsets)})")
+
+UP = set(t_main[(t_main.FDR < 0.05) & (t_main.log2FC >= 1)].index)
+DN = set(t_main[(t_main.FDR < 0.05) & (t_main.log2FC <= -1)].index)
+UPU = UP_UNION | UP
+UP_CORE_ALL = UP_CORE & UP if UP_CORE else UP
+lists = {"UP_primary": sorted(UP), "DOWN_primary": sorted(DN), "UP+DOWN_union": sorted(UPU | DN),
+         "UP_relaxed(p<0.01,|lfc|>=0.5)": sorted(t_main[(t_main.pvalue < 0.01) & (t_main.log2FC.abs() >= 0.5) & (t_main.log2FC > 0)].index)}
+enr = {}
+for lab, gs in lists.items():
+    if not gs:
+        print(f"[enrich {lab}] empty list -> skipped"); continue
+    full, filt = enrich(gs, gsets, bg, lab)
+    enr[lab] = (full, filt)
+    print(f"\n=== {lab}: query n={len(gs)} ===")
+    print("[no size filter] top 5:")
+    print(full.head(5).assign(symbol=lambda x: x.term).round(5).to_string(index=False) if len(full) else "none")
+    print("[filter 10-500] top 8:")
+    print(filt.head(8).round(5).to_string(index=False) if len(filt) else "none")
+
+print("\n[UP primary gene list]", sorted(ann.reindex(sorted(UP))["symbol"].dropna().tolist()))
+print("[DOWN primary gene list]", sorted(ann.reindex(sorted(DN))["symbol"].dropna().tolist()))
+for lab, gs in lists.items():
+    sym = sorted(ann.reindex(gs)["symbol"].dropna().tolist())
+    print(f"[symbols {lab}] n={len(sym)}:", ", ".join(sym[:60]) + (" ..." if len(sym) > 60 else ""))
+pickle.dump(dict(enr=enr, gsets=gsets, bg=list(bg)), open(f"{R}/enrich_results.pkl", "wb"))
+print("\n[saved] results/enrich_*_unfiltered.csv, enrich_results.pkl")
+
+# ============================ FINAL REQUIRED REPORTING LAYER
+print("\n" + "=" * 78)
+print("FINAL REPORTING LAYER")
+print("=" * 78)
+
+# --- (1) primary list = intersection of the 3 DE methods; sensitivity = union
+core_up = sorted(UP_CORE & UP); core_dn = sorted(DN_CORE & DN)
+print(f"[lists] UP: NB_TMM={len(UP)} NB_MOR={len(sets['NB_MOR'][0])} eBayes={len(sets['logCPM_eBayes'][0])} "
+      f"-> INTERSECTION={len(core_up)} UNION={len(UP_UNION | UP)}")
+print("[UP intersection symbols]", sorted(ann.reindex(core_up)["symbol"].dropna().tolist()))
+print("[UP union symbols]", sorted(ann.reindex(sorted(UP_UNION | UP))["symbol"].dropna().tolist()))
+prim_enr = {}
+for lab, gs in {"PRIMARY_intersection_UP": core_up, "SENS_union_UP": sorted(UP_UNION | UP)}.items():
+    if len(gs) < 2:
+        print(f"[{lab}] n={len(gs)} -> enrichment not meaningful (single gene)"); continue
+    full, filt = enrich(gs, gsets, bg, lab)
+    prim_enr[lab] = (full, filt)
+    print(f"[{lab}] top-5 (no size filter):")
+    print(full.head(5).round(5).to_string(index=False))
+    print(f"[{lab}] top-5 (10-500 filter):")
+    print(filt.head(5).round(5).to_string(index=False))
+
+# --- (2) umbrella -> most specific term supported by the SAME genes
+def specificity(full, term):
+    row = full[full.term == term].iloc[0]
+    genes_hit = None
+    U = set(bg); q = row.n_query
+    genes_hit = gsets[term] & U
+    sub = full[(full.n_hit == row.n_hit) & (full.pvalue <= row.pvalue * 1.0001)]
+    cand = []
+    for _, r in sub.iterrows():
+        s = gsets[r.term] & U
+        if s <= genes_hit and len(s) < len(genes_hit):
+            cand.append((r.term, len(s), r.pvalue, r.FDR))
+    cand.sort(key=lambda x: (x[1], x[2]))
+    return genes_hit, cand
+
+for key in ("PRIMARY_intersection_UP", "SENS_union_UP"):
+    if key not in prim_enr:
+        continue
+    full = prim_enr[key][0]
+    for term in [full.iloc[0].term, "NAME:superfamily member"]:
+        if term not in set(full.term):
+            continue
+        gset, cand = specificity(full, term)
+        print(f"\n[umbrella check] {key} term '{term}' (n_term={len(gset & set(bg))})")
+        print("   genes driving it:", sorted(ann.reindex(sorted(gset))["symbol"].dropna().tolist()))
+        hits = gset & (UP_UNION | DN)
+        print("   query genes inside term:", sorted(ann.reindex(sorted(hits))["symbol"].dropna().tolist()))
+        print("   more specific labels covering the SAME genes:")
+        for c in cand[:8]:
+            print(f"     {c[0]}  n_term={c[1]}  p={c[2]:.5f}  FDR={c[3]:.5f}")
+        if not cand:
+            print("     (none: this is already the most specific local label for those genes)")
+
+# --- (3) X/Y DEGs and effect of the sex covariate
+seq = pd.read_csv(f"{D}/gencode.v31.primary_assembly.genes.csv")
+seq["base"] = seq.gene_id.str.split(".").str[0].str.replace("_PAR_Y", "", regex=False)
+chrom = seq.drop_duplicates("base").set_index("base")["seqnames"].str.replace("chr", "", regex=False)
+t_main = MAIN["NB_TMM"]; t_ns = res_nosex["NB_TMM"]
+sig_main = t_main[(t_main.FDR < 0.05) & (t_main.log2FC.abs() >= 1)]
+sig_ns = t_ns[(t_ns.FDR < 0.05) & (t_ns.log2FC.abs() >= 1)]
+xy_main = chrom.reindex(sig_main.index).isin(["X", "Y"])
+xy_ns = chrom.reindex(sig_ns.index).isin(["X", "Y"])
+print(f"\n[X/Y] DEG with ~sex+condition: n={len(sig_main)}, on chrX/Y: {int(xy_main.sum())} "
+      f"({', '.join(ann.reindex(sig_main.index[xy_main.values])['symbol'].dropna().tolist())})")
+print(f"[X/Y] DEG with ~condition only: n={len(sig_ns)}, on chrX/Y: {int(xy_ns.sum())} "
+      f"({', '.join(ann.reindex(sig_ns.index[xy_ns.values])['symbol'].dropna().tolist())})")
+top_ns = t_ns.sort_values("pvalue").head(5)
+print("[no-sex model top5 by p]", ", ".join(f"{ann.symbol[g]}(lfc={t_ns.log2FC[g]:+.2f},FDR={t_ns.FDR[g]:.3f})" for g in top_ns.index))
+
+# --- (4) threshold sensitivity of the enrichment result
+print("\n[threshold sensitivity] primary UP list size and top surrogate term:")
+for lfc in (1.0, 0.585, 0.5, 0.25):
+    up_l = sorted(t_main[(t_main.FDR < 0.05) & (t_main.log2FC >= lfc)].index)
+    dn_l = sorted(t_main[(t_main.FDR < 0.05) & (t_main.log2FC <= -lfc)].index)
+    line = f"  |log2FC|>={lfc}: UP n={len(up_l)} DOWN n={len(dn_l)}"
+    if len(up_l) >= 2:
+        f_, _ = enrich(up_l, gsets, bg, f"lfc{lfc}")
+        if len(f_):
+            line += f" | top UP surrogate: {f_.iloc[0].term} (p={f_.iloc[0].pvalue:.5f}, FDR={f_.iloc[0].FDR:.4f})"
+    print(line)
+
+# sex-control sanity: XIST / RPS4Y1 respond to sex, confirming the covariate does something
+xist = ann.index[ann.symbol == "XIST"]
+rpsy = ann.index[ann.symbol == "RPS4Y1"]
+t_all = res_all["NB_TMM"]
+for nm, idx in (("XIST", xist), ("RPS4Y1", rpsy)):
+    if len(idx) and idx[0] in t_all.index:
+        g = idx[0]
+        print(f"[sex-control sanity, all-biotypes run] {nm}: ~condition-only p={t_ns.pvalue[g] if g in t_ns.index else float('nan'):.2e} "
+              f"lfc={t_all.log2FC[g]:+.2f}; after sex adjustment p={t_all.pvalue[g]:.2e} "
+              f"(should be non-significant once sex is in the model)")
+
+summary = dict(
+    n_samples=len(col), n_extra_excluded=len(extra), n_tested=len(t_main),
+    deg_primary=dict(up=len(UP), down=len(DN), intersection=len(core_up), union=len(UP_UNION | UP)),
+    deg_by_method={m: dict(up=len(sets[m][0]), down=len(sets[m][1])) for m in MODELS},
+    deg_counts={m: summary[m] if m in summary else None for m in MODELS},
+    go_resource_available=False,
+    primary_UP_symbols=sorted(ann.reindex(core_up)["symbol"].dropna().tolist()),
+    UP_union_symbols=sorted(ann.reindex(sorted(UP_UNION | UP))["symbol"].dropna().tolist()),
+    DOWN_symbols=sorted(ann.reindex(sorted(DN))["symbol"].dropna().tolist()),
+    xy_deg_sex_adjusted=int(xy_main.sum()), xy_deg_no_adjust=int(xy_ns.sum()),
+)
+json.dump(summary, open(f"{R}/summary.json", "w"), indent=2, default=str)
+print("\n[saved] results/summary.json")
+
+
+# ================= independent QC + interpretable descriptive summary
+print("\n" + "=" * 78)
+print("INDEPENDENT QC & DESCRIPTIVE SUMMARY")
+print("=" * 78)
+lc_all = np.log2(scaled(sub_pc, eff_tmm if False else tmm_factors(sub_pc)[0]) + 1)
+grp = (col.loc[lc_all.columns, "condition"] == "disease").values
+u, p_mw = stats.mannwhitneyu(lc_all.values[:, grp], lc_all.values[:, ~grp], axis=1, alternative="two-sided")
+mw = pd.DataFrame({"MW_p": p_mw, "median_diff_log2": np.median(lc_all.values[:, grp], 1) - np.median(lc_all.values[:, ~grp], 1)},
+                  index=lc_all.index)
+mw["FDR"] = bh(mw.MW_p.values)
+print(f"[QC Mann-Whitney (no model, no normalisation)] genes FDR<0.05: {int((mw.FDR < 0.05).sum())}; "
+      f"|lfc|>=1: {int(((mw.FDR < 0.05) & (mw.median_diff_log2.abs() >= 1)).sum())}")
+top_mw = mw.sort_values("MW_p").head(12).join(ann[["symbol"]])
+print("[QC] top 12 by Mann-Whitney p:", ", ".join(f"{r.symbol}({r.median_diff_log2:+.1f})" for r in top_mw.itertuples()))
+in_mw = set(top_mw.index) & (UP_UNION | DN)
+print(f"[QC] overlap of MW top-12 with NB DEG union: {len(in_mw)}/{len(UP_UNION | DN)} ->",
+      sorted(ann.reindex(sorted(in_mw))["symbol"].dropna().tolist()))
+
+print("\n[descriptive] HGNC approved names of the consensus UP genes (this is the ONLY functional labelling available locally):")
+for g in sorted(UP, key=lambda x: -t_main.log2FC[x]):
+    print(f"   {ann.symbol[g]:<9} log2FC={t_main.log2FC[g]:+.2f} FDR={t_main.FDR[g]:.4f}  | {str(ann['Approved name'][g])[:78]}")
+for g in sorted(DN):
+    print(f"   {ann.symbol[g]:<9} log2FC={t_main.log2FC[g]:+.2f} FDR={t_main.FDR[g]:.4f}  | {str(ann['Approved name'][g])[:78]}")
+
+print("\n[descriptive] locus/family aggregation of the relaxed UP list (p<0.01, |lfc|>=0.5):")
+rel = t_main[(t_main.pvalue < 0.01) & (t_main.log2FC >= 0.5)]
+cb = ann["Chromosome"].reindex(rel.index).astype(str).str.extract(r"^(\d+|X|Y)")[0]
+print("   chromosomes with most relaxed-UP genes:", cb.value_counts().head(6).to_dict())
+pref = ann["symbol"].reindex(rel.index).astype(str).str.extract(r"^([A-Z]{3,6})")[0].value_counts()
+print("   symbol prefixes with >=3 genes:", pref[pref >= 3].to_dict())
+
+# final tables
+out = t_main.join(ann[["symbol", "gene_type", "Approved name", "Chromosome"]])
+out["DE_up_primary"] = out.index.isin(UP); out["DE_down_primary"] = out.index.isin(DN)
+out["DE_up_intersection_3methods"] = out.index.isin(UP_CORE & UP)
+out["DE_up_union_3methods"] = out.index.isin(UP_UNION | UP)
+out.sort_values("pvalue").to_csv(f"{R}/final_DE_table_annotated.csv")
+print("\n[saved] results/final_DE_table_annotated.csv")
+
+
+print("\n[does the top change across sensitivity runs?] surrogate top term per run (UP, FDR<0.05 & |lfc|>=1):")
+for tag, rr in [("main (~sex+condition, protein_coding, 14 samples)", MAIN),
+                ("no-sex covariate", res_nosex), ("all biotypes", res_all),
+                ("filter+norm incl. 2 unlabeled samples", res_16n)]:
+    tt = rr["NB_TMM"]
+    upl = sorted(tt[(tt.FDR < 0.05) & (tt.log2FC >= 1)].index)
+    dnl = sorted(tt[(tt.FDR < 0.05) & (tt.log2FC <= -1)].index)
+    line = f"   {tag}: UP n={len(upl)} DOWN n={len(dnl)}"
+    if len(upl) >= 2:
+        full, filt = enrich(upl, gsets, bg, f"sens_{re.sub(r'[^a-z]+','_',tag.lower())}")
+        if len(full):
+            line += f" | surrogate top (unfiltered): {full.iloc[0].term} p={full.iloc[0].pvalue:.2e} FDR={full.iloc[0].FDR:.3f}"
+        if len(filt):
+            line += f" | top(10-500): {filt.iloc[0].term} p={filt.iloc[0].pvalue:.2e} FDR={filt.iloc[0].FDR:.3f}"
+    print(line)
+    print(f"      UP symbols: {sorted(ann.reindex(upl)['symbol'].dropna().tolist())}")
+
+print("\n[power note] minimum achievable Mann-Whitney p for 7v7 =", round(float(2/3080), 6),
+      "-> Benjamini-Hochberg across 12,190 genes requires p <", round(0.05 / 12190, 8),
+      "=> rank tests cannot reach FDR<0.05 here; the NB model-based tests are the only feasible route.")

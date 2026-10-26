@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+"""
+BixBench bix-9-q5 -- In which tissue type do bad responders show the highest number of
+significantly DE (lfc>0.5 and baseMean>10) genes compared to controls?
+
+Locked design
+-------------
+* 3 separate per-tissue models: baseline_blood, dentate_gyrus, final_blood (NEVER pooled)
+* contrast: bad_responder vs Control within tissue (good_responder samples excluded)
+* LITERAL rule (answer source): BH padj<0.05 AND log2FC>0.5 (up in bad responders) AND baseMean>10
+* both sources reported side by side:
+    (A) NB2 GLM (DESeq2-equivalent; statsmodels-validated) on the SUPPLIED normalized counts
+    (B) workbook's own precomputed DESeq blocks (Comparison 2/5/8 = Control vs bad_responder)
+* sensitivity variants (|lfc|>0.5, raw p<0.05) + the workbook's undocumented DEG(Max/Median) flags
+Environment: no R, no pydeseq2, no network -> vectorised NB2 GLM as DESeq2-equivalent.
+"""
+import json, re, time
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+XLSX = "data/Data_deposition_RNAseq_Paroxetine_2017.xlsx"
+OUT = "results"
+TISSUES = ["baseline_blood", "dentate_gyrus", "final_blood"]
+BAND = {"baseline blood": "baseline_blood", "dentate gyrus": "dentate_gyrus", "final blood": "final_blood"}
+SNAME = re.compile(r"(Control|good_responder|bad_responder)_(baseline_blood|dentate_gyrus|final_blood)\d+$")
+WB_BAD_VS_CTRL = {"baseline_blood": 2, "dentate_gyrus": 5, "final_blood": 8}   # empirically decoded
+LOG2_15 = float(np.log2(1.5))
+
+
+def load():
+    raw = pd.read_excel(XLSX, sheet_name="NormCount", header=None)
+    grp, sub, col = raw.iloc[0], raw.iloc[2], raw.iloc[3]
+    scols = [c for c in range(raw.shape[1]) if isinstance(col[c], str) and SNAME.match(str(col[c]))]
+    assert len(scols) == 90
+    meta = pd.DataFrame([(c, SNAME.match(col[c]).group(1), SNAME.match(col[c]).group(2)) for c in scols],
+                        columns=["xl_col", "Response", "Tissue"]).set_index("xl_col")
+    mp = pd.read_excel(XLSX, sheet_name="Mapping_statistics")
+    mp["Response"] = mp["Response"].str.strip(); mp["Tissue"] = mp["Tissue"].str.strip()
+    assert set(col[c] for c in scols) == set(mp["Code"])          # Code <-> column-name join
+    assert mp.groupby(["Response", "Tissue"]).size().unique().tolist() == [10]
+    genes = raw.iloc[4:, 1].astype(str).to_numpy()
+    counts = raw.iloc[4:, scols].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    assert np.isfinite(counts).all()
+    tmx = {col[c]: pd.to_numeric(raw.iloc[4:, c], errors="coerce").to_numpy(float) for c in (92, 93, 94)}
+    tmd = {col[c]: pd.to_numeric(raw.iloc[4:, c], errors="coerce").to_numpy(float) for c in (95, 96, 97)}
+    assert set(tmx) == set(TISSUES) and set(tmd) == set(TISSUES)
+    wb = {}
+    for k in range(1, 10):
+        b = 98 + (k - 1) * 9
+        wb[k] = {nm: pd.to_numeric(raw.iloc[4:, b + o], errors="coerce").to_numpy(float)
+                 for nm, o in [("baseMean", 0), ("baseMeanA", 1), ("baseMeanB", 2), ("lfc", 4), ("pval", 5), ("padj", 6)]}
+        wb[k]["deg_max"] = raw.iloc[4:, b + 7].astype(str).to_numpy()
+        wb[k]["deg_med"] = raw.iloc[4:, b + 8].astype(str).to_numpy()
+    return meta, genes, counts, tmx, tmd, wb, mp
+
+
+def bh(p):
+    p = np.asarray(p, float); ok = np.isfinite(p)
+    q = np.full(p.shape, np.nan); pv = p[ok]; n = pv.size
+    if n == 0: return q
+    o = np.argsort(pv); sv = pv[o] * n / np.arange(1, n + 1)
+    q[ok] = np.clip(np.minimum.accumulate(sv[::-1])[::-1], 0, 1)
+    return q
+
+
+def _nb2_loglik(Y, mu, alpha):
+    """NB2 log-likelihood per gene for integer counts Y, fitted means mu, dispersion alpha."""
+    from scipy.special import gammaln
+    r = 1.0 / alpha
+    return (np.sum(gammaln(Y + r) - gammaln(r) - gammaln(Y + 1.0), 1)
+            + np.sum(r * (np.log(r) - np.log(r + mu)), 1)
+            + np.sum(Y * (np.log(np.clip(mu, 1e-300, None)) - np.log(r + mu)), 1))
+
+
+def _nb2_loglik_grid(Y, mu, alpha2d):
+    """NB2 loglik per gene for a per-gene vector of candidate dispersions (G x K)."""
+    from scipy.special import gammaln
+    r = 1.0 / alpha2d[:, :, None]                       # G x K x 1
+    Yb = Y[:, None, :]; mb = mu[:, None, :]
+    ll = gammaln(Yb + r) - gammaln(r) - gammaln(Yb + 1.0)
+    ll += r * (np.log(r) - np.log(r + mb))
+    ll += Yb * (np.log(np.clip(mb, 1e-300, None)) - np.log(r + mb))
+    return ll.sum(-1)
+
+
+
+def nb2_glm(y, x, iters=60, tol=1e-9):
+    """Vectorised NB2 GLM  y ~ 1 + x (log link, size factor = 1: counts already DESeq-normalized),
+    counts rounded to integers (DESeq convention). beta by Fisher scoring, gene-wise NB2 dispersion
+    alpha by method-of-moments on the fitted group means (DESeq's initial estimator), iterated.
+    Wald test on beta1. Returns log2FC(=beta1), alpha, pval(two-sided)."""
+    Y = np.rint(y).astype(float)
+    G, n = Y.shape
+    X = np.column_stack([np.ones(n), np.asarray(x, float)])
+    mu = np.maximum(np.exp(np.log(np.clip(Y, 1e-6, None)).mean(1)), 1e-6)   # start: geometric-ish
+    gm = np.maximum(Y.mean(1), 1e-6)
+    beta = np.column_stack([np.log(gm * (1 - np.mean(x))), np.zeros(G)])
+    alpha = np.full(G, 0.05)
+    p_ = np.sum(x) / n
+    for outer in range(6):
+        for _ in range(iters):
+            eta = beta[:, 0:1] + beta[:, 1:2] * X[None, :, 1]
+            mu = np.exp(np.clip(eta, -30, 30))
+            w = mu / (1.0 + alpha[:, None] * mu)
+            z = eta + (Y - mu) / mu
+            # per-gene 2x2 Fisher information and score
+            I00 = w.sum(1); I01 = (w * X[None, :, 1]).sum(1); I11 = (w * X[None, :, 1] ** 2).sum(1)
+            s0 = (w * z).sum(1); s1 = (w * z * X[None, :, 1]).sum(1)
+            det = I00 * I11 - I01 ** 2
+            det = np.where(np.abs(det) < 1e-12, np.nan, det)
+            nb0 = (I11 * s0 - I01 * s1) / det
+            nb1 = (I00 * s1 - I01 * s0) / det
+            step = np.clip(np.column_stack([nb0 - beta[:, 0], nb1 - beta[:, 1]]), -1.5, 1.5)
+            beta = beta + step
+            if np.nanmax(np.abs(step)) < tol: break
+        # dispersion: method-of-moments start, then profile-likelihood grid refinement (NB2)
+        resid = (Y - mu) ** 2 - mu
+        num = resid.sum(1); den = (mu ** 2).sum(1)
+        mom = np.clip(np.where(den > 0, num / np.maximum(den, 1e-12), 0.05), 1e-6, 5.0)
+        if outer < 2:
+            alpha = mom
+        else:
+            eta_ = beta[:, 0:1] + beta[:, 1:2] * X[None, :, 1]
+            mu_ = np.exp(np.clip(eta_, -30, 30))
+            grid = np.exp(np.linspace(np.log(1e-6), np.log(5.0), 21))
+            ll = np.vstack([_nb2_loglik(Y, mu_, a) for a in grid])           # K x G
+            k1 = np.argmax(np.where(np.isfinite(ll), ll, -np.inf), axis=0)
+            lo = grid[np.maximum(k1 - 1, 0)]; hi = grid[np.minimum(k1 + 1, len(grid) - 1)]
+            frac = np.linspace(0.0, 1.0, 9)[None, :]
+            loc = lo[:, None] * (np.maximum(hi[:, None], lo[:, None] * 1.000001) / lo[:, None]) ** frac   # G x 9
+            ll2 = _nb2_loglik_grid(Y, mu_, loc)                                          # G x 9
+            alpha = np.clip(np.take_along_axis(loc, np.argmax(np.where(np.isfinite(ll2), ll2, -np.inf), axis=1)[:, None], 1)[:, 0], 1e-6, 5.0)
+    eta = beta[:, 0:1] + beta[:, 1:2] * X[None, :, 1]
+    mu = np.exp(np.clip(eta, -30, 30))
+    w = mu / (1.0 + alpha[:, None] * mu)
+    I00 = w.sum(1); I01 = (w * X[None, :, 1]).sum(1); I11 = (w * X[None, :, 1] ** 2).sum(1)
+    det = I00 * I11 - I01 ** 2
+    var1 = np.where(np.abs(det) < 1e-12, np.nan, I00 / det)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zz = beta[:, 1] / np.sqrt(var1)
+    pv = 2 * norm.sf(np.abs(zz))
+    bad = ~np.isfinite(zz)
+    pv[bad] = np.nan
+    return dict(log2FC=beta[:, 1], alpha=alpha, pval=pv)
+
+
+
+def validate_vs_statsmodels(counts, meta, n_test=150, tissue="dentate_gyrus"):
+    """Check the vectorised NB2 GLM against statsmodels.NegativeBinomial (NB2 ML) on a gene subset."""
+    import statsmodels.api as sm
+    cols = [c for c in meta.index if meta.loc[c, "Tissue"] == tissue]
+    ii = [list(meta.index).index(c) for c in cols]
+    x = np.array([1.0 if meta.loc[c, "Response"] == "bad_responder" else 0.0 for c in cols])
+    step = max(1, (counts.shape[0] - 5) // n_test)
+    sel = np.arange(5, counts.shape[0], step)[:n_test]
+    fast = nb2_glm(counts[np.ix_(sel, ii)], x)
+    Xd = sm.add_constant(x); rows = []
+    for j, g in enumerate(sel):
+        yv = np.rint(counts[g, ii])
+        if yv.sum() == 0 or len(np.unique(yv)) == 1:
+            continue
+        try:
+            fit = sm.NegativeBinomial(yv, Xd).fit(method="nm", maxiter=2000, xtol=1e-8, ftol=1e-8)
+            rows.append((genes_of(counts, g) if False else int(g), fast["log2FC"][j], float(fit.params[1]),
+                         fast["pval"][j], float(fit.pvalues[1]), float(fast["alpha"][j]), float(fit.params[2])))
+        except Exception:
+            pass
+    return pd.DataFrame(rows, columns=["row_index", "glm_log2FC", "statsmodels_log2FC", "glm_p",
+                                       "statsmodels_p", "glm_alpha", "statsmodels_alpha"]).dropna()
+
+
+def genes_of(counts, g):
+    return int(g)

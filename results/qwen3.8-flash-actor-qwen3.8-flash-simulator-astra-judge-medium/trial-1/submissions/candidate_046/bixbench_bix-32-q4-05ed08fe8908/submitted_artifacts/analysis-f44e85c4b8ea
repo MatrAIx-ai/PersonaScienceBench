@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""
+bix-32-q4 - KEGG over-representation analysis (ORA) of significantly DOWN-regulated
+genes in three Pseudomonas aeruginosa PA14 quorum-sensing mutant strains (97, 98, 99)
+relative to wildtype (strain 1).
+
+Fixed method (agreed with researcher):
+  1. Read DESeq2 DESeqResults objects (res_1vs97/98/99.rds) with a pure-Python RDS
+     reader (no R in this environment).
+  2. Gene selection: pvalue < 0.05 AND log2FoldChange < -1.5 (raw p, as asked;
+     log2FoldChange is the MLE column, label "Strain NN vs 1" => mutant / wildtype,
+     so negative = down in the mutant). Sensitivity: padj < 0.05 instead of pvalue.
+  3. Gene -> KEGG pathway mapping acquisition, in this order:
+       (i)  network (rest.kegg.jp / rest.kegg.cn / ftp.kegg.jp / mirrors)
+       (ii) local snapshot already present in the environment (TSV/GMT, caches)
+       (iii) if neither exists -> STOP, report BLOCKED_KEGG_MAPPING. No manual /
+            literature-based curation is performed (explicitly excluded).
+  4. ORA: one-sided hypergeometric (greater) + Benjamini-Hochberg, padj < 0.05.
+     Main background = the 5828 genes measured in the DESeq2 tables.
+     Sensitivity: background = all KEGG-annotated genes of the organism;
+     organism control: pae (PAO1) membership transferred through KO orthology.
+  5. Consistency: same KEGG pathway (same paXXXX ID) with padj < 0.05 in the DOWN
+     lists of 97, 98 and 99 simultaneously. No pruning to a "top-N", sizes reported.
+Outputs are written to ./outputs/.
+"""
+import gzip, json, os, re, struct, sys, urllib.request
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+DATA = "data"
+OUT = "outputs"
+FILES = {"97": "res_1vs97.rds", "98": "res_1vs98.rds", "99": "res_1vs99.rds"}
+COLS = ["baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj"]
+P_ALPHA, LFC_CUT, PADJ_CUT = 0.05, -1.5, 0.05
+KEGG_ORG = "pau"          # P. aeruginosa UCBPP-PA14 (inferred from PA14_ locus tags)
+KEGG_ORG_CONTROL = "pae"  # P. aeruginosa PAO1 (control for that inference)
+
+# ------------------------------------------------------------------ RDS reading
+TOK_STR_ELEM = b"\x00\x04\x00\x09"   # CHARSXP element marker used in these files
+TOK_STRSXP = b"\x00\x00\x00\x10"     # STRSXP type marker
+TOK_REALSXP = b"\x00\x00\x00\x0e"    # REALSXP type marker
+
+
+def _rds_bytes(path):
+    raw = open(path, "rb").read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    assert raw[:2] == b"X\n", "not an RDS stream"
+    return raw
+
+
+def _read_strsxp(buf, start):
+    """start points at the 4-byte length field; return (strings, end)."""
+    n = int.from_bytes(buf[start:start + 4], "big")
+    if n <= 0 or n > 200000:
+        return None, None
+    j, out = start + 4, []
+    for _ in range(n):
+        if buf[j:j + 4] != TOK_STR_ELEM:
+            return None, None
+        ln = int.from_bytes(buf[j + 4:j + 8], "big")
+        out.append(buf[j + 8:j + 8 + ln].decode("utf-8", "replace"))
+        j += 8 + ln
+    return out, j
+
+
+def _find_rownames(buf):
+    for m in re.finditer(re.escape(TOK_STRSXP), buf):
+        ids, end = _read_strsxp(buf, m.start() + 4)
+        if ids and len(ids) > 500 and len(set(ids)) == len(ids) and \
+           all(re.match(r"^[A-Za-z0-9_.-]+$", s) for s in ids):
+            return ids, m.start(), end
+    raise RuntimeError("no row-name STRSXP found")
+
+
+def _find_real_cols(buf, n, expect):
+    pat = TOK_REALSXP + n.to_bytes(4, "big")
+    locs = [m.start() for m in re.finditer(re.escape(pat), buf)]
+    cols = [np.array(struct.unpack(">%dd" % n, buf[L + 8:L + 8 + 8 * n]), dtype=float)
+            for L in locs]
+    if len(cols) != len(expect):
+        raise RuntimeError("expected %d REAL columns, found %d" % (len(expect), len(cols)))
+    return cols, locs
+
+
+def load_deseq_results(path):
+    """Return (DataFrame indexed by locus_tag, metadata dict)."""
+    buf = _rds_bytes(path)
+    ids, id_start, id_end = _find_rownames(buf)
+    n = len(ids)
+    cols, locs = _find_real_cols(buf, n, COLS)
+    df = pd.DataFrame({c: v for c, v in zip(COLS, cols)},
+                      index=pd.Index(ids, name="locus_tag"))
+    assert (df.baseMean >= 0).all(), "baseMean negative"
+    assert (df.lfcSE > 0).all(), "lfcSE non positive"
+    for c in ("pvalue", "padj"):
+        assert df[c].between(0, 1).all(), f"{c} outside [0,1]"
+    assert df.log2FoldChange.abs().max() < 25, "log2FoldChange out of range"
+
+    names_attr = None
+    for m in re.finditer(re.escape(TOK_STRSXP), buf[id_end:]):
+        v, _ = _read_strsxp(buf, id_end + m.start() + 4)
+        if v == COLS:
+            names_attr = v
+            break
+    desc = re.findall(rb"log2 fold change \(MLE\): [ -~]+", buf)
+    meta = {
+        "n_genes": n,
+        "n_columns": len(cols),
+        "column_names_attr_matches_expected_order": names_attr == COLS,
+        "col_stride": int(np.diff(locs).min()) if len(locs) > 1 else None,
+        "deseq2_description": desc[0].decode() if desc else None,
+        "class_attr": "DESeqResults/DESeq2" if b"DESeqResults" in buf else None,
+        "n_padj_na": int(df.padj.isna().sum()),
+    }
+    return df, meta
+
+
+def select(df, pcol="pvalue"):
+    down = set(df.index[(df[pcol] < P_ALPHA) & (df.log2FoldChange < LFC_CUT)])
+    up = set(df.index[(df[pcol] < P_ALPHA) & (df.log2FoldChange > -LFC_CUT)])
+    return down, up
+
+
+# ---------------------------------------------------------- KEGG mapping source
+KEGG_ENDPOINTS = ["https://rest.kegg.jp", "http://rest.kegg.jp", "https://rest.kegg.cn",
+                  "https://www.kegg.jp/kegg/rest", "https://kegg.jp/rest"]
+FTP_ENDPOINTS = ["https://ftp.kegg.jp", "http://ftp.kegg.jp", "https://ftp.genome.jp"]
+attempt_log = []
+
+
+def _get(url, timeout=10):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read()
+        attempt_log.append({"url": url, "ok": True, "bytes": len(body)})
+        return body.decode("utf-8", "replace")
+    except Exception as e:                                        # noqa: BLE001
+        attempt_log.append({"url": url, "ok": False,
+                            "error": f"{type(e).__name__}: {e}"[:140]})
+        return None
+
+
+def parse_kegg_link(text):
+    """KEGG REST `link/<org>/pathway` -> {gene_id: [paXXXX, ...]}"""
+    m = defaultdict(list)
+    for line in text.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        m[parts[0].split(":")[-1]].append(parts[1].split(":")[-1])
+    return dict(m)
+
+
+def parse_kegg_pathway_list(text):
+    out = {}
+    for line in text.strip().splitlines():
+        p = line.split("\t")
+        if len(p) >= 2:
+            out[p[0].split(":")[-1]] = p[1]
+    return out
+
+
+def parse_kegg_ftp_pathway(text):
+    """ftp.kegg.jp/kegg/pathway/<org>/pathway-<org>.txt"""
+    m = defaultdict(list)
+    for line in text.strip().splitlines():
+        p = line.split("\t")
+        if len(p) < 2:
+            continue
+        pid = "pa" + re.sub(r"\D", "", p[0]).zfill(5)
+        for g in re.split(r"[,\s]+", p[1].split(":")[-1]):
+            if g:
+                m[g].append(pid)
+    return dict(m)
+
+
+def try_network_mapping(org):
+    """(i) download gene->pathway (+ pathway names) from KEGG REST / FTP mirrors."""
+    for base in KEGG_ENDPOINTS:
+        txt = _get(f"{base}/link/{org}/pathway")
+        if txt:
+            nm = _get(f"{base}/list/pathway/{org}") or ""
+            src = f"{base}/link/{org}/pathway  (retrieved {pd.Timestamp.utcnow()})"
+            return parse_kegg_link(txt), parse_kegg_pathway_list(nm), src
+    for base in FTP_ENDPOINTS:
+        txt = _get(f"{base}/kegg/pathway/{org}/pathway-{org}.txt")
+        if txt:
+            return (parse_kegg_ftp_pathway(txt), {},
+                    f"{base}/kegg/pathway/{org}/pathway-{org}.txt")
+    return None, None, None
+
+
+def build_pae_control_via_ko(org_a, org_b):
+    """Transfer pathway membership org_a -> org_b through shared KO orthology."""
+    pa = _get(f"https://rest.kegg.jp/link/{org_a}/ko")
+    pb = _get(f"https://rest.kegg.jp/link/{org_b}/ko")
+    pw = _get(f"https://rest.kegg.jp/link/{org_b}/pathway")
+    if not (pa and pb and pw):
+        return None, None, None
+    ko_of_a = defaultdict(set)
+    for line in pa.splitlines():
+        p = line.split("\t")
+        if len(p) == 2:
+            ko_of_a[p[0].split(":")[-1]].add(p[1].split(":")[-1])
+    ko_of_b = defaultdict(set)
+    for line in pb.splitlines():
+        p = line.split("\t")
+        if len(p) == 2:
+            ko_of_b[p[1].split(":")[-1]].add(p[0].split(":")[-1])
+    pw_of_b = defaultdict(set)
+    for line in pw.splitlines():
+        p = line.split("\t")
+        if len(p) == 2:
+            pw_of_b[p[0].split(":")[-1]].add(p[1].split(":")[-1])
+    ko2pw = defaultdict(set)
+    for g, pws in pw_of_b.items():
+        for ko in ko_of_b.get(g, ()):
+            ko2pw[ko] |= pws
+    t2g = {g: sorted({p for ko in kos for p in ko2pw.get(ko, ())})
+           for g, kos in ko_of_a.items()}
+    t2g = {g: v for g, v in t2g.items() if v}
+    return t2g, {}, f"pae pathways transferred to {org_a} locus tags via KO orthology"
+
+
+LOCAL_PATS = ["*kegg*", "*KEGG*", "*pathway*", "*.gmt", "*term2gene*", "*pa14*", "*pau*"]
+LOCAL_ROOTS = [".", "data", "/workspace", "/workspace/data", os.path.expanduser("~")]
+
+
+def read_mapping_file(path):
+    """2-col TSV (gene<TAB>paXXXX[/name]) or GMT (term<TAB>desc<TAB>genes...)."""
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    rows = [l.split("\t") for l in text.splitlines() if l.strip()]
+    t2g, names = defaultdict(list), {}
+    if all(len(r) >= 3 for r in rows):                       # GMT-like
+        for r in rows:
+            term = re.split(r"[|;]", r[0])[0].strip()
+            for g in r[2:]:
+                t2g[g.strip().split(":")[-1]].append(term)
+            names[term] = r[0]
+    elif all(len(r) >= 2 for r in rows):
+        for r in rows:
+            g, term = r[0].split(":")[-1], r[1].split(":")[-1]
+            t2g[g].append(term)
+            names[term] = r[2] if len(r) > 2 else names.get(term, term)
+    else:
+        return None
+    # require that gene keys look like locus tags of this dataset
+    return dict(t2g), names
+
+
+def try_local_mapping(locus_example):
+    """(ii) look for a gene->pathway snapshot already present in the environment."""
+    import glob
+    seen, found = set(), []
+    for r in LOCAL_ROOTS:
+        for p in LOCAL_PATS:
+            for f in glob.glob(os.path.join(r, p)):
+                if os.path.isfile(f) and not f.endswith(".rds") and \
+                   os.path.abspath(f) not in seen:
+                    seen.add(os.path.abspath(f))
+                    found.append(f)
+    for f in found:
+        m = read_mapping_file(f)
+        if m and sum(g.startswith(locus_example[:5]) for g in m[0]) > 100:
+            return m[0], m[1], f
+    attempt_log.append({"local_search": {"roots": LOCAL_ROOTS, "patterns": LOCAL_PATS,
+                                        "files_matched_patterns": found}})
+    return None, None, None
+
+
+# --------------------------------------------------------------------------- ORA
+def ora(genes, term2gene, universe):
+    """One-sided hypergeometric (greater) over-representation test + BH."""
+    univ = set(universe)
+    genes = set(genes) & univ
+    members = {t: (set(g) & univ) for t, g in term2gene.items()}
+    members = {t: s for t, s in members.items() if s}
+    N, n = len(univ), len(genes)
+    rows = []
+    for term, mem in members.items():
+        K, k = len(mem), len(genes & mem)
+        p = float(hypergeom.sf(k - 1, N, K, n)) if k else 1.0
+        rows.append({"pathway": term, "k": k, "K": K, "N": N, "n": n, "p": p})
+    df = pd.DataFrame(rows)
+    if len(df):
+        df["padj"] = multipletests(df["p"].values, method="fdr_bh")[1]
+        df["k_over_K"] = (df.k / df.K).round(4)
+        df["genes_hit"] = [",".join(sorted(genes & members[t])) for t in df.pathway]
+    return df.sort_values("p").reset_index(drop=True)
+
+
+def smoke_test_engine():
+    """Synthetic TERM2GENE: proves ORA+BH+intersection run end-to-end.
+    Fabricated membership -> NOT a biological result."""
+    univ = [f"SYN_{i:05d}" for i in range(1000)]
+    t2g = {"SYN_PATH_A": univ[:40], "SYN_PATH_B": univ[100:170],
+           "SYN_PATH_C": univ[400:600]}
+    hit = univ[:35] + univ[500:560]
+    r = ora(hit, t2g, univ)
+    return r[["pathway", "k", "K", "N", "n", "p", "padj"]].to_dict("records")
+
+
+# -------------------------------------------------------------------------- main
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    report = {}
+    strains = sorted(FILES)
+    dfs, downs, ups, downs_adj = {}, {}, {}, {}
+    for s, f in FILES.items():
+        df, meta = load_deseq_results(os.path.join(DATA, f))
+        dfs[s] = df
+        downs[s], ups[s] = select(df, "pvalue")
+        downs_adj[s], _ = select(df, "padj")
+        df.loc[sorted(downs[s]), COLS].to_csv(f"{OUT}/down_genes_strain{s}.csv")
+        report[f"strain_{s}"] = {**meta,
+                                 "n_down_p": len(downs[s]), "n_down_padj": len(downs_adj[s]),
+                                 "n_up_p": len(ups[s]),
+                                 "down_sets_p_equal_padj": downs[s] == downs_adj[s]}
+
+    ov = []
+    for i in range(len(strains)):
+        for j in range(i + 1, len(strains)):
+            a, b = strains[i], strains[j]
+            ov.append({"set": "down (p<0.05 & lfc<-1.5)", "comparison": f"{a} vs {b}",
+                       "n_a": len(downs[a]), "n_b": len(downs[b]),
+                       "intersection": len(downs[a] & downs[b]),
+                       "union": len(downs[a] | downs[b]),
+                       "jaccard": round(len(downs[a] & downs[b]) / len(downs[a] | downs[b]), 3)})
+    trip = set.intersection(*[downs[s] for s in strains])
+    uni = set.union(*[downs[s] for s in strains])
+    ov.append({"set": "down (p<0.05 & lfc<-1.5)", "comparison": "97 & 98 & 99 (triple)",
+               "n_a": len(downs["97"]), "n_b": len(downs["98"]),
+               "intersection": len(trip), "union": len(uni),
+               "jaccard": round(len(trip) / len(uni), 3)})
+    tripu = set.intersection(*[ups[s] for s in strains])
+    ov.append({"set": "up (p<0.05 & lfc>+1.5)", "comparison": "97 & 98 & 99 (triple)",
+               "intersection": len(tripu), "union": len(set.union(*[ups[s] for s in strains])),
+               "jaccard": round(len(tripu) / len(set.union(*[ups[s] for s in strains])), 3)})
+    pd.DataFrame(ov).to_csv(f"{OUT}/down_list_overlaps.csv", index=False)
+    pd.Series(sorted(trip), name="locus_tag").to_csv(f"{OUT}/down_common_to_all3.csv", index=False)
+    report["overlaps"] = ov
+    report["universe_measured"] = {"n_genes": len(dfs["97"]),
+                                   "identical_gene_sets_across_strains":
+                                       set(dfs["97"].index) == set(dfs["98"].index) ==
+                                       set(dfs["99"].index)}
+
+    # ---------------- KEGG mapping acquisition (i) network -> (ii) local --------
+    mapping, names, source = try_network_mapping(KEGG_ORG)
+    how = "network_kegg_rest"
+    if mapping is None:
+        mapping, names, source = try_local_mapping(sorted(dfs["97"].index)[0])
+        how = "local_snapshot"
+    pae = (build_pae_control_via_ko(KEGG_ORG, KEGG_ORG_CONTROL)
+           if mapping is not None else (None, None, None))
+
+    report["kegg_mapping"] = {
+        "status": "OK" if mapping else "BLOCKED_KEGG_MAPPING",
+        "acquisition_order_attempted": ["(i) network KEGG REST/FTP mirrors",
+                                        "(ii) local snapshot in environment",
+                                        "(iii) NOT performed: manual curation excluded"],
+        "how": how if mapping else "NONE",
+        "source_and_version": source,
+        "organism_code_assumed": KEGG_ORG,
+        "network_and_local_attempts": attempt_log,
+        "n_locus_tags_requiring_mapping": len(dfs["97"]),
+        "n_locus_tags_mapped": (sum(1 for g in dfs["97"].index if g in mapping)
+                                if mapping else None),
+        "n_locus_tags_lost": (len(dfs["97"]) - sum(1 for g in dfs["97"].index if g in mapping)
+                              if mapping else None),
+        "down_list_coverage": ({s: {"n_down": len(downs[s]),
+                                    "mapped": sum(1 for g in downs[s] if g in mapping),
+                                    "lost": sum(1 for g in downs[s] if g not in mapping)}
+                                for s in strains} if mapping else None),
+    }
+
+    if mapping is None:
+        report["engine_validation"] = {
+            "note": "synthetic TERM2GENE smoke test only - fabricated membership, "
+                    "NOT a biological result; proves ORA+BH+intersection code runs",
+            "result": smoke_test_engine()}
+        report["next_step_when_unblocked"] = (
+            "Place the output of `kegg-link pau pathway` at data/kegg_link_pau.tsv "
+            "('gene<TAB>paXXXX' per line) and rerun `python3 analysis.py`; enrichment "
+            "long tables and the 3-strain intersection are produced automatically.")
+        json.dump(report, open(f"{OUT}/status.json", "w"), indent=2, default=str)
+        print(json.dumps(report, indent=2, default=str))
+        print("\nSTATUS: BLOCKED_KEGG_MAPPING  (DE-level analysis complete; "
+              "enrichment NOT executed: no gene->KEGG pathway source available)")
+        return 2
+
+    # ---------------- enrichment + consistency ---------------------------------
+    univ_measured = set(dfs["97"].index)
+    variants = {f"bg_measured_{KEGG_ORG}": (mapping, names, univ_measured),
+                f"bg_keggall_{KEGG_ORG}": (mapping, names, set(mapping))}
+    if pae[0]:
+        variants[f"pae_control_via_KO"] = (pae[0], pae[1], univ_measured)
+    report["enrichment"] = {}
+    for vname, (t2g, nm, univ) in variants.items():
+        long = pd.concat([ora(downs[s], t2g, univ).assign(variant=vname, strain=s)
+                          for s in strains], ignore_index=True)
+        cols = ["variant", "strain", "pathway", "pathway_name", "k", "K", "N", "n",
+                "k_over_K", "p", "padj", "genes_hit"]
+        long["pathway_name"] = long.pathway.map(lambda t: nm.get(t, ""))
+        long[cols].to_csv(f"{OUT}/enrichment_long_{vname}.csv", index=False)
+        sig = long[long.padj < PADJ_CUT]
+        per = {s: set(sig[sig.strain == s].pathway) for s in strains}
+        cons = sorted(set.intersection(*per.values())) if all(per.values()) else []
+        detail = long[(long.padj < PADJ_CUT) & long.pathway.isin(cons)] \
+            .sort_values(["pathway", "strain"])[cols[:-1]]
+        detail.to_csv(f"{OUT}/consistent_enrichment_{vname}.csv", index=False)
+        report["enrichment"][vname] = {
+            "n_pathways_tested": int(long.pathway.nunique()),
+            "n_sig_padj_lt_0.05_per_strain": {s: len(per[s]) for s in strains},
+            "consistent_across_all3": cons,
+            "consistent_pathway_names": {t: nm.get(t, "") for t in cons},
+            "table": detail.to_dict("records")}
+    report["engine_validation"] = {
+        "note": "synthetic TERM2GENE smoke test only - NOT a biological result",
+        "result": smoke_test_engine()}
+    json.dump(report, open(f"{OUT}/status.json", "w"), indent=2, default=str)
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

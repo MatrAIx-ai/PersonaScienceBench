@@ -1,0 +1,446 @@
+"""analysis.py -- learned local action-preference policy for symbolic grid search.
+
+Design (validated against data/training_levels.json):
+  * Training trajectories follow a hard behavioural rule: keep going straight
+    whenever straight is legal (385/385 turns happen exactly when the forward
+    cell is a wall) and never reverse.  Each level has at most ONE "free"
+    turn (both sides open) whose direction is NOT predictable from local
+    features (holdout acc ~0.475), so we do NOT overfit it: extra features
+    are heavily regularised and the probability mass on the alternative turn
+    is kept alive with a tempered temperature + epsilon floor.
+  * Policy: log-linear action-preference model over compound local features,
+    tempered softmax, illegal actions masked to 0, epsilon floor uniformly
+    over legal actions, defensive anti-loop (only if the level exposes
+    `start` and history is a reconstructible action list).
+
+Interface:
+    make_policy(training_data: dict, config: dict | None = None) -> Policy
+    Policy.action_probs(level, state, legal_actions) -> dict[str, float]
+        nonnegative, sums to 1 over legal actions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+
+ACTIONS = ("U", "D", "L", "R")
+DELTA = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+OPP = {"U": "D", "D": "U", "L": "R", "R": "L"}
+LEFT_OF = {"U": "L", "L": "D", "D": "R", "R": "U"}
+RIGHT_OF = {"U": "R", "R": "D", "D": "L", "L": "U"}
+
+CORE = ("bias", "straight", "reverse", "relleft", "relright")
+
+DEFAULT_CONFIG = {
+    "temperature": 0.15,     # selected by holdout SURROGATE EXPANSIONS (mean+max), not NLL
+    "eps_floor": 0.0,        # uniform floor; >0 costs search expansions (see tuning)
+    "l2_core": 0.005,
+    "l2_extra": 0.25,        # strong shrinkage on compound/context features
+    "lr": 0.5,
+    "iters": 150,
+    "side_prior_bonus": 1.1,  # additive logit for preferred turn side
+    "loop_flip_bonus": 3.0,   # flips side preference when a loop is detected
+    "revisit_penalty": 0.6,   # mild penalty if target cell already on path
+    "anti_loop": True,
+    "flip_mode": "current_revisit",
+}
+
+
+def _is_open(ch) -> bool:
+    """Interpret a neighbour token: wall-ish -> False, passable -> True."""
+    if ch is None or ch is False:
+        return False
+    if ch is True:
+        return True
+    if isinstance(ch, str):
+        s = ch.strip()
+        if s == "" or s in {"#", "wall", "x", "X", "?"}:
+            return False
+        return True
+    return bool(ch)
+
+
+def _ord01(ch) -> float:
+    """Normalised tile ordinal in [0,1]; 0.5 for unknown/wall/goal."""
+    if isinstance(ch, str) and len(ch) == 1:
+        if "a" <= ch <= "z":
+            return (ord(ch) - 96.0) / 20.0
+        if ch == "G":
+            return 0.5
+    return 0.5
+
+
+def _neighbour_chars(state: dict) -> dict:
+    nb = state.get("neighbors", state.get("neighbours"))
+    out = {}
+    if isinstance(nb, dict):
+        for a in ACTIONS:
+            for key in (a, a.lower(), a + "_open"):
+                if key in nb:
+                    out[a] = nb[key]
+                    break
+    elif isinstance(nb, (list, tuple)) and len(nb) == 4:
+        out = dict(zip(ACTIONS, nb))      # assumed action_order U,D,L,R
+    else:
+        for a in ACTIONS:
+            v = state.get("neighbor_" + a, state.get("neighbour_" + a))
+            if v is not None:
+                out[a] = v
+    return out
+
+
+def _legal(state: dict, legal_actions) -> list:
+    la = [a for a in (legal_actions or []) if a in ACTIONS]
+    if la:
+        return la
+    lm = state.get("legal_mask")
+    if isinstance(lm, dict):
+        out = [a for a in ACTIONS if lm.get(a)]
+        if out:
+            return out
+    elif isinstance(lm, (list, tuple)) and len(lm) == 4:
+        out = [a for a, v in zip(ACTIONS, lm) if v in (True, 1, "1", "y", "T")]
+        if out:
+            return out
+    elif isinstance(lm, str) and len(lm) == 4:
+        out = [a for a, c in zip(ACTIONS, lm) if c in "1yTt"]
+        if out:
+            return out
+    nb = _neighbour_chars(state)
+    if nb:
+        out = [a for a in ACTIONS if _is_open(nb.get(a))]
+        if out:
+            return out
+    return list(ACTIONS)
+
+
+def _history_actions(state: dict) -> list:
+    h = state.get("history", state.get("action_history"))
+    if isinstance(h, str):
+        h = list(h)
+    if not isinstance(h, (list, tuple)):
+        return []
+    return [x for x in h if isinstance(x, str) and x in ACTIONS]
+
+
+def _coerce_start(level):
+    try:
+        s = (level or {}).get("start")
+        if isinstance(s, (list, tuple)) and len(s) >= 2:
+            return (int(s[0]), int(s[1]))
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# local context + features
+# ---------------------------------------------------------------------------
+
+def _context(state: dict, legal: list) -> dict:
+    hist = _history_actions(state)
+    prev = state.get("previous_action", state.get("prev_action"))
+    if prev not in ACTIONS:
+        prev = hist[-1] if hist else None
+    run = state.get("run_length_bucket")
+    try:
+        run = int(run)
+    except (TypeError, ValueError):
+        run = None
+    if run is None:
+        run = 1
+        if prev:
+            for a in reversed(hist):
+                if a == prev:
+                    run += 1
+                else:
+                    break
+    depth = state.get("depth")
+    if not isinstance(depth, int):
+        depth = len(hist)
+    return {"prev": prev, "run": max(1, run), "depth": depth,
+            "cell": state.get("cell", state.get("tile")),
+            "nb": _neighbour_chars(state), "nlegal": len(legal)}
+
+
+def _features(ctx: dict, a: str) -> dict:
+    """Named scalar features for (context, action)."""
+    f = {"bias": 1.0}
+    prev = ctx["prev"]
+    if prev is None:
+        return f
+    straight = a == prev
+    reverse = a == OPP[prev]
+    f["straight"] = 1.0 if straight else 0.0
+    f["reverse"] = 1.0 if reverse else 0.0
+    if straight or reverse:
+        return f
+    left, right = LEFT_OF[prev], RIGHT_OF[prev]
+    f["relleft"] = 1.0 if a == left else 0.0
+    f["relright"] = 1.0 if a == right else 0.0
+    # compound local context (heavily regularised; kept small on purpose)
+    f["turn_depthmod"] = 1.0 if (ctx["depth"] % 4) == 0 else 0.0
+    nb = ctx["nb"]
+    other = right if a == left else left
+    f["turn_char_diff"] = _ord01(nb.get(a)) - _ord01(nb.get(other))
+    f["turn_char_side"] = _ord01(nb.get(a))
+    f["turn_char_cur"] = _ord01(ctx["cell"])
+    f["turn_mask_small"] = 1.0 if ctx["nlegal"] <= 2 else 0.0
+    f["run_bucket"] = min(ctx["run"], 12) / 12.0
+    return f
+
+
+# ---------------------------------------------------------------------------
+# policy object
+# ---------------------------------------------------------------------------
+
+class Policy:
+    def __init__(self, weights: dict, config: dict):
+        self.weights = weights       # {feature_name: {action: value}}
+        self.config = config
+
+    def _score(self, ctx: dict, a: str) -> float:
+        s = 0.0
+        for name, v in _features(ctx, a).items():
+            if v:
+                w = self.weights.get(name)
+                if w:
+                    s += w.get(a, 0.0) * v
+        return s
+
+    # ---- defensive anti-loop (needs level.start + action history) --------
+    @staticmethod
+    def _replay(start, hist):
+        """Replay actions from start: returns (current_pos, visited_before,
+        revisit) where revisit = current position was occupied before.
+        Well-formed training trajectories never revisit a cell (0/260),
+        so a revisit only happens inside a wrong-turn loop -> flip the
+        turn-side preference so the next free turn takes the other side."""
+        pos = start
+        visited = {start}
+        revisit = False
+        for a in hist:
+            pos = (pos[0] + DELTA[a][0], pos[1] + DELTA[a][1])
+            if pos in visited:
+                revisit = True
+            else:
+                visited.add(pos)
+        return pos, visited, revisit
+
+    def _anti_loop_info(self, level, hist):
+        start = _coerce_start(level)
+        if start is None or not hist:
+            return False, None
+        pos, visited, revisit = self._replay(start, hist)
+        visited = visited | {pos}
+        mode = self.config.get("flip_mode", "signature_or_current")
+        if mode == "sticky_revisit":
+            return revisit, visited
+        if mode == "current_revisit":
+            # flip only while standing on a cell occupied before (not sticky)
+            pos0 = start
+            cur_revisit = False
+            for a in hist[:-1]:
+                pos0 = (pos0[0] + DELTA[a][0], pos0[1] + DELTA[a][1])
+                if pos0 == pos:
+                    cur_revisit = True
+            return cur_revisit, visited
+        # default: sticky loop signal = position revisit anywhere (looped)
+        # AND we are back on a repeated cell now, or exact (pos, prev) repeat
+        return revisit, visited
+
+    def _side_prior(self, level) -> str:
+        try:
+            seed = (str((level or {}).get("id", "")) + "|"
+                    + str((level or {}).get("start", "")))
+            h = int(hashlib.md5(seed.encode()).hexdigest(), 16)
+        except Exception:
+            h = 0
+        return "L" if (h % 2 == 0) else "R"
+
+    # ---- public API -------------------------------------------------------
+    def action_probs(self, level: dict, state: dict,
+                     legal_actions=None) -> dict:
+        cfg = self.config
+        if not isinstance(level, dict):
+            level = {}
+        if not isinstance(state, dict):
+            state = {}
+        legal = _legal(state, legal_actions)
+        ctx = _context(state, legal)
+        hist = _history_actions(state)
+
+        flip, visited = False, None
+        if cfg.get("anti_loop", True):
+            try:
+                flip, visited = self._anti_loop_info(level, hist)
+            except Exception:
+                flip, visited = False, None
+
+        prev = ctx["prev"]
+        turn_regime = (prev is not None and prev not in legal
+                       and any(a in legal for a in (LEFT_OF[prev],
+                                                    RIGHT_OF[prev])))
+        prefer = None
+        if turn_regime:
+            prefer = LEFT_OF[prev] if self._side_prior(level) == "L" \
+                else RIGHT_OF[prev]
+            if flip:
+                prefer = OPP[prefer]
+
+        start = _coerce_start(level) if visited is not None else None
+        cur_pos = None
+        if start is not None:
+            cur_pos = start
+            for a in hist:
+                cur_pos = (cur_pos[0] + DELTA[a][0], cur_pos[1] + DELTA[a][1])
+
+        scores = {}
+        for a in legal:
+            s = self._score(ctx, a)
+            if turn_regime and a == prefer:
+                s += (cfg["loop_flip_bonus"] if flip
+                      else cfg["side_prior_bonus"])
+            if visited is not None and cur_pos is not None:
+                tgt = (cur_pos[0] + DELTA[a][0], cur_pos[1] + DELTA[a][1])
+                if tgt in visited:
+                    s -= cfg["revisit_penalty"]
+            scores[a] = s
+
+        T = max(1e-3, float(cfg.get("temperature", 0.35)))
+        m = max(scores.values())
+        exp = {a: math.exp((s - m) / T) for a, s in scores.items()}
+        z = sum(exp.values()) or 1.0
+        probs = {a: e / z for a, e in exp.items()}
+
+        eps = float(cfg.get("eps_floor", 0.0))
+        if eps > 0:
+            floor = eps / len(probs)
+            for a in probs:
+                probs[a] = max(probs[a], floor)
+        probs = {a: (p if p > 0 else 0.0) for a, p in probs.items()
+                 if a in legal}
+        z = sum(probs.values())
+        if z <= 0:
+            u = 1.0 / len(legal)
+            probs = {a: u for a in legal}
+        else:
+            probs = {a: p / z for a, p in probs.items()}
+        return probs
+
+
+# ---------------------------------------------------------------------------
+# training
+# ---------------------------------------------------------------------------
+
+def _heuristic_weights():
+    """Pure fallback when training data is missing/malformed:
+    straight-if-legal, never reverse, turns neutral (prior + eps decide)."""
+    w = {n: {a: 0.0 for a in ACTIONS}
+         for n in ("bias", "straight", "reverse", "relleft", "relright")}
+    for a in ACTIONS:
+        w["straight"][a] = 3.0
+    return w
+
+
+def _collect_samples(levels):
+    """Replay solved trajectories into local (context, legal, action) rows."""
+    samples = []
+    for lv in levels or []:
+        try:
+            grid = lv["grid"]
+            sol = lv["solution"]
+            r = int(lv["start"][0])
+            c = int(lv["start"][1])
+        except Exception:
+            continue
+        prev, run = None, 1
+        for i, a in enumerate(sol):
+            try:
+                nb = {d: grid[r + DELTA[d][0]][c + DELTA[d][1]]
+                      for d in ACTIONS}
+                legal = [d for d in ACTIONS if _is_open(nb[d])]
+                ctx = {"prev": prev, "run": run, "depth": i,
+                       "cell": grid[r][c], "nb": nb, "nlegal": len(legal)}
+                samples.append((ctx, legal, a))
+                r += DELTA[a][0]
+                c += DELTA[a][1]
+                if a == prev:
+                    run += 1
+                else:
+                    prev, run = a, 1
+            except Exception:
+                break
+    return samples
+
+
+def _train_weights(samples, cfg):
+    if not samples:
+        return _heuristic_weights()
+    names, per, legals, golds = set(), [], [], []
+    for ctx, legal, gold in samples:
+        pa = []
+        for a in ACTIONS:
+            fd = {k: v for k, v in _features(ctx, a).items() if v}
+            pa.append(list(fd.items()))
+            names.update(fd)
+        per.append(pa)
+        legals.append(legal)
+        golds.append(gold)
+    names = sorted(names)
+    w = {n: {a: 0.0 for a in ACTIONS} for n in names}
+    lr = float(cfg["lr"])
+    l2c, l2e = float(cfg["l2_core"]), float(cfg["l2_extra"])
+    N = len(samples)
+    idx = {a: i for i, a in enumerate(ACTIONS)}
+    for _ in range(int(cfg["iters"])):
+        grad = {n: {a: 0.0 for a in ACTIONS} for n in names}
+        for si in range(N):
+            pa, legal = per[si], legals[si]
+            sc = {}
+            for a in legal:
+                s = 0.0
+                for k, v in pa[idx[a]]:
+                    s += w[k][a] * v
+                sc[a] = s
+            m = max(sc.values())
+            ex = {a: math.exp(sc[a] - m) for a in legal}
+            z = sum(ex.values())
+            for a in legal:
+                coef = ex[a] / z - (1.0 if a == golds[si] else 0.0)
+                if coef:
+                    for k, v in pa[idx[a]]:
+                        grad[k][a] += coef * v
+        for n in names:
+            lam = l2c if n in CORE else l2e
+            for a in ACTIONS:
+                w[n][a] -= lr * (grad[n][a] / N + lam * w[n][a])
+    # structural guards (validated hard patterns: no reversals, straight wins)
+    for a in ACTIONS:
+        if w["reverse"][a] > -2.0:
+            w["reverse"][a] = -2.0
+        if w["straight"][a] < 1.0:
+            w["straight"][a] = 1.0
+    return w
+
+
+def make_policy(training_data: dict, config: dict | None = None):
+    cfg = dict(DEFAULT_CONFIG)
+    if isinstance(config, dict):
+        cfg.update({k: v for k, v in config.items() if v is not None})
+    levels = None
+    try:
+        if isinstance(training_data, dict):
+            levels = training_data.get("levels")
+        elif isinstance(training_data, (list, tuple)):
+            levels = training_data
+        if levels is not None and not isinstance(levels, (list, tuple)):
+            levels = None
+    except Exception:
+        levels = None
+    try:
+        weights = _train_weights(_collect_samples(levels), cfg)
+    except Exception:
+        weights = _heuristic_weights()
+    return Policy(weights, cfg)

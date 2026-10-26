@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+analysis.py -- D2Q9 BGK lattice-Boltzmann solver for flow around a square
+no-slip obstacle in a rectangular lattice domain.
+
+Input source : ./data/task_input.json (the only allowed input, UTF-8/-SIG)
+Outputs      : ./results/fluid_summary.csv
+               ./results/fluid_force_series.csv
+               ./results/fluid_centerline.csv
+               ./results/fluid_transverse_profile.csv
+               ./results/fluid_report.json
+
+Method (numpy-only; deterministic, no pre-/post-settling, no extra averaging):
+  * Scheme      : D2Q9 BGK.  nu = uin*square_size/re,  tau = 0.5 + 3*nu,
+                  omega = 1/tau (relaxation in the BGK collision).
+  * Initial     : rho = 1, u = (uin, 0) everywhere (f = equilibrium); the
+                  solid cells are no-slip from step 0 (bounce-back each step).
+  * Domain BCs  : left   = equilibrium velocity inlet (ux = uin, uy = 0);
+                  right  = first-order convective (zero-gradient) outflow;
+                  top/bottom = mirror (free-slip / specular) walls.
+  * Solid       : no-slip mask  x in [cx-half, cx-half+square_size),
+                  y in [cy-half, cy-half+square_size), half = square_size//2,
+                  clipped to the domain if needed; full bounce-back at solid
+                  nodes after each streaming step.
+  * Force       : momentum exchange from the bounce-back operation:
+                      F = sum_{solid s} sum_{i} e_i ( f_pre[s,i] - f_post[s,i] )
+                  with f_post = f_pre[:, OPP] (full reversal), i.e. the exact
+                  momentum transferred to the solid per update.
+                  cd = Fx / (0.5*uin^2*square_size),  cl = Fy / (0.5*uin^2*square_size).
+  * Time window : exactly n_steps updates from the deterministic initial field;
+                  force statistics exclude only the first warmup_steps and use
+                  every sample with (step - warmup_steps) % sample_every == 0.
+  * Profiles    : centerline u(x) along the obstacle's mid row y = cy (nx rows);
+                  transverse u(y), v(y) at x_probe = min(nx-1, cx+2*square_size)
+                  (ny rows). Both from the final (step = n_steps) state.
+  * "Converged" : cd time-mean over the last 25% of the allowed window within
+                  5% of the mean over the whole allowed window AND cl_rms finite.
+"""
+import json
+import os
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# D2Q9 lattice constants
+# ---------------------------------------------------------------------------
+CX = np.array([0, 1, 0, -1, 0, 1, -1, -1, 1], dtype=np.int64)   # e_x
+CY = np.array([0, 0, 1, 0, -1, 1, 1, -1, -1], dtype=np.int64)   # e_y
+W = np.array([4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+              1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0])
+OPP = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6], dtype=np.int64)     # reverse dir
+Q = 9
+
+
+def feq(rho, ux, uy):
+    """D2Q9 equilibrium distribution (vectorized over rho, ux, uy)."""
+    us2 = ux * ux + uy * uy
+    f = np.empty(rho.shape + (Q,), dtype=np.float64)
+    for i in range(Q):
+        eu = CX[i] * ux + CY[i] * uy
+        f[..., i] = W[i] * rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * us2)
+    return f
+
+
+def simulate_case(case, sample_steps):
+    """Run one LBM case; return summary, force series and final profiles."""
+    case_id = case["case_id"]
+    nx = int(case["nx"]); ny = int(case["ny"])
+    uin = float(case["uin"]); re = float(case["re"])
+    square_size = int(case["square_size"])
+    cx = int(case["square_center"][0]); cy = int(case["square_center"][1])
+    n_steps = int(case["n_steps"]); warmup = int(case["warmup_steps"])
+
+    nu = uin * square_size / re
+    tau = 0.5 + 3.0 * nu
+    omega = 1.0 / tau
+
+    # --- solid mask: [cx-half, cx-half+square_size) x [cy-half, cy-half+square_size)
+    half = square_size // 2
+    ys, xs = np.indices((ny, nx), dtype=np.int64)
+    solid = ((xs >= cx - half) & (xs < cx - half + square_size) &
+             (ys >= cy - half) & (ys < cy - half + square_size))
+
+    # --- precompute flat streaming index (periodic wrap; boundaries handled after)
+    src_y = np.zeros((ny, nx, Q), dtype=np.int64)
+    src_x = np.zeros((ny, nx, Q), dtype=np.int64)
+    for i in range(1, Q):
+        src_y[..., i] = (ys - CY[i]) % ny
+        src_x[..., i] = (xs - CX[i]) % nx
+    src_flat = (src_y * nx + src_x).reshape(-1, Q)
+    dirs9 = np.broadcast_to(np.arange(Q, dtype=np.int64)[None, :], (ny * nx, Q))
+
+    # --- solid cell coordinates for force + bounce-back
+    sol_y, sol_x = np.nonzero(solid)
+
+    # --- deterministic initial field: rho = 1, u = (uin, 0)
+    f = feq(np.ones((ny, nx)), np.full((ny, nx), uin), np.zeros((ny, nx)))
+    feq_in = feq(np.ones((ny, 1)), np.full((ny, 1), uin), np.zeros((ny, 1)))
+
+    cd_series = np.empty(len(sample_steps), dtype=np.float64)
+    cl_series = np.empty(len(sample_steps), dtype=np.float64)
+    sample_idx = 0
+    sample_set = set(sample_steps)
+
+    for step in range(1, n_steps + 1):
+        # 1) streaming (periodic wrap; boundaries overwritten below)
+        f = f.reshape(-1, Q)[src_flat, dirs9].reshape(ny, nx, Q)
+
+        # 2) momentum-exchange force on the solid (pre-bounce populations)
+        fs = f[sol_y, sol_x]
+        d = fs - fs[:, OPP]
+        Fx = float(CX @ d.sum(axis=0))
+        Fy = float(CY @ d.sum(axis=0))
+
+        # 3) full bounce-back at solid nodes (no-slip)
+        f[sol_y, sol_x] = fs[:, OPP]
+
+        # 4) domain boundary conditions
+        #    free-slip (mirror) top wall
+        f[ny - 1, :, 4] = f[ny - 1, :, 2]
+        f[ny - 1, :, 8] = f[ny - 1, :, 5]
+        f[ny - 1, :, 7] = f[ny - 1, :, 6]
+        #    free-slip (mirror) bottom wall
+        f[0, :, 2] = f[0, :, 4]
+        f[0, :, 5] = f[0, :, 8]
+        f[0, :, 6] = f[0, :, 7]
+        #    left: equilibrium velocity inlet (ux = uin, uy = 0)
+        f[:, 0, 3] = feq_in[:, 0, 3]
+        f[:, 0, 6] = feq_in[:, 0, 6]
+        f[:, 0, 7] = feq_in[:, 0, 7]
+        #    right: first-order convective (zero-gradient) outflow
+        f[:, nx - 1, 3] = f[:, nx - 2, 3]
+        f[:, nx - 1, 6] = f[:, nx - 2, 6]
+        f[:, nx - 1, 7] = f[:, nx - 2, 7]
+
+        # 5) BGK collision at all cells
+        rho = f.sum(axis=-1)
+        ux = np.einsum("d,ijd->ij", CX, f) / rho
+        uy = np.einsum("d,ijd->ij", CY, f) / rho
+        f += omega * (feq(rho, ux, uy) - f)
+
+        # 6) record force statistics on the allowed window
+        if step in sample_set:
+            cd_series[sample_idx] = Fx / (0.5 * uin * uin * square_size)
+            cl_series[sample_idx] = Fy / (0.5 * uin * uin * square_size)
+            sample_idx += 1
+
+    # --- final-frame diagnostics (last state = step n_steps) ---
+    rho_f = f.sum(axis=-1)
+    ux_f = np.einsum("d,ijd->ij", CX, f) / rho_f
+    uy_f = np.einsum("d,ijd->ij", CY, f) / rho_f
+
+    # centerline: u(x) along the obstacle's mid row
+    x_cols = np.arange(nx, dtype=np.int64)
+    u_center = ux_f[cy, :]
+
+    # transverse profile at x_probe
+    x_probe = int(min(nx - 1, cx + 2 * square_size))
+    y_cols = np.arange(ny, dtype=np.int64)
+    u_prof = ux_f[:, x_probe]
+    v_prof = uy_f[:, x_probe]
+
+    # --- statistics over the allowed window ---
+    cd_mean = float(cd_series.mean())
+    cl_rms = float(np.sqrt(np.mean(cl_series * cl_series)))
+
+    n_win = len(cd_series)
+    split = int(round(0.75 * n_win))
+    cd_first = cd_series[:split].mean() if split > 0 else cd_mean
+    cd_last = cd_series[split:].mean() if split < n_win else cd_mean
+    converged = bool(split > 0 and np.isfinite(cl_rms) and
+                     abs(cd_last - cd_first) <= 0.05 * abs(cd_mean))
+
+    return {
+        "summary": dict(case_id=case_id, nx=nx, ny=ny, re=re, uin=uin, nu=nu,
+                        tau=tau, n_steps=n_steps, cd_mean=cd_mean, cl_rms=cl_rms,
+                        converged=converged),
+        "series": dict(case_id=case_id, step=sample_steps, cd=cd_series,
+                       cl=cl_series),
+        "centerline": dict(case_id=case_id, x=x_cols, u=u_center),
+        "transverse": dict(case_id=case_id, x_probe=x_probe, y=y_cols,
+                           u=u_prof, v=v_prof),
+    }
+
+
+def main():
+    with open("./data/task_input.json", "r", encoding="utf-8-sig") as fh:
+        inp = json.load(fh)
+    cases = inp["cases"]
+    task_id = inp["task_id"]
+    units = inp["units"]
+
+    # allowed sample steps per case: (step - warmup) % sample_every == 0
+    sample_sets = {}
+    for c in cases:
+        warm = int(c["warmup_steps"]); n = int(c["n_steps"]); se = int(c["sample_every"])
+        sample_sets[c["case_id"]] = [s for s in range(warm, n + 1)
+                                     if (s - warm) % se == 0]
+
+    results = [simulate_case(c, sample_sets[c["case_id"]]) for c in cases]
+
+    # ---- assemble DataFrames (exact column names from the contract) ----
+    df_sum = pd.DataFrame([r["summary"] for r in results], columns=[
+        "case_id", "nx", "ny", "re", "uin", "nu", "tau", "n_steps",
+        "cd_mean", "cl_rms", "converged"])
+
+    ser_rows = []
+    for r in results:
+        s = r["series"]
+        for st, cd, cl in zip(s["step"], s["cd"], s["cl"]):
+            ser_rows.append((s["case_id"], st, cd, cl))
+    df_ser = pd.DataFrame(ser_rows, columns=["case_id", "step", "cd", "cl"])
+
+    cen_rows = []
+    for r in results:
+        c = r["centerline"]
+        for x, u in zip(c["x"], c["u"]):
+            cen_rows.append((c["case_id"], int(x), float(u)))
+    df_cen = pd.DataFrame(cen_rows, columns=["case_id", "x", "u"])
+
+    tra_rows = []
+    for r in results:
+        t = r["transverse"]
+        for y, u, v in zip(t["y"], t["u"], t["v"]):
+            tra_rows.append((t["case_id"], int(t["x_probe"]), int(y),
+                             float(u), float(v)))
+    df_tra = pd.DataFrame(tra_rows, columns=["case_id", "x_probe", "y", "u", "v"])
+
+    os.makedirs("./results", exist_ok=True)
+    df_sum.to_csv("./results/fluid_summary.csv", index=False)
+    df_ser.to_csv("./results/fluid_force_series.csv", index=False)
+    df_cen.to_csv("./results/fluid_centerline.csv", index=False)
+    df_tra.to_csv("./results/fluid_transverse_profile.csv", index=False)
+
+    cd_mean_avg = float(np.mean([r["summary"]["cd_mean"] for r in results]))
+    method_summary = (
+        "D2Q9 BGK lattice-Boltzmann flow around a square no-slip obstacle "
+        "on a rectangular lattice. nu=uin*S/re, tau=0.5+3*nu. Deterministic "
+        "init rho=1, u=(uin,0); solid bounce-back no-slip on "
+        "[cx-half,cx-half+S)x[cy-half,cy-half+S); left equilibrium velocity "
+        "inlet, right first-order convective outflow, top/bottom free-slip "
+        "(mirror) walls; force = solid momentum exchange normalized by "
+        "0.5*uin^2*S; statistics on steps >= warmup with "
+        "(step-warmup)%sample_every==0 only."
+    )
+    report = {"task_id": task_id, "units": units,
+              "cd_mean_avg": cd_mean_avg, "method_summary": method_summary}
+    with open("./results/fluid_report.json", "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+
+    # ---- diagnostics printed to stdout ----
+    print("=== fluid_summary.csv ===")
+    print(df_sum.to_string(index=False))
+    print("\nrow counts per case:")
+    print("  summary       :", df_sum.groupby("case_id").size().to_dict())
+    print("  force_series  :", df_ser.groupby("case_id").size().to_dict())
+    print("  centerline    :", df_cen.groupby("case_id").size().to_dict())
+    print("  transverse    :", df_tra.groupby("case_id").size().to_dict())
+    print("\nfinite check (all required CSVs, no NaN/Inf):")
+    for nm, df in [("fluid_summary", df_sum), ("fluid_force_series", df_ser),
+                   ("fluid_centerline", df_cen),
+                   ("fluid_transverse_profile", df_tra)]:
+        fin = bool(np.isfinite(df.select_dtypes(include=[np.number])).all().all())
+        print(f"  {nm}: {fin}")
+    print("\ncd_mean_avg:", cd_mean_avg)
+    print("report keys:", sorted(report.keys()))
+
+
+if __name__ == "__main__":
+    main()

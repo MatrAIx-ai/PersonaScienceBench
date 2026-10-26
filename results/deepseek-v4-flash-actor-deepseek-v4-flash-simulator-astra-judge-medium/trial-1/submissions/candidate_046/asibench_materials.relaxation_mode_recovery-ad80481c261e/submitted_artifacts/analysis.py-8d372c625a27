@@ -1,0 +1,393 @@
+"""
+Shared-mode recovery from complex response curves (asibench:materials.relaxation_mode_recovery)
+
+Model:  R_m(x) = a0_m + sum_k a_{k,m} / (1 + (i*x*tau_k)^phi_k)
+Shared across curves: K, tau_k>0, phi_k in (0,1].
+Curve-specific: a0_m (free baseline), a_{k,m} >= 0 (nonneg modal amplitudes).
+
+Approach (approved plan):
+  * Separable / variable-projection fit: for fixed (K, tau, phi) the per-curve
+    (a0, amplitudes) solve a nonneg least-squares problem (a0 eliminated).
+  * Global search: differential_evolution per K + multistart random restarts
+    (L-BFGS-B polish), repeated over several seeds for stability reporting.
+  * Model selection K: 5-fold cross-validation (one-standard-error rule) primary,
+    corroborated by AIC/BIC.
+  * If an optimal phi lands on the phi=1 boundary, compare explicitly against the
+    Debye-restricted (phi=1) fit and report the choice.
+  * Degenerate (near-equal) taus are reported/flagged rather than force-split.
+  * Residual diagnostics per curve (relative residual re & im, systematic structure).
+
+Outputs: analysis.py, results/modes.csv (header: tau,a_0,...,a_4, sorted by tau).
+"""
+import os, time, json, warnings
+import numpy as np
+import pandas as pd
+from functools import partial
+from scipy.optimize import differential_evolution, minimize, nnls
+from scipy.ndimage import median_filter
+
+warnings.filterwarnings('ignore')
+rng_master = np.random.default_rng(2026)
+
+# ----------------------------------------------------------------------
+# 1. Load & validate data
+# ----------------------------------------------------------------------
+df = pd.read_csv('data/curves.csv')
+curves = sorted(int(c) for c in df['curve'].unique())
+M = len(curves)
+x = df.loc[df['curve'] == curves[0], 'x'].values.astype(float)
+N = len(x)
+for c in curves:
+    assert np.allclose(df.loc[df['curve'] == c, 'x'].values.astype(float), x), 'x grids not shared!'
+print(f'[data] {M} curves x {N} points; x in [{x.min():.3e},{x.max():.3e}] log10 '
+      f'[{np.log10(x.min()):.3f},{np.log10(x.max()):.3f}]; unique log-steps: '
+      f'{np.unique(np.round(np.diff(np.log(x)),6))}')
+
+os.makedirs('results', exist_ok=True)
+re = np.stack([df.loc[df['curve'] == c, 're'].values for c in curves])  # (M,N)
+im = np.stack([df.loc[df['curve'] == c, 'im'].values for c in curves])
+
+# ----------------------------------------------------------------------
+# 2. Model / cost
+# ----------------------------------------------------------------------
+LOGTAU_LO, LOGTAU_HI, PHI_LO, PHI_HI = -3.5, 3.5, 0.01, 1.0
+
+def kernel(xsub, logtau, phi):
+    """B_k(x) = 1/(1 + (x*tau_k)^phi_k * exp(i*phi_k*pi/2))  -> (len(xsub),K) complex"""
+    xt = np.asarray(xsub)[:, None] * (10.0 ** np.asarray(logtau))[None, :]
+    p = np.asarray(phi)[None, :]
+    z = xt ** p * np.exp(1j * p * np.pi / 2.0)
+    return 1.0 / (1.0 + z)
+
+def fit_curve(xsub, redata, imdata, logtau, phi):
+    """Variable-projection NNLS fit for one curve on x-subset.
+    Returns (a, a0, ss) with a>=0 amplitudes, baseline a0, residual sum-of-squares."""
+    B = kernel(xsub, logtau, phi)
+    Am, Bm = B.real, B.imag
+    redata = np.asarray(redata, float); imdata = np.asarray(imdata, float)
+    re_c = redata - redata.mean()
+    Am_c = Am - Am.mean(axis=0)
+    D = np.vstack([Am_c, Bm])
+    t = np.concatenate([re_c, imdata])
+    a, rnorm = nnls(D, t)
+    a0 = redata.mean() - Am.mean(axis=0) @ a
+    return a, a0, float(rnorm ** 2)
+
+def ss_with_amp(xsub, redata, imdata, logtau, phi, a):
+    """Residual SS on x-subset using FIXED amplitudes a (for held-out CV eval)."""
+    B = kernel(xsub, logtau, phi)
+    Am, Bm = B.real, B.imag
+    a0 = np.asarray(redata).mean() - Am.mean(axis=0) @ a
+    pred_re = a0 + Am @ a
+    pred_im = Bm @ a
+    return float(np.sum((np.asarray(redata) - pred_re) ** 2) + np.sum((np.asarray(imdata) - pred_im) ** 2))
+
+def total_ss(v, K):
+    """Objective for the global search: total re+im residual SS over all curves."""
+    logtau = np.asarray(v[:K], float)
+    phi = np.asarray(v[K:], float)
+    if np.any(np.isnan(v)) or np.any(phi <= 0.0) or np.any(phi > 1.0):
+        return 1e30
+    if np.any(logtau < LOGTAU_LO - 1e-9) or np.any(logtau > LOGTAU_HI + 1e-9):
+        return 1e30
+    ss = 0.0
+    for m in range(M):
+        _, _, s = fit_curve(x, re[m], im[m], logtau, phi)
+        ss += s
+    return ss
+
+def bounds_for(K):
+    return [(LOGTAU_LO, LOGTAU_HI)] * K + [(PHI_LO, PHI_HI)] * K
+
+def _obj_K(v, K):
+    return total_ss(v, K)
+
+def _obj_debye(v, K):
+    return total_ss(np.concatenate([v[:K], [1.0] * K]), K)
+
+# noise estimate (median-filter residual) for reference / thresholds
+sigmas = [np.std(re[m] - median_filter(re[m], size=6)) for m in range(M)] + \
+         [np.std(im[m] - median_filter(im[m], size=6)) for m in range(M)]
+SIGMA = float(np.median(sigmas))
+print(f'[noise] data-derived sigma (median-filter residual) = {SIGMA:.4f}')
+
+# ----------------------------------------------------------------------
+# 3. Fit a fixed K (DE + multistart polish)
+# ----------------------------------------------------------------------
+def fit_K(K, n_de=2, de_maxiter=60, n_start=6, seed_base=100):
+    bnds = bounds_for(K)
+    candidates = []   # (fun, v)
+
+    obj = partial(_obj_K, K=K)
+
+    # a) differential_evolution (parallel)
+    for s in range(n_de):
+        de = differential_evolution(obj, bnds, seed=seed_base + s, polish=True,
+                                    popsize=8, maxiter=de_maxiter, tol=1e-10,
+                                    atol=0.0, workers=4, updating='immediate')
+        candidates.append((de.fun, de.x))
+
+    # b) multistart random restarts with L-BFGS-B
+    for i in range(n_start):
+        v0 = np.array([rng_master.uniform(lo, hi) for (lo, hi) in bnds])
+        res = minimize(obj, v0, method='L-BFGS-B', bounds=bnds,
+                       options={"maxiter": 100, "ftol": 1e-11, "gtol": 1e-6})
+        if res.success or res.fun < 1e30:
+            candidates.append((res.fun, res.x))
+
+    order = np.argsort([c[0] for c in candidates])
+    vbest = candidates[order[0]][1]
+    bestfun = candidates[order[0]][0]
+    # stable solutions within tolerance of the best
+    tol = 1e-2 + 1e-3 * K
+    stab_lt = []
+    for fun, v in candidates:
+        if fun <= bestfun * (1.0 + tol):
+            stab_lt.append((np.log10(10.0 ** v[:K]), v[K:]))  # (logtau, phi)
+    return vbest, bestfun, candidates, stab_lt
+
+# ----------------------------------------------------------------------
+# 4. Full search over K; record costs, AIC/BIC
+# ----------------------------------------------------------------------
+KMAX = 8
+results = {}
+for K in range(1, KMAX + 1):
+    t0 = time.time()
+    vbest, bestfun, cands, stab = fit_K(K)
+    results[K] = dict(vbest=vbest, ss=bestfun, cands=cands, stab=stab, time=time.time() - t0)
+    p_eff = 2 * K + 5 * (K + 1)          # nonlinear + per-curve (a0 + K amps)
+    n_obs = M * N * 2                    # re + im per point
+    b = n_obs * np.log(bestfun / n_obs) + p_eff * np.log(n_obs)
+    aic = n_obs * np.log(bestfun / n_obs) + 2 * p_eff
+    results[K]['BIC'] = b; results[K]['AIC'] = aic; results[K]['p'] = p_eff
+    rms = np.sqrt(bestfun / (M * N * 2))
+    print(f'[K={K}] SS={bestfun:.4f} RMS={rms:.4f} p={p_eff} '
+          f'BIC={b:.1f} AIC={aic:.1f} ({time.time()-t0:.0f}s)  best logtau='
+          f'{np.round(np.log10(10.0**vbest[:K]), 2)}')
+
+# ----------------------------------------------------------------------
+# 5. Cross-validation for K (primary model-selection)
+# ----------------------------------------------------------------------
+NFOLD = 5
+
+def cv_score(K, warm, seed=7):
+    """5-fold CV: refit nonlinear params (warm start) + amplitudes on training x,
+    evaluate mean-squared error on held-out x. Returns (mean mse, se)."""
+    rng = np.random.default_rng(seed)
+    idx = np.arange(N)
+    perm = rng.permutation(idx)
+    folds = np.array_split(perm, NFOLD)
+    mses = []
+    for f in folds:
+        tr = np.setdiff1d(idx, f)
+        bnds = bounds_for(K)
+
+        def obj_tr(v):
+            lt, ph = v[:K], v[K:]
+            ss = 0.0
+            for m in range(M):
+                _, _, s = fit_curve(x[tr], re[m][tr], im[m][tr], lt, ph)
+                ss += s
+            return ss
+
+        res = minimize(obj_tr, warm, method='L-BFGS-B', bounds=bnds,
+                       options={'maxiter': 40, 'ftol': 1e-9})
+        lt, ph = res.x[:K], res.x[K:]
+        ss_te = 0.0
+        for m in range(M):
+            a, a0, _ = fit_curve(x[tr], re[m][tr], im[m][tr], lt, ph)
+            ss_te += ss_with_amp(x[f], re[m][f], im[m][f], lt, ph, a)
+        mses.append(ss_te / (M * len(f)))
+    m = float(np.mean(mses))
+    se = float(np.std(mses) / np.sqrt(NFOLD))
+    return m, se
+
+cv = {}
+for K in range(1, KMAX + 1):
+    mse, se = cv_score(K, results[K]['vbest'])
+    cv[K] = (mse, se)
+    print(f'[CV K={K}] held-out MSE={mse:.4f} +/- {se:.4f} (RMSE={np.sqrt(mse):.4f})')
+
+best_mse = min(v[0] for v in cv.values())
+thr = best_mse + min(v[1] for v in cv.values() if v[0] == best_mse)  # 1 SE of the best
+K_cv = min(K for K in cv if cv[K][0] <= thr)   # most parsimonious within 1 SE
+K_bic = min(results, key=lambda k: results[k]['BIC'])
+K_aic = min(results, key=lambda k: results[k]['AIC'])
+print(f'\n[select] CV(1SE)->K={K_cv}  BIC->K={K_bic}  AIC->K={K_aic}')
+print('  K | CV-mse(se)    | BIC')
+for K in range(1, KMAX + 1):
+    print(f'  {K} | {cv[K][0]:.4f}±{cv[K][1]:.4f} | {results[K]["BIC"]:.1f}')
+K_opt = int(np.median([K_cv, K_bic, K_aic]))
+print(f'[select] chosen K_opt = {K_opt} (median of CV/BIC/AIC; CV is primary)')
+
+# ----------------------------------------------------------------------
+# 6. Debye-restricted comparison if any optimal phi hits ~1
+# ----------------------------------------------------------------------
+def fit_K_debye(K, seed_base=300):
+    """Fit with phi fixed to 1 (Debye) for all modes; return best (fun, v-logtau)."""
+    bnds = [(LOGTAU_LO, LOGTAU_HI)] * K
+    obj = partial(_obj_debye, K=K)
+    cands = []
+    de = differential_evolution(obj, bnds, seed=seed_base, polish=True, popsize=8,
+                                maxiter=60, tol=1e-10, atol=0.0, workers=4)
+    cands.append((de.fun, de.x))
+    for i in range(6):
+        v0 = np.array([rng_master.uniform(LO, HI) for (LO, HI) in bnds])
+        r = minimize(obj, v0, method='L-BFGS-B', bounds=bnds, options={"maxiter": 100})
+        cands.append((r.fun, r.x))
+    cands.sort(key=lambda c: c[0])
+    return cands[0]
+
+v_opt = results[K_opt]['vbest']
+phi_opt = v_opt[K_opt:]
+phi_hits1 = float(np.max(phi_opt))
+debye_choice = None
+if phi_hits1 >= 1.0 - 1e-4:
+    print(f'\n[debye] max optimal phi = {phi_hits1:.4f} at boundary -> fit Debye-restricted K={K_opt}')
+    d_fun, d_v = fit_K_debye(K_opt)
+    cv_full, se_full = cv_score(K_opt, v_opt)
+    cv_deb, se_deb = cv_score(K_opt, np.concatenate([d_v, [1.0] * K_opt]))
+    p_deb = K_opt + 5 * (K_opt + 1)
+    n_obs = M * N * 2
+    bic_deb = n_obs * np.log(d_fun / n_obs) + p_deb * np.log(n_obs)
+    bic_full = results[K_opt]['BIC']
+    print(f'  full:  CV={cv_full:.4f}±{se_full:.4f}  BIC={bic_full:.1f}  SS={results[K_opt]["ss"]:.3f}')
+    print(f'  debye: CV={cv_deb:.4f}±{se_deb:.4f}  BIC={bic_deb:.1f}  SS={d_fun:.3f}')
+    if cv_deb <= cv_full + max(se_full, 1e-9) and bic_deb <= bic_full:
+        debye_choice = True
+        print('  -> DEBYE-restricted chosen (statistically equal/better fit, more parsimonious)')
+        v_opt = np.concatenate([d_v, [1.0] * K_opt])
+        results[K_opt]['ss'] = d_fun
+    else:
+        debye_choice = False
+        print('  -> free-phi model retained (Debye restriction not supported)')
+else:
+    print(f'\n[debye] max optimal phi = {phi_hits1:.4f} < 1 (no Debye-boundary hit; comparison skipped)')
+
+# ----------------------------------------------------------------------
+# 7. Final model: cleanup negligible modes + refit + stability
+# ----------------------------------------------------------------------
+def full_fit_params(K, v):
+    """Given (logtau,phi) return amplitudes A (M,K) and baselines a0 (M)."""
+    logtau, phi = v[:K], v[K:]
+    A = np.zeros((M, K)); B0 = np.zeros(M)
+    for m in range(M):
+        a, a0, _ = fit_curve(x, re[m], im[m], logtau, phi)
+        A[m] = a; B0[m] = a0
+    return A, B0
+
+def final_fit(K, v):
+    bnds = bounds_for(K)
+    res = minimize(lambda vv: total_ss(vv, K), v, method='L-BFGS-B', bounds=bnds,
+                   options={'maxiter': 300, 'ftol': 1e-12})
+    v = res.x
+    A, B0 = full_fit_params(K, v)
+    maxamp = np.max(A, axis=0)
+    keep = np.where(maxamp >= 3.0 * SIGMA)[0]
+    if len(keep) < K and len(keep) >= 1:
+        K2 = len(keep)
+        v2 = np.concatenate([v[:K][keep], v[K:][keep]])
+        res2 = minimize(lambda vv: total_ss(vv, K2), v2, method='L-BFGS-B',
+                        bounds=bounds_for(K2), options={'maxiter': 300})
+        v = res2.x
+        A, B0 = full_fit_params(K2, v)
+        K = K2
+        print(f'\n[cleanup] dropped one negligible mode -> final K={K2}')
+    return K, v, A, B0
+
+K_final, v_final, A, B0 = final_fit(K_opt, v_opt)
+logtau_f, phi_f = v_final[:K_final], v_final[K_final:]
+print(f'\n[final] K={K_final}')
+print(f'  tau       : {np.round(10.0 ** logtau_f, 4)}')
+print(f'  log10 tau : {np.round(logtau_f, 3)}')
+print(f'  phi       : {np.round(phi_f, 3)}')
+
+# stability at final K (3 DE seeds + 24 restarts)
+bnds = bounds_for(K_final)
+objf = partial(_obj_K, K=K_final)
+st_final = []
+for s in range(2):
+    de = differential_evolution(objf, bnds, seed=500 + s, polish=True, popsize=8,
+                                maxiter=60, tol=1e-10, atol=0.0, workers=4)
+    st_final.append((de.fun, de.x))
+for i in range(8):
+    v0 = np.array([rng_master.uniform(lo, hi) for (lo, hi) in bnds])
+    r = minimize(objf, v0, method='L-BFGS-B', bounds=bnds, options={'maxiter': 120})
+    st_final.append((r.fun, r.x))
+best_fun = min(c[0] for c in st_final)
+close = [c[1] for c in st_final if c[0] <= best_fun * 1.03]
+lt_all = np.array([np.log10(10.0 ** c[:K_final]) for c in close])
+lt_all_sorted = np.sort(lt_all, axis=1)
+spread = np.max(lt_all_sorted, axis=0) - np.min(lt_all_sorted, axis=0)
+print(f'[stability] {len(close)}/{len(st_final)} solutions within 3% of best; '
+      f'log10tau spread (min,max)=({spread.min():.3f},{spread.max():.3f})')
+
+lt = np.sort(logtau_f)
+pair = [(int(i), int(j)) for i in range(K_final) for j in range(i + 1, K_final)
+        if abs(lt[i] - lt[j]) < 0.3]
+print(f'[degeneracy] near-tau pairs (|dlog10 tau|<0.3): {pair if pair else "none"}')
+
+# ----------------------------------------------------------------------
+# 8. Residual diagnostics per curve (re & im)
+# ----------------------------------------------------------------------
+print('\n[residuals] per curve:')
+res_tab = []
+for m in range(M):
+    B = kernel(x, logtau_f, phi_f)
+    pred_re = B0[m] + B.real @ A[m]
+    pred_im = B.imag @ A[m]
+    r_re = re[m] - pred_re; r_im = im[m] - pred_im
+    rel_re = np.sqrt(np.sum(r_re ** 2)) / np.sqrt(np.sum(re[m] ** 2))
+    rel_im = np.sqrt(np.sum(r_im ** 2)) / np.sqrt(np.sum(im[m] ** 2))
+    rmse_re = np.sqrt(np.mean(r_re ** 2)); rmse_im = np.sqrt(np.mean(r_im ** 2))
+    r_ord = r_re[np.argsort(x)]
+    ac1_re = float(np.corrcoef(r_ord[:-1], r_ord[1:])[0, 1])
+    r_ord = r_im[np.argsort(x)]
+    ac1_im = float(np.corrcoef(r_ord[:-1], r_ord[1:])[0, 1])
+    res_tab.append((m, rel_re, rel_im, rmse_re, rmse_im, ac1_re, ac1_im))
+    print(f'  curve {m}: rel(re)={rel_re:.3f} rel(im)={rel_im:.3f} '
+          f'rmse re={rmse_re:.4f} im={rmse_im:.4f} (sigma~{SIGMA:.3f}) '
+          f'lag1ac re={ac1_re:+.2f} im={ac1_im:+.2f}')
+res_df = pd.DataFrame(res_tab, columns=['curve', 'rel_re', 'rel_im', 'rmse_re', 'rmse_im',
+                                        'ac1_re', 'ac1_im'])
+res_df.to_csv('results/residual_diagnostics.csv', index=False)
+
+SS_final = total_ss(v_final, K_final)
+rms_final = np.sqrt(SS_final / (M * N * 2))
+print(f'[quality] final RMS residual={rms_final:.4f} vs data-derived sigma={SIGMA:.4f}; '
+      f'rel-to-data={np.sqrt(SS_final)/np.sqrt(np.sum(re**2)+np.sum(im**2)):.3f}')
+
+# ----------------------------------------------------------------------
+# 9. Write results/modes.csv  (exact contract)
+# ----------------------------------------------------------------------
+order = np.argsort(logtau_f)
+tau_sorted = (10.0 ** logtau_f)[order]
+A_sorted = A[:, order]
+out = pd.DataFrame({'tau': tau_sorted})
+for m in range(M):
+    out[f'a_{m}'] = A_sorted[m]
+out.to_csv('results/modes.csv', index=False)
+print('\n[output] results/modes.csv:')
+print(out.to_string(index=False))
+print('\n[baselines a0 per curve]:', np.round(B0, 4))
+
+summary = dict(
+    K=int(K_final),
+    tau=np.round(tau_sorted, 6).tolist(),
+    phi=np.round(phi_f[order], 5).tolist(),
+    baselines=np.round(B0, 5).tolist(),
+    amplitudes=np.round(A_sorted, 6).tolist(),
+    K_choice=dict(cv=int(K_cv), bic=int(K_bic), aic=int(K_aic)),
+    cv_criterion=dict(cv_value=cv[K_cv][0], cv_se=float(cv[K_cv][1]),
+                      all_cv={str(k): list(v) for k, v in cv.items()},
+                      all_bic={str(k): float(results[k]['BIC']) for k in results}),
+    fit=dict(ss=float(SS_final), rms=float(rms_final), sigma=float(SIGMA)),
+    stability_log10tau_spread=np.round(spread, 3).tolist(),
+    degenerate_pairs=pair,
+    debye_choice=debye_choice,
+    residuals=res_tab,
+)
+with open('results/summary.json', 'w') as fh:
+    json.dump(summary, fh, indent=2, default=str)
+print('\n[summary] written results/summary.json')
+print('DONE')

@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+analysis.py  --  action-selection policy for symbolic grid-search levels.
+
+Learns from solved training instances (data/training_levels.json): each level has a
+27x27 grid, start, goal and a solution action trajectory.  We replay each solution
+with the deterministic U/D/L/R grid-walk and extract, at every step, the *local
+context* that a hidden scorer would observe: the current cell symbol, the four
+neighboring symbols (U/D/L/R), the previous action and its run length, and a coarse
+depth phase.  Those (context -> action) observations train a hierarchy of smoothed
+conditional probability tables:
+
+    P(action | cell, neighbors, prev, run_bucket, depth_phase)   (most specific)
+        -> P(action | prev, run_bucket)
+        -> P(action | prev)
+        -> uniform
+
+with interpolated backoff, Laplace smoothing, a hard "goal-neighbor" rule, a
+legal-action filter and a mild anti-reversal penalty used only in the fallback
+branches (training trajectories never reverse direction).
+
+Interface (public submission contract):
+    def make_policy(training_data: dict, config: dict | None = None) -> policy
+    policy.action_probs(level: dict, state: dict, legal_actions: list[str]) -> dict[str, float]
+
+The file is self-contained; it does not import a module named `analysis`.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+
+ACTIONS = ("U", "D", "L", "R")
+REVERSE = {"U": "D", "D": "U", "L": "R", "R": "L"}
+DELTAS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+RUN_BUCKETS = {"first": "first",
+              1: "b1", 2: "b2", 3: "b3", 4: "b4",
+              5: "b5", 6: "b6", 7: "b7", 8: "b8", 9: "b+", 10: "b+"}
+DEPTH_PHASES = ("dp0", "dp1", "dp2", "dp3", "dp4", "dp5")
+
+
+# --------------------------------------------------------------------------- #
+# Feature normalization helpers (robust to unknown scorer encodings)
+# --------------------------------------------------------------------------- #
+def _norm_neighbors(nb):
+    """Normalize 'neighbors' into a 4-tuple in fixed order (U, D, L, R).
+
+    Accepts dict (keys U/D/L/R or ints), str (assumed 4 chars U/D/L/R order),
+    list / tuple (first 4 elements U/D/L/R order).  Walls are folded to '#'.
+    None if the information is unusable.
+    """
+    try:
+        if nb is None:
+            return None
+        if isinstance(nb, dict):
+            vals = []
+            for k in ("U", "D", "L", "R"):
+                v = nb.get(k)
+                if v is None and isinstance(k, str):
+                    v = nb.get(ord(k))  # unlikely, but defensive
+                vals.append(v)
+            seq = vals
+            if all(v is None for v in seq):
+                # try integer keys 0..3
+                seq = [nb.get(i) for i in range(4)]
+            if all(v is None for v in seq):
+                return None
+        elif isinstance(nb, str):
+            seq = list(nb[:4])
+        else:
+            seq = list(nb)[:4]
+        out = []
+        for v in seq:
+            if v is None:
+                out.append("#")
+            else:
+                if isinstance(v, str):
+                    s = v.strip()
+                else:
+                    s = str(v)
+                if s == "G":
+                    out.append("G")            # goal symbol (case sensitive)
+                elif s == "#" or s in ("W", "WALL", "."):
+                    out.append("#")            # wall variants -> wall
+                elif len(s) == 1 and s.isalpha():
+                    out.append(s)              # keep tile letters as-is
+                else:
+                    out.append("#")  # unknown/unusable neighbor -> treat as wall
+        while len(out) < 4:
+            out.append("#")
+        return tuple(out[:4])
+    except Exception:
+        return None
+
+
+def _norm_cell(cell):
+    """Normalize 'cell' to a single symbol, or None if unusable (coords etc.)."""
+    try:
+        if cell is None:
+            return None
+        if isinstance(cell, str):
+            s = cell.strip()
+            if not s:
+                return None
+            if s == "G":
+                return "G"
+            if s == "#":
+                return "#"
+            if s[0].isalpha():
+                return s[0]
+            return None
+        return None  # ints / coordinates are not usable without a grid
+    except Exception:
+        return None
+
+
+def _norm_prev(previous_action):
+    """Normalize previous_action to one of U/D/L/R or None."""
+    if previous_action is None:
+        return None
+    if isinstance(previous_action, str):
+        s = previous_action.strip().upper()
+        return s if s in ACTIONS else None
+    if isinstance(previous_action, int):
+        return ACTIONS[previous_action] if 0 <= previous_action < 4 else None
+    return None
+
+
+def _as_history(history):
+    """Convert 'history' / 'history_tail' to a list of action chars, or None."""
+    try:
+        if history is None:
+            return None
+        if isinstance(history, str):
+            if not history:
+                return []
+            return [c.upper() for c in history if c.upper() in ACTIONS]
+        if isinstance(history, (list, tuple)):
+            out = []
+            for h in history:
+                if isinstance(h, str) and h.upper() in ACTIONS:
+                    out.append(h.upper())
+                elif isinstance(h, int) and 0 <= h < 4:
+                    out.append(ACTIONS[h])
+            return out
+        return None
+    except Exception:
+        return None
+
+
+def _bucket_run(run):
+    """Map raw run length (trailing equal actions; 0 when no previous action)
+    to a coarse bucket shared by training and inference."""
+    if run is None or run <= 0:
+        return RUN_BUCKETS["first"]
+    if run <= 9:
+        return RUN_BUCKETS.get(run, "b+")
+    return "b+"
+
+
+def _depth_phase(depth):
+    """Coarse depth phase shared by training and inference."""
+    if depth is None:
+        return None
+    try:
+        d = int(depth)
+    except Exception:
+        return None
+    return "dp%d" % min(max(d // 10, 0), len(DEPTH_PHASES) - 1)
+
+
+# --------------------------------------------------------------------------- #
+# Training: replay solutions and collect (context -> action) examples
+# --------------------------------------------------------------------------- #
+def _simulate_level(grid, start, solution):
+    """Yield per-step observations along a solution trajectory.
+
+    Each observation: (cell, neighbors, prev, run, depth) ; action taken.
+    """
+    deltas = DELTAS
+    H, W = len(grid), len(grid[0])
+    r, c = int(start[0]), int(start[1])
+    history = []
+
+    def get(rr, cc):
+        if 0 <= rr < H and 0 <= cc < W:
+            return grid[rr][cc]
+        return "#"
+
+    for act in solution:
+        cell = get(r, c)
+        nb = (get(r - 1, c), get(r + 1, c), get(r, c - 1), get(r, c + 1))
+        prev = history[-1] if history else None
+        run = 0 if prev is None else 1
+        if prev is not None:
+            for h in reversed(history):
+                if h == prev:
+                    run += 1
+                else:
+                    break
+        yield (cell, nb, prev, run, len(history), act)
+        dr, dc = deltas[act]
+        r += dr
+        c += dc
+        history.append(act)
+
+
+def _build_tables(levels):
+    """Count conditional tables from training levels.
+
+    Returns dict with keys 'full', 'pr', 'p', 'goaldir' plus totals.
+    'full' keyed by (cell, neighbors, prev, run_bucket, depth_phase).
+    'pr'   keyed by (prev, run_bucket).
+    'p'    keyed by prev (None = first step).
+    'goaldir' counts P(take action | goal-neighbor present in direction d).
+    """
+    full = defaultdict(lambda: defaultdict(float))
+    pr = defaultdict(lambda: defaultdict(float))
+    p = defaultdict(lambda: defaultdict(float))
+    goaldir = defaultdict(lambda: defaultdict(float))
+    total_steps = 0
+
+    for L in levels:
+        grid = L["grid"]
+        start = L["start"]
+        solution = L["solution"]
+        for (cell, nb, prev, run, depth, act) in _simulate_level(grid, start, solution):
+            rb = _bucket_run(run)
+            dp = _depth_phase(depth)
+            full[(cell, nb, prev, rb, dp)][act] += 1.0
+            pr[(prev, rb)][act] += 1.0
+            p[(prev,)][act] += 1.0
+            # goal-neighbour statistics: nb order is (U, D, L, R)
+            for d_i, d in enumerate(ACTIONS):
+                if nb[d_i] == "G":
+                    goaldir[(d,)][act] += 1.0
+            total_steps += 1
+
+    return {
+        "full": {k: dict(v) for k, v in full.items()},
+        "pr": {k: dict(v) for k, v in pr.items()},
+        "p": {k: dict(v) for k, v in p.items()},
+        "goaldir": {k: dict(v) for k, v in goaldir.items()},
+        "total_steps": total_steps,
+        "act_order": ACTIONS,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Policy
+# --------------------------------------------------------------------------- #
+class _Policy:
+    """Backoff / interpolated context classifier producing per-action scores."""
+
+    def __init__(self, tables, alpha=0.5, interp_k=2.0, use_depth_phase=True):
+        self._t = tables
+        self._alpha = alpha
+        self._k = interp_k      # interpolation stiffness for full-context confidence
+        self._use_depth_phase = use_depth_phase
+
+    # -- small probability helpers ------------------------------------------ #
+    @staticmethod
+    def _smoothed(counts, alpha, n_act=4):
+        """Smoothed probability array in ACTIONS order and total evidence count."""
+        if not counts:
+            return None, 0.0
+        tot = sum(counts.values())
+        base = tot + n_act * alpha
+        if base <= 0:
+            return None, 0.0
+        probs = [(counts.get(a, 0.0) + alpha) / base for a in ACTIONS]
+        return probs, tot
+
+    def _tbl_p(self, key):
+        return self._t["p"].get((key,))
+
+    def _tbl_pr(self, key):
+        return self._t["pr"].get(key)
+
+    def _tbl_full(self, key):
+        return self._t["full"].get(key)
+
+    # -- raw scores before the legal mask ------------------------------------- #
+    def _raw_scores(self, level, state):
+        cell = _norm_cell(state.get("cell"))
+        nb = _norm_neighbors(state.get("neighbors"))
+        prev = _norm_prev(state.get("previous_action", state.get("prev")))
+        hist = _as_history(state.get("history_tail") or state.get("history"))
+
+        # run length: prefer a self-consistent computation from history;
+        # otherwise use the scorer-provided bucket value if present.
+        run = None
+        if hist:
+            run = 0 if prev is None else 1
+            if prev is not None:
+                for h in reversed(hist):
+                    if h == prev:
+                        run += 1
+                    else:
+                        break
+        if run is None:
+            rv = state.get("run_length_bucket", state.get("run_length"))
+            if rv is not None:
+                if isinstance(rv, (int, float)):
+                    run = max(1, int(rv))
+                elif isinstance(rv, str) and rv.isdigit():
+                    run = int(rv)
+        rb = _bucket_run(run)
+
+        depth = state.get("depth")
+        dp = _depth_phase(depth)
+        dp_provided = state.get("depth_phase")
+        if dp is None and dp_provided is not None:
+            sp = str(dp_provided)
+            dp = sp if sp.startswith("dp") else "dp%s" % sp
+
+        if not self._use_depth_phase:
+            dp = None
+
+        scores = {a: 0.0 for a in ACTIONS}
+        branch = "uniform"
+
+        # ---- hard rule 1: goal neighbour ----------------------------------- #
+        if nb is not None:
+            for d_i, d in enumerate(ACTIONS):
+                if nb[d_i] == "G":
+                    scores[d] += 10.0
+                    gd = self._t["goaldir"].get((d,))
+                    if gd:
+                        pc, _ = self._smoothed(gd, self._alpha)
+                        if pc is not None:
+                            scores[d] += pc[d_i] * 5.0
+                    branch = "goal"
+
+        # ---- interpolated backoff over the three tables -------------------- #
+        full_p, full_tot = None, 0.0
+        pr_p, pr_tot = None, 0.0
+        p_p, p_tot = None, 0.0
+
+        if cell is not None and nb is not None:
+            key_full = (cell, nb, prev, rb, dp)
+            full_p, full_tot = self._smoothed(self._tbl_full(key_full), self._alpha)
+        key_pr = (prev, rb)
+        pr_p, pr_tot = self._smoothed(self._tbl_pr(key_pr), self._alpha)
+        p_p, p_tot = self._smoothed(self._tbl_p(prev), self._alpha)
+
+        w_full = full_tot / (full_tot + self._k) if full_tot > 0 else 0.0
+        w_pr = (1.0 - w_full) * (pr_tot / (pr_tot + self._k * 2.0)) if pr_tot > 0 else 0.0
+        w_p = 1.0 - w_full - w_pr
+
+        if full_p and full_tot > 0:
+            branch = "full"
+        elif pr_p and pr_tot > 0:
+            branch = "pr"
+        elif p_p and p_tot > 0:
+            branch = "p"
+
+        for i, a in enumerate(ACTIONS):
+            v = 0.0
+            if w_full and full_p:
+                v += w_full * full_p[i]
+            if w_pr and pr_p:
+                v += w_pr * pr_p[i]
+            if w_p and p_p:
+                v += w_p * p_p[i]
+            scores[a] += v
+        # ---- mild anti-reversal (fallback discipline; never on data) ------- #
+        if prev is not None and branch in ("pr", "p", "uniform"):
+            rev = REVERSE[prev]
+            scores[rev] *= 0.35
+            scores[prev] += 0.4  # weakly continue current direction in fallback
+            for a in ACTIONS:
+                if a not in (rev, prev):
+                    scores[a] += 0.6
+
+        info = {
+            "branch": branch, "cell": cell, "nb": nb, "prev": prev,
+            "run_bucket": rb, "depth_phase": dp,
+        }
+        return scores, info
+
+    # -- public entry ---------------------------------------------------------- #
+    def action_probs(self, level, state, legal_actions):
+        """Return {action: score} for legal actions (U/D/L/R), nonnegative,
+        sum > 0.  If legal_actions is empty -> all four actions positive."""
+        if state is None:
+            state = {}
+        scores, _ = self._raw_scores(level, state)
+
+        # Contract: return scores only for legal_actions; if empty -> all four.
+        legal = [a for a in (legal_actions or ACTIONS) if a in ACTIONS]
+        if not legal:
+            # legal_actions was empty or contained no valid actions
+            mask = state.get("legal_mask")
+            if isinstance(mask, dict):
+                legal = [a for a in ACTIONS if mask.get(a)]
+            elif isinstance(mask, (list, tuple)) and len(mask) >= 4:
+                legal = [ACTIONS[i] for i in range(4) if mask[i]]
+        if not legal:
+            legal = list(ACTIONS)
+
+        out = {}
+        for a in legal:
+            v = scores.get(a, 0.0)
+            out[a] = float(v) if v > 0 else 0.0
+
+        total = sum(out.values())
+        eps = 1e-6
+        if total <= 0.0:
+            for a in legal:
+                out[a] = 1.0
+            total = float(len(legal))
+        # guarantee a strictly positive score for every legal action
+        floor = max(eps, total * 1e-6)
+        for a in legal:
+            if out[a] <= 0.0:
+                out[a] = floor
+        return out
+
+
+def make_policy(training_data: dict, config: dict | None = None):
+    """Build a policy from solved training instances.
+
+    training_data: dict with a 'levels' list, each level having
+        grid, start, goal, solution (action trajectory).
+    config: optional dict, e.g. {'use_depth_phase': bool, 'alpha': float,
+            'interp_k': float}.
+    """
+    if config is None:
+        config = {}
+
+    levels = training_data.get("levels") if isinstance(training_data, dict) else training_data
+    if levels is None:
+        levels = []
+    levels = [L for L in levels if L.get("solution") is not None]
+
+    tables = _build_tables(levels)
+    alpha = float(config.get("alpha", 0.5))
+    interp_k = float(config.get("interp_k", 2.0))
+    use_dp = bool(config.get("use_depth_phase", True))
+
+    policy = _Policy(tables, alpha=alpha, interp_k=interp_k, use_depth_phase=use_dp)
+    policy.tables = tables  # for inspection / debugging
+    return policy
+
+
+if __name__ == "__main__":
+    # quick self-test on the training file
+    import json
+    with open("data/training_levels.json") as f:
+        tr = json.load(f)
+    pol = make_policy(tr)
+    print("tables:", {k: len(v) for k, v in pol.tables.items() if hasattr(v, "__len__")},
+          "steps:", pol.tables["total_steps"])
+    st = {"cell": "a", "neighbors": ("b", "#", "c", "d"), "previous_action": "U",
+          "history": ["U", "U", "U"], "depth": 30}
+    print("sample:", pol.action_probs({"id": "train_000"}, st, ["U", "D", "L", "R"]))

@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+asibench HMC Neal-funnel forensic audit -- deterministic transition-kernel reconstruction.
+
+Builds, from the anonymous candidate transition evidence, the *selected valid* reversible,
+volume-preserving transition map and replays the production and held-out streams exactly.
+
+Inferred kernel (single shared object):
+    velocity-Verlet leapfrog (drift-kick-drift), kinetic metric G = inverse_mass_matrix,
+    L = integration_steps, eps = step_size
+      production: L=18, eps=0.0732   |   holdout: L=24, eps=0.0765
+The observed candidate proposal/reverse arrays carry small deterministic perturbations;
+they are used *verbatim* for the audit metrics but the replay uses the *exact* inferred map.
+
+Transition-audit window alignment (documented):
+    production transition_audit  = trailing 80 post-warmup transitions, indices t in [940, 1020)
+    holdout   transition_audit   = trailing 100 transitions,           indices t in [60, 160)
+    energy_diagnostics / diagnostics.json statistics = kept (post-warmup) window, indices t in [120, 1020)
+"""
+import json, csv, math, os
+import numpy as np
+
+RESULTS = "results"
+os.makedirs(RESULTS, exist_ok=True)
+
+# ----------------------------- inputs ---------------------------------------
+man     = json.load(open("data/target_manifest.json", "r"))
+sched   = json.load(open("data/transition_schedule.json", "r"))
+bundle  = np.load("data/candidate_transition_bundle.npz", allow_pickle=True)
+panel   = np.load("data/candidate_chain_panel.npz", allow_pickle=True)
+init_lat= np.load("data/initial_latent_states.npy")
+momenta = np.load("data/transition_momenta.npy")
+uniforms= np.load("data/transition_uniforms.npy")
+hold_init = np.load("data/holdout_initial_latent_states.npy")
+hold_mom  = np.load("data/holdout_transition_momenta.npy")
+hold_uni  = np.load("data/holdout_transition_uniforms.npy")
+
+with open("data/profile_bins.csv", newline="") as f:
+    bin_rows = [r for r in csv.reader(f)][1:]
+PROFILE_BINS = [(int(r[0]), float(r[1]), float(r[2])) for r in bin_rows]
+
+D     = man["dimension"]; SIGV = man["sigma_v"]
+W     = np.asarray(man["sampler_chart"]["matrix"], dtype=float)
+SHIFT = np.asarray(man["sampler_chart"]["shift"], dtype=float)
+WARP  = man["sampler_chart"]["warp_strength"]
+PHASE = np.asarray(man["sampler_chart"]["warp_phase"], dtype=float)
+G     = np.asarray(man["kinetic_metric"]["inverse_mass_matrix"], dtype=float)
+M     = np.asarray(man["kinetic_metric"]["mass_matrix"], dtype=float)
+CAND_IDS = list(man["public_candidate_ids"])
+
+N_CH, WARMUP, KEPT, TOTAL = sched["n_chains"], sched["warmup_transitions"], sched["kept_transitions"], sched["total_transitions"]
+STEP, LSTEP = sched["step_size"], sched["integration_steps"]
+AUDIT = sched["audit_transitions"]
+H_CH, H_TR, H_STEP, H_LSTEP = sched["holdout_chains"], sched["holdout_transitions"], sched["holdout_step_size"], sched["holdout_integration_steps"]
+H_AUDIT = sched["holdout_audit_transitions"]
+LADDER  = np.asarray(bundle["step_size_ladder"], dtype=float)
+BASE_LADDER = int(np.argmin(np.abs(LADDER - STEP)))      # index 2, exact 0.0732 match
+
+# ----------------------------- target mechanics (public formulas) -------------
+def to_centered(q):
+    """sampler coordinate q -> centered (v, x_1..x_11) via the manifest sampler chart."""
+    u = (q - SHIFT) @ W.T
+    c = np.empty(D)
+    c[0] = u[0]
+    c[1:] = u[1:] + WARP * np.sin(u[0] + PHASE)
+    return c
+
+def U(q):
+    c = to_centered(q); v, xs = c[0], c[1:]
+    return 0.5 * (v / SIGV) ** 2 + 0.5 * (D - 1) * v + 0.5 * np.exp(-v) * np.dot(xs, xs)
+
+def grad_U(q):
+    c = to_centered(q); v, xs = c[0], c[1:]
+    g = np.empty(D)
+    g[0] = v / SIGV**2 + 0.5 * (D - 1) - 0.5 * np.exp(-v) * np.dot(xs, xs)
+    g[1:] = np.exp(-v) * xs
+    gu = np.empty(D)
+    gu[0] = g[0] + WARP * np.sum(g[1:] * np.cos(c[0] + PHASE))
+    gu[1:] = g[1:]
+    return gu @ W
+
+def K(p):
+    return 0.5 * float(p @ G @ p)
+
+def H(q, p):
+    return U(q) + K(p)
+
+def z_residual(q):
+    """standard funnel residuals z from sampler-coordinate q."""
+    c = to_centered(q); v = c[0]
+    z = np.empty(D); z[0] = v / SIGV; z[1:] = np.exp(-v / 2) * c[1:]
+    return z
+
+# ----------------------------- inferred kernel --------------------------------
+def velocity_verlet(q, p, eps, n_steps):
+    """velocity-Verlet (drift-kick-drift); drift uses G p (dq/dt = grad_p K(p)), kick uses -grad_q U."""
+    q, p = np.array(q, float), np.array(p, float)
+    for _ in range(n_steps):
+        qh = q + 0.5 * eps * (G @ p)
+        p = p - eps * grad_U(qh)
+        q = qh + 0.5 * eps * (G @ p)
+    return q, p
+
+KERNEL = {"family": "velocity_verlet_drift_kick_drift", "metric": "inverse_mass_matrix",
+          "integration_steps_production": LSTEP, "integration_steps_holdout": H_LSTEP,
+          "step_size_production": STEP, "step_size_holdout": H_STEP, "base_ladder_index": BASE_LADDER}
+
+# ----------------------------- candidate transition audit --------------------
+probe_q, probe_p = bundle["probe_states"], bundle["probe_momenta"]
+prop_q, prop_p = bundle["proposal_states"], bundle["proposal_momenta"]
+rev_q,  rev_p  = bundle["reverse_states"], bundle["reverse_momenta"]
+v_in, v_out    = bundle["volume_input"], bundle["volume_output"]
+
+H_probe = np.array([H(probe_q[i], probe_p[i]) for i in range(len(probe_q))])
+
+def energy_rmse(ci, li):
+    Hp = np.array([H(prop_q[ci, li, i], prop_p[ci, li, i]) for i in range(len(probe_q))])
+    return float(np.sqrt(np.mean((Hp - H_probe) ** 2)))
+
+def reverse_p95(ci, li):
+    r = np.linalg.norm(rev_q[ci, li] - probe_q, axis=1) + np.linalg.norm(rev_p[ci, li] + probe_p, axis=1)
+    return float(np.percentile(r, 95))
+
+def volume_logdet_abs(ci):
+    X = np.hstack([v_in, np.ones((v_in.shape[0], 1))])
+    A, *_ = np.linalg.lstsq(X, v_out[ci], rcond=None)
+    s, ld = np.linalg.slogdet(A[:24])
+    return float(abs(ld) if s > 0 else np.inf)
+
+def split_rhat(x):
+    """split-Rhat over chain splits; x: (chains, n)."""
+    n = x.shape[1]; half = n // 2
+    splits = np.vstack([x[:, :half], x[:, half:2 * half]])
+    N = splits.shape[1]
+    m = splits.mean(axis=1); v = splits.var(axis=1, ddof=1)
+    Wv = v.mean(); B = N * np.var(m, ddof=1)
+    return float(np.sqrt((Wv * (N - 1) / N + B / N) / Wv))
+
+def ess_ips(x):
+    """Geyer initial-positive-sequence ESS on pooled (flattened) chain values."""
+    xf = x.flatten(); n = len(xf); xc = xf - xf.mean()
+    s0 = float(xc @ xc)
+    if s0 == 0: return float("nan")
+    ac = []
+    for lag in range(n):
+        val = float(xc[:n - lag] @ xc[lag:])
+        if val <= 0: break
+        ac.append(val)
+    rho = np.array(ac) / s0
+    tau = 1.0 + 2.0 * float(np.sum(rho))
+    return float(n / tau) if tau > 0 else float("nan")
+
+def linear(err, full, zero):
+    if err <= full: return 1.0
+    if err >= zero: return 0.0
+    return (zero - err) / (zero - full)
+
+audit_rows = []
+for ci, cid in enumerate(CAND_IDS):
+    rmse_by_lad = np.array([energy_rmse(ci, li) for li in range(len(LADDER))])
+    slope = float(np.polyfit(np.log(LADDER), np.log(rmse_by_lad), 1)[0])
+    rp95  = reverse_p95(ci, BASE_LADDER)
+    vl    = volume_logdet_abs(ci)
+    acc   = float(panel["panel_accepted"][ci].mean())
+    vp    = panel["panel_centered_samples"][ci][:, :, 0]
+    pm_v  = float(vp.mean()); pvar = float(vp.var(ddof=1))
+    ess   = ess_ips(vp); rhat = split_rhat(vp)
+    val   = (0.24 * linear(rmse_by_lad[BASE_LADDER], 0.01, 0.18)
+             + 0.24 * linear(rp95, 1e-8, 5e-3)
+             + 0.20 * linear(vl, 1e-5, 0.08)
+             + 0.16 * linear(abs(pvar - SIGV**2) / SIGV**2, 0.08, 0.55)
+             + 0.16 * linear(abs(0.82 - acc), 0.25, 0.80))
+    audit_rows.append([cid, float(rmse_by_lad[BASE_LADDER]), slope, rp95, vl,
+                       acc, pm_v, pvar, ess, rhat, val])
+
+with open(os.path.join(RESULTS, "kernel_audit.csv"), "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["candidate_id", "energy_rmse", "energy_slope", "reverse_p95", "volume_logdet_abs",
+                "acceptance_rate", "panel_mean_v", "panel_var_v", "panel_ess_v", "panel_rhat_v", "validity_score"])
+    w.writerows(audit_rows)
+
+# ----------------------------- failure-mode adjudication ---------------------
+adj_notes = {}
+for ci in [1, 4]:
+    vp = panel["panel_centered_samples"][ci][:, :, 0]
+    early, late = vp[:, :110], vp[:, 110:]
+    gap = float(abs(late.mean() - early.mean()))
+    acc_c = float(panel["panel_accepted"][ci].mean())
+    term_v = float(vp[:, -1].mean())
+    sres = np.linalg.norm(rev_q[ci, BASE_LADDER] - probe_q, axis=1)
+    mneg = np.linalg.norm(rev_p[ci, BASE_LADDER] + probe_p, axis=1)
+    msame= np.linalg.norm(rev_p[ci, BASE_LADDER] - probe_p, axis=1)
+    essc = ess_ips(vp)
+    adj_notes[f"kernel_{ci:02d}"] = {
+        "reverse_state_resid_p95": float(np.percentile(sres, 95)),
+        "reverse_momentum_resid_WITH_negation_p95": float(np.percentile(mneg, 95)),
+        "reverse_momentum_resid_WITHOUT_negation_p95": float(np.percentile(msame, 95)),
+        "momentum_negation_present": bool(np.percentile(mneg, 95) < np.percentile(msame, 95)),
+        "terminal_mean_v": term_v,
+        "panel_segment_early_mean_v": float(early.mean()),
+        "panel_segment_late_mean_v": float(late.mean()),
+        "panel_segment_gap": gap, "panel_acceptance": acc_c,
+        "panel_ess_v": essc, "ess_share_of_n": essc / vp.size,
+    }
+adj_notes["decision"] = {
+    "kernel_01": "terminal_imbalance", "kernel_04": "delayed_response",
+    "basis": ("Per-step peeled reverse residuals are distributed (already present after the first "
+              "peeled leapfrog step), not concentrated at the terminal step, and momentum negation is "
+              "correct for both k_01/k_04. Both show high acceptance with lagged mixing; k_04 is a "
+              "scaled-up copy of the same defect. No signal is present in exactly one candidate, so the "
+              "provisional assignment is retained and stated plainly."),
+}
+with open(os.path.join(RESULTS, "adjudication_notes.json"), "w") as f:
+    json.dump(adj_notes, f, indent=2)
+
+failure_modes = {"kernel_00": "energy_drift",        # energy diverges (mean dH +27, slope 5.27, Rhat 7.4)
+                 "kernel_01": "terminal_imbalance",  # subtle reversibility break (provisional, see notes)
+                 "kernel_02": "volume_loss",         # volume_logdet_abs 5.53, mono-decreasing dH<0, acc 1.0
+                 "kernel_03": "coordinate_mismatch", # reversible+vol-pres but huge energy error 117 (stuck)
+                 "kernel_04": "delayed_response",    # high acceptance + lagged mixing (provisional, see notes)
+                 "kernel_05": "valid_transition"}    # v-Verlet L=18, reversible, vol-pres, slope 2.17
+with open(os.path.join(RESULTS, "failure_modes.json"), "w") as f:
+    json.dump(failure_modes, f, indent=2)
+
+with open(os.path.join(RESULTS, "selected_kernel.json"), "w") as f:
+    json.dump({"selected_candidate_id": "kernel_05", "selected_valid": True, "kernel": KERNEL,
+               "rationale": ("kernel_05 matches velocity-Verlet (drift-kick-drift, metric G) with "
+                             "L=integration_steps at the production ladder base within the observed "
+                             "perturbation scale; clean reversibility, volume preservation, energy "
+                             "slope ~2; the only candidate reproduced by a reversible volume-preserving "
+                             "integrator at the schedule's L=18.")}, f, indent=2)
+
+# ----------------------------- production replay ------------------------------
+audit_start = TOTAL - AUDIT            # trailing post-warmup audit window [940, 1020)
+kept_start  = WARMUP                   # kept window [120, 1020)
+prod_kept   = np.zeros((N_CH, KEPT, D))
+prod_prop_lat = np.zeros((N_CH, AUDIT, D))
+prod_acc_lat  = np.zeros((N_CH, AUDIT, D))
+prod_dh = np.zeros((N_CH, TOTAL)); prod_accept = np.zeros((N_CH, TOTAL)); prod_aprob = np.zeros((N_CH, TOTAL))
+for ch in range(N_CH):
+    state = init_lat[ch].copy(); a_idx = 0
+    for t in range(TOTAL):
+        q_prop, p_prop = velocity_verlet(state, momenta[ch, t], STEP, LSTEP)
+        dh = H(q_prop, p_prop) - H(state, momenta[ch, t])
+        ap = math.exp(-dh) if dh > 0 else 1.0
+        acc = bool(uniforms[ch, t] < ap)
+        prod_dh[ch, t] = dh; prod_aprob[ch, t] = ap; prod_accept[ch, t] = acc
+        if acc: state = q_prop
+        if t >= audit_start:
+            prod_prop_lat[ch, a_idx] = q_prop; prod_acc_lat[ch, a_idx] = state; a_idx += 1
+        if t >= kept_start:
+            prod_kept[ch, t - kept_start] = state
+prod_centered = np.array([to_centered(q) for q in prod_kept.reshape(-1, D)]).reshape(N_CH, KEPT, D)
+np.save(os.path.join(RESULTS, "latent_samples.npy"), prod_kept)
+np.save(os.path.join(RESULTS, "samples.npy"), prod_centered)
+np.savez(os.path.join(RESULTS, "transition_audit.npz"),
+         accepted_latent=prod_acc_lat, proposal_latent=prod_prop_lat,
+         delta_h=prod_dh[:, audit_start:], accept_prob=prod_aprob[:, audit_start:],
+         accepted=prod_accept[:, audit_start:])
+
+# ----------------------------- holdout replay ---------------------------------
+h_audit_start = H_TR - H_AUDIT          # [60, 160)
+hold_terminal = np.zeros((H_CH, D))
+h_acc_lat = np.zeros((H_CH, H_AUDIT, D)); h_prop_lat = np.zeros((H_CH, H_AUDIT, D))
+h_dh = np.zeros((H_CH, H_TR)); h_acc = np.zeros((H_CH, H_TR)); h_aprob = np.zeros((H_CH, H_TR))
+for ch in range(H_CH):
+    state = hold_init[ch].copy(); a_idx = 0
+    for t in range(H_TR):
+        q_prop, p_prop = velocity_verlet(state, hold_mom[ch, t], H_STEP, H_LSTEP)
+        dh = H(q_prop, p_prop) - H(state, hold_mom[ch, t])
+        ap = math.exp(-dh) if dh > 0 else 1.0
+        acc = bool(hold_uni[ch, t] < ap)
+        h_dh[ch, t] = dh; h_aprob[ch, t] = ap; h_acc[ch, t] = acc
+        if acc: state = q_prop
+        if t >= h_audit_start:
+            h_prop_lat[ch, a_idx] = q_prop; h_acc_lat[ch, a_idx] = state; a_idx += 1
+    hold_terminal[ch] = state
+np.save(os.path.join(RESULTS, "holdout_terminal_states.npy"), hold_terminal)
+np.savez(os.path.join(RESULTS, "holdout_transition_audit.npz"),
+         accepted_latent=h_acc_lat, proposal_latent=h_prop_lat,
+         delta_h=h_dh[:, h_audit_start:], accept_prob=h_aprob[:, h_audit_start:],
+         accepted=h_acc[:, h_audit_start:])
+
+# ----------------------------- energy_diagnostics.csv --------------------------
+kept_dh = prod_dh[:, kept_start:]; kept_acc = prod_accept[:, kept_start:]
+with open(os.path.join(RESULTS, "energy_diagnostics.csv"), "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["chain_id", "acceptance_rate", "mean_abs_delta_h", "p95_abs_delta_h", "max_abs_delta_h"])
+    for ch in range(N_CH):
+        ab = np.abs(kept_dh[ch])
+        w.writerow([ch, float(kept_acc[ch].mean()), float(ab.mean()),
+                    float(np.percentile(ab, 95)), float(ab.max())])
+
+# ----------------------------- funnel profile (exact grid) ---------------------
+v_keep = prod_centered[:, :, 0]; xs_keep = prod_centered[:, :, 1:]
+radius2 = np.sum(xs_keep ** 2, axis=-1)
+flat_v = v_keep.reshape(-1); flat_r2 = radius2.reshape(-1); total_n = flat_v.size
+profile_rows = []
+for (bid, vl_, vr_) in PROFILE_BINS:
+    m = (flat_v >= vl_) & (flat_v < vr_)
+    cnt = int(m.sum()); exp_r2 = ""
+    if cnt > 0:
+        exp_r2 = f"{(D - 1) * float(np.exp(flat_v[m]).mean()):.6f}"
+    profile_rows.append([bid, f"{vl_:.1f}", f"{vr_:.1f}", cnt,
+                         f"{cnt / total_n:.8f}" if cnt else "0",
+                         f"{float(flat_v[m].mean()):.6f}" if cnt else "",
+                         f"{float(flat_r2[m].mean()):.6f}" if cnt else "",
+                         exp_r2])
+with open(os.path.join(RESULTS, "funnel_profile.csv"), "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["bin_id", "v_left", "v_right", "count", "fraction", "mean_v", "mean_radius2", "expected_radius2"])
+    w.writerows(profile_rows)
+
+# ----------------------------- diagnostics.json --------------------------------
+Z = np.array([z_residual(q) for q in prod_kept.reshape(-1, D)]).reshape(N_CH, KEPT, D)
+z_maxabs = np.abs(Z).max(axis=-1).reshape(-1)
+diag = {
+    "mean_v": float(v_keep.mean()), "var_v": float(v_keep.var(ddof=1)),
+    "mean_radius2": float(flat_r2.mean()),
+    "split_rhat_v": split_rhat(v_keep), "ess_v": ess_ips(v_keep),
+    "split_rhat_radius2": split_rhat(radius2), "ess_radius2": ess_ips(radius2),
+    "overall_acceptance_rate": float(kept_acc.mean()),
+    "chain_acceptance_rates": [float(kept_acc[c].mean()) for c in range(N_CH)],
+    "mean_abs_delta_h": float(np.abs(kept_dh).mean()),
+    "p95_abs_delta_h": float(np.percentile(np.abs(kept_dh), 95)),
+    "max_abs_delta_h": float(np.abs(kept_dh).max()),
+    "latent_mean_abs_max": float(z_maxabs.mean()),
+    "latent_var_abs_max": float(z_maxabs.var(ddof=1)),
+    "left_tail_prob_v_lt_minus5": float((flat_v < -5).mean()),
+    "right_tail_prob_v_gt_5": float((flat_v > 5).mean()),
+}
+with open(os.path.join(RESULTS, "diagnostics.json"), "w") as f:
+    json.dump(diag, f, indent=2)
+
+# ----------------------------- overview.png ------------------------------------
+def draw_raster_figure():
+    """pure-numpy multi-panel overview (matplotlib-free fallback)."""
+    import zlib, struct
+    Wp, Hp = 900, 700
+    c = np.full((Hp, Wp, 3), 255, np.uint8)
+    def line(x0, y0, x1, y1, col=(0, 0, 0), wd=1):
+        steps = max(abs(int(x1) - int(x0)), abs(int(y1) - int(y0)), 1)
+        for s in range(steps + 1):
+            x = int(round(x0 + (x1 - x0) * s / steps)); y = int(round(y0 + (y1 - y0) * s / steps))
+            for dx in range(-wd, wd + 1):
+                for dy in range(-wd, wd + 1):
+                    if 0 <= x + dx < Wp and 0 <= y + dy < Hp:
+                        c[y + dy, x + dx] = col
+    def bars(vals, x0, x1, ybase, ytop, col=(40, 160, 40)):
+        n = len(vals); vmax = max(vals) if vals else 1
+        bw = (x1 - x0) / n
+        for i, v in enumerate(vals):
+            hh = int((ytop - ybase) * v / vmax)
+            for x in range(int(x0 + i * bw), int(x0 + (i + 1) * bw) - 1):
+                for y in range(ybase + 1, ybase + hh):
+                    if y < Hp: c[y, x] = col
+        return vmax
+    # panel A: v traces (top-left)
+    line(30, 220, 450, 220); line(30, 30, 30, 220)
+    colors = [(30, 30, 200), (200, 30, 30), (30, 160, 30), (200, 130, 20)]
+    for ch in range(N_CH):
+        prev = (30, 220 - (v_keep[ch, 0] + 10) / 20 * 190)
+        for t in range(0, KEPT, 5):
+            yv = 220 - (v_keep[ch, t] + 10) / 20 * 190
+            px = 30 + t / KEPT * 420
+            line(prev[0], prev[1], px, yv, col=colors[ch])
+            prev = (px, yv)
+    # panel B: radius2 vs v (top-right)
+    line(480, 220, 880, 220); line(480, 30, 480, 220)
+    r2max = float(np.percentile(flat_r2, 99))
+    for xv, rv in zip(flat_v[::10], flat_r2[::10]):
+        px = 480 + (float(xv) + 10) / 20 * 400
+        py = 220 - min(float(rv), r2max) / r2max * 190
+        if 0 <= py: line(px, py, px, py, col=(150, 80, 150), wd=2)
+    # panel C: acceptance bars (bottom-left)
+    line(30, 500, 450, 500); line(30, 300, 30, 500)
+    bars([diag["chain_acceptance_rates"][ch] for ch in range(N_CH)], 60, 420, 500, 300, col=(40, 140, 200))
+    # panel D: abs delta_h distribution (bottom-right)
+    line(480, 500, 880, 500); line(480, 300, 480, 500)
+    abd = np.abs(kept_dh).reshape(-1)
+    hist, edges = np.histogram(abd, bins=25, range=(0, float(np.percentile(abd, 99))))
+    hsc = hist / hist.max()
+    for i in range(len(hist)):
+        x0 = 480 + i * 16; x1 = 480 + (i + 1) * 15
+        for x in range(x0, x1):
+            hh = int(hsc[i] * 190)
+            for y in range(500 - hh, 500):
+                c[y, x] = (200, 120, 20)
+    def chunk(tag, data):
+        cc = struct.pack(">I", len(data)) + tag + data
+        cc += struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+        return cc
+    raw = b"".join(b"\x00" + c[i].tobytes() for i in range(Hp))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", Wp, Hp, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    for ch in range(N_CH):
+        axes[0, 0].plot(v_keep[ch], lw=0.6, label=f"chain {ch}")
+    axes[0, 0].set_title("kept v trace per chain"); axes[0, 0].set_xlabel("kept transition"); axes[0, 0].set_ylabel("v"); axes[0, 0].legend(fontsize=7)
+    axes[0, 1].scatter(flat_v[::10], flat_r2[::10], s=2, alpha=0.3)
+    axes[0, 1].set_title("radius2 vs v (kept centered samples)"); axes[0, 1].set_xlabel("v"); axes[0, 1].set_ylabel("radius2")
+    axes[1, 0].bar(range(N_CH), diag["chain_acceptance_rates"]); axes[1, 0].set_title("per-chain acceptance"); axes[1, 0].set_ylim(0, 1)
+    axes[1, 1].hist(np.abs(kept_dh).reshape(-1), bins=50); axes[1, 1].set_title("abs delta_h (kept)"); axes[1, 1].set_xlabel("|dH|")
+    fig.suptitle("HMC forensic replay overview — inferred velocity-Verlet kernel (L=18, step=0.0732)")
+    fig.tight_layout(); fig.savefig(os.path.join(RESULTS, "overview.png"), dpi=110); plt.close(fig)
+except Exception:
+    with open(os.path.join(RESULTS, "overview.png"), "wb") as f:
+        f.write(draw_raster_figure())
+
+# ----------------------------- consistency gate + stdout summary ----------------
+gate = {}
+qq = np.zeros_like(probe_q); mm = np.zeros_like(probe_p)
+for i in range(len(probe_q)):
+    qq[i], mm[i] = velocity_verlet(probe_q[i], probe_p[i], LADDER[BASE_LADDER], LSTEP)
+rep_rmse = float(np.sqrt(np.mean((qq - prop_q[5, BASE_LADDER]) ** 2 + (mm - prop_p[5, BASE_LADDER]) ** 2)))
+move_scale = float(np.percentile(np.linalg.norm(prop_q[5, BASE_LADDER] - probe_q, axis=1), 50))
+gate["kernel_05_replay_rmse_base"] = rep_rmse
+gate["kernel_05_forward_move_scale_median"] = move_scale
+gate["within_perturbation_scale"] = bool(rep_rmse < 0.1)
+gate["selected_kernel_matches_bundle"] = bool(rep_rmse < move_scale / 10.0)
+gate["holdout_terminal_equals_last_audited"] = bool(np.allclose(hold_terminal, h_acc_lat[:, -1, :], atol=1e-12))
+gate["production_kept_capacity"] = int(prod_kept.shape[1])
+gate["audit_window_production"] = f"[{audit_start},{TOTAL})"
+gate["audit_window_holdout"] = f"[{h_audit_start},{H_TR})"
+gate["energy_diagnostics_window"] = f"kept indices [{kept_start},{TOTAL})"
+gate["selected_rank_by_validity"] = int(np.argmax([r[-1] for r in audit_rows]))
+gate["selected_is_highest_validity"] = bool(np.argmax([r[-1] for r in audit_rows]) == 5)
+with open(os.path.join(RESULTS, "consistency_report.json"), "w") as f:
+    json.dump(gate, f, indent=2)
+
+print("kernel_audit (base ladder step %.5f):" % LADDER[BASE_LADDER])
+print("\t".join(["cand", "en_rmse", "en_slope", "rev_p95", "vol_ld", "acc", "pvar", "pess", "prhat", "validity"]))
+for r in audit_rows:
+    print("\t".join([r[0]] + [f"{x:.4g}" for x in r[1:]]))
+print("failure_modes:", failure_modes)
+print("selected_kernel:", "kernel_05")
+print("funnel_profile:", profile_rows)
+print("diagnostics:", json.dumps(diag, indent=1))
+print("consistency gate:", json.dumps(gate, indent=1))
+print("adjudication basis:", adj_notes["decision"]["basis"])
+print("ALL REQUIRED ARTIFACTS WRITTEN.")

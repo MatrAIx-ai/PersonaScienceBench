@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""2D leapfrog vortex (VPFM: Vortex Particle Flow Map) reproduction.
+
+MAC staggered grid, 135x135 cells on [0,1]^2, dx = dy = 1/135.
+
+Layout (x-first, verified from the input files):
+    u_x[i, j] : horizontal face velocity at (x = i*dx,      y = (j+1/2)*dx)  -> (136,135)
+    u_y[i, j] : vertical   face velocity at (x = (i+1/2)*dx, y = j*dx)       -> (135,136)
+Cell-centred arrays are (135,135): a[i,j] at (x=(i+1/2)dx, y=(j+1/2)dx).
+
+Method (as specified):
+  * quadratic B-spline (N2) kernel for every particle<->grid transfer (G2P and P2G)
+  * APIC-style flow-map tracking: dT/dt = -(grad u)^T T,  C_c = T^T * init_C_c
+  * midpoint velocity: semi-Lagrangian RK4 backward advection of grid vorticity by
+    0.5*dt, then a Poisson solve for the stream function
+  * particles and T matrices reinitialized (uniform 4x4 subgrid, T = I) every step
+  * 16 particles per cell
+  * near-exact Dirichlet Poisson solve (psi = 0 on boundary), LU factorization reused
+  * dt = min(CFL*dx/u_max, time to next frame), CFL = 1.8797, dt_frame = 0.1, 107 frames,
+    frame 0 captured at t = 0 before any step (=> 108 kinetic-energy entries)
+
+Outputs (current working directory):
+    vorticity_frames.npy  (5,135,135) float32  at frames [0,26,52,78,104]
+    kinetic_energy.npy    (108,)      float32  E = sum 0.5*dx^2*(ubar^2+vbar^2)
+
+No command-line arguments.  CPU-only numpy/scipy.
+"""
+import os
+import sys
+import time
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from scipy import ndimage
+
+# ----------------------------------------------------------------------- parameters
+N = 135
+DX = 1.0 / N
+INV_DX = float(N)
+CFL = 1.8797
+DT_FRAME = 0.1
+N_FRAMES = 107
+SAVE_FRAMES = [0, 26, 52, 78, 104]
+SUB = 4
+PPC = SUB * SUB
+DATA_DIR = "data"
+VORT_OUT = "vorticity_frames.npy"
+KE_OUT = "kinetic_energy.npy"
+DIAG = {}
+# Sensitivity switch for the APIC/flow-map gradient correction used in P2G.
+#   "TT"   : C_c = T^T * init_C_c   (as specified in the brief -- production default)
+#   "T"    : C_c = T   * init_C_c   (covector transport alternative, for comparison only)
+#   "none" : no gradient correction (plain N2 P2G, comparison only)
+GRAD_MODE = "TT"
+# What is carried as the evolved state between steps:
+#   "vorticity" (default) : the grid vorticity omega is the state; velocities are always
+#                           recovered from the stream function.  This is the vorticity-form
+#                           VPFM loop described in the brief.
+#   "faces"              : MAC face velocities are carried and omega is recomputed from
+#                           them with the clamped central-difference curl at every step.
+#                           That extra projection+curl round trip is a low-pass filter
+#                           (~6-11% of max|omega| per step on sigma=2dx cores); kept here
+#                           so the variant can be reproduced with one line.
+STATE = "vorticity"
+
+
+# ---------------------------------------------- finite differences (clamped indices)
+def cd(a, axis):
+    """Central difference with out-of-bounds indices clamped to the valid range."""
+    n = a.shape[axis]
+    idx = np.arange(n)
+    lo = np.take(a, np.maximum(idx - 1, 0), axis=axis)
+    hi = np.take(a, np.minimum(idx + 1, n - 1), axis=axis)
+    return (hi - lo) / (2.0 * DX)
+
+
+def to_centers(ux, uy):
+    return 0.5 * (ux[1:, :] + ux[:-1, :]), 0.5 * (uy[:, 1:] + uy[:, :-1])
+
+
+def to_faces(u_c, v_c):
+    """Cell-centre velocities -> MAC face velocities (clamped edge averaging)."""
+    i = np.arange(N + 1)
+    ux = 0.5 * (np.take(u_c, np.clip(i - 1, 0, N - 1), axis=0)
+                + np.take(u_c, np.clip(i, 0, N - 1), axis=0))
+    uy = 0.5 * (np.take(v_c, np.clip(i - 1, 0, N - 1), axis=1)
+                + np.take(v_c, np.clip(i, 0, N - 1), axis=1))
+    return ux, uy
+
+
+def vorticity_from_faces(ux, uy):
+    ubar, vbar = to_centers(ux, uy)
+    return cd(vbar, 0) - cd(ubar, 1)
+
+
+def kinetic_energy(ux, uy):
+    ubar, vbar = to_centers(ux, uy)
+    return 0.5 * DX * DX * float(np.sum(ubar * ubar + vbar * vbar))
+
+
+# ------------------------------------------------------------------------- Poisson
+class Poisson:
+    """lap(psi) = omega at cell centres, psi = 0 on the outer ring;
+    u = -dpsi/dy, v = +dpsi/dx (sign convention validated against the initial file)."""
+
+    def __init__(self, n=N):
+        m = n - 2
+        I = sp.identity(m, format="csr")
+        T = sp.diags([np.ones(m - 1), -2.0 * np.ones(m), np.ones(m - 1)], [-1, 0, 1],
+                     format="csr")
+        self.L = (sp.kron(T, I, format="csr") + sp.kron(I, T, format="csr")) / (DX * DX)
+        self.lu = spla.splu(self.L.tocsc())
+        self.m, self.n = m, n
+        self.n_solves = 0
+        self.max_rel_res = 0.0
+
+    def psi(self, w):
+        b = np.ascontiguousarray(w[1:-1, 1:-1]).ravel()
+        x = self.lu.solve(b)
+        nb = np.linalg.norm(b)
+        if nb > 0.0:
+            self.max_rel_res = max(self.max_rel_res,
+                                   float(np.linalg.norm(self.L.dot(x) - b) / nb))
+        self.n_solves += 1
+        out = np.zeros((self.n, self.n))
+        out[1:-1, 1:-1] = x.reshape(self.m, self.m)
+        return out
+
+    def velocity(self, w):
+        p = self.psi(w)
+        return -cd(p, 1), cd(p, 0)
+
+
+# ---------------------------------------------------------------- N2 kernel transfers
+def n2_weights(s):
+    """1-D N2 weights at grid coordinate s (node p at s = p): base index + 3 weights."""
+    i0 = np.floor(s + 0.5).astype(np.int64)
+    t = s - i0
+    return i0, (0.5 * (0.5 - t) ** 2, 0.75 - t * t, 0.5 * (0.5 + t) ** 2)
+
+
+def grid_index(x_phys):
+    return n2_weights(x_phys * INV_DX - 0.5)
+
+
+def gather_at(grid, x, y):
+    """N2 interpolation of a cell-centred (N,N) grid at physical positions x, y."""
+    i0, wx = grid_index(x)
+    j0, wy = grid_index(y)
+    out = np.zeros(np.shape(x))
+    for a in (-1, 0, 1):
+        ia = np.clip(i0 + a, 0, N - 1)
+        for b in (-1, 0, 1):
+            jb = np.clip(j0 + b, 0, N - 1)
+            out += grid[ia, jb] * (wx[a + 1] * wy[b + 1])
+    return out
+
+
+def rk4_backtrack(w, u_c, v_c, h):
+    """Semi-Lagrangian RK4 backward traceback of grid vorticity over time h.
+    Departure points clamped to [dx/2, 1-dx/2]; N2 interpolation."""
+    xs = (np.arange(N) + 0.5) * DX
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    k1u, k1v = gather_at(u_c, X, Y), gather_at(v_c, X, Y)
+    x2, y2 = X - 0.5 * h * k1u, Y - 0.5 * h * k1v
+    k2u, k2v = gather_at(u_c, x2, y2), gather_at(v_c, x2, y2)
+    x3, y3 = X - 0.5 * h * k2u, Y - 0.5 * h * k2v
+    k3u, k3v = gather_at(u_c, x3, y3), gather_at(v_c, x3, y3)
+    x4, y4 = X - h * k3u, Y - h * k3v
+    k4u, k4v = gather_at(u_c, x4, y4), gather_at(v_c, x4, y4)
+    xd = np.clip(X - (h / 6.0) * (k1u + 2 * k2u + 2 * k3u + k4u), 0.5 * DX, 1 - 0.5 * DX)
+    yd = np.clip(Y - (h / 6.0) * (k1v + 2 * k2v + 2 * k3v + k4v), 0.5 * DX, 1 - 0.5 * DX)
+    return gather_at(w, xd, yd)
+
+
+class Particles:
+    """Uniform 4x4-per-cell particle set (rebuilt every step) + its fixed N2 stencil."""
+
+    def __init__(self):
+        sub = (np.arange(SUB) + 0.5) / SUB
+        g = ((np.arange(N)[:, None] + sub[None, :]).ravel()) * DX
+        self.x0 = np.repeat(g, g.size)
+        self.y0 = np.tile(g, g.size)
+        self.n = self.x0.size                                # 16 * N * N
+        i0, wx = grid_index(self.x0)
+        j0, wy = grid_index(self.y0)
+        flat, wt = [], []
+        for a in (-1, 0, 1):
+            ia = np.clip(i0 + a, 0, N - 1)
+            for b in (-1, 0, 1):
+                jb = np.clip(j0 + b, 0, N - 1)
+                flat.append(ia * N + jb)
+                wt.append(wx[a + 1] * wy[b + 1])
+        self.flat = np.asarray(flat)
+        self.wt = np.asarray(wt)
+
+    def g2p(self, fields):
+        """N2 G2P for a list of cell-centred grids (shared stencil -> one pass)."""
+        stack = np.stack([np.ascontiguousarray(f).ravel() for f in fields])
+        acc = np.zeros((len(fields), self.n))
+        for k in range(9):
+            acc += stack[:, self.flat[k]] * self.wt[k]
+        return [acc[k] for k in range(len(fields))]
+
+
+def p2g(x, y, omega_p, cx, cy):
+    """N2 P2G with the flow-map linear (x_j - X_p).C_p vorticity-gradient correction.
+    omega_new[j] = (1/PPC) sum_p [omega_p + (x_j - X_p).C_p] W_jp ."""
+    i0, wx = grid_index(x)
+    j0, wy = grid_index(y)
+    num = np.zeros(N * N)
+    for a in (-1, 0, 1):
+        ia = np.clip(i0 + a, 0, N - 1)
+        xn = (ia + 0.5) * DX - x
+        for b in (-1, 0, 1):
+            jb = np.clip(j0 + b, 0, N - 1)
+            val = omega_p + cx * xn + cy * ((jb + 0.5) * DX - y)
+            num += np.bincount(ia * N + jb, weights=val * (wx[a + 1] * wy[b + 1]),
+                               minlength=N * N)
+    return (num / PPC).reshape(N, N)
+
+
+# --------------------------------------------------------------------- diagnostics
+def core_positions(w):
+    """Circulation-weighted centroids of the dominant vorticity cores."""
+    out = []
+    for thr in (0.5 * w.max(), 0.5 * w.min()):
+        if thr == 0.0:
+            continue
+        lab, nb = ndimage.label(w > thr if thr > 0 else w < thr)
+        ww_all = np.abs(w)
+        for k in range(1, nb + 1):
+            m = lab == k
+            if m.sum() < 3:
+                continue
+            ww = ww_all * m
+            tot = ww.sum()
+            pk = np.unravel_index(np.argmax(ww), w.shape)
+            xc = float((np.arange(N)[:, None] * ww).sum() / tot + 0.5) * DX
+            yc = float((np.arange(N)[None, :] * ww).sum() / tot + 0.5) * DX
+            out.append((xc, yc, float(w[pk]), int(m.sum())))
+    return sorted(out)
+
+
+def data_path(*parts):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.getcwd(), here):
+        p = os.path.join(base, *parts)
+        if os.path.exists(p):
+            return p
+    return os.path.join(os.getcwd(), *parts)
+
+
+# ------------------------------------------------------------------------- main run
+def main():
+    t_wall0 = time.time()
+    ux = np.load(data_path(DATA_DIR, "initial_u_x.npy")).astype(np.float64)
+    uy = np.load(data_path(DATA_DIR, "initial_u_y.npy")).astype(np.float64)
+    assert ux.shape == (N + 1, N) and uy.shape == (N, N + 1), (ux.shape, uy.shape)
+
+    solver = Poisson(N)
+    pg = Particles()
+
+    vort_frames, ke_hist = [], []
+    DIAG.update(t=[0.0], dt=[], cfl=[], steps=0, circ=[], maxw=[], cores={}, ke_frame={})
+    # frames are defined by physical time t = k*dt_frame (several steps may land in one
+    # frame); kinetic_energy.npy therefore holds exactly N_FRAMES + 1 entries.
+
+    # ---- frame 0: t = 0, straight from the raw input faces (before any time step)
+    w0 = vorticity_from_faces(ux, uy)
+    ke_hist.append(kinetic_energy(ux, uy))
+    DIAG["circ"].append(float(w0.sum() * DX * DX))
+    DIAG["maxw"].append(float(np.abs(w0).max()))
+    DIAG["cores"][0] = core_positions(w0)
+    DIAG["ke_frame"][0] = ke_hist[0]
+    if 0 in SAVE_FRAMES:
+        vort_frames.append(w0.astype(np.float32))
+    w = w0.copy()                                    # evolved state vorticity
+    print("frame   0  t=0.0000  KE=%.8e  max|w|=%8.3f  circ=%+.6e"
+          % (ke_hist[0], DIAG["maxw"][0], DIAG["circ"][0]), flush=True)
+    for c in DIAG["cores"][0]:
+        print("        core x=%.4f y=%.4f w=%+.2f npix=%d" % c, flush=True)
+
+    frame, t = 0, 0.0
+    while frame < N_FRAMES:
+        t_next = (frame + 1) * DT_FRAME            # physical time of the next frame
+
+        # (0) current velocity field of the state vorticity
+        if STATE == "faces":
+            ux, uy = to_faces(*solver.velocity(w))     # MAC face velocities
+            ubar, vbar = to_centers(ux, uy)
+            w = vorticity_from_faces(ux, uy)           # literal face-state variant
+        else:
+            u_c, v_c = solver.velocity(w)
+            ubar, vbar = u_c, v_c
+        u_max = float(np.sqrt(ubar * ubar + vbar * vbar).max())
+        dt = min(CFL * DX / u_max, t_next - t) if u_max > 0.0 else (t_next - t)
+        dt = max(dt, 1e-12)
+        cfl_act = dt * u_max * INV_DX
+
+        # (1) vorticity of the state, (2) its velocity field
+        if STATE == "faces":
+            u_c, v_c = solver.velocity(w)
+
+        # (3) half-step semi-Lagrangian RK4 predictor of the grid vorticity
+        w_half = rk4_backtrack(w, u_c, v_c, 0.5 * dt)
+        # (4) temporal midpoint velocity
+        um_c, vm_c = solver.velocity(w_half)
+
+        # (5) reinitialize particles (uniform positions, T = I); N2 G2P
+        wp, cx, cy, up, vp, dudx_p, dudy_p, dvdx_p, dvdy_p = pg.g2p(
+            [w, cd(w, 0), cd(w, 1), um_c, vm_c,
+             cd(um_c, 0), cd(um_c, 1), cd(vm_c, 0), cd(vm_c, 1)])
+
+        # (6) midpoint advection of the particles
+        xn = np.clip(pg.x0 + dt * up, 0.5 * DX, 1.0 - 0.5 * DX)
+        yn = np.clip(pg.y0 + dt * vp, 0.5 * DX, 1.0 - 0.5 * DX)
+
+        # (7) dT/dt = -(grad u)^T T (frozen midpoint gradient, 2nd-order Taylor),
+        #     then C_c = T^T * init_C_c
+        a00, a01, a10, a11 = dudx_p, dvdx_p, dudy_p, dvdy_p          # (grad u)^T
+        b00 = a00 * a00 + a01 * a10
+        b01 = a00 * a01 + a01 * a11
+        b10 = a10 * a00 + a11 * a10
+        b11 = a10 * a01 + a11 * a11                                   # ((grad u)^T)^2
+        T00, T01 = 1.0 - dt * a00 + 0.5 * dt * dt * b00, -dt * a01 + 0.5 * dt * dt * b01
+        T10, T11 = -dt * a10 + 0.5 * dt * dt * b10, 1.0 - dt * a11 + 0.5 * dt * dt * b11
+        if GRAD_MODE == "TT":            # C_c = T^T init_C_c  (as specified)
+            cx_n, cy_n = T00 * cx + T10 * cy, T01 * cx + T11 * cy
+        elif GRAD_MODE == "T":           # covector transport alternative
+            cx_n, cy_n = T00 * cx + T01 * cy, T10 * cx + T11 * cy
+        else:                            # "none": plain N2 P2G
+            cx_n = cy_n = 0.0
+
+        # (8) N2 P2G (with the linear gradient correction) -> new grid vorticity
+        w = p2g(xn, yn, wp, cx_n, cy_n)
+
+        t += dt
+        DIAG["steps"] += 1
+        DIAG["dt"].append(dt)
+        DIAG["cfl"].append(cfl_act)
+
+        if t_next - t <= 1e-12:                      # a frame boundary has been reached
+            t = t_next
+            frame += 1
+            ux, uy = to_faces(*solver.velocity(w))   # MAC velocities for the diagnostics
+            w_out = vorticity_from_faces(ux, uy)
+            ke_hist.append(kinetic_energy(ux, uy))
+            DIAG["t"].append(t)
+            DIAG["circ"].append(float(w_out.sum() * DX * DX))
+            DIAG["maxw"].append(float(np.abs(w_out).max()))
+            if frame in SAVE_FRAMES:
+                vort_frames.append(w_out.astype(np.float32))
+                DIAG["ke_frame"][frame] = ke_hist[-1]
+            if frame % 5 == 0 or frame in SAVE_FRAMES:
+                DIAG["cores"][frame] = core_positions(w_out)
+            print("frame %3d  t=%.4f  dt=%.5f  CFL=%.4f  KE=%.8e  max|w|=%8.3f  circ=%+.6e"
+                  % (frame, t, dt, cfl_act, ke_hist[-1], DIAG["maxw"][-1],
+                     DIAG["circ"][-1]), flush=True)
+
+    # ------------------------------------------------------------------- save output
+    vort = np.stack(vort_frames, axis=0).astype(np.float32)
+    ke = np.asarray(ke_hist, dtype=np.float32)
+    assert vort.shape == (len(SAVE_FRAMES), N, N), vort.shape
+    assert ke.shape == (N_FRAMES + 1,), ke.shape
+    np.save(VORT_OUT, vort)
+    np.save(KE_OUT, ke)
+
+    # ------------------------------------------------------------------- diagnostics
+    dt_a, cfl_a = np.asarray(DIAG["dt"]), np.asarray(DIAG["cfl"])
+    ke_a, mw = np.asarray(ke_hist), np.asarray(DIAG["maxw"])
+    circ = np.asarray(DIAG["circ"])
+    print("\n================ diagnostics ================", flush=True)
+    print("config: STATE=%s  GRAD_MODE=%s  particles/step=%d" % (STATE, GRAD_MODE, pg.n))
+    print("wall clock                 : %.2f s" % (time.time() - t_wall0))
+    print("time steps taken           : %d  (T = %.1f)" % (DIAG["steps"], N_FRAMES * DT_FRAME))
+    print("dt   min/mean/max          : %.5f / %.5f / %.5f"
+          % (dt_a.min(), dt_a.mean(), dt_a.max()))
+    print("CFL  min/mean/max          : %.4f / %.4f / %.4f"
+          % (cfl_a.min(), cfl_a.mean(), cfl_a.max()))
+    print("Poisson solves             : %d ,  max relative residual %.3e"
+          % (solver.n_solves, solver.max_rel_res))
+    print("KE[0] (raw input faces)    : %.8e" % ke_a[0])
+    for f in SAVE_FRAMES:
+        print("KE[frame %3d]            : %.8e" % (f, ke_a[f]))
+    print("KE min / max               : %.8e (frame %d) / %.8e (frame %d)"
+          % (ke_a.min(), int(ke_a.argmin()), ke_a.max(), int(ke_a.argmax())))
+    print("KE drift (end-start)/start : %+.3f %%" % (100.0 * (ke_a[-1] - ke_a[0]) / ke_a[0]))
+    print("circulation sum(w)dx^2     : start %+.6e end %+.6e (%+.3f %%)"
+          % (circ[0], circ[-1], 100.0 * (circ[-1] - circ[0]) / max(abs(circ[0]), 1e-30)))
+    print("max|w| start/max/end       : %.3f / %.3f / %.3f" % (mw[0], mw.max(), mw[-1]))
+    print("\nvortex-core tracks (x, y, w_peak):")
+    for f in sorted(DIAG["cores"]):
+        print(" frame %3d: %s" % (f, "  ".join("(%.3f,%.3f,%+.1f)"
+                                              % (c[0], c[1], c[2])
+                                              for c in DIAG["cores"][f])), flush=True)
+    if 78 in DIAG["cores"] and 104 in DIAG["cores"]:
+        sep = lambda fl: [abs(c[1] - d[1]) for c in DIAG["cores"][fl] for d in DIAG["cores"][fl]
+                          if np.sign(c[2]) != np.sign(d[2])]
+        print("\ntrend check 78 -> 104: max|w| %.3f -> %.3f ; min opposite-sign |dy| "
+              "%.4f -> %.4f" % (mw[78], mw[104], min(sep(78)), min(sep(104))))
+
+    rv, rk = np.load(VORT_OUT), np.load(KE_OUT)
+    print("\nreloaded %s : shape=%s dtype=%s finite=%s"
+          % (VORT_OUT, rv.shape, rv.dtype, bool(np.isfinite(rv).all())))
+    print("reloaded %s   : shape=%s dtype=%s finite=%s"
+          % (KE_OUT, rk.shape, rk.dtype, bool(np.isfinite(rk).all())))
+    print("frames %s ; max|w| per saved frame: %s"
+          % (SAVE_FRAMES, np.array2string(np.abs(rv).max(axis=(1, 2)), precision=2)))
+    return vort, ke
+
+
+if __name__ == "__main__":
+    main()

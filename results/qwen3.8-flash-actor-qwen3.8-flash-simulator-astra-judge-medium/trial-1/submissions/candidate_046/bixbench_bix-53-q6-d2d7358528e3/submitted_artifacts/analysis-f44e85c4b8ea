@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+UBE2M KD vs control -> most enriched KEGG_2019_Mouse pathway via GSEApy (brief-fixed).
+
+Fixed requirements: DEG = baseMean>10 -> raw p<0.05 -> |log2FC raw|>1, applied IN THIS
+ORDER on the DESeq2 result table estimated with ALL genes; then DESeq2-style log2FC
+shrinkage (legacy 'normal' prior) to adjust the raw log2FC values; gseapy.prerank GSEA
+with ranked list = filtered DEG ordered by shrunken log2FC; gene sets KEGG_2019_Mouse;
+1000 permutations; seed=42; threads=4; main criterion = lowest adjusted p (NES and
+nominal p also reported). Groups: KL1-KL3 = UBE2M knockdown, WL1-WL3 = control --
+ASSUMPTION from sample names only, support reported via normalized Ube2m expression.
+
+Strategy (approved): attempt the REAL toolchain first (pydeseq2/R DESeq2, gseapy,
+Enrichr download of KEGG_2019_Mouse, ENSMUSG->symbol mapping via mygene.info). Only if
+that is impossible, run an explicitly labeled FALLBACK (DESeq2-equivalent NB GLM in
+numpy/scipy). GSEA is ATTEMPTED for real; if the KEGG_2019_Mouse GMT cannot be obtained
+it is reported as NOT RUN. No symbols invented, no enrichment numbers fabricated.
+"""
+import json, urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy import stats, optimize
+from scipy.special import gammaln
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "analysis"; OUT.mkdir(exist_ok=True)
+SEED, NPERM = 42, 1000
+np.random.seed(SEED)
+LOG = {"started": datetime.now(timezone.utc).isoformat(), "notes": []}
+def note(msg, err=None):
+    LOG["notes"].append({"msg": msg, "err": str(err)[:200] if err is not None else None})
+    print("[note]", msg, "" if err is None else f"| ERR {type(err).__name__}: {str(err)[:110]}", flush=True)
+
+cnt = pd.read_csv(ROOT / "data" / "count.csv")
+samples = ["KL1", "KL2", "KL3", "WL1", "WL2", "WL3"]
+groups = np.array(["KD", "KD", "KD", "CTRL", "CTRL", "CTRL"])   # ASSUMPTION (names only)
+Y = cnt[samples].to_numpy(np.float64); n = Y.shape[1]
+
+# ---------------------------------------------------- ENSMUSG -> symbol (real)
+def map_symbols_mygene(ens_ids):
+    url = "https://mygene.info/v3/query"; out = {}
+    for i in range(0, len(ens_ids), 1000):
+        body = json.dumps({"q": ",".join(ens_ids[i:i + 1000]), "scopes": "ensembl.gene",
+                           "species": "mouse", "fields": "symbol"}).encode()
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            for rec in json.loads(r.read()):
+                if rec.get("symbol") and rec.get("query"):
+                    out.setdefault(rec["query"], rec["symbol"])
+    return out
+
+# ---------------- QC: sample correlation / PCA (observable grouping support)
+def sample_qc():
+    gmm = np.nanmean(np.where(Y > 0, np.log(Y), np.nan), 1)
+    lY = np.where(Y > 0, np.log(Y), np.nan)
+    sfc = np.exp(np.nanmedian(lY[np.isfinite(gmm)] - gmm[np.isfinite(gmm), None], 0))
+    Lm = np.log1p(Y * (sfc.mean() / sfc)[None, :])
+    ex = (Y > 0).all(1) & (Y.mean(1) > 10)
+    Lc = (Lm[ex] - Lm[ex].mean(1, keepdims=True)).T
+    U, sv, _ = np.linalg.svd(Lc, full_matrices=False)
+    varr = sv ** 2 / (sv ** 2).sum()
+    pc1 = U[:, 0] * np.sign(U[np.abs(U[:, 0]).argmax(), 0])
+    return {"pc1_var": float(varr[0]), "pc2_var": float(varr[1]),
+            "pc1_by_sample": dict(zip(samples, np.round(pc1, 3).tolist())),
+            "pc1_separates_KL_vs_WL": bool(((pc1[:3] < 0).all() and (pc1[3:] > 0).all())
+                                           or ((pc1[:3] > 0).all() and (pc1[3:] < 0).all()))}
+qc = sample_qc()
+note(f"QC/PCA: PC1={qc['pc1_var']:.1%} PC2={qc['pc2_var']:.1%} "
+     f"PC1 separates KL from WL: {qc['pc1_separates_KL_vs_WL']} | {qc['pc1_by_sample']}")
+
+symbol_map, mapping_method = None, None
+try:
+    symbol_map = map_symbols_mygene(cnt["geneID"].tolist())
+    mapping_method = "mygene.info (real online mapping)"
+    note(f"symbol mapping OK: {len(symbol_map)} symbols")
+except Exception as e:
+    note("ENSMUSG->symbol mapping FAILED (mygene.info unreachable).", e)
+    try:
+        import pyensembl  # noqa: F401
+        note("pyensembl importable: offline mapping possible")
+    except Exception as e2:
+        note("no offline mapping resource (pyensembl/GTF/gene2ensembl absent)", e2)
+
+def bh(p):
+    o = np.argsort(p); m = len(p); q = p[o] * m / (np.arange(m) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out = np.empty(m); out[o] = np.clip(q, 0, 1); return out
+
+# ---------------------------------------------------- DE: pydeseq2 real, else fallback
+use_pydeseq2 = False
+try:
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+    use_pydeseq2 = True
+except Exception as e:
+    note("pydeseq2 not importable -> documented FALLBACK NB GLM.", e)
+
+if use_pydeseq2:
+    import anndata as ad
+    cd = pd.DataFrame({"counts": Y.T, "condition": np.where(groups == "KD", "KD", "CTRL")},
+                      index=cnt["geneID"])
+    a = ad.AnnData(cd[["counts"]].astype(np.int64), obs=cd[["condition"]])
+    dds = DeseqDataSet(a, design="~condition", ref_level=["condition", "CTRL"],
+                       quiet=True, seed=SEED); dds.deseq2()
+    st = DeseqStats(dds, contrast=["condition", "KD", "CTRL"], quiet=True); st.summary()
+    r = st.results_df.reset_index()
+    r.columns = ["geneID"] + list(r.columns[1:])
+    res = r.rename(columns={"log2FoldChange": "lfc_raw"})[
+        ["geneID", "baseMean", "lfc_raw", "lfcSE", "pvalue", "padj"]].rename(
+        columns={"lfc_raw": "log2FoldChange"})
+    DE_BACKEND = "pydeseq2 (real)"
+    norm_cpm = None
+else:
+    # ---- FALLBACK (explicitly labeled, NOT pydeseq2): DESeq2-equivalent NB GLM ----
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gm = np.nanmean(np.where(Y > 0, np.log(Y), np.nan), axis=1)
+    okg = np.isfinite(gm) & (Y.sum(1) > 0)
+    logY = np.where(Y > 0, np.log(Y), np.nan)
+    sf = np.exp(np.nanmedian(logY[okg] - gm[okg, None], axis=0))
+    sf = np.where(np.isfinite(sf) & (sf > 0), sf, 1.0)
+    sc = sf[groups == "CTRL"].mean() / sf
+    NORM = Y * sc[None, :]
+    baseMean = NORM.mean(axis=1)                      # DESeq2 baseMean = mean of normalized counts
+    x = (groups == "KD").astype(float)
+    n1, n0 = int(x.sum()), int((1 - x).sum())
+    logsf = np.log(sc)                                # size-factor offsets (DESeq2-style)
+    sum1 = Y[:, x == 1].sum(1); sum0 = Y[:, x == 0].sum(1)
+    sc1, sc0 = sc[x == 1].sum(), sc[x == 0].sum()
+    mu1 = (sum1 + 0.5) / sc1; mu0v = (sum0 + 0.5) / sc0   # offset-corrected Cox means
+    mu0_mat = np.repeat(mu0v[:, None], n, axis=1)
+    mu0_mat[:, x == 1] = mu1[:, None]
+    # exact hat-matrix diagonals for Poisson 2-group design (weights = mu_j)
+    A00 = mu0_mat.sum(1); A11 = mu0_mat[:, x == 1].sum(1); det = A00 * A11 - A11 ** 2
+    hc = A11 / np.maximum(det, 1e-12); hk = (A00 - A11) / np.maximum(det, 1e-12)
+    hj = np.zeros_like(mu0_mat); hj[:, x == 0] = hc[:, None]; hj[:, x == 1] = hk[:, None]
+    hj = np.clip(hj, 0, 0.999)
+    num = ((Y - mu0_mat) ** 2 - mu0_mat).sum(1)
+    den = ((1 - hj) * mu0_mat ** 2).sum(1)
+    ag = np.clip(np.nan_to_num(num / np.where(den > 0, den, np.nan),
+                               nan=0.05, posinf=10.0, neginf=1e-8), 1e-8, 10.0)
+    mbar = mu0_mat.mean(1); expr = mbar > 1e-6
+    Xtr = np.column_stack([np.ones(int(expr.sum())), 1 / np.maximum(mbar[expr], 1e-6)])
+    coef, *_ = np.linalg.lstsq(Xtr, np.log(ag[expr]), rcond=None)
+    at = np.clip(np.exp(coef[0] + coef[1] / np.maximum(mbar, 1e-6)), 1e-8, 10.0)
+    dv = np.log(ag[expr]) - np.log(at[expr])
+    prior_var = max(np.var(dv) - np.pi ** 2 / 6.0, 0.25)
+    ww = np.clip(prior_var / (prior_var + 1.0 / max(n - 2, 1)), 0.0, 1.0)
+    alpha = np.clip(np.exp(ww * np.log(ag) + (1 - ww) * np.log(at)), 1e-8, 10.0)
+    # per-gene NB MLE (L-BFGS-B, analytic gradient); start = Poisson 2-group MLE
+    b = np.zeros((len(Y), 2)); se1 = np.full(len(Y), np.nan)
+    b0i = np.log(np.maximum(mu0v, 1e-6)) - np.mean(logsf[x == 0])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        b1i = np.log(np.maximum(mu1, 1e-6)) - np.log(np.maximum(mu0v, 1e-6))
+    b1i = np.nan_to_num(np.clip(b1i, -5, 5), nan=0.0)
+    for i in range(len(Y)):
+        k = Y[i]; a = alpha[i]
+        if k.sum() == 0:
+            b[i] = (b0i[i], 0.0); continue
+        r = 1.0 / a
+        def fg(bb, k=k, a=a, r=r):
+            eta = np.clip(bb[0] + bb[1] * x + logsf, -30, 30); mu = np.exp(eta)
+            f = -np.sum(k * eta + gammaln(k + r) - gammaln(r) - gammaln(k + 1)
+                        + k * np.log(r) - (k + r) * np.log(mu + r))
+            d = (k + r) / (mu + r) * mu - k          # d(-LL)/dbeta (exact)
+            return f, np.array([d.sum(), (d * x).sum()])
+        ri = optimize.minimize(fg, [b0i[i], b1i[i]], jac=True, method="L-BFGS-B",
+                               options=dict(maxiter=300, ftol=1e-13, gtol=1e-10))
+        b[i] = ri.x
+        mu = np.exp(np.clip(ri.x[0] + ri.x[1] * x + logsf, -30, 30))
+        W = mu / (1 + a * mu)
+        s11 = W[x == 1].sum(); s00 = W.sum()
+        dt = max(s00 * s11 - s11 ** 2, 1e-12)
+        se1[i] = np.sqrt(max(s00 / dt, 0.0))
+    lfc = b[:, 1] / np.log(2.0); se_lfc = se1 / np.log(2.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zst = np.where(np.isfinite(se_lfc) & (se_lfc > 0), lfc / se_lfc, 0.0)
+    pval = np.clip(np.nan_to_num(2 * stats.norm.sf(np.abs(zst)), nan=1.0), 0, 1)
+    res = pd.DataFrame({"geneID": cnt["geneID"].values, "baseMean": baseMean,
+                        "log2FoldChange": np.nan_to_num(lfc), "lfcSE": se_lfc,
+                        "pvalue": pval, "padj": bh(pval)})
+    DE_BACKEND = ("FALLBACK (documented, NOT pydeseq2): DESeq2-equivalent NB GLM in "
+                  "numpy/scipy - median-of-ratios size factors, MoM dispersion + "
+                  "parametric trend + prior blend, per-gene NB-GLM MLE (L-BFGS-B), "
+                  "Wald test on log2FC, BH padj.")
+    norm_cpm = NORM / NORM.sum(0) * 1e6
+note("DE backend used: " + DE_BACKEND)
+
+# ------------------------- observable support for the group ASSUMPTION: Ube2m
+ube2m_support = "NOT AVAILABLE: no ENSMUSG->symbol mapping obtainable (offline)"
+if symbol_map:
+    inv = {v.upper(): k for k, v in symbol_map.items()}
+    g = inv.get("UBE2M")
+    if g in set(cnt["geneID"]):
+        i = int(np.flatnonzero(cnt["geneID"].values == g)[0])
+        if norm_cpm is None:   # pydeseq2 path: recompute simple CPM support
+            norm_cpm = Y / Y.sum(0) * 1e6
+        ube2m_support = {"geneID": g, "CPM_KL1": float(norm_cpm[i, 0]),
+                         "CPM_KL2": float(norm_cpm[i, 1]), "CPM_KL3": float(norm_cpm[i, 2]),
+                         "CPM_WL1": float(norm_cpm[i, 3]), "CPM_WL2": float(norm_cpm[i, 4]),
+                         "CPM_WL3": float(norm_cpm[i, 5]),
+                         "log2FC_KD_vs_CTRL": float(np.log2((norm_cpm[i, :3].mean() + 1e-9)
+                                                            / (norm_cpm[i, 3:].mean() + 1e-9)))}
+note(f"Ube2m support for KL=KD assumption: {ube2m_support}")
+
+# ------------------------- filters in the exact brief order (on result table)
+f1 = res["baseMean"] > 10
+f2 = f1 & (res["pvalue"] < 0.05)
+f3 = f2 & (res["log2FoldChange"].abs() > 1)
+funnel = {"total_genes": int(len(res)), "baseMean_gt_10": int(f1.sum()),
+          "plus_p_lt_0.05": int(f2.sum()), "plus_abs_lfc_raw_gt_1": int(f3.sum())}
+note(f"Filter funnel (brief order): {funnel}")
+
+# DESeq2-style legacy 'normal'-prior lfcShrink; tau^2 fit on ALL genes (MoM)
+b_all = res["log2FoldChange"].values; se_all = res["lfcSE"].values
+okf = np.isfinite(b_all) & np.isfinite(se_all) & (se_all > 0)
+# MoM for tau^2 (prior variance), DESeq2-legacy-style with robustification:
+# fit on well-expressed genes (baseMean>10), MAD-based variance minus median SE^2.
+rob = okf & (res["baseMean"].values > 10)
+mad = np.median(np.abs(b_all[rob] - np.median(b_all[rob]))) * 1.4826
+tau2_rob = max(float(mad ** 2 - np.median(se_all[rob] ** 2)), 1e-4)
+tau2_plain = max(float(np.var(b_all[okf], ddof=1) - np.mean(se_all[okf] ** 2)), 1e-4)
+tau2 = max(tau2_rob, 1e-4)
+res["log2FoldChange_shrunk"] = np.where(okf, b_all * tau2 / (tau2 + se_all ** 2), b_all)
+note(f"normal-prior lfcShrink: tau2={tau2:.5f} (robust MoM on baseMean>10; "
+     f"plain MoM all-genes={tau2_plain:.6f})")
+frac_p05 = float(np.mean((res['pvalue'] < 0.05)[f1.values]))
+note(f"calibration diagnostic: fraction of p<0.05 among baseMean>10 = {frac_p05:.3f} "
+     f"(null expectation ~0.05; excess = signal and/or dispersion underestimate)")
+
+deg = res.loc[f3].sort_values("log2FoldChange_shrunk", ascending=False).copy()
+if symbol_map: deg["symbol"] = deg["geneID"].map(symbol_map)
+deg.to_csv(OUT / "de_results_filtered.csv", index=False)
+res.to_csv(OUT / "de_results_full.csv.gz", index=False,
+          compression="gzip")
+f3s = int((f2 & (res["log2FoldChange_shrunk"].abs() > 1)).sum())
+note(f"SECONDARY sensitivity (filter on shrunken lfc): {f3s} DEG (main: {int(f3.sum())})")
+
+# ------------------------- GSEA: must be gseapy + KEGG_2019_Mouse (real)
+def get_kegg_sets():
+    import gseapy
+    try:
+        lib = gseapy.get_library("KEGG_2019_Mouse")
+        src = "gseapy.get_library(KEGG_2019_Mouse) [Enrichr, real]"
+    except Exception:
+        url = ("https://maayanlab.cloud/Enrichr/geneSetLibrary?"
+               "mode=text&libraryName=KEGG_2019_Mouse")
+        txt = urllib.request.urlopen(url, timeout=30).read().decode()
+        lib = {}
+        for ln in txt.splitlines():
+            p = ln.split("\t")
+            if len(p) >= 2: lib[p[0]] = [g.strip() for g in p[2:] if g.strip()]
+        src = "direct Enrichr download KEGG_2019_Mouse [real]"
+    return lib, src
+
+gsea_done, gsea_src, kegg = False, None, None
+try:
+    kegg, gsea_src = get_kegg_sets()
+    note(f"KEGG_2019_Mouse loaded: {len(kegg)} gene sets via {gsea_src}")
+except Exception as e:
+    note("KEGG_2019_Mouse retrieval FAILED -> GSEA cannot be executed (offline).", e)
+
+ranked_note = "n/a"
+if kegg is not None and symbol_map is not None:
+    allsyms = set()
+    kegg_u = {k: {g.upper() for g in v} for k, v in kegg.items()}
+    for v in kegg_u.values(): allsyms |= v
+    d = deg.dropna(subset=["symbol"]).copy()
+    d["sym_u"] = d["symbol"].str.upper()
+    d = d[d["sym_u"].isin(allsyms)]
+    rn = pd.Series(d["log2FoldChange_shrunk"].values,
+                   index=d["sym_u"].values).sort_values(ascending=False)
+    ranked_note = (f"ranked list after case-insensitive KEGG matching: {len(rn)} / "
+                   f"{int(f3.sum())} DEG mapped ({len(rn)/max(int(f3.sum()),1):.1%})")
+    note(ranked_note)
+    try:
+        import gseapy
+        pr = gseapy.prerank(rnk=rn, gene_sets=kegg, permutation_num=NPERM,
+                            seed=SEED, min_size=15, max_size=500, threads=4,
+                            outdir=None, scores="Signal to Noise")
+        pr.res2d.to_csv(OUT / "enrichment_results.csv", index=False)
+        gsea_done = True
+        note("GSEA executed with gseapy.prerank (REAL).")
+    except Exception as e:
+        note("gseapy.prerank execution FAILED.", e)
+else:
+    note("GSEA NOT RUN (limiting finding): KEGG_2019_Mouse GMT unavailable offline "
+         "AND no ENSMUSG->symbol mapping obtainable. No symbols invented; no "
+         "enrichment numbers fabricated; no home-grown surrogate substituted.")
+
+if not gsea_done:
+    pd.DataFrame(columns=["Term", "Name", "Nom p-val", "Multiplier",
+                          "FDR q-val", "NES", "Leading_genes"]).to_csv(
+        OUT / "enrichment_results.csv", index=False)
+
+LOG.update(dict(de_backend=DE_BACKEND,
+                symbol_mapping=mapping_method or
+                "UNAVAILABLE (no network; no local mapping resource found)",
+                ube2m_support=ube2m_support, filter_funnel=funnel,
+                sensitivity_shrunken_filter=f3s,
+                n_up=int((deg["log2FoldChange_shrunk"] > 0).sum()),
+                n_down=int((deg["log2FoldChange_shrunk"] < 0).sum()),
+                tau2_normal_prior=tau2, gsea_executed=gsea_done,
+                gsea_source=gsea_src or "NOT RUN - KEGG_2019_Mouse unavailable offline",
+                ranked_list=ranked_note, nperm=NPERM, seed=SEED,
+                qc=qc, groups_assumption="KL1-3=KD vs WL1-3=CTRL (name-based, unconfirmed)",
+                finished=datetime.now(timezone.utc).isoformat()))
+(OUT / "run_log.json").write_text(json.dumps(LOG, indent=2, default=str))
+print("\n=== SUMMARY ===")
+for k in ["de_backend", "symbol_mapping", "ube2m_support", "filter_funnel",
+          "sensitivity_shrunken_filter", "n_up", "n_down", "tau2_normal_prior",
+          "gsea_executed", "gsea_source"]:
+    print(f"{k}: {LOG[k]}")
+cols = [c for c in ["geneID", "symbol", "baseMean", "log2FoldChange",
+                    "log2FoldChange_shrunk", "pvalue", "padj"] if c in deg]
+print("\nTop 10 DEG by |shrunken log2FC|:")
+print(deg.sort_values("log2FoldChange_shrunk", key=np.abs, ascending=False)
+      .head(10)[cols].to_string(index=False))

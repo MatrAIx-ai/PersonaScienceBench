@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""
+analysis.py -- Process-based 3-layer snowpack dynamics model
+============================================================
+Brief: build a process-based fixed-3-layer snowpack model driven by hourly
+atmospheric forcing, tracking per-layer thickness, density, ice/liquid water
+mass, and temperature. Required outputs:
+
+    analysis.py                       this implementation
+    results/snow_state.npy            float64 (n_days,3,5) [thickness,density,ice,liq,temp]
+    results/snow_summary.csv          day,swe_mm,snow_depth_m,melt_mm,refreeze_mm,runoff_mm,mean_density
+    results/snow_evolution.png        diagnostic figure
+
+Physics (each process documents a stated assumption where no data drives it):
+
+  * COMPACTION  - Anderson(1976) style, two mechanisms:
+      destructive metamorphism: (1/rho) d(rho)/dt = C1*exp(C2*(T-Tf)), only
+      while rho < rho_dst (cap ~250 kg/m3); C1=2.8e-7 /s, C2=0.042 /K.
+      overburden (viscous) settling: d(rho)/dt = rho*g*W_above / eta,
+      eta = eta0*exp(kp*rho/1000 + kt*(Tf - T)), eta0=3.7e10 Pa s, kp=0.08,
+      kt=0.023 /K.  rho capped at rho_max=550 kg/m3.
+  * LIQUID RETENTION / DRAINAGE - each layer holds ret_frac*ice (ret_frac=0.05);
+    excess liquid drains top-down; bottom-layer excess becomes runoff.
+  * MELT / REFREEZE with latent-heat accounting - after the implicit conduction
+    step: T>Tf & ice>0 => melt excess heat into liquid; T<Tf & liq>0 =>
+    freeze liquid, releasing latent heat to warm the layer. Energy is conserved
+    between sensible and latent reservoirs; mass is conserved.
+  * SURFACE ENERGY EXCHANGE - layer1: Q = (1-albedo)*SW + eps*(LW_in - sigma*T^4)
+    + sensible rho_air*cp*(T_air - T1)/r_a ; latent flux neglected (no
+    humidity/wind data).  albedo=0.8, eps=1, r_a=50 s/m (calm assumption).
+  * INTER-LAYER HEAT CONDUCTION - implicit backward-Euler 3-layer tridiagonal
+    solve; k = max(0.02, 2.22*(rho/917)^1.88) harmonic mean at interfaces.
+  * DEPOSITION - hourly snowfall added to layer 1 at rho_fresh=100 kg/m3 and
+    temp min(T_air, Tf) (mass- and energy-weighted mixing).
+  * RAINFALL - added to layer 1 liquid at T_air (branch never triggers: the
+    forcing contains zero rainfall).
+  * BOTTOM BOUNDARY - fixed small geothermal flux 0.05 W/m2 into layer 3.
+  * TIME STEP - dt=600 s substeps within each hourly forcing interval; daily
+    samples taken at the end of each 24 h block (days 1..68).
+  * BOOKKEEPING - ice and liq are separate state variables; layer bulk density
+    rho is a state; thickness h = (ice+liq)/rho, so h and rho are always
+    consistent with mass.  h,rho are updated after every mass change.
+
+Mass balance check: cumulative snow+rain == SWE change + runoff (+0 sublimation);
+the residual is printed and included in the diagnostic figure.
+"""
+
+import json
+import os
+import struct
+import zlib
+
+import numpy as np
+
+# ----------------------------------------------------------------------------
+# constants (SI unless noted; flagged assumptions inline)
+# ----------------------------------------------------------------------------
+TF          = 273.15           # freezing point of water, K
+LF          = 334_000.0        # latent heat of fusion, J/kg
+C_ICE       = 2100.0           # specific heat of ice, J/kg/K
+C_WAT       = 4186.0           # specific heat of water, J/kg/K
+GRAV        = 9.80665          # m/s2
+RD          = 287.04           # gas constant dry air, J/kg/K
+CP_AIR      = 1005.0           # specific heat of air at const P, J/kg/K
+SIGMA       = 5.670374419e-8   # Stefan-Boltzmann, W/m2/K4
+
+# --- surface energy exchange (assumed parameters) ---------------------------
+ALBEDO      = 0.8              # constant broadband snow albedo (assumed)
+EPS_OUT     = 1.0              # snow surface emissivity (assumed)
+RS_AER      = 50.0             # aerodynamic resistance s/m (calm assumption)
+GROUND_FLUX = 0.05             # geothermal flux into bottom layer, W/m2 (assumed)
+
+# --- deposition & retention (assumed parameters) ----------------------------
+RHO_FRESH   = 100.0            # fresh (new) snow density kg/m3 (assumed)
+RET_FRAC    = 0.05             # irreducible liquid retention fraction of ice
+
+# --- compaction (Anderson 1976 style; constants stated as assumed) -----------
+C_DEST      = 2.8e-7           # destructive metamorphism prefactor, 1/s
+C_TEMP      = 0.042            # destructive exponent, 1/K
+RHO_DST     = 250.0            # destructive-metamorphism density cap, kg/m3
+ETA0        = 3.7e10           # viscosity prefactor, Pa s
+KP          = 0.08             # viscosity density exponent (rho/1000 units)
+KT          = 0.023            # viscosity temperature exponent, 1/K
+RHO_MAX     = 550.0            # hard density cap, kg/m3
+
+DT          = 600.0            # integration substep, s
+SEC_PER_H   = 3600.0
+def main():
+    # ----------------------------------------------------------------------
+    # 1. load inputs
+    # ----------------------------------------------------------------------
+    with open("data/snowpack_init.json", "r") as f:
+        init = json.load(f)
+
+    layers = init["layers"]
+    # state arrays indexed layer 0 = TOP, 2 = BOTTOM
+    ice = np.array([L["ice_mm"] for L in layers], dtype=float)     # mm = kg/m2
+    liq = np.array([L["liq_mm"] for L in layers], dtype=float)     # mm = kg/m2
+    temp = np.array([L["temp_K"] for L in layers], dtype=float)    # K
+    rho = np.array([L["density_kg_m3"] for L in layers], dtype=float)
+
+    import pandas as pd
+    forc = pd.read_csv("data/forcing.csv")
+    t_air  = forc["t_air_K"].to_numpy(float)
+    p_atm  = forc["p_atm_Pa"].to_numpy(float)
+    snow_h = forc["snowfall_mm_hr"].to_numpy(float)
+    rain_h = forc["rainfall_mm_hr"].to_numpy(float)
+    sw_in  = forc["sw_in_wm2"].to_numpy(float)
+    lw_in  = forc["lw_in_wm2"].to_numpy(float)
+
+    n_hours = len(snow_h)
+    n_days  = n_hours // 24
+    n_steps_per_hour = int(round(SEC_PER_H / DT))
+    dt = SEC_PER_H / n_steps_per_hour   # 600 s
+    rho_air = p_atm / (RD * t_air)      # kg/m3 from ideal gas law
+
+    # ----------------------------------------------------------------------
+    # 2. model helper functions (closures over state)
+    # ----------------------------------------------------------------------
+    def layer_thickness(i):
+        """h[m] consistent with tracked bulk density and masses."""
+        return (ice[i] + liq[i]) / rho[i]
+
+    def interface_conductivity(i):
+        """harmonic-mean effective conductivity between layer i and i+1."""
+        k_a = max(0.02, 2.22 * (rho[i] / 917.0) ** 1.88)
+        k_b = max(0.02, 2.22 * (rho[i + 1] / 917.0) ** 1.88)
+        return 2.0 * k_a * k_b / (k_a + k_b)
+
+    def deposition(i, snow_mm, rain_mm, t_snow_K, t_rain_K):
+        """Add new mass to layer i with energy-consistent temperature update."""
+        nonlocal temp, rho
+        if snow_mm > 0.0:
+            e_old = C_ICE * ice[i] * (temp[i] - TF)      # sensible, ~TF ref
+            e_new = C_ICE * snow_mm * (t_snow_K - TF)
+            denom = C_ICE * (ice[i] + snow_mm) + C_WAT * liq[i]
+            temp[i] = TF + (e_old + e_new) / max(denom, 1e-12)
+            h_old = layer_thickness(i)
+            rho[i] = (ice[i] + liq[i] + snow_mm) / (h_old + snow_mm / RHO_FRESH)
+            ice[i] += snow_mm
+            rho[i] = min(rho[i], RHO_MAX)
+        if rain_mm > 0.0:
+            e_old = (C_ICE * ice[i] + C_WAT * liq[i]) * (temp[i] - TF)
+            e_new = C_WAT * rain_mm * (t_rain_K - TF)
+            denom = C_ICE * ice[i] + C_WAT * (liq[i] + rain_mm)
+            temp[i] = TF + (e_old + e_new) / max(denom, 1e-12)
+            liq[i] += rain_mm
+
+    def compaction_step(i, over_mass_above, time_dt):
+        """Update layer bulk density by metamorphism + overburden (Anderson)."""
+        nonlocal rho
+        dr = 0.0
+        dT_c = temp[i] - TF
+        # destructive metamorphism (only below the density cap)
+        if rho[i] < RHO_DST:
+            dr += rho[i] * C_DEST * np.exp(C_TEMP * dT_c) * time_dt
+        # overburden (viscous) settling
+        if over_mass_above > 0.0:
+            eta = ETA0 * np.exp(KP * rho[i] / 1000.0 + KT * (TF - temp[i]))
+            dr += rho[i] * GRAV * over_mass_above / eta * time_dt
+        rho[i] = min(rho[i] + dr, RHO_MAX)
+        rho[i] = max(rho[i], 1.0)
+
+    def conduction_solve(q_sfc, q_gnd, time_dt):
+        """Implicit backward-Euler 3-layer conduction update of temperatures."""
+        nonlocal temp
+        C = C_ICE * ice + C_WAT * liq            # J/m2/K per layer
+        C = np.maximum(C, 1e-6)
+        k12 = interface_conductivity(0)
+        k23 = interface_conductivity(1)
+        z12 = 0.5 * (layer_thickness(0) + layer_thickness(1))
+        z23 = 0.5 * (layer_thickness(1) + layer_thickness(2))
+        g12 = k12 / z12
+        g23 = k23 / z23
+        A = np.zeros((3, 3)); b = np.zeros(3)
+        A[0, 0] = C[0] / time_dt + g12; A[0, 1] = -g12
+        b[0] = C[0] / time_dt * temp[0] + q_sfc
+        A[1, 0] = -g12; A[1, 1] = C[1] / time_dt + g12 + g23; A[1, 2] = -g23
+        b[1] = C[1] / time_dt * temp[1]
+        A[2, 1] = -g23; A[2, 2] = C[2] / time_dt + g23
+        b[2] = C[2] / time_dt * temp[2] + q_gnd
+        temp = np.linalg.solve(A, b)
+        temp = np.clip(temp, 150.0, 400.0)
+    def phase_change(i):
+        """Melt/refreeze with latent-heat accounting. Returns (melt, refreeze)."""
+        nonlocal temp, ice, liq
+        melt = refreeze = 0.0
+        if temp[i] > TF and ice[i] > 0.0:
+            surplus = (C_ICE * ice[i] + C_WAT * liq[i]) * (temp[i] - TF)
+            m = min(ice[i], surplus / LF)
+            ice[i] -= m; liq[i] += m; melt = m
+            if m > 0.0:
+                resid = surplus - m * LF
+                if ice[i] <= 1e-12:
+                    temp[i] = TF + resid / max(C_WAT * liq[i], 1e-12)
+                else:
+                    temp[i] = TF
+        elif temp[i] < TF and liq[i] > 1e-12:
+            deficit = (C_ICE * ice[i] + C_WAT * liq[i]) * (TF - temp[i])
+            f_needed = deficit / LF
+            f = min(liq[i], f_needed)
+            liq[i] -= f; ice[i] += f; refreeze = f
+            if f >= f_needed - 1e-9:
+                temp[i] = TF
+            else:
+                c_new = C_ICE * ice[i] + C_WAT * liq[i]
+                temp[i] = TF + (f * LF - deficit) / max(c_new, 1e-12)
+        return melt, refreeze
+
+    # ----------------------------- accumulators ----------------------------
+    state_out   = np.zeros((0, 3, 5))
+    summary_out = []
+    melt_history, refreeze_history, runoff_history = [], [], []
+    day_melt = day_refreeze = day_runoff = 0.0
+    cum_runoff = 0.0
+    cum_met = 0.0
+    init_total_mass = ice.sum() + liq.sum()
+
+    # ----------------------------------------------------------------------
+    # 3. main time loop
+    # ----------------------------------------------------------------------
+    for h in range(n_hours):
+        for s in range(n_steps_per_hour):
+            T_air = t_air[h]
+            # deposition into top layer
+            snow_mm = snow_h[h] / n_steps_per_hour
+            rain_mm = rain_h[h] / n_steps_per_hour
+            cum_met += snow_mm + rain_mm
+            if snow_mm > 0.0 or rain_mm > 0.0:
+                deposition(0, snow_mm, rain_mm, min(T_air, TF), T_air)
+
+            # surface energy balance (layer 1)
+            H = rho_air[h] * CP_AIR * (T_air - temp[0]) / RS_AER
+            q_sw = (1.0 - ALBEDO) * sw_in[h]
+            q_lw = EPS_OUT * (lw_in[h] - SIGMA * temp[0] ** 4.0)
+            q_sfc = q_sw + q_lw + H
+
+            # implicit conduction
+            conduction_solve(q_sfc, GROUND_FLUX, dt)
+
+            # phase change
+            for L in range(3):
+                dm, dfr = phase_change(L)
+                day_melt += dm
+                day_refreeze += dfr
+
+            # compaction
+            for L in range(3):
+                over_mass = 0.0
+                if L > 0:
+                    over_mass = (ice[:L].sum() + liq[:L].sum())
+                compaction_step(L, over_mass, dt)
+
+            # liquid retention & top-down drainage
+            for L in range(3):
+                cap = RET_FRAC * ice[L]
+                if liq[L] > cap:
+                    exc = liq[L] - cap
+                    liq[L] = cap
+                    if L < 2:
+                        liq[L + 1] += exc
+                    else:
+                        day_runoff += exc
+                        cum_runoff += exc
+
+            rho = np.minimum(rho, RHO_MAX)
+            liq = np.maximum(liq, 0.0)
+            ice = np.maximum(ice, 0.0)
+
+        # daily sampling (end of each 24 h block)
+        if (h + 1) % 24 == 0:
+            thickness = np.array([layer_thickness(i) for i in range(3)])
+            sample = np.stack([thickness, rho, ice, liq, temp], axis=1)
+            state_out = np.concatenate([state_out, sample[None, :, :]], axis=0)
+            day_no = (h + 1) // 24
+            swe = ice.sum() + liq.sum()
+            depth = float(thickness.sum())
+            mean_dens = swe / depth if depth > 1e-9 else 0.0
+            summary_out.append([day_no, swe, depth, day_melt, day_refreeze,
+                                day_runoff, mean_dens])
+            melt_history.append(day_melt)
+            refreeze_history.append(day_refreeze)
+            runoff_history.append(day_runoff)
+            day_melt = day_refreeze = day_runoff = 0.0
+    # ----------------------------------------------------------------------
+    # 4. outputs
+    # ----------------------------------------------------------------------
+    state_out = np.ascontiguousarray(state_out, dtype=np.float64)   # (n_days,3,5)
+    os.makedirs("results", exist_ok=True)
+
+    np.save("results/snow_state.npy", state_out)
+
+    import pandas as pd
+    summ_df = pd.DataFrame(
+        summary_out,
+        columns=["day", "swe_mm", "snow_depth_m", "melt_mm", "refreeze_mm",
+                 "runoff_mm", "mean_density_kg_m3"],
+    )
+    summ_df.to_csv("results/snow_summary.csv", index=False)
+
+    final_total_mass = ice.sum() + liq.sum()
+    mass_residual = cum_met - (final_total_mass - init_total_mass) - cum_runoff
+    print("=" * 60)
+    print("MASS BALANCE")
+    print(f"  total snow+rain added   : {cum_met:9.3f} mm")
+    print(f"  runoff                  : {cum_runoff:9.3f} mm")
+    print(f"  initial SWE             : {init_total_mass:9.3f} mm")
+    print(f"  final SWE               : {final_total_mass:9.3f} mm")
+    print(f"  SWE change              : {final_total_mass - init_total_mass:+9.3f} mm")
+    print(f"  residual (should be ~0) : {mass_residual:+10.5f} mm")
+    print(f"  residual frac of precip : {100.0 * mass_residual / max(cum_met, 1e-12):+8.4f} %")
+    print(f"  final depth             : {sum(layer_thickness(i) for i in range(3)):.3f} m")
+    print(f"  final layer densities   : {np.round(rho, 1).tolist()}")
+    print(f"  final layer temps       : {np.round(temp, 2).tolist()}")
+    print("=" * 60)
+
+    figs = {
+        "days": np.arange(1, n_days + 1),
+        "swe": state_out[:, :, 2].sum(axis=1) + state_out[:, :, 3].sum(axis=1),
+        "depth": state_out[:, :, 0].sum(axis=1),
+        "melt": np.array(melt_history),
+        "refreeze": np.array(refreeze_history),
+        "runoff": np.array(runoff_history),
+        "density": state_out[:, :, 1],
+        "temp": state_out[:, :, 4] - TF,
+        "thick": state_out[:, :, 0],
+        "mass_added": cum_met, "final_swe": float(final_total_mass),
+        "init_swe": float(init_total_mass), "residual": float(mass_residual),
+        "runoff_cum": float(cum_runoff),
+    }
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        _figure_matplotlib(figs, n_days, save="results/snow_evolution.png")
+        print("figure: matplotlib")
+    except Exception as exc:
+        print("matplotlib unavailable -> pure-stdlib PNG renderer:", repr(exc))
+        _figure_stdlib(figs, n_days, save="results/snow_evolution.png")
+
+    print("wrote analysis.py, results/snow_state.npy, results/snow_summary.csv, "
+          "results/snow_evolution.png")
+
+
+# ============================================================================
+# matplotlib figure (used when available)
+# ============================================================================
+def _figure_matplotlib(figs, n_days, save):
+    import matplotlib.pyplot as plt
+    d = figs
+    fig, axs = plt.subplots(3, 2, figsize=(13, 11))
+    days = d["days"]
+    axs[0, 0].plot(days, d["swe"], lw=1.5, color="tab:blue"); axs[0, 0].set_title("SWE (mm)")
+    axs[0, 1].plot(days, d["depth"], lw=1.5, color="tab:green"); axs[0, 1].set_title("Snow depth (m)")
+    for L in range(3):
+        axs[1, 0].plot(days, d["density"][:, L], lw=1.2, label=f"layer {L+1}")
+    axs[1, 0].set_title("Layer density (kg/m3)"); axs[1, 0].legend()
+    for L in range(3):
+        axs[1, 1].plot(days, d["temp"][:, L], lw=1.2, label=f"layer {L+1}")
+    axs[1, 1].axhline(0, color="k", lw=0.6); axs[1, 1].set_title("Layer temperature (deg C)")
+    axs[1, 1].legend()
+    axs[2, 0].bar(days - 0.25, d["melt"], 0.5, label="melt", color="tab:red")
+    axs[2, 0].bar(days, d["refreeze"], 0.5, label="refreeze", color="tab:purple")
+    axs[2, 0].bar(days + 0.25, d["runoff"], 0.5, label="runoff", color="tab:orange")
+    axs[2, 0].set_title("Daily melt / refreeze / runoff (mm)"); axs[2, 0].legend()
+    axs[2, 1].plot(days, np.cumsum(d["melt"]), label="cum melt")
+    axs[2, 1].plot(days, np.cumsum(d["runoff"]), label="cum runoff")
+    axs[2, 1].axhline(d["mass_added"], ls="--", color="k", lw=0.8, label=f"in {d['mass_added']:.1f} mm")
+    axs[2, 1].set_title(f"Mass balance, residual {d['residual']:+.3f} mm")
+    axs[2, 1].legend(fontsize=8)
+    for a in axs.ravel():
+        a.set_xlabel("day")
+    fig.suptitle("Snowpack dynamics: fixed 3-layer process model", fontsize=13)
+    fig.tight_layout(); fig.savefig(save, dpi=110); plt.close(fig)
+# ---------------- pure-stdlib PNG renderer (no matplotlib needed) ----------
+_FONT5x7 = {
+    'A':[0x0E,0x11,0x11,0x1F,0x11,0x11,0x11],'B':[0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E],
+    'C':[0x0E,0x11,0x10,0x10,0x10,0x11,0x0E],'D':[0x1E,0x11,0x11,0x11,0x11,0x11,0x1E],
+    'E':[0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F],'F':[0x1F,0x10,0x10,0x1E,0x10,0x10,0x10],
+    'G':[0x0E,0x11,0x10,0x17,0x11,0x11,0x0F],'H':[0x11,0x11,0x11,0x1F,0x11,0x11,0x11],
+    'I':[0x0E,0x04,0x04,0x04,0x04,0x04,0x0E],'J':[0x07,0x02,0x02,0x02,0x02,0x12,0x0C],
+    'K':[0x11,0x12,0x14,0x18,0x14,0x12,0x11],'L':[0x10,0x10,0x10,0x10,0x10,0x10,0x1F],
+    'M':[0x11,0x1B,0x15,0x15,0x11,0x11,0x11],'N':[0x11,0x11,0x19,0x15,0x13,0x11,0x11],
+    'O':[0x0E,0x11,0x11,0x11,0x11,0x11,0x0E],'P':[0x1E,0x11,0x11,0x1E,0x10,0x10,0x10],
+    'Q':[0x0E,0x11,0x11,0x11,0x15,0x12,0x0D],'R':[0x1E,0x11,0x11,0x1E,0x14,0x12,0x11],
+    'S':[0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E],'T':[0x1F,0x04,0x04,0x04,0x04,0x04,0x04],
+    'U':[0x11,0x11,0x11,0x11,0x11,0x11,0x0E],'V':[0x11,0x11,0x11,0x11,0x11,0x0A,0x04],
+    'W':[0x11,0x11,0x11,0x15,0x15,0x1B,0x11],'X':[0x11,0x11,0x0A,0x04,0x0A,0x11,0x11],
+    'Y':[0x11,0x11,0x11,0x0A,0x04,0x04,0x04],'Z':[0x1F,0x01,0x02,0x04,0x08,0x10,0x1F],
+    '0':[0x0E,0x11,0x13,0x15,0x19,0x11,0x0E],'1':[0x04,0x0C,0x04,0x04,0x04,0x04,0x0E],
+    '2':[0x0E,0x11,0x01,0x02,0x04,0x08,0x1F],'3':[0x1F,0x02,0x04,0x02,0x01,0x11,0x0E],
+    '4':[0x02,0x06,0x0A,0x12,0x1F,0x02,0x02],'5':[0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E],
+    '6':[0x06,0x08,0x10,0x1E,0x11,0x11,0x0E],'7':[0x1F,0x01,0x01,0x02,0x04,0x08,0x08],
+    '8':[0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E],'9':[0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C],
+    '-':[0x00,0x00,0x00,0x1F,0x00,0x00,0x00],'_':[0x00,0x00,0x00,0x00,0x00,0x00,0x1F],
+    ' ': [0,0,0,0,0,0,0],'.':[0,0,0,0,0,0,0x03],':':[0,0,0x04,0,0x04,0,0],
+    '+':[0x00,0x04,0x04,0x1F,0x04,0x04,0x00],
+    '(':[0x02,0x04,0x08,0x08,0x08,0x04,0x02],')':[0x08,0x04,0x02,0x02,0x02,0x04,0x08],
+    '=':[0x00,0x00,0x1F,0x00,0x1F,0x00,0x00],'/':[0x01,0x01,0x02,0x04,0x08,0x10,0x10],
+    '%':[0x11,0x12,0x04,0x08,0x12,0x21,0x00],
+}
+_FONT5x7.setdefault('*', [0,0,0,0,0,0,0])
+
+def _fig_canvas(W, H, bg=(255, 255, 255)):
+    c = np.zeros((H, W, 3), dtype=np.uint8)
+    c[:, :] = bg
+    return c
+
+def _fig_px(c, x, y, col=(0, 0, 0)):
+    H, W = c.shape[:2]
+    if 0 <= x < W and 0 <= y < H:
+        c[y, x] = col
+
+def _fig_line(c, x0, y0, x1, y1, col=(0, 0, 0)):
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        _fig_px(c, x0, y0, col)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy; x0 += sx
+        if e2 < dx:
+            err += dx; y0 += sy
+
+def _fig_text(c, x, y, s, col=(0, 0, 0), scale=1):
+    cx = int(x)
+    for ch in s:
+        bmp = _FONT5x7.get(ch.upper(), _FONT5x7[' '])
+        for r in range(7):
+            row = bmp[r]
+            for cc in range(5):
+                if row & (0x10 >> cc):
+                    for sx in range(scale):
+                        for sy in range(scale):
+                            _fig_px(c, cx + cc * scale + sx, int(y) + r * scale + sy, col)
+        cx += 6 * scale
+
+def _fig_series(c, box, days, y, vmin, vmax, col):
+    x0, y0, xspan, yspan = box
+    n = len(days)
+    for i in range(n - 1):
+        px0 = x0 + (days[i] - days[0]) / max(days[-1] - days[0], 1e-9) * xspan
+        px1 = x0 + (days[i + 1] - days[0]) / max(days[-1] - days[0], 1e-9) * xspan
+        py0 = y0 + (1 - (y[i] - vmin) / max(vmax - vmin, 1e-9)) * yspan
+        py1 = y0 + (1 - (y[i + 1] - vmin) / max(vmax - vmin, 1e-9)) * yspan
+        _fig_line(c, px0, py0, px1, py1, col)
+def _figure_stdlib(figs, n_days, save):
+    """Multi-panel diagnostic PNG using only the standard library."""
+    W, H = 1120, 1480
+    c = _fig_canvas(W, H)
+    d = figs
+    days = d["days"]
+    x0, x1 = 90, W - 40
+    panels = 6
+    top = 64
+    gap = 30
+    plot_h = (H - top - gap * (panels + 1)) // panels
+    yb = [top + gap * (p + 1) + plot_h * p for p in range(panels)]
+
+    _fig_text(c, x0, 14, "Snowpack dynamics - fixed 3-layer process model", (0, 0, 0), 2)
+    titles = ["SWE (mm)", "Snow depth (m)", "Layer density (kg m-3)",
+              "Layer temperature (deg C)", "Daily melt/refreeze/runoff (mm)",
+              "Mass balance (cumulative mm)"]
+    for p in range(panels):
+        _fig_text(c, x0, yb[p] - 22, titles[p], (0, 0, 0), 1)
+
+    for p in range(panels):
+        _fig_line(c, x0, yb[p], x0, yb[p] + plot_h, (30, 30, 30))
+        _fig_line(c, x1, yb[p], x1, yb[p] + plot_h, (30, 30, 30))
+        _fig_line(c, x0, yb[p] + plot_h, x1, yb[p] + plot_h, (30, 30, 30))
+
+    box0 = (x0 + 4, yb[0] + 4, x1 - x0 - 8, plot_h - 8)
+
+    # 1 SWE
+    vmin, vmax = float(d["swe"].min()), float(d["swe"].max())
+    vmin = max(0.0, vmin * 0.95); vmax = vmax * 1.05
+    _fig_series(c, box0, days, d["swe"], vmin, vmax, (20, 90, 220))
+    _fig_text(c, x1 - 70, yb[0] + 2, f"{vmax:.0f}", (90, 90, 90))
+    _fig_text(c, x1 - 70, yb[0] + plot_h - 12, f"{vmin:.0f}", (90, 90, 90))
+
+    # 2 depth
+    vmax = float(d["depth"].max()) * 1.05
+    _fig_series(c, box0, days, d["depth"], 0.0, vmax, (30, 140, 60))
+    _fig_text(c, x1 - 70, yb[1] + 2, f"{vmax:.1f}", (90, 90, 90))
+
+    # 3 density (3 layers)
+    rmin = float(d["density"].min()) * 0.9; rmax = float(d["density"].max()) * 1.05
+    cols = [(220, 60, 40), (40, 140, 220), (140, 60, 200)]
+    for L in range(3):
+        _fig_series(c, box0, days, d["density"][:, L], rmin, rmax, cols[L])
+    _fig_text(c, x1 - 170, yb[2] + 2, "L1", (220, 60, 40))
+    _fig_text(c, x1 - 140, yb[2] + 2, "L2", (40, 140, 220))
+    _fig_text(c, x1 - 110, yb[2] + 2, "L3", (140, 60, 200))
+
+    # 4 temps (deg C)
+    tmin, tmax = float(d["temp"].min()) - 1, float(d["temp"].max()) + 1
+    _fig_line(c, x0 + 4, yb[3] + 4 + (1 - (0 - tmin) / (tmax - tmin)) * (plot_h - 8),
+              x1 - 4, yb[3] + 4 + (1 - (0 - tmin) / (tmax - tmin)) * (plot_h - 8), (0, 0, 0))
+    for L in range(3):
+        _fig_series(c, box0, days, d["temp"][:, L], tmin, tmax, cols[L])
+
+    # 5 daily melt/refreeze/runoff (thin bars)
+    vb = max(float(d["melt"].max()), float(d["refreeze"].max()),
+             float(d["runoff"].max()), 1e-9) * 1.1
+    for i in range(n_days):
+        xx = x0 + 4 + i * (x1 - x0 - 8) / max(n_days - 1, 1)
+        for val, off, col in [(-4, d["melt"][i], (220, 40, 40)),
+                              (0, d["refreeze"][i], (160, 60, 200)),
+                              (4, d["runoff"][i], (240, 150, 20))]:
+            hh = (plot_h - 8) * val / vb
+            _fig_line(c, xx + off, yb[4] + 4, xx + off, yb[4] + 4 - hh, col)
+    _fig_text(c, x0 + 6, yb[4] + plot_h - 12, "R melt  P refreeze  O runoff", (120, 120, 120))
+
+    # 6 cumulative melt & runoff vs total input
+    cm = np.cumsum(d["melt"]); cr = np.cumsum(d["runoff"])
+    v6 = float(d["mass_added"]) * 1.15
+    _fig_series(c, box0, days, cm, 0.0, v6, (220, 40, 40))
+    _fig_series(c, box0, days, cr, 0.0, v6, (240, 150, 20))
+    _fig_line(c, x0 + 4, yb[5] + 4 + (1 - d["mass_added"] / v6) * (plot_h - 8),
+              x1 - 4, yb[5] + 4 + (1 - d["mass_added"] / v6) * (plot_h - 8), (0, 0, 0))
+    _fig_text(c, x0 + 6, yb[5] + plot_h - 12,
+              f"in {d['mass_added']:.1f} mm init {d['init_swe']:.1f} final {d['final_swe']:.1f}",
+              (120, 120, 120))
+    _fig_text(c, x0 + 6, yb[5] + plot_h - 24, f"residual {d['residual']:+.3f} mm",
+              (180, 30, 30))
+
+    for p in range(panels):
+        _fig_text(c, x0 + 2, yb[p] + plot_h + 3, "0", (120, 120, 120))
+        _fig_text(c, x1 - 12, yb[p] + plot_h + 3, str(n_days), (120, 120, 120))
+        _fig_text(c, (x0 + x1) // 2 - 10, yb[p] + plot_h + 3, "day", (120, 120, 120))
+
+    # ---- write PNG (pure stdlib) ----
+    Hh, Ww = c.shape[:2]
+    raw = bytearray()
+    for y in range(Hh):
+        raw.append(0)  # filter type 0
+        for x in range(Ww):
+            raw += struct.pack(">BBB", int(c[y, x, 0]), int(c[y, x, 1]), int(c[y, x, 2]))
+    def chunk(tag, data):
+        out = struct.pack(">I", len(data)) + tag + data
+        out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return out
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", Ww, Hh, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    png += chunk(b"IEND", b"")
+    with open(save, "wb") as f:
+        f.write(png)
+
+
+if __name__ == "__main__":
+    main()

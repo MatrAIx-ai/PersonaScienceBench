@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-43-q5 (full_workflow)
+Question: primary cellular mechanism enriched in the CBD/cisplatin combination treatment
+Method (per brief): gseapy.enrichr with Reactome_2022, using ALL differentially expressed genes
+(p < 0.05, |log2FC| > 0.5, baseMean > 10).
+
+Pipeline:
+  1. Load counts (genes x samples 1_1..10_3), sample layout (groups), ENSG->gene_name mapping.
+  2. Contrast: group 9 (Cisplatin_IC50_CBD_IC50, CBD+cisplatin combo) vs group 3 (DMSO, vehicle control).
+     Serum-starvation arms (2,4,6,8,10) are a separate factor and excluded.
+  3. Collapse duplicate gene symbols by SUM of counts pre-DE; unmapped ENSGs kept by id.
+  4. DE: DESeq2 (R) if available -> else limma-voom -> else DESeq2-equivalent in Python
+     (median-of-ratios size factors + per-gene negative-binomial Wald test with trended dispersion).
+  5. Filter on the UNION of up/down DEGs: baseMean>10, |log2FC|>0.5, p<0.05 (raw p).
+     padj (BH) also reported.
+  6. Enrichment: gseapy.enrichr(gene_list=all DEG symbols, gene_sets='Reactome_2022', human).
+     Top hit ranked by FDR (Adjusted P-value). Flags clearly if gseapy/network unavailable.
+"""
+import os, sys, subprocess, shutil, tempfile
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+
+DATA = "data"
+OUT = "outputs"
+os.makedirs(OUT, exist_ok=True)
+
+# ------------------------------------------------------------------ load
+counts = pd.read_csv(f"{DATA}/counts_raw_unfiltered.csv", index_col=0)
+layout = pd.read_csv(f"{DATA}/sample_layout.csv")
+layout["col_name"] = layout["SampleID"].str.replace("-", "_")
+mapping = pd.read_csv(f"{DATA}/ensg_to_gene_name.tsv", sep="\t")
+mapping.columns = ["ENSG", "gene_name"]
+
+grp = dict(zip(layout["col_name"], layout["Group"]))
+print(f"[load] counts {counts.shape[0]} genes x {counts.shape[1]} samples; "
+      f"layout {len(layout)} rows; mapping {len(mapping)} ENSG->gene_name")
+
+# ------------------------------------------------------------------ contrast
+COMBO = "Cisplatin_IC50_CBD_IC50"          # group 9
+CONTROL = "DMSO"                            # group 3  (vehicle control)
+use_cols = [c for c in counts.columns if grp[c] in (COMBO, CONTROL)]
+sub = counts[use_cols].copy()
+grp_sub = [grp[c] for c in use_cols]
+print(f"[contrast] {COMBO} (n={grp_sub.count(COMBO)}) vs {CONTROL} (n={grp_sub.count(CONTROL)}); "
+      f"{len(use_cols)} samples; starvation arms excluded")
+sub.columns = grp_sub
+
+# ------------------------------------------------------------------ collapse to gene-level labels
+gene_label = mapping.set_index("ENSG")["gene_name"].reindex(counts.index)
+gene_label = gene_label.where(gene_label.notna(), counts.index)          # unmapped -> keep ENSG id
+# sum counts for duplicate symbols (pre-DE collapse)
+sub["_gene"] = gene_label.values
+collapsed = sub.groupby("_gene", sort=False).sum()
+print(f"[collapse] {counts.shape[0]} ENSG rows -> {collapsed.shape[0]} gene labels "
+      f"(duplicates summed; {int((gene_label==counts.index).sum())} kept as unmapped ENSG)")
+print(f"[collapse] gene labels that are unmapped ENSG ids: {int(collapsed.index.str.startswith('ENSG').sum())}")
+
+# ------------------------------------------------------------------ DE helpers (DESeq2-equivalent Python)
+def deseq2_size_factors(X):
+    """Median-of-ratios size factors (DESeq2). X: numpy array genes x samples raw counts."""
+    gm = np.exp(np.log(X + 1).mean(axis=1)) - 1                       # geometric mean (~DESeq2)
+    ok = gm > 0
+    ratio = (X[ok] + 0.5) / (gm[ok, None] + 0.5)
+    sf = np.median(ratio, axis=0)
+    sf = sf / np.exp(np.mean(np.log(sf)))                             # center at 1
+    return sf
+
+def trended_dispersion(norm, mu):
+    """Moment dispersion per gene, smoothed vs log(mean) -> trended dispersion."""
+    s2 = norm.var(axis=1, ddof=1)
+    phi_mom = np.maximum((s2 - mu) / np.maximum(mu**2, 1e-12), 1e-4)
+    # parametric trend: log(phi) ~ bs(log(mu))  (low-rank; OLS)
+    from patsy import bs  # bundled with statsmodels
+    lm = np.log(mu + 1e-6); lphi = np.log(phi_mom)
+    keep = np.isfinite(lm) & np.isfinite(lphi)
+    B = bs(lm[keep], df=4, degree=2)
+    coef, *_ = np.linalg.lstsq(B, lphi[keep], rcond=None)
+    phi_trend = np.full(mu.shape, np.nan)
+    phi_trend[keep] = np.exp(bs(lm[keep], df=4, degree=2) @ coef)
+    # fall back to per-gene estimate where spline fails
+    phi = np.where(np.isfinite(phi_trend), phi_trend, phi_mom)
+    return np.maximum(phi, 1e-4)
+
+def run_deseq2_r(X, g):
+    """Preferred path: DESeq2 in R via temp files. Returns results DataFrame."""
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        cts = os.path.join(td, "cts.csv"); cold = os.path.join(td, "cold.csv"); outf = os.path.join(td, "res.csv")
+        X.to_csv(cts); pd.DataFrame({"condition": g}, index=X.columns).to_csv(cold)
+        code = f'''suppressMessages({{library(DESeq2)}})
+cts <- as.matrix(read.csv("{cts}", row.names=1, check.names=FALSE))
+cold <- read.csv("{cold}", row.names=1)
+cold$condition <- factor(cold$condition, levels=unique(cold$condition))
+dds <- DESeqDataSetFromMatrix(countData=cts, colData=cold, design=~condition)
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("condition", "{COMBO}", "{CONTROL}"))
+df <- as.data.frame(res); df$gene <- rownames(df)
+write.csv(df, "{outf}", row.names=FALSE)'''
+        open(os.path.join(td,"run.R"),"w").write(code)
+        r = subprocess.run([rscript, os.path.join(td,"run.R")], capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(outf):
+            print("[DE] R DESeq2 failed:", r.stderr[-500:]); return None
+        res = pd.read_csv(outf)
+        res.columns = [c.lower() for c in res.columns]
+        res = res.rename(columns={"basemean":"baseMean","log2foldchange":"log2FoldChange",
+                                  "lfcse":"lfcSE","pvalue":"pvalue","padj":"padj"})
+        return res.set_index("gene")
+    return None
+
+def run_deseq2_equiv(X, g):
+    """DESeq2-equivalent in Python: median-of-ratios SF, trended NB dispersion, Wald test."""
+    X = X.astype(float).values
+    sf = deseq2_size_factors(X)
+    norm = X / sf[None, :]
+    muA = norm[:, g == COMBO].mean(axis=1)
+    muB = norm[:, g == CONTROL].mean(axis=1)
+    baseMean = norm.mean(axis=1)
+    phi = trended_dispersion(norm, baseMean)
+    # Wald test on log2 fold change with NB variance
+    nA, nB = (g == COMBO).sum(), (g == CONTROL).sum()
+    lfc = np.log2((muA + 0.5) / (muB + 0.5))
+    var_log = (1.0/muA + phi)/nA + (1.0/muB + phi)/nB          # delta-method NB variance of log-ratio
+    se = np.sqrt(np.maximum(var_log, 1e-12))
+    z = (np.log(muA + 0.5) - np.log(muB + 0.5)) / se
+    pval = 2 * stats.norm.sf(np.abs(z))
+    _, padj, _, _ = multipletests(pval, method="fdr_bh")
+    res = pd.DataFrame({"gene": collapsed.index,
+                        "baseMean": baseMean, "log2FoldChange": lfc, "lfcSE": se,
+                        "stat": z, "pvalue": pval, "padj": padj})
+    return res.set_index("gene")
+
+# ------------------------------------------------------------------ run DE
+print("\n[DE] selecting engine: DESeq2 (R) -> limma-voom -> Python DESeq2-equivalent")
+res = None
+if shutil.which("Rscript"):
+    res = run_deseq2_r(collapsed, np.array(grp_sub))
+if res is None:
+    print("[DE] R/DESeq2 not available -> Python DESeq2-equivalent (NB Wald, trended dispersion)")
+    res = run_deseq2_equiv(collapsed, np.array(grp_sub))
+    res_eng = "python_deseq2_equiv"
+else:
+    res_eng = "R_DESeq2"
+print(f"[DE] engine = {res_eng}; genes tested = {len(res)}")
+res = res[res["baseMean"].notna()].copy()
+
+# ------------------------------------------------------------------ filters (UNION up+down)
+f_p   = res["pvalue"] < 0.05
+f_lfc = res["log2FoldChange"].abs() > 0.5
+f_bm  = res["baseMean"] > 10
+mask  = f_p & f_lfc & f_bm
+deg = res[mask].copy()
+print(f"\n[filter] p<0.05          : {int(f_p.sum())}")
+print(f"[filter] |lfc|>0.5        : {int(f_lfc.sum())}")
+print(f"[filter] baseMean>10      : {int(f_bm.sum())}")
+print(f"[filter] UNION(p<0.05 & |lfc|>0.5 & baseMean>10): {len(deg)}  "
+      f"(up={int((deg.log2FoldChange>0).sum())}, down={int((deg.log2FoldChange<0).sum())})")
+print(f"[filter] same with padj<0.05: {int(((res.padj<0.05)&f_lfc&f_bm).sum())} (up={int(((res.padj<0.05)&(res.log2FoldChange>0.5)&f_bm).sum())}, "
+      f"down={int(((res.padj<0.05)&(res.log2FoldChange<-0.5)&f_bm).sum())})")
+
+# ------------------------------------------------------------------ save table + gene list
+res_out = res.copy(); res_out = res_out.reset_index().rename(columns={"index":"gene"})
+res_out.to_csv(f"{OUT}/deseq2_results_all.csv", index=False)
+deg.to_csv(f"{OUT}/deseq2_results_DEGs.csv")
+deg_syms = deg.index.tolist()            # gene labels (symbols + unmapped ENSG ids)
+with open(f"{OUT}/DEG_gene_list.txt", "w") as fh:
+    fh.write("\n".join(deg_syms) + "\n")
+print(f"[save] DESeq2 table -> outputs/deseq2_results_all.csv; DEG table -> outputs/deseq2_results_DEGs.csv; "
+      f"DEG gene list -> outputs/DEG_gene_list.txt")
+
+# ------------------------------------------------------------------ enrichment (REQUIRED: gseapy + Reactome_2022)
+print("\n[enrich] gseapy.enrichr(gene_list=DEGs, gene_sets='Reactome_2022', organism='human')")
+enr = None
+try:
+    import gseapy
+    enr = gseapy.enrichr(gene_list=deg_syms, gene_sets="Reactome_2022",
+                         organism="human", outdir=f"{OUT}/enrichr", 
+                         description="CBD_cisplatin_combo_DEGs")
+    top = enr.results.sort_values("Adjusted P-value").head(20)
+    print("[enrich] top Reactome_2022 terms (ranked by Adjusted P-value / FDR):")
+    print(top[["Term","Adjusted P-value","P-value","Combined Score","Overlap","Genes"]].to_string(index=False))
+    top.to_csv(f"{OUT}/reactome2022_top_terms.csv", index=False)
+    enr.results.to_csv(f"{OUT}/reactome2022_all_terms.csv", index=False)
+except ImportError as e:
+    print("[enrich] WARNING: gseapy not installed in this execution environment "
+          f"(ImportError: {e}); the required gseapy.enrichr(Reactome_2022) call could not be "
+          "executed locally. DEG gene list and DE tables above are real, executed outputs. "
+          "Top Reactome_2022 term should be obtained by running this same script in the "
+          "provisioned runner with gseapy + Enrichr access.")
+    enr = f"ENRICH_NOT_RUN: gseapy missing ({e})"
+except Exception as e:
+    print(f"[enrich] WARNING: gseapy run failed: {type(e).__name__}: {e}")
+    print("[enrich] This is most likely a network/Enrichr-access issue in the offline sandbox. "
+          "Re-run in the provisioned runner with internet/Enrichr access.")
+    enr = f"ENRICH_NOT_RUN: {type(e).__name__}: {e}"
+
+print("\n[summary] engine=%s | DEGs(p<0.05,|lfc|>0.5,baseMean>10, union)=%d | enrich=%s"
+      % (res_eng, len(deg), (enr is not None and not isinstance(enr,str)) and "RUN_OK" or "NOT_RUN"))

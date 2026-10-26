@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+Leaf-level coupled Farquhar(C3)/Collatz(C4) photosynthesis + Ball-Berry
+stomatal conductance, land-surface (CLM/Noah-MP) convention.
+
+Data pathway = C4 (leaf_params.json), so BOTH sun and shade leaves use the
+C4 three-way limitation.  The C3 branch is implemented for completeness but
+is NOT used for outputs (no C3 parameter set exists in the inputs).
+
+Units convention (explicit, per task statement):
+  - A reported in umol CO2 m-2 s-1;  A_mol = A * UMOL_TO_MOL (mol m-2 s-1)
+    is used ONLY inside the diffusion-closure equations and gs equation.
+  - cf = p_atm/(R*T)  [mol m-3]
+  - rb*A_mol/cf has units (s/m * mol/m2/s) / (mol/m3) = dimensionless
+    (a mole-fraction difference); multiplied by p_atm -> Pa.  Same for
+    rs*A_mol/cf * p_atm.  This is how the pressure drops are formed.
+  - gs in mol m-2 s-1;  rs = cf/gs in s m-1;  Ci, cs, ca in Pa.
+"""
+import json
+import math
+import sys
+import zlib
+import struct
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import brentq
+
+# ----------------------------- named constants -----------------------------
+R_GAS = 8.314              # J mol-1 K-1 (universal gas constant)
+UMOL_TO_MOL = 1e-6         # umol m-2 s-1  ->  mol m-2 s-1 conversion factor
+KC25 = 30.0                # Pa   Michaelis constant for CO2 at 25 C
+KO25 = 30000.0             # Pa   Michaelis constant for O2 at 25 C
+Q10_KC, Q10_KO, Q10_RD = 2.1, 1.2, 2.4
+# CLM/Noah-MP Q10 with high-temperature inhibition for Vcmax:
+VCMAX_Q10 = 2.4
+HA_VC = 2.2e5              # J mol-1  deactivation enthalpy
+HD_VC = 710.0              # J mol-1 K-1  deactivation entropy
+GAMMA_LITERAL = 0.5        # Gamma* = 0.5*(Kc/Ko)*O2*0.21  (literal task
+#                        convention: O2 column AND 0.21 both kept as written;
+#                        double-dilution is intentional, only affects C3 branch)
+GAMMA_O2_FRACTION = 0.21
+RD_FRAC = 0.015            # Rd = 0.015 * Vcmax(T)
+APAR_FACTOR = 4.6          # APAR = 4.6 * PAR  (no extra absorptance)
+RB_BUNDLE = 1.37           # boundary-layer  CO2 pathway multiplier
+RB_LEAF = 1.65             # leaf-interior   CO2 pathway multiplier
+# Buck saturation vapour pressure constants (Pa, T in deg C)
+ESAT_A = 610.78
+ESAT_B = 22.058
+HS_MIN, HS_MAX = 0.25, 1.0
+GS_FLOOR = 1e-6            # mol m-2 s-1, numerical floor to keep rs finite
+NIGHT_PAR_THRESHOLD = 1e-6 # W m-2: par<=this (incl. 1e-13 numerical zeros)
+# solver
+FP_OMEGA = 0.5             # damping / relaxation factor
+FP_TOL = 1e-3              # Pa absolute tolerance on |Ci_new - Ci|
+FP_TOL_REL = 1e-6
+FP_MAXIT = 200
+DATA_DIR = "data"
+RES_DIR = "results"
+
+
+# ------------------------------ leaf physiology ----------------------------
+def esat_buck(tc):
+    """Saturation water vapour pressure [Pa], Buck formula, tc in deg C."""
+    return ESAT_A * math.exp(ESAT_B * tc / (tc + 273.15))
+
+
+def vcmax_at_t(vcmax25, t_k):
+    """CLM/Noah-MP Q10 response with high-temperature inhibition (task eq.)."""
+    tc = t_k - 273.15
+    tk = tc + 273.16
+    num = VCMAX_Q10 ** ((tc - 25.0) / 10.0)
+    den = 1.0 + math.exp((-HA_VC + HD_VC * tk) / (R_GAS * tk))
+    return vcmax25 * num / den
+
+
+def kc_ko_gamma(t_k, o2_pa):
+    tc = t_k - 273.15
+    kc = KC25 * Q10_KC ** ((tc - 25.0) / 10.0)
+    ko = KO25 * Q10_KO ** ((tc - 25.0) / 10.0)
+    gamma = GAMMA_LITERAL * (kc / ko) * o2_pa * GAMMA_O2_FRACTION
+    return kc, ko, gamma
+
+
+def photosynthesis_c3(ci, vcmax_t, kc, ko, gamma, rd, apar):
+    """C3 branch (implemented per task, NOT exercised: pathway is C4).
+    NOTE: `apar` is ALREADY APAR = 4.6*PAR (converted once at the caller);
+    the 4.6 factor must NOT be applied again here."""
+    j = alpha_q_global * apar   # J = alpha_q * APAR (single 4.6 factor)
+    wc = vcmax_t * (ci - gamma) / (ci + kc * (1.0 + o2_global / ko))
+    wj = j * (ci - gamma) / (4.0 * ci + 8.0 * gamma)
+    we = 0.5 * vcmax_t
+    return min(wc, wj, we) - rd, (wc, wj, we)
+
+
+def photosynthesis_c4(ci, vcmax_t, p_atm, rd, apar):
+    """C4 branch (used).  Wc=Vcmax, Wj=alpha_q*APAR, We=4000*Vcmax*Ci/p_atm.
+    `apar` is already APAR=4.6*PAR (converted once at the caller); the 4.6
+    factor must NOT be applied again here (previous bug, fixed)."""
+    wc = vcmax_t
+    wj = alpha_q_global * apar   # Wj = alpha_q * APAR (single 4.6 factor)
+    we = 4000.0 * vcmax_t * ci / p_atm
+    return min(wc, wj, we) - rd, (wc, wj, we)
+
+
+# globals set from leaf_params.json / forcing row before each solve
+alpha_q_global = 0.0
+o2_global = 0.0
+
+
+def closure(ca, p_atm, t_k, rb, hs, a_umol, b0, m):
+    """Gas-diffusion closure given A [umol m-2 s-1] -> cs, gs, rs, ci_rhs."""
+    cf = p_atm / (R_GAS * t_k)                 # mol m-3
+    a_mol = a_umol * UMOL_TO_MOL               # mol m-2 s-1
+    cs = ca - RB_BUNDLE * rb * a_mol / cf * p_atm
+    gs = m * a_mol * hs / cs * p_atm + b0
+    gs = max(gs, GS_FLOOR)                     # keep rs finite/non-negative
+    rs = cf / gs
+    ci = cs - RB_LEAF * rs * a_mol / cf * p_atm
+    return cs, gs, rs, ci, cf
+
+
+# ------------------------------ fixed-point solver -------------------------
+def solve_leaf_row(row, pars, par_wm2, ci_init, branch="C4", diagnostics=None):
+    """Solve the coupled fixed point for one leaf of one forcing row.
+
+    Returns dict(A_umol, gs, rs, ci, cs, n_iter, method, ok, night, extras).
+    Night (par <= NIGHT_PAR_THRESHOLD): A=-Rd, gs=b0, rs=cf/gs,
+    ci = cs - 1.65*rs*A_mol/cf*p_atm  (A<0 => ci>cs).  No iteration.
+    """
+    global alpha_q_global, o2_global
+    t_k = row["t_air_K"]
+    p_atm = row["p_atm_Pa"]
+    ca = row["co2_pa"]
+    o2 = row["o2_pa"]
+    vpd = row["vpd_Pa"]
+    rb = row["rb_sm"]
+    btran = row["btran"]
+    m = pars["m"]
+    b0 = pars["b0"]
+    alpha_q_global = pars["alpha_q"]
+    o2_global = o2
+
+    vcmax25 = pars["vcmax25"] * pars["n_factor"] * btran   # capacity scaling
+    vcmax_t = vcmax_at_t(vcmax25, t_k)
+    kc, ko, gamma = kc_ko_gamma(t_k, o2)
+    rd = RD_FRAC * vcmax_t                                  # Rd=0.015*Vcmax(T)
+    esat = esat_buck(t_k - 273.15)
+    hs = min(max(1.0 - vpd / esat, HS_MIN), HS_MAX)
+    cf = p_atm / (R_GAS * t_k)
+    apar = APAR_FACTOR * par_wm2
+
+    def a_of_ci(ci):
+        if branch == "C4":
+            a, w = photosynthesis_c4(ci, vcmax_t, p_atm, rd, apar)
+        else:
+            a, w = photosynthesis_c3(ci, vcmax_t, kc, ko, gamma, rd, apar)
+        return a, w
+
+    def residual(ci):
+        a, _ = a_of_ci(ci)
+        _, _, _, ci_rhs, _ = closure(ca, p_atm, t_k, rb, hs, a, b0, m)
+        return ci_rhs - ci
+
+    night = par_wm2 <= NIGHT_PAR_THRESHOLD
+    if night:
+        # Night convention (approved): A = -Rd, gs = b0 EXACTLY (intercept
+        # conductance, unmodulated by hs or the A-term), rs = cf/gs > 0,
+        # cs from the same boundary-layer drop (A<0 => cs>ca), and
+        # ci = cs - 1.65*rs*A_mol/cf*p_atm  (=> ci > cs at night).
+        a_umol = -rd
+        cf_ = p_atm / (R_GAS * t_k)
+        a_mol = a_umol * UMOL_TO_MOL
+        cs = ca - RB_BUNDLE * rb * a_mol / cf_ * p_atm
+        gs = max(b0, GS_FLOOR)
+        rs = cf_ / gs
+        ci = cs - RB_LEAF * rs * a_mol / cf_ * p_atm
+        out = dict(A=a_umol, gs=gs, rs=rs, ci=ci, cs=cs, n_iter=0,
+                   method="night", ok=True, night=True,
+                   Wc=None, Wj=None, We=None)
+        if diagnostics is not None:
+            diagnostics.update(dict(vcmax_t=vcmax_t, apar=apar, rd=rd, hs=hs,
+                                    W=None, cf=cf, esat=esat))
+        return out
+
+    # ---- daytime: damped fixed point, Brentq fallback on residual ----
+    lo = max(gamma, 1e-6) + 1e-6          # Gamma* (literal) lower bracket
+    # upper bracket: cs at A=-Rd is the maximum possible cs (A>0 => ci<cs)
+    _, _, _, ci_hi0, _ = closure(ca, p_atm, t_k, rb, hs, -rd, b0, m)
+    hi = ci_hi0
+    while residual(hi) > 0.0 and hi < 1e5:   # pathological: expand (logged)
+        hi *= 1.5
+    ci = min(max(float(ci_init), lo + 1e-9), hi - 1e-9)
+
+    method, ok, n_iter = "fixed-point", True, 0
+    a, w = a_of_ci(ci)
+    _, _, _, ci_rhs, _ = closure(ca, p_atm, t_k, rb, hs, a, b0, m)
+    while True:
+        n_iter += 1
+        step = ci_rhs - ci
+        ci_new = ci + FP_OMEGA * step
+        if abs(ci_new - ci) <= max(FP_TOL, FP_TOL_REL * abs(ci_new)):
+            ci = ci_new
+            break
+        ci = ci_new
+        if n_iter >= FP_MAXIT:
+            ok = False
+            break
+        a, w = a_of_ci(ci)
+        _, _, _, ci_rhs, _ = closure(ca, p_atm, t_k, rb, hs, a, b0, m)
+
+    if not ok:
+        # Brentq fallback on [Gamma*, cs_max]; count its iterations too
+        root = brentq(residual, lo, hi, xtol=FP_TOL, rtol=8.9e-12,
+                      maxiter=200, full_output=True)
+        ci_new, res = root[0], root[1]
+        n_iter_fp = n_iter
+        n_iter += res.iterations
+        ci = min(max(ci_new, lo), hi)
+        method = "brentq-fallback(fp_iters=%d)" % n_iter_fp
+        ok = res.converged
+
+    a, w = a_of_ci(ci)
+    cs, gs, rs, ci_final, _ = closure(ca, p_atm, t_k, rb, hs, a, b0, m)
+    out = dict(A=a, gs=gs, rs=rs, ci=ci_final, cs=cs, n_iter=n_iter,
+               method=method, ok=ok, night=False, Wc=w[0], Wj=w[1], We=w[2])
+    if diagnostics is not None:
+        diagnostics.update(dict(vcmax_t=vcmax_t, apar=apar, rd=rd, hs=hs,
+                                W=w, cf=cf, esat=esat))
+    return out
+
+
+# ------------------- minimal PNG renderer (matplotlib fallback) ------------
+# Pure numpy + zlib PNG writer with a built-in 5x7 bitmap font, used because
+# matplotlib is not installed in this environment and there is no network.
+_FONT = {
+ ' ':('00000','00000','00000','00000','00000','00000','00000'),
+ '0':('01110','10001','10011','10101','11001','10001','01110'),
+ '1':('00100','01100','00100','00100','00100','00100','01110'),
+ '2':('01110','10001','00001','00010','00100','01000','11111'),
+ '3':('11110','00001','00001','01110','00001','00001','11110'),
+ '4':('00010','00110','01010','10010','11111','00010','00010'),
+ '5':('11111','10000','11110','00001','00001','10001','01110'),
+ '6':('00110','01000','10000','11110','10001','10001','01110'),
+ '7':('11111','00001','00010','00100','01000','01000','01000'),
+ '8':('01110','10001','10001','01110','10001','10001','01110'),
+ '9':('01110','10001','10001','01111','00001','00010','01100'),
+ 'A':('01110','10001','10001','11111','10001','10001','10001'),
+ 'B':('11110','10001','10001','11110','10001','10001','11110'),
+ 'C':('01110','10001','10000','10000','10000','10001','01110'),
+ 'D':('11100','10010','10001','10001','10001','10010','11100'),
+ 'E':('11111','10000','10000','11110','10000','10000','11111'),
+ 'F':('11111','10000','10000','11110','10000','10000','10000'),
+ 'G':('01110','10001','10000','10111','10001','10001','01111'),
+ 'H':('10001','10001','10001','11111','10001','10001','10001'),
+ 'I':('11111','00100','00100','00100','00100','00100','11111'),
+ 'J':('00111','00010','00010','00010','00010','10010','01100'),
+ 'K':('10001','10010','10100','11000','10100','10010','10001'),
+ 'L':('10000','10000','10000','10000','10000','10000','11111'),
+ 'M':('10001','11011','10101','10101','10001','10001','10001'),
+ 'N':('10001','11001','10101','10011','10001','10001','10001'),
+ 'O':('01110','10001','10001','10001','10001','10001','01110'),
+ 'P':('11110','10001','10001','11110','10000','10000','10000'),
+ 'Q':('01110','10001','10001','10001','10101','10010','01101'),
+ 'R':('11110','10001','10001','11110','10100','10010','10001'),
+ 'S':('01111','10000','10000','01110','00001','00001','11110'),
+ 'T':('11111','00100','00100','00100','00100','00100','00100'),
+ 'U':('10001','10001','10001','10001','10001','10001','01110'),
+ 'V':('10001','10001','10001','10001','10001','01010','00100'),
+ 'W':('10001','10001','10001','10101','10101','11011','10001'),
+ 'X':('10001','10001','01010','00100','01010','10001','10001'),
+ 'Y':('10001','10001','01010','00100','00100','00100','00100'),
+ 'Z':('11111','00001','00010','00100','01000','10000','11111'),
+ '.':('00000','00000','00000','00000','00000','01100','01100'),
+ ',':('00000','00000','00000','00000','01100','00100','01000'),
+ '-':('00000','00000','00000','11111','00000','00000','00000'),
+ '_':('00000','00000','00000','00000','00000','00000','11111'),
+ ':':('00000','01100','01100','00000','01100','01100','00000'),
+ '/':('00001','00010','00010','00100','01000','01000','10000'),
+ '(':('00010','00100','01000','01000','01000','00100','00010'),
+ ')':('01000','00100','00010','00010','00010','00100','01000'),
+ '=':('00000','00000','11111','00000','11111','00000','00000'),
+ '+':('00000','00100','00100','11111','00100','00100','00000'),
+ '[':('01110','01000','01000','01000','01000','01000','01110'),
+ ']':('01110','00010','00010','00010','00010','00010','01110'),
+}
+
+
+class Canvas:
+    def __init__(self, w, h):
+        self.px = np.full((h, w, 3), 255, dtype=np.uint8)
+
+    def point(self, x, y, rgb):
+        h, w, _ = self.px.shape
+        if 0 <= x < w and 0 <= y < h:
+            self.px[y, x] = rgb
+
+    def hline(self, x0, x1, y, rgb):
+        self.px[y, min(x0, x1):max(x0, x1) + 1] = rgb
+
+    def vline(self, x, y0, y1, rgb):
+        self.px[min(y0, y1):max(y0, y1) + 1, x] = rgb
+
+    def line(self, x0, y0, x1, y1, rgb, width=2):
+        x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for i in range(n + 1):
+            t = i / n
+            x = int(round(x0 + (x1 - x0) * t))
+            y = int(round(y0 + (y1 - y0) * t))
+            for dx in range(width):
+                for dy in range(width):
+                    self.point(x + dx, y + dy, rgb)
+
+    def text(self, x, y, s, rgb=(0, 0, 0), scale=1):
+        cx = x
+        for ch in s.upper():
+            g = _FONT.get(ch, _FONT[' '])
+            for r, row in enumerate(g):
+                for c, bit in enumerate(row):
+                    if bit == '1':
+                        self.px[y + r * scale:y + (r + 1) * scale,
+                                cx + c * scale:cx + (c + 1) * scale] = rgb
+            cx += 6 * scale
+        return cx
+
+    def text_w(self, s, scale=1):
+        return len(s) * 6 * scale
+
+    def save_png(self, path):
+        h, w, _ = self.px.shape
+        raw = bytearray()
+        for y in range(h):
+            raw.append(0)                       # filter type 0 (None)
+            raw.extend(self.px[y].tobytes())
+        comp = zlib.compress(bytes(raw), 9)
+
+        def chunk(tag, data):
+            return (struct.pack('>I', len(data)) + tag + data
+                    + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+        ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+        with open(path, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+            f.write(chunk(b'IHDR', ihdr))
+            f.write(chunk(b'IDAT', comp))
+            f.write(chunk(b'IEND', b''))
+
+
+def nice_ticks(vmin, vmax, n=5):
+    if vmax - vmin <= 0:
+        vmax = vmin + 1.0
+    span = vmax - vmin
+    step = 10.0 ** math.floor(math.log10(span / max(n - 1, 1)))
+    for mult in (1, 2, 2.5, 5, 10):
+        if span / (step * mult) <= n - 1:
+            step *= mult
+            break
+    start = math.ceil(vmin / step) * step
+    ticks = []
+    t = start
+    while t <= vmax + 1e-9:
+        ticks.append(t)
+        t += step
+    return ticks
+
+
+def fmt(v):
+    if abs(v) >= 1000:
+        return "%.0f" % v
+    if abs(v) >= 10:
+        return "%.0f" % v
+    if abs(v) >= 1:
+        return "%.1f" % v
+    return "%.2f" % v
+
+
+def draw_panel(cv, x0, y0, x1, y1, xs, series, ylabel, title):
+    """series: list of (name, ys, rgb). Draws axes, ticks, curves, legend."""
+    black = (0, 0, 0)
+    cv.hline(x0, x1, y0, black)
+    cv.hline(x0, x1, y1, black)
+    cv.vline(x0, y0, y1, black)
+    cv.vline(x1, y0, y1, black)
+    ymin = min(min(s[1]) for s in series)
+    ymax = max(max(s[1]) for s in series)
+    pad = 0.05 * (ymax - ymin + 1e-9)
+    ymin, ymax = ymin - pad, ymax + pad
+    xmn, xmx = float(min(xs)), float(max(xs))
+
+    def tx(x):
+        return int(round(x0 + (x - xmn) / (xmx - xmn) * (x1 - x0)))
+
+    def ty(v):
+        return int(round(y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)))
+
+    for v in nice_ticks(ymin, ymax, 6):
+        yy = ty(v)
+        cv.hline(x0 - 4, x0, yy, black)
+        cv.text(x0 - 6 - cv.text_w(fmt(v), 1), yy - 3, fmt(v), black, 1)
+    for xv in nice_ticks(xmn, xmx, 7):
+        if xv < xmn or xv > xmx:
+            continue
+        xx = tx(xv)
+        cv.vline(xx, y1, y1 + 4, black)
+        s = "%d" % int(round(xv))
+        cv.text(xx - cv.text_w(s) // 2, y1 + 7, s, black, 1)
+    for name, ys, rgb in series:
+        for i in range(len(xs) - 1):
+            cv.line(tx(xs[i]), ty(ys[i]), tx(xs[i + 1]), ty(ys[i + 1]), rgb)
+    # legend (top-left inside panel)
+    lx, ly = x0 + 10, y0 + 8
+    for name, ys, rgb in series:
+        cv.line(lx, ly + 3, lx + 22, ly + 3, rgb)
+        cv.text(lx + 28, ly, name, black)
+        ly += 12
+    # titles
+    cv.text((x0 + x1) // 2 - cv.text_w(title) // 2, y0 - 14, title, black, 1)
+    cv.text(4, (y0 + y1) // 2 - 3, ylabel, black, 1)
+
+
+def make_figure(time_hr, sun, shade, path):
+    W, H = 960, 700
+    cv = Canvas(W, H)
+    ml, mr = 75, 25
+    p1 = (ml, 45, W - mr, 300)
+    p2 = (ml, 400, W - mr, 655)
+    draw_panel(cv, *p1, time_hr,
+               [("A_SUN (UMOL M-2 S-1)", [s["A"] for s in sun], (200, 0, 0)),
+                ("A_SHADE (UMOL M-2 S-1)", [s["A"] for s in shade], (0, 0, 200))],
+               "A (UMOL CO2 M-2 S-1)",
+               "DIURNAL CO2 ASSIMILATION: FARQUHAR/BALL-BERRY C4")
+    draw_panel(cv, *p2, time_hr,
+               [("RS_SUN (S M-1)", [s["rs"] for s in sun], (200, 0, 0)),
+                ("RS_SHADE (S M-1)", [s["rs"] for s in shade], (0, 0, 200))],
+               "RS (S M-1)",
+               "DIURNAL LEAF RESISTANCE: SUN vs SHADE")
+    cv.text(ml, 680, "TIME (HR)  - 5-DAY FORCING SERIES (120 HOURLY STEPS)",
+            (0, 0, 0))
+    try:
+        import matplotlib  # noqa: F401  (preferred path if ever available)
+        HAVE_MPL = True
+    except Exception:
+        HAVE_MPL = False
+    cv.save_png(path)
+    return cv, HAVE_MPL
+
+
+def verify_png(path):
+    """Byte-level readback: chunks, CRCs, IHDR dims, zlib inflate, pixels."""
+    data = open(path, 'rb').read()
+    rep = {"bytes": len(data), "sig": data[:8] == b'\x89PNG\r\n\x1a\n'}
+    assert rep["sig"]
+    pos, chunks, idat = 8, [], b''
+    while pos < len(data):
+        ln = struct.unpack('>I', data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + ln]
+        crc = struct.unpack('>I', data[pos + 8 + ln:pos + 12 + ln])[0]
+        ok = (zlib.crc32(tag + body) & 0xffffffff) == crc
+        chunks.append((tag.decode(), ln, ok))
+        if tag == b'IDAT':
+            idat += body
+        pos += 12 + ln
+    rep["chunks"] = chunks
+    rep["crc_all_ok"] = all(c[2] for c in chunks)
+    ihdr = None
+    pos = 8
+    while pos < len(data):
+        ln = struct.unpack('>I', data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        if tag == b'IHDR':
+            ihdr = struct.unpack('>IIBBBBB', data[pos + 8:pos + 8 + ln])
+        pos += 12 + ln
+    w, h, depth, ctype = ihdr[0], ihdr[1], ihdr[2], ihdr[3]
+    rep["width"], rep["height"] = w, h
+    rep["bit_depth"], rep["color_type"] = depth, ctype
+    raw = zlib.decompress(idat)
+    rep["raw_bytes"] = len(raw)
+    assert len(raw) == h * (1 + w * 3), "raw scanline length mismatch"
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, 1 + w * 3, 1)
+    nonwhite = int(np.sum(np.any(arr[:, 1:] != 255, axis=-1)))
+    rep["nonwhite_pixels"] = nonwhite
+    rep["pixels_ok"] = nonwhite > 1000
+    rep["filters_ok"] = all(raw[y * (1 + w * 3)] == 0 for y in range(h))
+    return rep
+
+
+# ---------------------------------- main ------------------------------------
+def main():
+    log = []
+
+    def p(*a):
+        s = " ".join(str(x) for x in a)
+        print(s)
+        log.append(s)
+
+    def perr(*a):
+        s = " ".join(str(x) for x in a)
+        print(s, file=sys.stderr)
+        log.append("[stderr] " + s)
+
+    pars_in = json.load(open(f"{DATA_DIR}/leaf_params.json"))
+    df = pd.read_csv(f"{DATA_DIR}/forcing.csv")
+    cases = json.load(open(f"{DATA_DIR}/test_cases.json"))
+    pars = dict(vcmax25=float(pars_in["vcmax25"]), m=float(pars_in["bb_slope"]),
+                b0=float(pars_in["bb_intercept"]), alpha_q=float(pars_in["alpha_q"]),
+                n_factor=float(pars_in.get("n_factor", 1.0)))
+    branch = pars_in.get("pathway", "C4").upper()
+    p("=" * 72)
+    p("RUN CONFIG: pathway=%s (C3 branch implemented but NOT exercised: no C3"
+      % branch)
+    p("parameter set exists in leaf_params.json; sun & shade both use C4).")
+    p("vcmax25=%.4f  m=%.3f  b0=%.3f  alpha_q=%.3f  n_factor=%.3f"
+      % (pars["vcmax25"], pars["m"], pars["b0"], pars["alpha_q"],
+         pars["n_factor"]))
+    p("=" * 72)
+
+    n = len(df)
+    nonconv, fallback = [], []
+    diag_sun12, diag_shade12, diag_night = {}, {}, {}
+
+    for i in range(n):
+        row = df.iloc[i].to_dict()
+        for side, parcol, diag in (("sun", "par_sun_wm2", None),
+                                   ("shade", "par_shade_wm2", None)):
+            par = float(row[parcol])
+            ci0 = 0.5 * row["co2_pa"]
+            d = {} if (i in (0, 12)) else None
+            out = solve_leaf_row(row, pars, par, ci0, branch=branch,
+                                 diagnostics=d)
+            STORE[side][i] = out
+            if not out["ok"]:
+                nonconv.append((i, side))
+            if "brentq" in out["method"]:
+                fallback.append((i, side, out["method"]))
+            if d is not None:
+                if i == 12:
+                    (diag_sun12 if side == "sun" else diag_shade12).update(
+                        dict(out=out, **d))
+                elif i == 0:
+                    diag_night[side] = dict(out=out, **d)
+
+    # ---- leaf_fluxes.csv ----
+    flux = pd.DataFrame({
+        "time_hr": df["time_hr"].values,
+        "A_sun": [s["A"] for s in STORE["sun"]],
+        "A_shade": [s["A"] for s in STORE["shade"]],
+        "rs_sun": [s["rs"] for s in STORE["sun"]],
+        "rs_shade": [s["rs"] for s in STORE["shade"]],
+        "ci_sun": [s["ci"] for s in STORE["sun"]],
+        "ci_shade": [s["ci"] for s in STORE["shade"]],
+        "gs_sun": [s["gs"] for s in STORE["sun"]],
+        "gs_shade": [s["gs"] for s in STORE["shade"]],
+    })
+    flux.to_csv(f"{RES_DIR}/leaf_fluxes.csv", index=False)
+
+    # ---- case_convergence.csv (same routine, sun PAR, given ci_init) ----
+    crows, shade_alt, case_ends = [], [], []
+    for c in cases:
+        i = int(c["forcing_index"])
+        row = df.iloc[i].to_dict()
+        d = {}
+        out = solve_leaf_row(row, pars, float(row["par_sun_wm2"]),
+                             c["ci_init_pa"], branch=branch, diagnostics=d)
+        crows.append(dict(case_id=c["case_id"], ci_init_pa=c["ci_init_pa"],
+                          ci_final_pa=out["ci"], A_final=out["A"],
+                          rs_final=out["rs"], n_iterations=out["n_iter"]))
+        case_ends.append(out["ci"])
+        if "brentq" in out["method"]:
+            p("case %s used fallback: %s" % (c["case_id"], out["method"]))
+        alt = solve_leaf_row(row, pars, float(row["par_shade_wm2"]),
+                             c["ci_init_pa"], branch=branch)
+        shade_alt.append((c["case_id"], out["ci"], out["A"], out["rs"],
+                          alt["ci"], alt["A"], alt["rs"]))
+    pd.DataFrame(crows).to_csv(f"{RES_DIR}/case_convergence.csv", index=False)
+
+    perr("=" * 72)
+    perr("SENSITIVITY of case results to the sun-vs-shade leaf-type")
+    perr("assumption (shade column is diagnostic only, NOT a deliverable):")
+    perr("%-9s | %-28s | %s" % ("case", "SUN: ci / A / rs", "SHADE: ci / A / rs"))
+    for cid, ci, A, rs, aci, aA, ars in shade_alt:
+        perr("%-9s | %8.3f %8.2f %8.2f | %8.3f %8.2f %8.2f"
+             % (cid, ci, A, rs, aci, aA, ars))
+    spread = max(case_ends) - min(case_ends)
+    p("Case-endpoint consistency across ci_init = 0.1..1.1 x ca:")
+    p("  ci_final values:", np.round(case_ends, 6).tolist())
+    p("  max pairwise spread = %.3e Pa (expect ~0 -> unique fixed point)"
+      % spread)
+
+    # ---- diurnal.png ----
+    cv, have_mpl = make_figure(df["time_hr"].values, STORE["sun"],
+                               STORE["shade"], f"{RES_DIR}/diurnal.png")
+    p("matplotlib available: %s -> used built-in numpy/zlib PNG renderer"
+      % have_mpl)
+    rep = verify_png(f"{RES_DIR}/diurnal.png")
+    p("PNG verification:", {k: rep[k] for k in
+                            ("bytes", "sig", "crc_all_ok", "width", "height",
+                             "bit_depth", "color_type", "nonwhite_pixels",
+                             "pixels_ok", "filters_ok")})
+    p("PNG chunks:", rep["chunks"])
+
+    # ---------------- self-checks / run log ------------------------------
+    p("=" * 72)
+    p("CONVERGENCE: %d rows x 2 leaf types = %d daytime+night solves"
+      % (n, 2 * n))
+    day = df["par_sun_wm2"].values > NIGHT_PAR_THRESHOLD
+    fp_all = ([s["n_iter"] for s in STORE["sun"]]
+              + [s["n_iter"] for s in STORE["shade"]])
+    p("  day rows=%d night rows=%d ; fixed-point iters (day): min=%d max=%d"
+      % (int(day.sum()), int((~day).sum()),
+         min([s['n_iter'] for s, d2 in zip(STORE['sun'], day) if d2]
+             + [s['n_iter'] for s, d2 in zip(STORE['shade'], day) if d2]) if day.any() else 0,
+         max(fp_all)))
+    p("  non-converged solves: %d %s" % (len(nonconv), nonconv))
+    p("  brentq fallback used: %d %s" % (len(fallback), fallback))
+    for col in ("A_sun", "A_shade", "rs_sun", "rs_shade", "gs_sun",
+                "gs_shade", "ci_sun", "ci_shade"):
+        v = flux[col].values
+        p("  %-9s min=%12.4f @hr %5.1f   max=%12.4f @hr %5.1f"
+          % (col, v.min(), df['time_hr'].values[int(np.argmin(v))],
+             v.max(), df['time_hr'].values[int(np.argmax(v))]))
+    # validity checks
+    viol = []
+    for side in ("sun", "shade"):
+        for i in range(n):
+            s = STORE[side][i]
+            if not (s["gs"] > 0 and s["rs"] > 0 and abs(s["A"]) < 1e4):
+                viol.append((i, side, "positivity/bound", s["gs"], s["rs"], s["A"]))
+            if not s["night"]:
+                if s["A"] > 0 and not (0 < s["ci"] < s["cs"]):
+                    viol.append((i, side, "ci out of (0,cs) day", s["ci"], s["cs"], s["A"]))
+            else:
+                if not (s["ci"] > s["cs"]):
+                    viol.append((i, side, "night ci<=cs", s["ci"], s["cs"], s["A"]))
+    p("  validity violations (gs>0, rs>0, |A|<1e4, ci placement): %d %s"
+      % (len(viol), viol[:5]))
+    # active-limitation census at ca=64 Pa, sun and shade separately,
+    # plus quantitative limitation margins and the Wj-vs-convention assertion
+    gs_near_b0 = 0
+    margin_records = []
+    wj_assert_viol = 0
+    wj_assert_checked = 0
+    for side in ("sun", "shade"):
+        cens = {"Wc": 0, "Wj": 0, "We": 0}
+        min_wj_wc = (np.inf, None)
+        min_we_wc = (np.inf, None)
+        for i in range(n):
+            s = STORE[side][i]
+            if s["night"]:
+                continue
+            par = float(df["par_sun_wm2" if side == "sun"
+                            else "par_shade_wm2"].iloc[i])
+            # explicit assertion (researcher requirement): for every par>0
+            # row, Wj == alpha_q * 4.6 * par within 1e-9 relative tolerance
+            wj_ref = pars["alpha_q"] * APAR_FACTOR * par
+            wj_assert_checked += 1
+            if abs(s["Wj"] - wj_ref) > 1e-9 * abs(wj_ref):
+                wj_assert_viol += 1
+                p("  WJ ASSERTION VIOLATION row %d %s: Wj=%.12g ref=%.12g"
+                  % (i, side, s["Wj"], wj_ref))
+            k = min(("Wc", s["Wc"]), ("Wj", s["Wj"]), ("We", s["We"]),
+                    key=lambda t: t[1])
+            cens[k[0]] += 1
+            rwj, rwe = s["Wj"] / s["Wc"], s["We"] / s["Wc"]
+            if rwj < min_wj_wc[0]:
+                min_wj_wc = (rwj, i)
+            if rwe < min_we_wc[0]:
+                min_we_wc = (rwe, i)
+            if s["gs"] < 1.2 * pars["b0"]:
+                gs_near_b0 += 1
+            margin_records.append((side, i, rwj, rwe))
+        p("  active-limitation census [%5s]: %s" % (side, cens))
+        p("  min(Wj/Wc) [%s] = %.3f at hr=%s ; min(We/Wc) [%s] = %.3f at hr=%s"
+          % (side, min_wj_wc[0], df["time_hr"].iloc[min_wj_wc[1]],
+             side, min_we_wc[0], df["time_hr"].iloc[min_we_wc[1]]))
+        for sd, i, rwj, rwe in margin_records:
+            if sd == side and rwj < 1.5:
+                p("  WARNING: %s row hr=%s Wj/Wc=%.3f < 1.5 (sensitive to "
+                  "Wj factor)" % (side, df["time_hr"].iloc[i], rwj))
+    p("  Wj==alpha_q*4.6*par assertion: %d/%d day solves PASS (%d violations)"
+      % (wj_assert_checked - wj_assert_viol, wj_assert_checked,
+         wj_assert_viol))
+    p("  gs<1.2*b0 count:", gs_near_b0)
+
+    def dump(tag, d):
+        o, e = d["out"], d
+        p("  %s: Vcmax(T)=%.4f APAR=%.2f Rd=%.4f hs=%.4f esat=%.1f cf=%.3f"
+          % (tag, e["vcmax_t"], e["apar"], e["rd"], e["hs"], e["esat"], e["cf"]))
+        if e.get("W") is not None:
+            p("     Wc=%.4f Wj=%.4f We=%.4f -> A=%.4f" % (*e["W"], o["A"]))
+        p("     cs=%.4f gs=%.6f rs=%.3f ci=%.4f  (method=%s, iters=%d)"
+          % (o["cs"], o["gs"], o["rs"], o["ci"], o["method"], o["n_iter"]))
+
+    p("FULL INTERMEDIATES (for formula-by-formula review):")
+    dump("DAY row time_hr=12 SUN  ", diag_sun12)
+    dump("DAY row time_hr=12 SHADE", diag_shade12)
+    dump("NIGHT row time_hr=0 SUN ", diag_night["sun"])
+
+    with open(f"{RES_DIR}/run_log.txt", "w") as f:
+        f.write("\n".join(log) + "\n")
+    print("done")
+
+
+if __name__ == "__main__":
+    import os
+    os.makedirs(RES_DIR, exist_ok=True)
+    _n = len(pd.read_csv(f"{DATA_DIR}/forcing.csv"))
+    _STORE_TMP = {"sun": [None] * _n, "shade": [None] * _n}
+    globals()["STORE"] = _STORE_TMP
+    main()

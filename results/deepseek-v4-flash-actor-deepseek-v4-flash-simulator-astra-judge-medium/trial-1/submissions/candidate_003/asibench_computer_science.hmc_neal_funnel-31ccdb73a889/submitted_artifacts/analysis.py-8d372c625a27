@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Deterministic transition-kernel forensic audit for the anonymous HMC Neal-funnel instance.
+
+Pipeline
+--------
+1. Build target mechanics (sampler chart -> centered funnel coordinates, U, grad U, K, H)
+   with the PUBLIC formulas from the manifest / brief.
+2. Kernel audit: for every public candidate compute the contract metrics
+   (energy_rmse, energy_slope, reverse_p95, volume_logdet_abs, acceptance_rate,
+   panel_mean_v/var_v, panel_ess_v, panel_rhat_v, validity_score).
+3. Identify the selected valid kernel:
+     * primary signal: fit the leapfrog / velocity-Verlet template (L = integration_steps,
+       epsilon = ladder step, kinetic 0.5 p^T G p, force = -dU/dq in SAMPLER q through the
+       full chart) against the observed forward proposal arrays and keep the candidate with
+       the smallest robust (median-abs) residual;
+     * confirm with the contract validity_score (must be the maximum).
+   This yields candidate kernel_05 == leapfrog, so the replay uses the leapfrog template
+   with the schedule's step_size / integration_steps (production) and the holdout values.
+   NOTE: the candidate forward/reverse arrays are observational and contain small
+   deterministic perturbations; the replay therefore uses the inferred template, not the
+   raw arrays.
+4. Failure-mode labels: deterministic, metric-based priority assignment (documented below).
+5. Deterministic replay of the production and hold-out streams using the *supplied*
+   transition_momenta / transition_uniforms (no independent redraws).
+6. Centered-coordinate samples, funnel profile, diagnostics, figure.
+
+Every data/figure artifact is written under results/.
+"""
+
+import json
+import os
+import numpy as np
+
+OUT = "results"
+os.makedirs(OUT, exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# Inputs
+# ----------------------------------------------------------------------------
+manifest = json.load(open("data/target_manifest.json"))
+schedule = json.load(open("data/transition_schedule.json"))
+
+DIM = manifest["dimension"]
+SIG_V = float(manifest["sigma_v"])
+CHART = manifest["sampler_chart"]
+MATRIX = np.asarray(CHART["matrix"], dtype=float)          # M (12 x 12)
+SHIFT = np.asarray(CHART["shift"], dtype=float)            # (12,)
+WARP = float(CHART["warp_strength"])
+PHASE = np.asarray(CHART["warp_phase"], dtype=float)       # (11,)
+G = np.asarray(manifest["kinetic_metric"]["inverse_mass_matrix"], dtype=float)  # (12,12)
+
+N_CHAINS = schedule["n_chains"]
+WARMUP = schedule["warmup_transitions"]
+KEPT = schedule["kept_transitions"]
+TOTAL = schedule["total_transitions"]
+STEP_SIZE = schedule["step_size"]
+INT_STEPS = schedule["integration_steps"]
+AUDIT_TRANS = schedule["audit_transitions"]
+
+HO_CHAINS = schedule["holdout_chains"]
+HO_TRANS = schedule["holdout_transitions"]
+HO_STEP = schedule["holdout_step_size"]
+HO_INT_STEPS = schedule["holdout_integration_steps"]
+HO_AUDIT = schedule["holdout_audit_transitions"]
+
+bundle = np.load("data/candidate_transition_bundle.npz")
+panel = np.load("data/candidate_chain_panel.npz")
+PROFILE_BINS = np.loadtxt("data/profile_bins.csv", delimiter=",", skiprows=1)
+
+# ----------------------------------------------------------------------------
+# Target mechanics (public formulas, sampler <-> centered funnel chart)
+# ----------------------------------------------------------------------------
+def chart_u(q):
+    """u = (q - shift) @ matrix.T"""
+    return (q - SHIFT) @ MATRIX.T
+
+
+def centered_from_u(u):
+    """centered[0] = u[0]; centered[j] = u[j] + warp*sin(u[0] + warp_phase[j-1])"""
+    u0 = u[..., 0]
+    c = np.empty_like(u)
+    c[..., 0] = u0
+    if DIM > 1:
+        c[..., 1:] = u[..., 1:] + WARP * np.sin(u0[..., None] + PHASE[None, :])
+    return c
+
+
+def U_centered(c):
+    """funnel potential in centered coordinates: v=centered[0], x_i=centered[i]"""
+    v = c[..., 0]
+    x = c[..., 1:]
+    return (0.5 * (v / SIG_V) ** 2 + 0.5 * (DIM - 1) * v
+            + 0.5 * np.exp(-v) * np.sum(x * x, axis=-1))
+
+
+def U(q):
+    """potential of a sampler-coordinate state q (full chart transform)"""
+    return U_centered(centered_from_u(chart_u(q)))
+
+
+def gradU_centered(c):
+    v = c[..., 0]
+    x = c[..., 1:]
+    g = np.empty_like(c)
+    g[..., 0] = v / SIG_V**2 + 0.5 * (DIM - 1) - 0.5 * np.exp(-v) * np.sum(x * x, axis=-1)
+    g[..., 1:] = np.exp(-v)[..., None] * x
+    return g
+
+
+def gradU(q):
+    """grad U in sampler coordinates (public formula: grad_u -> grad_U(q)=grad_u @ matrix)"""
+    u = chart_u(q)
+    c = centered_from_u(u)
+    gc = gradU_centered(c)
+    gu = np.empty_like(gc)
+    gu[..., 0] = gc[..., 0] + WARP * np.sum(
+        gc[..., 1:] * np.cos(u[..., 0:1] + PHASE[None, :]), axis=-1)
+    gu[..., 1:] = gc[..., 1:]
+    return gu @ MATRIX
+
+
+def kinetic(p):
+    """K(p) = 0.5 p^T G p"""
+    return 0.5 * np.einsum("...i,...ij,...j->...", p, G, p)
+
+
+def hamiltonian(q, p):
+    return U(q) + kinetic(p)
+
+
+def leapfrog(q, p, eps, L):
+    """velocity-Verlet / leapfrog map T(q,p) = (q', p') (reversible, volume-preserving)."""
+    q = np.array(q, dtype=float)
+    p = np.array(p, dtype=float)
+    for _ in range(L):
+        p = p - 0.5 * eps * gradU(q)
+        q = q + eps * (p @ G)
+        p = p - 0.5 * eps * gradU(q)
+    return q, p
+
+
+def forward_euler(q, p, eps, L):
+    """first-order (non time-reversible) Euler map, used only for kernel identification."""
+    q = np.array(q, dtype=float)
+    p = np.array(p, dtype=float)
+    for _ in range(L):
+        q = q + eps * (p @ G)
+        p = p - eps * gradU(q)
+    return q, p
+
+# ----------------------------------------------------------------------------
+# 3. Kernel audit
+# ----------------------------------------------------------------------------
+cand_ids = list(bundle["candidate_ids"])
+ladder = bundle["step_size_ladder"]                       # (4,)
+base_idx = int(np.argmin(np.abs(ladder - STEP_SIZE)))     # = 2 (exact match to 0.0732)
+
+probe_states = bundle["probe_states"]                     # (72, 12) sampler q
+probe_mom = bundle["probe_momenta"]                       # (72, 12)
+prop_states = bundle["proposal_states"]                   # (6,4,72,12)
+prop_mom = bundle["proposal_momenta"]
+rev_states = bundle["reverse_states"]
+rev_mom = bundle["reverse_momenta"]
+vol_in = bundle["volume_input"]                           # (64, 24)
+vol_out = bundle["volume_output"]                         # (6,64,24)
+
+panel_samples = panel["panel_centered_samples"]           # (6,3,220,12) centered
+panel_dh = panel["panel_delta_h"]                         # (6,3,260)
+panel_acc = panel["panel_accepted"]                       # (6,3,260)
+
+
+def linear(error, full, zero):
+    """linear(error, full, zero) = 1 if error<=full, 0 if error>=zero, else linear."""
+    error = float(error)
+    if error <= full:
+        return 1.0
+    if error >= zero:
+        return 0.0
+    return (zero - error) / (zero - full)
+
+
+def ips_ess(x):
+    """Geyer initial-positive-sequence ESS for a 1-d chain."""
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n < 3:
+        return float(n)
+    xc = x - x.mean()
+    acf = np.correlate(xc, xc, "full")[n - 1:] / n
+    rho = acf / acf[0]
+    tau = 1.0
+    prev = 1.0
+    for k in range(1, len(rho)):
+        cur = min(rho[k], prev)
+        if cur <= 0:
+            break
+        tau += 2.0 * cur
+        prev = cur
+    return max(1.0, n / tau)
+
+
+def split_rhat(x):
+    """split-Rhat for a 2-d array x of shape (chains, n): split each chain in half."""
+    x = np.asarray(x, dtype=float)
+    n = x.shape[1]
+    if n < 2:
+        return float("nan")
+    half = n // 2
+    segs = np.concatenate([x[:, :half], x[:, half:]], axis=0)   # (2*C, half)
+    M = segs.shape[0]
+    ns = segs.shape[1]
+    means = segs.mean(axis=1)
+    grand = means.mean()
+    B = ns / (M - 1) * np.sum((means - grand) ** 2)
+    W = segs.var(axis=1, ddof=1).mean()
+    var_hat = (ns - 1) / ns * W + B / ns
+    return float(np.sqrt(var_hat / W))
+
+
+audit_rows = []
+validity = {}
+for i, cid in enumerate(cand_ids):
+    # --- energy_rmse at base ladder step + energy_slope over the ladder
+    rmse_by_ladder = []
+    for li in range(4):
+        dH = (hamiltonian(prop_states[i, li], prop_mom[i, li])
+              - hamiltonian(probe_states, probe_mom))
+        rmse_by_ladder.append(float(np.sqrt(np.mean(dH ** 2))))
+    energy_rmse = rmse_by_ladder[base_idx]
+    energy_slope = float(np.polyfit(np.log(ladder), np.log(rmse_by_ladder), 1)[0])
+
+    # --- reverse_p95 at base ladder
+    d_rev = (np.linalg.norm(rev_states[i, base_idx] - probe_states, axis=-1)
+             + np.linalg.norm(rev_mom[i, base_idx] + probe_mom, axis=-1))
+    reverse_p95 = float(np.percentile(d_rev, 95))
+
+    # --- volume_logdet_abs via local affine least squares (with intercept)
+    Xa = np.hstack([vol_in, np.ones((vol_in.shape[0], 1))])
+    coef, _, _, _ = np.linalg.lstsq(Xa, vol_out[i], rcond=None)
+    A_local = coef[:24]                                  # 24x24 linear part
+    sign, logdet = np.linalg.slogdet(A_local)
+    volume_logdet_abs = float(abs(logdet)) if sign != 0 else float("inf")
+
+    # --- panel statistics
+    acceptance_rate = float(panel_acc[i].mean())
+    v_panel = panel_samples[i][..., 0].reshape(panel_samples.shape[1], -1)
+    panel_mean_v = float(v_panel.mean())
+    panel_var_v = float(v_panel.var(ddof=1))
+    panel_rhat_v = split_rhat(v_panel)
+    per_chain_ess = [ips_ess(panel_samples[i][c, :, 0]) for c in range(panel_samples.shape[1])]
+    panel_ess_v = float(np.sum(per_chain_ess))
+
+    # --- contract validity score
+    var_rel = abs(panel_var_v - SIG_V**2) / SIG_V**2
+    acc_dev = abs(0.82 - acceptance_rate)
+    score = (0.24 * linear(energy_rmse, 0.01, 0.18)
+             + 0.24 * linear(reverse_p95, 1e-8, 5e-3)
+             + 0.20 * linear(volume_logdet_abs, 1e-5, 0.08)
+             + 0.16 * linear(var_rel, 0.08, 0.55)
+             + 0.16 * linear(acc_dev, 0.25, 0.80))
+    validity[cid] = score
+    audit_rows.append(dict(candidate_id=cid, energy_rmse=energy_rmse,
+                           energy_slope=energy_slope, reverse_p95=reverse_p95,
+                           volume_logdet_abs=volume_logdet_abs,
+                           acceptance_rate=acceptance_rate,
+                           panel_mean_v=panel_mean_v, panel_var_v=panel_var_v,
+                           panel_ess_v=panel_ess_v, panel_rhat_v=panel_rhat_v,
+                           validity_score=score))
+
+cols = ["candidate_id", "energy_rmse", "energy_slope", "reverse_p95",
+        "volume_logdet_abs", "acceptance_rate", "panel_mean_v", "panel_var_v",
+        "panel_ess_v", "panel_rhat_v", "validity_score"]
+with open(os.path.join(OUT, "kernel_audit.csv"), "w") as f:
+    f.write(",".join(cols) + "\n")
+    for row in audit_rows:
+        f.write(",".join(str(row[c]) for c in cols) + "\n")
+
+# ----------------------------------------------------------------------------
+# Selected kernel: infer the anonymous reversible volume-preserving map
+# ----------------------------------------------------------------------------
+# Primary identification: leapfrog/velocity-Verlet template with L = integration_steps.
+# The frame of the probe arrays is sampler q (their H values through the full chart are
+# meaningful and the template reproduces candidate kernel_05 essentially exactly).
+templ_resid = []
+for i, cid in enumerate(cand_ids):
+    res = []
+    for li in range(4):
+        qq, pp = leapfrog(probe_states, probe_mom, ladder[li], INT_STEPS)
+        res.append(float(np.median(np.abs(qq - prop_states[i, li]))
+                         + np.median(np.abs(pp - prop_mom[i, li]))))
+    templ_resid.append(np.mean(res))
+selected_by_template = cand_ids[int(np.argmin(templ_resid))]
+
+# corroborating identification: forward Euler template (first-order, non-reversible)
+euler_resid = []
+for i, cid in enumerate(cand_ids):
+    res = []
+    for li in range(4):
+        qq, pp = forward_euler(probe_states, probe_mom, ladder[li], INT_STEPS)
+        res.append(float(np.median(np.abs(qq - prop_states[i, li]))
+                         + np.median(np.abs(pp - prop_mom[i, li]))))
+    euler_resid.append(np.mean(res))
+
+selected_by_score = max(cand_ids, key=lambda c: validity[c])
+assert selected_by_template == selected_by_score, \
+    "template identification and validity-score selection disagree"
+selected = selected_by_template
+print("leapfrog template residual per candidate :", np.round(templ_resid, 6))
+print("forward-Euler template residual per candid:", np.round(euler_resid, 6))
+print("validity scores                          :", {c: round(validity[c], 4) for c in cand_ids})
+print("selected valid candidate                 :", selected)
+
+kernel_meta = {
+    "selected_candidate_id": selected,
+    "transition_family": "leapfrog_velocity_verlet",
+    "reversible": True,
+    "volume_preserving": True,
+    "coordinate_frame": "sampler_q",
+    "production_step_size": STEP_SIZE,
+    "production_integration_steps": INT_STEPS,
+    "holdout_step_size": HO_STEP,
+    "holdout_integration_steps": HO_INT_STEPS,
+    "kinetic": "0.5 p^T G p (G = inverse_mass_matrix)",
+    "selection_rule": ("minimum robust (median-abs) forward-template residual across the "
+                       "step-size ladder among leapfrog templates, confirmed by maximum "
+                       "contract validity_score"),
+    "leapfrog_template_residuals": dict(zip(cand_ids, np.round(templ_resid, 8).tolist())),
+}
+json.dump(kernel_meta, open(os.path.join(OUT, "selected_kernel.json"), "w"), indent=2)
+
+# ----------------------------------------------------------------------------
+# Failure modes: deterministic metric-priority assignment
+# ----------------------------------------------------------------------------
+# Rule (documented): exactly one candidate is valid (selected above). The remaining
+# candidates receive the five canonical failure labels by dominant anomaly, in a fixed
+# deterministic priority order of the contract metrics:
+#   1) energy_drift        <- largest energy_rmse (runaway/divergent Hamiltonian)
+#   2) volume_loss         <- largest |volume_logdet_abs| (non volume-preserving map)
+#   3) terminal_imbalance  <- largest reverse_p95 (time-reversal / terminal symmetry broken)
+#   4) coordinate_mismatch <- largest panel-var deviation |var_v - sigma_v^2|/sigma_v^2
+#   5) delayed_response    <- remaining candidate
+labels = {c: None for c in cand_ids}
+labels[selected] = "valid_transition"
+pool = [c for c in cand_ids if c != selected]
+m = {r["candidate_id"]: r for r in audit_rows}
+
+lab_energy = max(pool, key=lambda c: m[c]["energy_rmse"])
+labels[lab_energy] = "energy_drift"; pool.remove(lab_energy)
+lab_volume = max(pool, key=lambda c: abs(m[c]["volume_logdet_abs"]))
+labels[lab_volume] = "volume_loss"; pool.remove(lab_volume)
+lab_term = max(pool, key=lambda c: m[c]["reverse_p95"])
+labels[lab_term] = "terminal_imbalance"; pool.remove(lab_term)
+lab_coord = max(pool, key=lambda c: abs(m[c]["panel_var_v"] - SIG_V**2) / SIG_V**2)
+labels[lab_coord] = "coordinate_mismatch"; pool.remove(lab_coord)
+labels[pool[0]] = "delayed_response"
+label_set = set(labels.values())
+assert len(label_set) == 6 and "valid_transition" in label_set
+json.dump(labels, open(os.path.join(OUT, "failure_modes.json"), "w"), indent=2)
+print("failure modes:", labels)
+
+# ----------------------------------------------------------------------------
+# Deterministic replay (uses the *supplied* momenta and uniform draws only)
+# ----------------------------------------------------------------------------
+init_states = np.load("data/initial_latent_states.npy")          # (4,12)
+momenta = np.load("data/transition_momenta.npy")                 # (4,1020,12)
+uniforms = np.load("data/transition_uniforms.npy")               # (4,1020)
+
+
+def replay_stream(init, moms, unifs, eps, L):
+    """Return accepted_latent/proposal_latent arrays over the whole stream and terminal q."""
+    n_ch, n_tr, _ = moms.shape
+    acc_lat = np.empty((n_ch, n_tr, DIM))
+    prop_lat = np.empty((n_ch, n_tr, DIM))
+    delta_h = np.empty((n_ch, n_tr))
+    accept_prob = np.empty((n_ch, n_tr))
+    accepted = np.empty((n_ch, n_tr), dtype=bool)
+    q = np.array(init, dtype=float)
+    for t in range(n_tr):
+        p = moms[:, t, :]
+        qp, pp = leapfrog(q, p, eps, L)
+        dh = hamiltonian(qp, pp) - hamiltonian(q, p)
+        ap = np.minimum(1.0, np.exp(-dh))
+        acc = unifs[:, t] < ap
+        prop_lat[:, t, :] = qp
+        delta_h[:, t] = dh
+        accept_prob[:, t] = ap
+        accepted[:, t] = acc
+        newq = np.where(acc[:, None], qp, q)
+        acc_lat[:, t, :] = newq
+        q = newq
+    return acc_lat, prop_lat, delta_h, accept_prob, accepted, q
+
+
+acc_lat, prop_lat, delta_h, accept_prob, accepted, _ = \
+    replay_stream(init_states, momenta, uniforms, STEP_SIZE, INT_STEPS)
+
+# latent_samples = accepted sampler-coordinate states after the kept window
+latent_samples = acc_lat[:, WARMUP:TOTAL, :]          # (4,900,12)
+# transition audit = first audit_transitions of the stream
+np.savez_compressed(
+    os.path.join(OUT, "transition_audit.npz"),
+    accepted_latent=acc_lat[:, :AUDIT_TRANS, :],
+    proposal_latent=prop_lat[:, :AUDIT_TRANS, :],
+    delta_h=delta_h[:, :AUDIT_TRANS],
+    accept_prob=accept_prob[:, :AUDIT_TRANS],
+    accepted=accepted[:, :AUDIT_TRANS],
+)
+np.save(os.path.join(OUT, "latent_samples.npy"), latent_samples)
+print("latent_samples shape:", latent_samples.shape,
+      "acceptance (kept):", float(accepted[:, WARMUP:TOTAL].mean()))
+
+# --- holdout replay ---
+ho_init = np.load("data/holdout_initial_latent_states.npy")     # (3,12)
+ho_moms = np.load("data/holdout_transition_momenta.npy")        # (3,160,12)
+ho_unifs = np.load("data/holdout_transition_uniforms.npy")      # (3,160)
+ho_acc, ho_prop, ho_dh, ho_ap, ho_ac, ho_term = \
+    replay_stream(ho_init, ho_moms, ho_unifs, HO_STEP, HO_INT_STEPS)
+np.savez_compressed(
+    os.path.join(OUT, "holdout_transition_audit.npz"),
+    accepted_latent=ho_acc[:, :HO_AUDIT, :],
+    proposal_latent=ho_prop[:, :HO_AUDIT, :],
+    delta_h=ho_dh[:, :HO_AUDIT],
+    accept_prob=ho_ap[:, :HO_AUDIT],
+    accepted=ho_ac[:, :HO_AUDIT],
+)
+np.save(os.path.join(OUT, "holdout_terminal_states.npy"), ho_term)
+print("holdout audit shapes:", ho_acc[:, :HO_AUDIT].shape,
+      "terminal:", ho_term.shape,
+      "holdout acceptance:", float(ho_ac.mean()))
+
+# ----------------------------------------------------------------------------
+# Centered samples and funnel profile
+# ----------------------------------------------------------------------------
+samples = centered_from_u(chart_u(latent_samples))       # (4,900,12) centered funnel coords
+np.save(os.path.join(OUT, "samples.npy"), samples)
+
+v_all = samples[..., 0].ravel()                          # v coordinate
+radius2_all = np.sum(samples[..., 1:] ** 2, axis=-1).ravel()
+n_total = v_all.size
+
+rows = []
+for b in range(PROFILE_BINS.shape[0]):
+    left, right = PROFILE_BINS[b, 1], PROFILE_BINS[b, 2]
+    if b == PROFILE_BINS.shape[0] - 1:
+        mask = (v_all >= left) & (v_all <= right)
+    else:
+        mask = (v_all >= left) & (v_all < right)
+    count = int(mask.sum())
+    if count == 0:
+        rows.append((int(PROFILE_BINS[b, 0]), left, right, count, 0.0,
+                     float("nan"), float("nan"), float("nan")))
+    else:
+        vv = v_all[mask]
+        rr = radius2_all[mask]
+        mean_v = float(vv.mean())
+        mean_radius2 = float(rr.mean())
+        expected_radius2 = float((DIM - 1) * np.mean(np.exp(vv)))
+        rows.append((int(PROFILE_BINS[b, 0]), left, right, count, count / n_total,
+                     mean_v, mean_radius2, expected_radius2))
+
+with open(os.path.join(OUT, "funnel_profile.csv"), "w") as f:
+    f.write("bin_id,v_left,v_right,count,fraction,mean_v,mean_radius2,expected_radius2\n")
+    for r in rows:
+        f.write(",".join(str(x) for x in r) + "\n")
+
+# ----------------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------------
+def ips_ess_multi(x):                      # x: (chains, n) 1-d
+    return float(np.sum([ips_ess(x[c]) for c in range(x.shape[0])]))
+
+kept_slice = slice(WARMUP, TOTAL)
+v_kept = samples[..., 0]                      # (4,900)
+r2_kept = np.sum(samples[..., 1:] ** 2, axis=-1)  # (4,900)
+dh_kept = delta_h[:, kept_slice]
+acc_kept = accepted[:, kept_slice]
+abs_dh_kept = np.abs(dh_kept)
+
+diag = {}
+diag["mean_v"] = float(v_kept.mean())
+diag["var_v"] = float(v_kept.var(ddof=1))
+diag["mean_radius2"] = float(r2_kept.mean())
+diag["split_rhat_v"] = split_rhat(v_kept)
+diag["ess_v"] = ips_ess_multi(v_kept)
+diag["split_rhat_radius2"] = split_rhat(r2_kept)
+diag["ess_radius2"] = ips_ess_multi(r2_kept)
+diag["overall_acceptance_rate"] = float(acc_kept.mean())
+diag["chain_acceptance_rates"] = [float(acc_kept[c].mean()) for c in range(N_CHAINS)]
+diag["mean_abs_delta_h"] = float(abs_dh_kept.mean())
+diag["p95_abs_delta_h"] = float(np.percentile(abs_dh_kept, 95))
+diag["max_abs_delta_h"] = float(abs_dh_kept.max())
+
+# latent diagnostics from the standard funnel residuals z (NOT from q)
+z = np.empty_like(samples)
+z[..., 0] = samples[..., 0] / SIG_V
+z[..., 1:] = np.exp(-samples[..., 0:1] / 2.0) * samples[..., 1:]
+diag["latent_mean_abs_max"] = float(np.abs(z).mean(axis=(0, 1)).max())
+diag["latent_var_abs_max"] = float(z.var(axis=(0, 1)).max())
+diag["left_tail_prob_v_lt_minus5"] = float((v_kept < -5.0).mean())
+diag["right_tail_prob_v_gt_5"] = float((v_kept > 5.0).mean())
+json.dump(diag, open(os.path.join(OUT, "diagnostics.json"), "w"), indent=2)
+
+# per-chain energy diagnostics
+with open(os.path.join(OUT, "energy_diagnostics.csv"), "w") as f:
+    f.write("chain_id,acceptance_rate,mean_abs_delta_h,p95_abs_delta_h,max_abs_delta_h\n")
+    for c in range(N_CHAINS):
+        a = abs_dh_kept[c]
+        f.write(f"{c},{acc_kept[c].mean():.6f},{a.mean():.6e},"
+                f"{np.percentile(a,95):.6e},{a.max():.6e}\n")
+
+print("diagnostics keys ok, mean_v=%.4f var_v=%.4f mean_radius2=%.4f"
+      % (diag["mean_v"], diag["var_v"], diag["mean_radius2"]))
+
+
+# ----------------------------------------------------------------------------
+# Overview figure (pure-python PNG renderer; no matplotlib dependency)
+# ----------------------------------------------------------------------------
+import zlib as _zlib
+import struct as _struct
+
+_GLYPHS = {
+ 'A':'0E11111F111111','B':'1E11111E11111E','C':'0E11101010110E',
+ 'D':'1E11111111111E','E':'1F10101E10101F','F':'1F10101E101010',
+ 'G':'0E11101711110F','H':'1111111F111111','I':'0E04040404040E',
+ 'J':'0702020202120C','K':'11121418141211','L':'1010101010101F',
+ 'M':'111B1515111111','N':'11191513111111','O':'0E11111111110E',
+ 'P':'1E11111E101010','Q':'0E11111115120D','R':'1E11111E141211',
+ 'S':'0F10100E01011E','T':'1F040404040404','U':'1111111111110E',
+ 'V':'11111111110A04','W':'111115151B1111','X':'11110A040A1111',
+ 'Y':'11110A04040404','Z':'1F01020408101F','0':'0E11131519110E',
+ '1':'040C040404040E','2':'0E11010204081F','3':'1F02040201110E',
+ '4':'02060A121F0202','5':'1F101E0101110E','6':'0608101E11110E',
+ '7':'1F010204080808','8':'0E11110E11110E','9':'0E11110F01020C',
+ ' ':'00000000000000','.':'00000000000C0C',',':'000000000C0800',
+ '-':'0000001F000000','_':'0000000000001F','(':'02040808080402',
+ ')':'08040202020408','=':'00001F001F0000',':':'000C0C000C0C00',
+ '/':'01020204080810','+':'0004041F040400','[':'0E08080808080E',
+ ']':'0E02020202020E','^':'040A1100000000','%':'0011120204081F',
+ '<':'02040810080402','>':'08040201020408','s':'0F101E01111E00',
+ 'v':'0A0A1100000000','x':'110A04040A1100','z':'1F020408101F00',
+ 'm':'00000000000000',
+}
+
+def _glyph(ch):
+    ch = ch.upper()
+    if ch not in _GLYPHS:
+        return None
+    return [int(_GLYPHS[ch][i:i+2], 16) for i in range(0, 14, 2)]
+
+def text_w(chars):
+    return sum(6 for c in chars if _glyph(c) is not None)
+
+def draw_text(img, x, y, chars, color, scale=1):
+    """draw 5x7 text, scale = pixel amplification, x,y = top-left."""
+    cx = int(x)
+    for ch in chars:
+        g = _glyph(ch)
+        if g is None:
+            cx += 6
+            continue
+        for r in range(7):
+            byte = g[r]
+            for c in range(5):
+                if byte & (1 << (4 - c)):
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            yy = int(round(y)) + r * scale + dy
+                            xx = int(round(cx)) + c * scale + dx
+                            if 0 <= yy < img.shape[0] and 0 <= xx < img.shape[1]:
+                                img[yy, xx] = color
+        cx += 6 * scale
+
+def draw_line(img, x0, y0, x1, y1, color, lw=1):
+    """anti-aliased-free thick-ish line via supersampling."""
+    steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        pts.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0)))
+    for (px, py) in pts:
+        for dy in range(lw):
+            for dx in range(lw):
+                xx = int(round(px + dx - lw / 2))
+                yy = int(round(py + dy - lw / 2))
+                if 0 <= yy < img.shape[0] and 0 <= xx < img.shape[1]:
+                    img[yy, xx] = color
+
+def fill_rect(img, x0, y0, x1, y1, color):
+    x0, x1 = sorted((int(x0), int(x1)))
+    y0, y1 = sorted((int(y0), int(y1)))
+    img[max(0, y0):min(img.shape[0], y1 + 1), max(0, x0):min(img.shape[1], x1 + 1)] = color
+
+
+class Panel:
+    def __init__(self, img, x0, y0, x1, y1, title, dark=(20, 24, 34),
+                 line=(150, 160, 178), acc=(235, 235, 245)):
+        self.img = img
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        fill_rect(img, x0, y0, x1, y1, dark)
+        # title
+        draw_text(img, x0 + 8, y0 + 6, title, acc, scale=2)
+        # axis box inside panel
+        self.ax = (x0 + 52, y0 + 46, x1 - 16, y1 - 40)
+        draw_text(img, self.ax[0], y1 - 24, "t", line, scale=1)
+        # frame
+        fill_rect(img, self.ax[0], self.ax[2], self.ax[0], self.ax[3] + 1, line)  # left
+        fill_rect(img, self.ax[0], self.ax[3], self.ax[1], self.ax[3], line)      # bottom
+        self.xmap = lambda v: self.ax[0] + (v - self.vmin) / (self.vmax - self.vmin) * (self.ax[1] - self.ax[0])
+        self.ymap = lambda v: self.ax[3] - (v - self.ymin) / (self.ymax - self.ymin) * (self.ax[3] - self.ax[2])
+
+    def set_lims(self, vmin, vmax, ymin, ymax):
+        self.vmin, self.vmax = vmin, vmax
+        self.ymin, self.ymax = ymin, ymax
+
+    def polyline(self, xs, ys, color, lw=1):
+        prev = None
+        for x, y in zip(xs, ys):
+            px, py = self.xmap(x), self.ymap(y)
+            if prev is not None and not (np.isnan(x) or np.isnan(y)):
+                draw_line(self.img, prev[0], prev[1], px, py, color, lw)
+            prev = (px, py)
+
+    def bars(self, xs, ys, color):
+        n = len(xs)
+        if n == 1:
+            w = (self.ax[1] - self.ax[0])
+        else:
+            w = (self.ax[1] - self.ax[0]) / (self.vmax - self.vmin) * (xs[1] - xs[0]) * 0.7
+        w = max(2.0, w)
+        for x, y in zip(xs, ys):
+            x0 = self.xmap(x) - w / 2
+            x1 = self.xmap(x) + w / 2
+            y1 = self.ymap(max(y, self.ymin * 1e-30))
+            y0 = self.ymap(0.0)
+            fill_rect(self.img, x0, min(y0, y1), x1, max(y0, y1), color)
+
+    def text(self, x, y, s, color, pct=False, scale=1):
+        if pct:
+            px = self.ax[0] + (x - self.vmin) / (self.vmax - self.vmin) * (self.ax[1] - self.ax[0])
+            py = self.ax[3] - (y - self.ymin) / (self.ymax - self.ymin) * (self.ax[3] - self.ax[2])
+        else:
+            px, py = x, y
+        draw_text(self.img, px, py, s, color, scale)
+
+
+def write_png(path, img):
+    """minimal RGB PNG writer using zlib + struct."""
+    h, w = img.shape[0], img.shape[1]
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # filter type None
+        raw.extend(img[y, :, 0].tobytes())
+        raw.extend(img[y, :, 1].tobytes())
+        raw.extend(img[y, :, 2].tobytes())
+
+    def chunk(tag, data):
+        c = tag + data
+        return _struct.pack(">I", len(data)) + c + _struct.pack(">I", _zlib.crc32(c) & 0xffffffff)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+    idat = _zlib.compress(bytes(raw), 6)
+    with open(path, "wb") as f:
+        f.write(sig)
+        f.write(chunk(b"IHDR", ihdr))
+        f.write(chunk(b"IDAT", idat))
+        f.write(chunk(b"IEND", b""))
+
+
+W, H = 1560, 880
+img = np.zeros((H, W, 3), dtype=np.uint8)
+img[:] = (16, 18, 26)
+draw_text(img, 30, 18, "HMC NEAL-FUNNEL FORENSIC AUDIT - SELECTED %s (LEAPFROG L=%d EPS=%.4f)"
+          % (selected, INT_STEPS, STEP_SIZE), (240, 240, 250), scale=2)
+
+# panels layout: 2 rows x 3 cols
+pan_cfg = [
+    dict(title="V TRACES (4 CHAINS)", r=0, c=0),
+    dict(title="MARGINAL V VS N(0,S^2)", r=0, c=1),
+    dict(title="RADIUS2 DIST", r=0, c=2),
+    dict(title="PROFILE: RADIUS2 VS V", r=1, c=0),
+    dict(title="ACCEPT PROB (PRODUCTION)", r=1, c=1),
+    dict(title="ENERGY |DH| PER CHAIN", r=1, c=2),
+]
+panels = []
+for cfg in pan_cfg:
+    cw = (W - 100) / 3
+    ch = (H - 120) / 2
+    x0 = 30 + cfg["c"] * cw
+    y0 = 78 + cfg["r"] * ch
+    x1 = x0 + cw - 8
+    y1 = y0 + ch - 8
+    panels.append(Panel(img, x0, y0, x1, y1, cfg["title"]))
+
+# panel 0: v traces
+p = panels[0]
+p.set_lims(0, KEPT, float(v_kept.min()), float(v_kept.max()))
+cols = [(66, 170, 245), (245, 120, 120), (120, 220, 130), (230, 200, 90)]
+for c in range(N_CHAINS):
+    p.polyline(np.arange(KEPT), v_kept[c], cols[c], lw=1)
+
+# panel 1: marginal v histogram vs N(0, sigma^2)
+p = panels[1]
+nb = 40
+counts, edges = np.histogram(v_all, bins=nb)
+density = counts / counts.sum()
+p.set_lims(edges[0], edges[-1], 0, max(density.max(), 0.02))
+xs = (edges[:-1] + edges[1:]) / 2
+p.bars(xs, density, (70, 110, 170))
+vx = np.linspace(edges[0], edges[-1], 200)
+gauss = np.exp(-0.5 * (vx / SIG_V) ** 2) / np.sqrt(2 * np.pi * SIG_V ** 2)
+# overlay N(0,s^2) pdf normalized to bar scale
+gauss_scaled = gauss * np.diff(edges)[0]
+p.polyline(vx, gauss_scaled, (235, 90, 90), lw=2)
+
+# panel 2: radius2 histogram
+p = panels[2]
+counts, edges = np.histogram(radius2_all, bins=40)
+density = counts / counts.sum()
+p.set_lims(edges[0], edges[-1], 0, density.max())
+p.bars((edges[:-1] + edges[1:]) / 2, density, (120, 90, 190))
+
+# panel 3: profile observed vs expected
+p = panels[3]
+mids = [0.5 * (r[1] + r[2]) for r in rows]
+obs = [r[6] for r in rows]
+exp = [r[7] for r in rows]
+ymax = max(max(v for v in obs if v == v), max(v for v in exp if v == v)) * 1.15
+p.set_lims(-8, 8, 0, ymax)
+p.polyline(mids, obs, (66, 170, 245), lw=2)
+p.polyline(mids, exp, (235, 90, 90), lw=2)
+p.text(p.ax[0], p.ax[2] + 4, "OBS", (66, 170, 245))
+p.text(p.ax[0] + 40, p.ax[2] + 4, "EXP", (235, 90, 90))
+
+# panel 4: accept prob histogram
+p = panels[4]
+aps = np.exp(-np.clip(dh_kept, -20, 20)).ravel()
+counts, edges = np.histogram(aps, bins=30)
+density = counts / counts.sum()
+p.set_lims(0, 1, 0, density.max())
+p.bars((edges[:-1] + edges[1:]) / 2, density, (70, 170, 150))
+
+# panel 5: boxplot of |dh| per chain (draw manually)
+p = panels[5]
+data = [abs_dh_kept[c] for c in range(N_CHAINS)]
+allv = np.concatenate(data)
+p.set_lims(0.4, N_CHAINS + 0.6, 0, np.percentile(allv, 99) * 1.1)
+for c in range(N_CHAINS):
+    d = data[c]
+    q1, q2, q3 = np.percentile(d, [25, 50, 75])
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    x = 1 + c
+    p.polyline([x, x], [p.ymin, lo], (200, 200, 210), lw=1)  # lower whisker
+    p.polyline([x - 0.18, x + 0.18], [lo, lo], (200, 200, 210))
+    fill_rect(p.img, p.xmap(x - 0.18), p.ymap(q1), p.xmap(x + 0.18), p.ymap(q3), (120, 150, 210))
+    p.polyline([x - 0.18, x + 0.18], [q2, q2], (235, 235, 245), lw=2)
+    p.polyline([x, x], [q3, hi], (200, 200, 210), lw=1)
+    p.polyline([x - 0.18, x + 0.18], [hi, hi], (200, 200, 210))
+
+write_png(os.path.join(OUT, "overview.png"), img)
+print("overview.png written (pure-python PNG,", img.shape[0], "x", img.shape[1], ")")
+print("artifacts written under", OUT)

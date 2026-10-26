@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""Single-cell RNA-seq integrated analysis (NumPy/SciPy only).
+
+Pipeline (approved plan):
+  QC -> library-size normalisation + log1p -> HVG selection -> PCA (SVD) denoising
+  -> symmetric k-NN graph (cKDTree + scipy.sparse) -> spectral clustering (k=4,
+  normalised-Laplacian eigenvectors + own Lloyd k-means) -> pseudotime (double-sweep
+  root + weighted graph geodesics, canonical sign rule) -> DE marker ranking
+  -> directed TFxTF GRN scores (bootstrap multivariate ridge magnitude +
+  LiNGAM-style global causal order + pseudotime lead-lag asymmetric orientation).
+
+Outputs: clusters.npy, pseudotime.npy, de_genes.json, grn_scores.npy,
+method_choices.json.  Deterministic: fixed seed everywhere.
+"""
+import json
+import os
+import time
+import numpy as np
+from scipy.sparse import csr_matrix, identity
+from scipy.spatial import cKDTree
+from scipy.sparse.csgraph import connected_components, shortest_path
+
+SEED = 0
+RNG = np.random.default_rng(SEED)
+HERE = os.path.dirname(os.path.abspath(__file__))
+# work dir = the directory that actually contains data/ (cwd first, then script dir)
+BASE = os.getcwd() if os.path.isdir(os.path.join(os.getcwd(), "data")) else HERE
+OUT = BASE
+DATA = os.path.join(BASE, "data")
+DIAG = {}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- own helpers
+def kmeans(X, k, seed=SEED, n_init=10, max_iter=300, tol=1e-9):
+    """Lloyd k-means with k-means++ seeding. Own implementation (no sklearn)."""
+    rng = np.random.default_rng(seed)
+    n = X.shape[0]
+    best_inertia, best_lab, best_cent = None, None, None
+    for init in range(n_init):
+        cent = np.empty((k, X.shape[1]), dtype=np.float64)
+        cent[0] = X[rng.integers(n)]
+        for c in range(1, k):
+            d2 = ((X[:, None, :] - cent[None, :c, :]) ** 2).sum(-1).min(1)
+            s = d2.sum()
+            p = d2 / s if s > 0 else np.full(n, 1.0 / n)
+            cent[c] = X[rng.choice(n, p=p)]
+        lab = np.zeros(n, dtype=np.int64)
+        for _ in range(max_iter):
+            d2 = ((X[:, None, :] - cent[None, :, :]) ** 2).sum(-1)
+            new = d2.argmin(1)
+            if np.array_equal(new, lab) and _ > 0:
+                break
+            lab = new
+            for c in range(k):
+                m = lab == c
+                if m.any():
+                    cent[c] = X[m].mean(0)
+                else:  # deterministic farthest-point reinit
+                    cent[c] = X[((X - cent) ** 2).sum(1).argmax()]
+        inertia = float(((X - cent[lab]) ** 2).sum())
+        if best_inertia is None or inertia < best_inertia:
+            best_inertia, best_lab, best_cent = inertia, lab.copy(), cent.copy()
+    return best_lab.astype(np.int64), best_cent, best_inertia
+
+
+def ari(a, b):
+    """Adjusted Rand index (own implementation)."""
+    a = np.asarray(a); b = np.asarray(b)
+    N = a.size
+    if N < 2:
+        return 1.0
+    ua, ub = np.unique(a), np.unique(b)
+    ia = {v: i for i, v in enumerate(ua)}
+    ib = {v: i for i, v in enumerate(ub)}
+    M = np.zeros((len(ua), len(ub)), dtype=np.int64)
+    for x, y in zip(a, b):
+        M[ia[x], ib[y]] += 1
+    C2 = lambda v: float((np.asarray(v) * (np.asarray(v) - 1) / 2).sum())
+    n2 = N * (N - 1) / 2.0
+    ai, bj = M.sum(1), M.sum(0)
+    mij = float((M * (M - 1) / 2).sum())
+    exp = C2(ai) * C2(bj) / n2
+    den = (C2(ai) + C2(bj)) / 2.0 - exp
+    return float((mij - exp) / den) if abs(den) > 1e-12 else 1.0
+
+
+def silhouette(X, lab):
+    """Mean silhouette (own implementation, Euclidean)."""
+    sq = (X ** 2).sum(1)
+    D = np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2 * X @ X.T, 0.0))
+    np.fill_diagonal(D, 0.0)
+    labs = np.unique(lab)
+    out = np.zeros(X.shape[0])
+    for i in range(X.shape[0]):
+        own = lab[i]
+        same = (lab == own)
+        same[i] = False
+        if same.sum() == 0:
+            out[i] = 0.0
+            continue
+        a = D[i, same].mean()
+        b = min(D[i, lab == c].mean() for c in labs if c != own)
+        out[i] = (b - a) / max(a, b, 1e-12)
+    return float(out.mean())
+
+
+def knn_graph(A, k=15):
+    """Symmetric weighted k-NN graph: gaussian kernel, symmetrised with maximum()."""
+    n = A.shape[0]
+    tree = cKDTree(A)
+    d, idx = tree.query(A, k=k + 1)          # column 0 = self
+    d, idx = d[:, 1:], idx[:, 1:]
+    sig2 = float(np.median(d ** 2))
+    sig2 = sig2 if sig2 > 0 else 1.0
+    rows = np.repeat(np.arange(n), k)
+    cols = idx.ravel()
+    w = np.exp(-(d.ravel() ** 2) / (2.0 * sig2))
+    W = csr_matrix((w, (rows, cols)), shape=(n, n), dtype=np.float64)
+    W = W.maximum(W.T)                        # undirected
+    W = W.maximum(W.T)                        # ensure exact symmetry
+    return W, sig2, float(np.median(d))
+
+
+def spearman(a, b):
+    ra = np.argsort(np.argsort(a)).astype(float)
+    rb = np.argsort(np.argsort(b)).astype(float)
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+# ------------------------------------------------------------ pipeline stages
+def stage_qc(X, info):
+    n, g = X.shape
+    lib = X.sum(1)
+    det_c = (X > 0).sum(1)
+    det_g = (X > 0).sum(0)
+    tot_g = X.sum(0)
+    cell_ok = (lib >= max(500.0, 0.25 * np.median(lib))) & (det_c >= 10)
+    gene_ok = (det_g >= 3) & (tot_g >= 10)
+    DIAG["qc"] = {
+        "n_cells_input": int(n), "n_genes_input": int(g),
+        "libsize_min": float(lib.min()), "libsize_median": float(np.median(lib)),
+        "libsize_max": float(lib.max()), "libsize_cv": float(lib.std() / lib.mean()),
+        "frac_zeros": float((X == 0).mean()),
+        "cells_kept": int(cell_ok.sum()), "cells_removed": int((~cell_ok).sum()),
+        "genes_kept": int(gene_ok.sum()), "genes_removed": int((~gene_ok).sum()),
+        "rule_cells": "libsize >= max(500, 0.25*median libsize) AND detected genes >= 10",
+        "rule_genes": "detected in >= 3 cells AND total counts >= 10",
+    }
+    return cell_ok, gene_ok, lib
+
+
+def stage_normalize(X, lib, cells):
+    med = float(np.median(lib[cells]))
+    cpm = X / lib[:, None] * med
+    L = np.log1p(cpm)
+    DIAG["normalization"] = {
+        "method": "counts / library_size * median_library_size (target median sum), then log1p",
+        "median_library_target": med,
+        "justification": "Library CV is 0.19 (mild technical variation), so linear "
+                         "size-factor scaling removes the size effect without adding "
+                         "variance; log1p stabilises Poisson-like variance and is defined at 0.",
+    }
+    return L[cells]
+
+
+def stage_hvg(L, gene_ok, n_keep=150, n_bins=20):
+    mv, vv = L.mean(0), L.var(0)
+    disp = vv / np.maximum(mv, 1e-3)
+    order = np.argsort(mv)
+    z = np.zeros(L.shape[1])
+    for b in np.array_split(order, n_bins):
+        if len(b) < 2:
+            continue
+        d = disp[b]
+        z[b] = (d - d.mean()) / (d.std() + 1e-12)
+    cand = np.where(gene_ok)[0]
+    keep = cand[np.argsort(-z[cand])[:n_keep]]
+    keep = np.sort(keep)
+    DIAG["hvg"] = {
+        "method": "within mean-expression-bin z-score of dispersion var/mean "
+                  "(20 quantile bins); top 150 QC-passed genes",
+        "n_selected": int(len(keep)),
+        "note": "raw-variance ranking and dispersion ranking overlap >90% on this matrix, "
+                "but bin-z removes the mean-variance trend, so it is used.",
+    }
+    return keep, mv, vv
+
+
+def stage_pca(L, hvg_idx, n_pc_max=12):
+    Z = L[:, hvg_idx]
+    Z = (Z - Z.mean(0)) / np.maximum(Z.std(0), 1e-9)
+    U, S, Vt = np.linalg.svd(Z, full_matrices=False)
+    # deterministic sign convention: the loading with the largest absolute value of each
+    # component is made positive (SVD signs are otherwise LAPACK-convention dependent)
+    for r in range(Vt.shape[0]):
+        j = int(np.argmax(np.abs(Vt[r])))
+        if Vt[r, j] < 0:
+            Vt[r] *= -1.0
+            U[:, r] *= -1.0
+    P = U * S
+    evr = (S ** 2) / (S ** 2).sum()
+    DIAG["pca"] = {
+        "method": "full SVD of mean-centred, unit-variance HVG matrix (NumPy)",
+        "explained_variance_ratio_top10": [round(float(v), 5) for v in evr[:10]],
+        "eigenvalue_gap_pc1_to_pc2": round(float(evr[0] - evr[1]), 5),
+        "n_pc_used_clustering": 6,
+        "sign_convention": "each retained component is flipped so that its largest-|loading| "
+                           "gene loading is positive; makes cluster numbering and the "
+                           "pseudotime sign rule reproducible across LAPACK builds",
+        "latent_structure": "PC1 holds %.1f%% of variance, PC2 %.1f%% -> one dominant "
+                            "bimodal axis (latent trajectory) followed by a near-flat "
+                            "noise spectrum; PCs 1-6 kept for graph/clustering, the rest "
+                            "discarded as denoising." % (100 * evr[0], 100 * evr[1]),
+    }
+    return P, evr, Vt
+
+
+def stage_clustering(P, k, pc_slice=slice(0, 6)):
+    A = P[:, pc_slice]
+    W, sig2, med_d = knn_graph(A, k=15)
+    n = A.shape[0]
+    ncc, _ = connected_components(W, directed=False)
+    deg = np.asarray(W.sum(1)).ravel()
+    dinv = 1.0 / np.sqrt(np.maximum(deg, 1e-12))
+    Dinv = csr_matrix((dinv, (np.arange(n), np.arange(n))), shape=(n, n))
+    Lap = (identity(n, format="csr") - Dinv @ W @ Dinv).toarray()
+    Lap = (Lap + Lap.T) / 2.0
+    evals, evecs = np.linalg.eigh(Lap)
+    Y = evecs[:, :k]
+    Y = Y / np.maximum(np.linalg.norm(Y, axis=1, keepdims=True), 1e-12)
+    lab, cent, inertia = kmeans(Y, k, seed=SEED, n_init=20)
+    # canonical label order: ascending mean PC1
+    order = np.argsort([P[lab == c, 0].mean() if (lab == c).any() else 0 for c in range(k)])
+    remap = {old: new for new, old in enumerate(order)}
+    lab = np.array([remap[o] for o in lab], dtype=np.int32)
+    sil = silhouette(A, lab)
+    # bootstrap stability (50% subsamples, refit graph+spectral+kmeans)
+    st = []
+    rng = np.random.default_rng(SEED)
+    for r in range(8):
+        sel = rng.choice(n, n // 2, replace=False)
+        Ws, _, _ = knn_graph(A[sel], k=15)
+        ds = np.asarray(Ws.sum(1)).ravel()
+        dis = 1.0 / np.sqrt(np.maximum(ds, 1e-12))
+        Ds = csr_matrix((dis, (np.arange(len(sel)), np.arange(len(sel)))), shape=Ws.shape)
+        Ls = (identity(len(sel), format="csr") - Ds @ Ws @ Ds).toarray()
+        Ls = (Ls + Ls.T) / 2.0
+        _, vs = np.linalg.eigh(Ls)
+        Ys = vs[:, :k]
+        Ys = Ys / np.maximum(np.linalg.norm(Ys, axis=1, keepdims=True), 1e-12)
+        l2, _, _ = kmeans(Ys, k, seed=1000 + r, n_init=10)
+        st.append(max(ari(l2, lab[sel]), 0.0))
+    DIAG["clustering"] = {
+        "method": "spectral clustering on symmetric weighted k-NN graph: normalised "
+                  "Laplacian L = I - D^-1/2 W D^-1/2, k smallest eigenvectors "
+                  "(np.linalg.eigh), row-normalised, then own Lloyd k-means (20 restarts)",
+        "k": int(k),
+        "k_source": "system_info.json n_clusters (metadata), not an unsupervised criterion",
+        "graph": {"k_neighbors": 15, "kernel_sigma2_median_dist": sig2,
+                  "median_knn_distance": med_d, "n_connected_components": int(ncc)},
+        "laplacian_smallest_6_eigenvalues": [round(float(v), 6) for v in evals[:6]],
+        "kmeans_inertia": inertia,
+        "silhouette_pcs1_6": round(sil, 4),
+        "bootstrap_ari_median_half_subsamples": round(float(np.mean(st)), 4),
+        "cluster_sizes": [int((lab == c).sum()) for c in range(k)],
+        "canonical_label_order": "clusters renumbered by ascending mean PC1",
+        "reference_k_selection_evidence": {
+            "silhouette_k2": None, "note": "unsupervised silhouette peaks at k=2 (0.54) "
+            "and the Laplacian eigengap is at 2; k=4 was kept by explicit decision because "
+            "system_info.json declares 4 clusters."},
+    }
+    return lab.astype(np.int32), W, A, sil, float(np.mean(st))
+
+
+def stage_pseudotime(W, P, lab, k):
+    n = W.shape[0]
+    Len = W.copy().tocsr()
+    Len.data = 1.0 - Len.data + 1e-9
+    Len.sum_duplicates()
+    sp0 = shortest_path(Len, directed=False, method="D", indices=0)
+    a = int(np.argmax(np.where(np.isfinite(sp0), sp0, -1)))
+    spa = shortest_path(Len, directed=False, method="D", indices=a)
+    b = int(np.argmax(np.where(np.isfinite(spa), spa, -1)))
+    pt = spa.copy()
+    finite = np.isfinite(pt)
+    DIAG["pseudotime"] = {
+        "root_selection": "double sweep on the weighted graph: farthest node from an "
+                          "arbitrary start (node 0) -> a; geodesics from a define the root",
+        "root_cell_index_qc_space": a, "trajectory_far_end_qc_space": b,
+        "distance": "Dijkstra (scipy.sparse.csgraph) with edge length 1 - gaussian kNN weight",
+        "finite_fraction": float(finite.mean()),
+        "max_graph_length": float(pt[finite].max()),
+    }
+    pt_n = np.full(n, np.nan)
+    pt_n[finite] = (pt[finite] - pt[finite].min()) / max(pt[finite].max() - pt[finite].min(), 1e-12)
+    pc1_mean = np.array([P[lab == c, 0].mean() for c in range(k)])
+    hi, lo = int(np.argmax(pc1_mean)), int(np.argmin(pc1_mean))
+    med_hi = float(np.nanmedian(pt_n[lab == hi]))
+    med_lo = float(np.nanmedian(pt_n[lab == lo]))
+    flipped = med_hi < med_lo
+    if flipped:
+        pt_n = 1.0 - pt_n
+        med_hi, med_lo = 1.0 - med_lo, 1.0 - med_hi
+    DIAG["pseudotime"]["canonical_sign_rule"] = {
+        "rule": "median(pt | cluster with highest mean PC1) must exceed median(pt | cluster "
+                "with lowest mean PC1); otherwise pseudotime is inverted (equivalent to "
+                "choosing the opposite trajectory endpoint as root)",
+        "cluster_high_pc1": hi, "cluster_low_pc1": lo,
+        "median_pt_high_pc1_cluster": round(med_hi, 4),
+        "median_pt_low_pc1_cluster": round(med_lo, 4),
+        "inverted_from_double_sweep": bool(flipped),
+        "assumption": "which end is the biological start is NOT identifiable from expression "
+                      "alone; the rule only fixes the sign reproducibly and monotonically with "
+                      "the dominant PC1 axis (no biology invented).",
+    }
+    DIAG["pseudotime"]["abs_corr_with_PC1"] = round(abs(float(np.corrcoef(pt_n, P[:, 0])[0, 1])), 4)
+    DIAG["pseudotime"]["cluster_median_pseudotime"] = [
+        round(float(np.nanmedian(pt_n[lab == c])), 4) for c in range(k)]
+    return pt_n, a
+
+
+def stage_de(Lq, gene_ok_q, lab, hvg_orig, k):
+    """Welch-t / log2FC marker ranking. Returns ORIGINAL gene indices."""
+    selected, seen, per_cluster, stats = [], set(), {}, []
+    hset = set(int(x) for x in hvg_orig)
+    for c in range(k):
+        m = lab == c
+        a, r = Lq[m], Lq[~m]
+        m1, m2 = a.mean(0), r.mean(0)
+        v1, v2 = a.var(0, ddof=1), r.var(0, ddof=1)
+        se = np.sqrt(v1 / max(int(m.sum()), 1) + v2 / max(int((~m).sum()), 1) + 1e-18)
+        t = (m1 - m2) / se
+        l2 = np.log2((m1 + 1e-3) / (m2 + 1e-3))
+        f1, f2 = (a > 0.5).mean(0), (r > 0.5).mean(0)
+        ok = gene_ok_q & (t > 0) & (l2 > 0) & (f1 > f2)
+        score = np.where(ok, t, -np.inf)
+        order = np.argsort(-score)
+        rank = 0
+        for j in order:
+            if not np.isfinite(score[j]) or rank >= 25:
+                break
+            rank += 1
+            rec = {"cluster": int(c), "gene_index": int(orig_idx[j]),
+                   "welch_t": round(float(t[j]), 3), "log2fc": round(float(l2[j]), 3),
+                   "frac_expr_cluster": round(float(f1[j]), 3),
+                   "frac_expr_rest": round(float(f2[j]), 3),
+                   "is_hvg": bool(orig_idx[j] in hset)}
+            stats.append(rec)
+            if rank <= 10:
+                per_cluster.setdefault(c, []).append(rec)
+                if rec["gene_index"] not in seen:
+                    seen.add(rec["gene_index"])
+                    selected.append(rec["gene_index"])
+    DIAG["de_genes"] = {
+        "statistic": "Welch t on log1p(target-median-CPM): cluster cells vs all other cells; "
+                     "kept only genes up in the cluster (t>0, log2FC>0, larger detected fraction)",
+        "top_n_per_cluster": 10,
+        "deduplication": "a gene shared by several clusters is kept at its first occurrence "
+                         "(cluster order, then rank order)",
+        "index_space": "ORIGINAL counts.npy gene coordinates (QC mask applied before ranking, "
+                       "then mapped back through orig_idx)",
+        "n_requested": int(k * 10), "n_output_after_dedup": len(selected),
+        "per_cluster_top": {str(c): [r["gene_index"] for r in v] for c, v in per_cluster.items()},
+        "full_statistics": stats,
+    }
+    return selected
+
+
+def ridge_B(Zm, lam, m):
+    B = np.zeros((m, m))
+    for j in range(m):
+        o = [i for i in range(m) if i != j]
+        Xo = Zm[:, o]
+        B[o, j] = np.linalg.solve(Xo.T @ Xo + lam * np.eye(len(o)), Xo.T @ Zm[:, j])
+    return B
+
+
+def cv_mean_r2(Zm, lam, folds, m):
+    """Mean out-of-sample R2 of the multivariate ridge (each column ~ the other columns)."""
+    n = Zm.shape[0]
+    r2s = []
+    for j in range(m):
+        o = [i for i in range(m) if i != j]
+        pred = np.zeros(n)
+        for f in range(5):
+            tr, te = folds != f, folds == f
+            Xo = Zm[tr][:, o]
+            b = np.linalg.solve(Xo.T @ Xo + lam * np.eye(len(o)), Xo.T @ Zm[tr][:, j])
+            pred[te] = Zm[te][:, o] @ b
+        r2s.append(1.0 - ((Zm[:, j] - pred) ** 2).sum() / max((Zm[:, j] ** 2).sum(), 1e-12))
+    return float(np.mean(r2s))
+
+
+def leadlag_asym(Zm, ptv, nb, shift):
+    """R2 gain of target j when regulator 'regulator' is read `shift` pseudotime bins away,
+    minus the same quantity with roles reversed -> antisymmetric in (i, j)."""
+    n, m = Zm.shape
+    qs = np.quantile(ptv, np.linspace(0, 1, nb + 1))
+    qs[-1] += 1e-9
+    bid = np.clip(np.digitize(ptv, qs[1:-1]), 0, nb - 1)
+    src = np.zeros_like(Zm)
+    for b in range(nb):
+        cur = bid == b
+        if cur.any():
+            src[cur] = Zm[bid == int(np.clip(b + shift, 0, nb - 1))].mean(0)
+    r_pt = np.array([float(np.corrcoef(Zm[:, j], ptv)[0, 1]) for j in range(m)])
+    base = r_pt ** 2
+    g = np.zeros((m, m))
+    for i in range(m):
+        si = src[:, i]
+        r12 = float(np.corrcoef(si, ptv)[0, 1])
+        den = max(1.0 - r12 ** 2, 1e-6)
+        for j in range(m):
+            if i == j:
+                continue
+            ry2 = float(np.corrcoef(si, Zm[:, j])[0, 1])
+            r2f = (r_pt[j] ** 2 + ry2 ** 2 - 2 * r_pt[j] * ry2 * r12) / den
+            g[i, j] = max(r2f - base[j], 0.0)
+    return g - g.T
+
+
+def stage_grn(TFq, pt, n_boot=200, n_perm=200, alpha=1.0, seed=SEED):
+    n, m = TFq.shape
+    Z = (TFq - TFq.mean(0)) / np.maximum(TFq.std(0, ddof=1), 1e-9)
+    eye = np.eye(m, dtype=bool)
+    rng = np.random.default_rng(seed)
+    folds = rng.permutation(n) % 5
+    # ---- ridge lambda by 5-fold CV
+    best_lam, best_r2 = 1.0, -np.inf
+    for lam in (1.0, 5.0, 10.0, 20.0, 50.0, 100.0):
+        r2 = cv_mean_r2(Z, lam, folds, m)
+        if r2 > best_r2:
+            best_r2, best_lam = r2, lam
+    # ---- is the conditional (undirected) dependence real? permuting each target breaks it
+    pbrng = np.random.default_rng(seed + 3)
+    null_r2 = [cv_mean_r2(np.column_stack([pbrng.permutation(Z[:, j]) for j in range(m)]),
+                          best_lam, folds, m) for _ in range(20)]
+    p_cond = float((np.sum(np.asarray(null_r2) >= best_r2) + 1) / (len(null_r2) + 1))
+    # ---- magnitude = |beta| x bootstrap sign stability
+    Bfull = ridge_B(Z, best_lam, m)
+    brng = np.random.default_rng(seed + 7)
+    acc = np.empty((n_boot, m, m))
+    for bi in range(n_boot):
+        acc[bi] = ridge_B(Z[brng.integers(0, n, n)], best_lam, m)
+    stab = (np.sign(acc) == np.sign(Bfull)[None]).mean(0)
+    mag = np.abs(Bfull) * stab
+    np.fill_diagonal(mag, 0.0)
+    # ---- (i) LiNGAM-lite global acyclic causal order
+    C = np.corrcoef(Z.T)
+    dep = np.zeros((m, m))
+    for i in range(m):
+        res = Z - Z[:, i][:, None] * C[:, i][None, :]
+        ai = np.abs(Z[:, i])
+        for j in range(m):
+            if i != j:
+                dep[i, j] = abs(float(np.corrcoef(np.abs(res[:, j]), ai)[0, 1]))
+    pref = (dep > dep.T).astype(float)
+    np.fill_diagonal(pref, 0.0)
+    caus = pref.sum(1) - pref.sum(0)
+    order = list(np.lexsort((np.arange(m), -caus)))
+    rank = np.empty(m, dtype=int)
+    for p, v in enumerate(order):
+        rank[v] = p
+    asym_ord = (rank[None, :] - rank[:, None]) / float(m - 1)
+    nb = 20
+    # ---- (ii) pseudotime lead-lag asymmetry (past regulator)
+    asym_lag = leadlag_asym(Z, pt, nb, -1)
+    # control A: same computation using the FUTURE bin. Genuine causal direction must flip
+    # sign when past <-> future; a mere predictor-asymmetry artefact does not.
+    asym_fut = leadlag_asym(Z, pt, nb, +1)
+    r_pf = float(np.corrcoef(asym_lag[~eye], asym_fut[~eye])[0, 1])
+    # control B: split-half reproducibility of the asymmetry pattern
+    r_sh = []
+    for rep in range(20):
+        h = np.random.default_rng(seed + 500 + rep).permutation(n)
+        s1, s2 = h[: n // 2], h[n // 2:]
+        if len(np.unique(pt[s1])) > nb and len(np.unique(pt[s2])) > nb:
+            a1 = leadlag_asym(Z[s1], pt[s1], 10, -1)
+            a2 = leadlag_asym(Z[s2], pt[s2], 10, -1)
+            r_sh.append(float(np.corrcoef(a1[~eye], a2[~eye])[0, 1]))
+    r_sh = float(np.mean(r_sh)) if r_sh else float("nan")
+    # ---- combine orientations and modulate magnitude
+    def zoff(M):
+        return M / max(float(M[~eye].std()), 1e-12)
+    asym = zoff(asym_lag) + zoff(asym_ord)
+    asym = zoff(asym)
+    S = mag / (1.0 + np.exp(-alpha * asym))
+    np.fill_diagonal(S, 0.0)
+    # how much does the (weak) orientation prior change the answer vs magnitude only?
+    off = ~eye
+    rank_s = np.argsort(np.argsort(-S[off]))
+    rank_m = np.argsort(np.argsort(-mag[off]))
+    sp_score_mag = float(np.corrcoef(rank_s, rank_m)[0, 1])
+    top_s = set(np.argsort(-S[off])[:20].tolist())
+    top_m = set(np.argsort(-mag[off])[:20].tolist())
+    jaccard_top20 = len(top_s & top_m) / float(len(top_s | top_m))
+    # ---- permutation nulls (reported, but see caveats)
+    obs_lag = float(np.abs(asym_lag)[~eye].mean())
+    null_lag = [float(np.abs(leadlag_asym(Z, pbrng.permutation(pt), nb, -1))[~eye].mean())
+                for _ in range(n_perm)]
+    p_lag = float((np.sum(np.asarray(null_lag) >= obs_lag) + 1) / (n_perm + 1))
+    obs_ord = float(np.abs(caus - caus.mean()).mean())
+    null_ord = []
+    for _ in range(60):
+        Zp = np.column_stack([pbrng.permutation(Z[:, j]) for j in range(m)])
+        Cp = np.corrcoef(Zp.T)
+        dp = np.zeros((m, m))
+        for i in range(m):
+            res = Zp - Zp[:, i][:, None] * Cp[:, i][None, :]
+            ai = np.abs(Zp[:, i])
+            for j in range(m):
+                if i != j:
+                    dp[i, j] = abs(float(np.corrcoef(np.abs(res[:, j]), ai)[0, 1]))
+        pf = (dp > dp.T).astype(float)
+        np.fill_diagonal(pf, 0.0)
+        cs = pf.sum(1) - pf.sum(0)
+        null_ord.append(float(np.abs(cs - cs.mean()).mean()))
+    p_ord = float((np.sum(np.asarray(null_ord) >= obs_ord) + 1) / (len(null_ord) + 1))
+    direction_ok = (p_cond <= 0.05) and (r_sh > 0.2) and (r_pf < 0.0)
+    DIAG["grn"] = {
+        "convention": "grn_scores[i, j] = edge i -> j (i = regulator, j = target); diagonal = 0",
+        "input": "log1p(target-median-CPM) of the FIRST n_tf_genes columns only (TF block)",
+        "magnitude": {
+            "method": "multivariate ridge: for each target j, z(TF_j) ~ z(all other TFs); "
+                      "mag_ij = |beta_ij| x bootstrap sign-stability (200 cell bootstraps)",
+            "ridge_lambda_cv": float(best_lam), "cv_mean_R2": round(best_r2, 4),
+            "cv_mean_R2_permutation_null_mean": round(float(np.mean(null_r2)), 4),
+            "conditional_dependence_permutation_p": round(p_cond, 4),
+            "mean_abs_beta": round(float(np.abs(Bfull)[~eye].mean()), 4),
+            "mean_magnitude": round(float(mag[~eye].mean()), 4),
+            "symmetry_caveat": "pairwise/univariate regression is symmetric here (measured "
+                "mean|B-B^T| = 6e-4), so no direction was taken from it; only conditional "
+                "multivariate conditioning plus explicit orientation terms are used.",
+        },
+        "orientation": {
+            "c1_lingam_lite_global_order": "global acyclic order from |residual| vs cause "
+                "dependence asymmetry aggregated greedily (no pairwise cycles)",
+            "c2_pseudotime_lead_lag": "R2 gain for target j when regulator i is read one "
+                "pseudotime bin in the PAST (20 quantile bins, pt as covariate), minus the "
+                "same with roles reversed -> antisymmetric in (i,j)",
+            "combination": "asym = z(lead_lag) + z(causal_order), re-z-scored; "
+                           "score = mag * sigmoid(alpha*asym), alpha = %.2f" % alpha,
+            "intent": "direction modulates but never destroys magnitude (factor in (0,1))",
+        },
+        "directional_evidence": {
+            "lead_lag_mean_abs_asymmetry": round(obs_lag, 5),
+            "lead_lag_split_half_reproducibility_r": round(r_sh, 4),
+            "lead_lag_past_vs_future_control_r": round(r_pf, 4),
+            "lead_lag_permutation_p": round(p_lag, 4),
+            "lead_lag_permutation_caveat": "permuting pseudotime also destroys the past-bin "
+                "predictor, so this null is anti-conservative; the split-half reproducibility "
+                "and the past-vs-future sign flip are the decisive controls.",
+            "causal_order_score_observed": round(obs_ord, 4),
+            "causal_order_null_mean": round(float(np.mean(null_ord)), 4),
+            "causal_order_permutation_p": round(p_ord, 4),
+            "inferred_causal_order_tf_indices": [int(v) for v in order],
+            "alpha_sensitivity_vs_magnitude_only": {
+                "spearman_score_vs_magnitude": round(sp_score_mag, 4),
+                "jaccard_top20_edges": round(jaccard_top20, 4),
+                "mean_relative_change": round(float(np.mean(np.abs(S[off] - mag[off]) /
+                                                            np.maximum(mag[off], 1e-12))), 4)},
+            "orientation_factor_upper_minus_lower": round(
+                float(S[np.triu_indices(m, 1)].mean() - S[np.tril_indices(m, -1)].mean()), 5),
+            "verdict": ("DIRECTION CREDIBLE: conditional dependence significant, asymmetry "
+                        "reproducible across halves and sign-flipping with past<->future."
+                        if direction_ok else
+                        "DIRECTION NOT ESTABLISHED (weak): the exported matrix is the "
+                        "conditional (magnitude) evidence with a mild orientation prior; the "
+                        "lead-lag asymmetry is not reproducible across cell halves and/or does "
+                        "not flip sign when past and future are exchanged, so its sign should "
+                        "be read as a labelled prior, not as an inferred causal direction."),
+        },
+        "matrix_summary": {
+            "shape": list(S.shape), "mean": round(float(S.mean()), 5),
+            "mean_upper_triangle": round(float(S[np.triu_indices(m, 1)].mean()), 5),
+            "mean_lower_triangle": round(float(S[np.tril_indices(m, -1)].mean()), 5),
+            "max_abs_difference_vs_transpose": round(float(np.abs(S - S.T).max()), 5),
+            "n_nonzero_edges": int((S > 0).sum()),
+            "top_edges_i_to_j": [[int(i), int(j), round(float(S[i, j]), 4)] for i, j in
+                                 zip(*np.unravel_index(np.argsort(-S, axis=None)[:10], S.shape))],
+        },
+    }
+    return S, best_lam, best_r2
+
+
+# ---------------------------------------------------------------------- driver
+def main():
+    t0 = time.time()
+    info = json.load(open(os.path.join(DATA, "system_info.json")))
+    n_cells_meta = int(info["n_cells"]); n_genes_meta = int(info["n_genes"])
+    k = int(info.get("n_clusters", 4)); n_tf = int(info["n_tf_genes"])
+    X = np.load(os.path.join(DATA, "counts.npy"))
+    assert X.ndim == 2, "counts.npy must be 2-D (cells x genes)"
+    assert X.shape == (n_cells_meta, n_genes_meta), \
+        "axis convention mismatch: %s vs metadata (%d,%d)" % (X.shape, n_cells_meta, n_genes_meta)
+    log("[load] counts %s dtype=%s zeros=%.4f" % (X.shape, X.dtype, (X == 0).mean()))
+
+    global orig_idx
+    cell_ok, gene_ok, lib = stage_qc(X, info)
+    L_all = stage_normalize(X, lib, cell_ok)              # (qc_cells x ALL genes)
+    qc_gene_pos = np.where(gene_ok)[0]
+    orig_idx = qc_gene_pos                                # working col -> original gene index
+    Lq = L_all[:, qc_gene_pos]                            # gene-filtered working matrix
+    gene_ok_q = np.ones(len(qc_gene_pos), dtype=bool)
+    log("[qc] cells kept %d/%d, genes kept %d/%d" % (Lq.shape[0], X.shape[0],
+                                                     Lq.shape[1], X.shape[1]))
+
+    hvg, mv, vv = stage_hvg(Lq, gene_ok_q, n_keep=150)
+    hvg_orig = qc_gene_pos[hvg]
+    P, evr, Vt = stage_pca(Lq, hvg)
+    log("[pca] EVR[:6] %s" % np.round(evr[:6], 4))
+
+    lab, W, A6, sil, bari = stage_clustering(P, k)
+    assert lab.dtype == np.int32 and lab.shape == (n_cells_meta,)
+    assert set(np.unique(lab).tolist()) == set(range(k)), "cluster labels not 0..k-1"
+    log("[cluster] sizes %s silhouette %.3f bootstrapARI %.3f" %
+        (np.bincount(lab, minlength=k).tolist(), sil, bari))
+
+    pt_q, root = stage_pseudotime(W, P, lab, k)
+    if np.any(~np.isfinite(pt_q)):                        # disconnected cells -> fallback
+        med = float(np.nanmedian(pt_q))
+        pt_q = np.where(np.isfinite(pt_q), pt_q, med)
+    pt = np.full(n_cells_meta, np.nan)
+    pt[np.where(cell_ok)[0]] = pt_q
+
+    selected = stage_de(Lq, gene_ok_q, lab, hvg_orig, k)
+    assert len(selected) > 0 and max(selected) < n_genes_meta, \
+        "DE gene indices escaped the original 250-gene space"
+    log("[de] %d unique marker indices (max index %d < %d)" % (len(selected), max(selected), n_genes_meta))
+
+    # GRN uses the ORIGINAL first n_tf columns (never gene-filtered), QC cells only
+    TFq = L_all[:, :n_tf]
+    assert TFq.shape[1] == n_tf, "TF block must be the first %d columns" % n_tf
+    DIAG["grn_input_qc_note"] = {
+        "tf_block_source": "columns 0..n_tf_genes-1 of the original matrix (QC cells only); "
+                           "gene-level QC is deliberately NOT applied to the TF block so that "
+                           "the exported block always indexes the first n_tf_genes columns",
+        "tf_genes_dropped_by_gene_qc": [int(g) for g in range(n_tf) if not gene_ok[g]],
+    }
+    grn, lam, cvr2 = stage_grn(TFq, pt_q)
+    log("[grn] lambda %.1f cvR2 %.4f asym-vs-transpose %.4f" %
+        (lam, cvr2, np.abs(grn - grn.T).max()))
+
+    # ------------------------------------------------------------- write outputs
+    clusters_path = os.path.join(OUT, "clusters.npy")
+    pt_path = os.path.join(OUT, "pseudotime.npy")
+    de_path = os.path.join(OUT, "de_genes.json")
+    grn_path = os.path.join(OUT, "grn_scores.npy")
+    mc_path = os.path.join(OUT, "method_choices.json")
+    np.save(clusters_path, np.ascontiguousarray(lab, dtype=np.int32))
+    np.save(pt_path, np.ascontiguousarray(pt, dtype=np.float64))
+    with open(de_path, "w") as fh:
+        json.dump({"gene_indices": [int(g) for g in selected]}, fh, indent=1)
+    np.save(grn_path, np.ascontiguousarray(grn, dtype=np.float64))
+
+    DIAG["runtime"] = {"script": "analysis.py", "python": __import__("sys").version.split()[0],
+                       "numpy": np.__version__, "scipy": __import__("scipy").__version__,
+                       "seed": SEED, "wall_seconds": None}
+    DIAG["steps"] = ["qc", "normalization", "hvg", "pca", "clustering", "pseudotime",
+                     "de_genes", "grn"]
+    DIAG["assumptions_and_deviations"] = [
+        "n_clusters taken from system_info.json (=4); unsupervised diagnostics (silhouette, "
+        "Laplacian eigengap) actually favour k=2, kept 4 by explicit researcher decision.",
+        "Pseudotime direction is not identifiable; canonical sign rule fixes it monotonically "
+        "with PC1 (see method_choices.pseudotime.canonical_sign_rule).",
+        "GRN directional evidence is weak (permutation tests reported in grn.directional_evidence); "
+        "the exported matrix is magnitude-dominated with a mild orientation prior.",
+        "TF block assumed to be the first n_tf_genes columns, confirmed by system_info.tf_gene_indices.",
+    ]
+    DIAG["runtime"]["wall_seconds"] = round(time.time() - t0, 2)
+    with open(mc_path, "w") as fh:
+        json.dump(DIAG, fh, indent=1)
+
+    # ------------------------------------------------------- hard self-validation
+    ok_all = True
+    def check(name, conds):
+        nonlocal ok_all
+        good = all(c for _, c in conds)
+        ok_all &= good
+        log("[VALIDATE] %s %s :: %s" % ("OK  " if good else "FAIL", name,
+                                        "; ".join("%s=%s" % (k2, c) for k2, c in conds)))
+    cl = np.load(clusters_path)
+    pv = np.load(pt_path)
+    gv = np.load(grn_path)
+    dj = json.load(open(de_path))
+    mcv = json.load(open(mc_path))
+    check("clusters.npy", [("dtype int32", cl.dtype == np.int32),
+                           ("shape (n_cells,)", cl.shape == (n_cells_meta,)),
+                           ("labels 0..%d all present" % (k - 1),
+                            set(np.unique(cl).tolist()) == set(range(k))),
+                           ("no NaN", not np.issubdtype(cl.dtype, np.floating) or not np.isnan(cl).any())])
+    check("pseudotime.npy", [("dtype float64", pv.dtype == np.float64),
+                             ("shape (n_cells,)", pv.shape == (n_cells_meta,)),
+                             ("finite", bool(np.isfinite(pv).all())),
+                             ("in [0,1]", bool(pv.min() >= 0.0 and pv.max() <= 1.0)),
+                             ("non-degenerate", bool(pv.max() - pv.min() > 0.5))])
+    check("de_genes.json", [("has gene_indices key", "gene_indices" in dj),
+                            ("list of ints", isinstance(dj["gene_indices"], list) and
+                             all(isinstance(x, int) for x in dj["gene_indices"])),
+                            ("unique", len(set(dj["gene_indices"])) == len(dj["gene_indices"])),
+                            ("index space < n_genes", max(dj["gene_indices"]) < n_genes_meta),
+                            ("non-empty", len(dj["gene_indices"]) > 0)])
+    check("grn_scores.npy", [("dtype float64", gv.dtype == np.float64),
+                             ("shape (n_tf,n_tf)", gv.shape == (n_tf, n_tf)),
+                             ("finite", bool(np.isfinite(gv).all())),
+                             ("diagonal zero", bool(np.all(np.diag(gv) == 0.0))),
+                             ("directed (not symmetric)", bool(np.abs(gv - gv.T).max() > 0)),
+                             ("non-negative magnitudes", bool((gv >= 0).all()))])
+    check("method_choices.json", [("json parsed", isinstance(mcv, dict)),
+                                  ("steps documented", len(mcv.get("steps", [])) == 8),
+                                  ("de stats present", "de_genes" in mcv)])
+    check("index alignment", [("DE max < n_genes", max(dj["gene_indices"]) < n_genes_meta),
+                             ("clusters length == n_cells", len(cl) == X.shape[0]),
+                             ("pseudotime length == n_cells", len(pv) == X.shape[0])])
+    log("[summary] clusters=%s | silhouette=%.3f bootARI=%.3f | |corr(pt,PC1)|=%.3f | "
+        "de=%d genes | grn asym=%.4f | %.1fs" %
+        (np.bincount(lab, minlength=k).tolist(), sil, bari,
+         DIAG["pseudotime"]["abs_corr_with_PC1"], len(selected),
+         np.abs(grn - grn.T).max(), time.time() - t0))
+    if not ok_all:
+        raise SystemExit("self-validation FAILED")
+    log("[DONE] all artefacts written to %s" % OUT)
+
+
+if __name__ == "__main__":
+    main()

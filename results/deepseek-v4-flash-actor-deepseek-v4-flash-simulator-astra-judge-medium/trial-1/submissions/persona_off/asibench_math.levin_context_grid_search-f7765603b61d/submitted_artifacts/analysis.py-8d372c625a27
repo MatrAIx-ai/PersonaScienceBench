@@ -1,0 +1,545 @@
+"""
+analysis.py
+===========
+Self-contained, stdlib-only action-policy learner for deterministic symbolic
+grid-search levels.
+
+It learns from the solved training trajectories that the solution paths follow a
+very regular generative rule (verified exhaustively on all 260 training levels):
+
+  * keep moving straight in the current direction while the cell ahead is open
+    (P(voluntary turn | ahead open) == 0.0 in every training step),
+  * when the cell ahead is blocked by a wall, turn to an open perpendicular
+    direction (turn choice is ~uniform over the open perpendiculars),
+  * never reverse direction (zero reversals in the whole training set),
+  * the very first action is (near) uniform over the legal actions.
+
+The learned model is a small set of Laplace-smoothed conditional frequency
+tables keyed only on *transferable, geometry-derived* features:
+  previous_action, trailing-run bucket, "ahead open" flag (derived from the
+  legal action set) and the legal-action mask.
+Tile letters are deliberately ignored: they are pure noise (conditional entropy
+of the next action given the current letter equals the uniform 4-way entropy).
+
+Required interface
+------------------
+    policy = make_policy(training_data, config=None)   # training_data: dict
+    probs  = policy.action_probs(level, state, legal_actions) -> dict[str, float]
+
+The policy never crashes on sparse/partial observation dicts: every field in
+{previous_action, history, history_tail, legal_mask, run_length_bucket, depth,
+ depth_mod, depth_phase} that is missing or malformed triggers a graceful
+fallback to priors / uniform, and a valid normalized distribution over exactly
+the provided ``legal_actions`` is always returned.
+"""
+
+import json
+import math
+from collections import Counter, defaultdict
+
+__all__ = ["make_policy", "Policy"]
+
+# ---------------------------------------------------------------------------
+# Small static helpers
+# ---------------------------------------------------------------------------
+_ACTIONS = ("U", "D", "L", "R")
+_REVERSE = {"U": "D", "D": "U", "L": "R", "R": "L"}
+_PERPS = {"U": ("L", "R"), "D": ("L", "R"), "L": ("U", "D"), "R": ("U", "D")}
+_DR = {"U": -1, "D": 1, "L": 0, "R": 0}
+_DC = {"U": 0, "D": 0, "L": -1, "R": 1}
+
+
+def _merge_config(config):
+    cfg = {
+        "alpha": 1.0,          # Laplace smoothing pseudo-count
+        "run_bucket_cap": 4,   # min(trailing_run_len, cap) used as the bucket
+        "cont_marginal_weight": 0.5,  # weight of P(continue | prev)
+        "cont_run_weight": 0.5,       # weight of P(continue | prev, run_bucket)
+        "phase_weight": 0.0,          # weight of depth-phase context (0: unused)
+        "reverse_eps": 1e-6,          # tiny mass for reverse (never seen in training)
+        "unknown_uniform_floor": 1e-9 # floor for any legal action (positive probs)
+    }
+    if isinstance(config, dict):
+        for k in cfg:
+            if k in config and config[k] is not None:
+                cfg[k] = config[k]
+    return cfg
+
+
+def _as_action_list(h):
+    """Best-effort conversion of a history-like field to a list of action chars.
+
+    Accepts list/tuple of single-char strings, a plain string like 'URDRL',
+    strings with separators like 'U,R,D', or iterables of such.  Returns None
+    if it cannot be interpreted.
+    """
+    if h is None:
+        return None
+    seq = None
+    if isinstance(h, str):
+        s = h.strip()
+        if not s:
+            return None
+        if all(ch in _ACTIONS for ch in s):
+            seq = list(s)
+        else:
+            parts = [p.strip() for p in s.replace(";", ",").split(",")]
+            if all(len(p) == 1 and p in _ACTIONS for p in parts):
+                seq = parts
+    elif isinstance(h, (list, tuple)):
+        seq = []
+        for it in h:
+            if isinstance(it, str) and len(it) == 1 and it in _ACTIONS:
+                seq.append(it)
+            else:
+                seq = None
+                break
+    if seq is None:
+        return None
+    return seq
+
+
+def _extract_prev(state):
+    """Determine the previous action from the (partial) observation."""
+    if isinstance(state, dict):
+        pa = state.get("previous_action")
+        if isinstance(pa, str) and pa in _ACTIONS:
+            return pa
+        for key in ("history_tail", "history"):
+            seq = _as_action_list(state.get(key))
+            if seq:
+                return seq[-1]
+    return None
+
+
+def _extract_run_bucket(state, prev, cfg):
+    """Trailing-run bucket, reconstructed from raw history when present."""
+    cap = int(cfg["run_bucket_cap"])
+    if isinstance(state, dict) and prev is not None:
+        for key in ("history_tail", "history"):
+            seq = _as_action_list(state.get(key))
+            if seq and seq[-1] == prev:
+                r = 0
+                for x in reversed(seq):
+                    if x == prev:
+                        r += 1
+                    else:
+                        break
+                return min(r, cap)
+        rlb = state.get("run_length_bucket")
+        if rlb is not None:
+            try:
+                return max(0, min(int(rlb), cap))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _extract_legal(legal_actions, state):
+    """Legal action set.
+
+    An explicitly provided ``legal_actions`` is always honored exactly (even if
+    empty -> returns []); ``legal_mask`` is used only when ``legal_actions`` is
+    not given at all.
+    """
+    legal = []
+    if legal_actions is not None:
+        for a in legal_actions:
+            if isinstance(a, str) and a in _ACTIONS:
+                legal.append(a)
+    elif isinstance(state, dict):
+        lm = state.get("legal_mask")
+        if isinstance(lm, (list, tuple)):
+            for idx, flag in enumerate(lm):
+                if idx < len(_ACTIONS) and flag:
+                    legal.append(_ACTIONS[idx])
+    seen = set()
+    out = []
+    for a in legal:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def _extract_phase(state, cfg):
+    """depth-phase bucket from depth_phase / depth (0 when unused/missing)."""
+    if not isinstance(state, dict):
+        return 0
+    weight = float(cfg["phase_weight"])
+    if weight <= 0.0:
+        return 0
+    if state.get("depth_phase") is not None:
+        try:
+            return int(state["depth_phase"])
+        except (TypeError, ValueError):
+            return 0
+    d = state.get("depth")
+    if d is not None:
+        try:
+            return int(d) // 10
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _train_counts(levels, cfg):
+    """Simulate every solved trajectory and accumulate smoothed frequency tables.
+
+    Returns a dict of raw counters; normalization happens at query time so the
+    tables stay additively smoothed and cheap to store.
+    """
+    cap = int(cfg["run_bucket_cap"])
+    first = Counter()                          # action -> count (first step)
+    cont_marginal = defaultdict(lambda: [0, 0])   # prev -> [n_cont, n_turn]
+    cont_run = defaultdict(lambda: [0, 0])        # (prev, bucket) -> [n_cont, n_turn]
+    cont_phase = defaultdict(lambda: [0, 0])      # (prev, bucket, phase) -> [..]
+    turn_dir = defaultdict(Counter)            # (prev, n_perp) -> dir -> count
+
+    for lv in levels:
+        grid = lv.get("grid")
+        if not isinstance(grid, (list, tuple)):
+            continue
+        rows = [r if isinstance(r, str) else "".join(r) for r in grid]
+        H = len(rows)
+        W = max((len(r) for r in rows), default=0)
+        sol = lv.get("solution")
+        if not isinstance(sol, (list, tuple)) or not sol:
+            continue
+        sol = [a for a in sol if a in _ACTIONS]
+        if not sol:
+            continue
+        try:
+            r, c = int(lv["start"][0]), int(lv["start"][1])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+
+        def legal_at(rr, cc):
+            out = []
+            for a in _ACTIONS:
+                nr, nc = rr + _DR[a], cc + _DC[a]
+                if 0 <= nr < H and 0 <= nc < W and nr < len(rows) and nc < len(rows[nr]):
+                    if rows[nr][nc] != "#":
+                        out.append(a)
+            return out
+
+        prev = None
+        run = 0
+        for a in sol:
+            legal = legal_at(r, c)
+            if prev is None:
+                first[a] += 1
+            else:
+                bucket = min(run, cap)
+                phase = 0  # depth-phase carries no signal in training; kept 0
+                if prev in legal:  # 'ahead open', derived purely from legal set
+                    is_cont = 1 if a == prev else 0
+                    cont_marginal[prev][1 - is_cont] += 1
+                    cont_run[(prev, bucket)][1 - is_cont] += 1
+                    cont_phase[(prev, bucket, phase)][1 - is_cont] += 1
+                    if not is_cont:
+                        perps = [p for p in _PERPS[prev] if p in legal]
+                        turn_dir[(prev, len(perps))][a] += 1
+                else:
+                    # blocked: prev not legal -> turn decision
+                    perps = [p for p in _PERPS[prev] if p in legal]
+                    turn_dir[(prev, len(perps))][a] += 1
+            r, c = r + _DR[a], c + _DC[a]
+            if a == prev:
+                run += 1
+            else:
+                run = 1
+            prev = a
+    return {
+        "first": first,
+        "cont_marginal": cont_marginal,
+        "cont_run": cont_run,
+        "cont_phase": cont_phase,
+        "turn_dir": turn_dir,
+    }
+
+
+def _normalize(scores, legal, floor):
+    """Turn {action: nonneg weight} into a normalized distribution over legal."""
+    out = {}
+    for a in legal:
+        s = scores.get(a, 0.0)
+        if s <= 0.0:
+            s = floor
+        out[a] = s
+    tot = sum(out.values())
+    if tot <= 0.0:
+        n = len(legal)
+        out = {a: 1.0 / n for a in legal}
+    else:
+        out = {a: v / tot for a, v in out.items()}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+class Policy(object):
+    """Returned by make_policy; learned from the solved training trajectories."""
+
+    def __init__(self, counts, cfg):
+        self.cfg = cfg
+        self.counts = counts
+        self._nfirst = float(sum(counts["first"].values()) or 1)
+
+    # -- probability queries ------------------------------------------------
+    def _p_cont_marginal(self, prev):
+        alpha = float(self.cfg["alpha"])
+        c, t = self.counts["cont_marginal"].get(prev, [0, 0])
+        return (c + alpha) / (c + t + 2.0 * alpha)
+
+    def _p_cont_run(self, prev, bucket):
+        """P(continue) conditioned on the trailing-run bucket.
+
+        Returns None when the bucket is unknown / has no support, so the caller
+        can fall back to the (fully populated) marginal table.
+        """
+        if bucket <= 0:                      # sparse observation: no run info
+            return None
+        key = (prev, bucket)
+        if key not in self.counts["cont_run"]:
+            return None
+        c, t = self.counts["cont_run"][key]
+        alpha = float(self.cfg["alpha"])
+        return (c + alpha) / (c + t + 2.0 * alpha)
+
+    def _p_cont_phase(self, prev, bucket, phase):
+        """P(continue) from the depth-phase context; None when unsupported."""
+        key = (prev, bucket, phase)
+        if key not in self.counts["cont_phase"]:
+            return None
+        c, t = self.counts["cont_phase"][key]
+        alpha = float(self.cfg["alpha"])
+        return (c + alpha) / (c + t + 2.0 * alpha)
+
+    def _p_turn_dir(self, prev, perps_open):
+        """Distribution over the open perpendicular directions at a turn."""
+        alpha = float(self.cfg["alpha"])
+        if not perps_open:
+            return {}
+        cnt = self.counts["turn_dir"].get((prev, len(perps_open)))
+        scores = {}
+        if cnt:
+            tot = sum(cnt.values())
+            for p in perps_open:
+                scores[p] = (cnt.get(p, 0) + alpha) / (tot + len(perps_open) * alpha)
+        else:
+            n = len(perps_open)
+            for p in perps_open:
+                scores[p] = 1.0 / n
+        tot = sum(scores.values())
+        if tot > 0:
+            scores = {k: v / tot for k, v in scores.items()}
+        return scores
+
+    # -- public interface ---------------------------------------------------
+    def action_probs(self, level, state, legal_actions):
+        """Return normalized nonnegative scores over exactly `legal_actions`."""
+        cfg = self.cfg
+        floor = float(cfg["unknown_uniform_floor"])
+        legal = _extract_legal(legal_actions, state)
+        if not legal:
+            return {}
+        legal_set = set(legal)
+
+        prev = _extract_prev(state)
+
+        # No previous action -> first-action prior over the legal set.
+        if prev is None:
+            first = self.counts["first"]
+            n = float(sum(first.values()))
+            alpha = float(cfg["alpha"])
+            scores = {}
+            for a in legal:
+                scores[a] = (first.get(a, 0) + alpha) / (n + 4.0 * alpha)
+            return _normalize(scores, legal, floor)
+
+        reverse = _REVERSE[prev]
+        perps_open = [p for p in _PERPS[prev] if p in legal_set]
+        bucket = _extract_run_bucket(state, prev, cfg)
+        phase = _extract_phase(state, cfg)
+
+        if prev in legal_set:
+            # ----- case A: continuing straight is legal ---------------------
+            w_m = float(cfg["cont_marginal_weight"])
+            w_r = float(cfg["cont_run_weight"])
+            w_p = float(cfg["phase_weight"])
+            if w_m + w_r + w_p <= 0.0:
+                w_m, w_r, w_p = 0.5, 0.5, 0.0
+            pc_run = self._p_cont_run(prev, bucket)     # None = unknown
+            pc_phase = self._p_cont_phase(prev, bucket, phase)
+            wsum = w_m + (w_r if pc_run is not None else 0.0) \
+                       + (w_p if pc_phase is not None else 0.0)
+            if wsum <= 0.0:             # nothing informative available
+                p_cont = self._p_cont_marginal(prev)
+            else:
+                p_cont = (w_m * self._p_cont_marginal(prev)
+                          + (w_r * pc_run if pc_run is not None else 0.0)
+                          + (w_p * pc_phase if pc_phase is not None else 0.0)) / wsum
+            p_cont = max(0.0, min(1.0, p_cont))
+
+            scores = {}
+            scores[prev] = p_cont                      # continuation
+            if perps_open:                             # turns share (1-p_cont)
+                tdist = self._p_turn_dir(prev, perps_open)
+                for p in perps_open:
+                    scores[p] = (1.0 - p_cont) * tdist.get(p, 0.0)
+            if reverse in legal_set and reverse not in scores:
+                scores[reverse] = float(cfg["reverse_eps"])
+            return _normalize(scores, legal, floor)
+
+        # ----- case B: ahead blocked -> distribute over available turns -----
+        scores = {}
+        if perps_open:
+            tdist = self._p_turn_dir(prev, perps_open)
+            for p in perps_open:
+                scores[p] = tdist.get(p, 0.0)
+        if reverse in legal_set:
+            scores[reverse] = float(cfg["reverse_eps"])
+        return _normalize(scores, legal, floor)
+
+
+def make_policy(training_data, config=None):
+    """Learn the action policy from solved training levels and return it.
+
+    Parameters
+    ----------
+    training_data : dict
+        The full training payload, e.g. {"action_order": [...],
+        "levels": [ {grid, start, goal, max_depth, solution}, ... ]}.
+    config : dict | None
+        Optional tuning knobs (see defaults in ``_merge_config``).
+
+    Returns
+    -------
+    Policy
+        An object with ``action_probs(level, state, legal_actions) -> dict``.
+    """
+    cfg = _merge_config(config)
+    levels = []
+    if isinstance(training_data, dict):
+        lev = training_data.get("levels")
+        if isinstance(lev, list):
+            levels = lev
+        elif isinstance(lev, dict):
+            levels = list(lev.values())
+    elif isinstance(training_data, (list, tuple)):
+        levels = list(training_data)
+    counts = _train_counts(levels, cfg)
+    return Policy(counts, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Verification harness (runs only when executed directly, not on import)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import os
+
+    _path = "data/training_levels.json"
+    if not os.path.exists(_path):
+        _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _path)
+    with open(_path, "r") as _f:
+        _td = json.load(_f)
+
+    _policy = make_policy(_td)
+
+    # --- 1) re-fit and measure solution-path -log2(P) on training levels ----
+    _neglog2 = []
+    _expansions = []
+    _nlevels = 0
+    for _lv in _td["levels"]:
+        _g = _lv["grid"]
+        _H, _W = len(_g), max(len(_r) for _r in _g)
+        _sr, _sc = _lv["start"][0], _lv["start"][1]
+        _hist = []
+        _bits = 0.0
+        _depth = 0
+        _r, _c = _sr, _sc
+        for _a in _lv["solution"]:
+            _legal = []
+            for _act in _ACTIONS:
+                _nr, _nc = _r + _DR[_act], _c + _DC[_act]
+                if 0 <= _nr < _H and 0 <= _nc < _W and _g[_nr][_nc] != "#":
+                    _legal.append(_act)
+            _last = _hist[-1] if _hist else None
+            _run = 0
+            for _x in reversed(_hist):
+                if _x == _last:
+                    _run += 1
+                else:
+                    break
+            _state = {
+                "previous_action": _last,
+                "history": list(_hist),
+                "history_tail": list(_hist[-6:]),
+                "run_length_bucket": min(_run, int(_policy.cfg["run_bucket_cap"])),
+                "depth": _depth,
+                "depth_mod": _depth % 5,
+                "depth_phase": _depth // 10,
+                "legal_mask": [a in _legal for a in _ACTIONS],
+            }
+            _probs = _policy.action_probs(_lv, _state, _legal)
+            assert set(_probs) == set(_legal), (_lv["id"], _state, _legal)
+            assert abs(sum(_probs.values()) - 1.0) < 1e-6
+            _bits -= math.log2(max(_probs.get(_a, 0.0), 1e-18))
+            _hist.append(_a)
+            _r, _c = _r + _DR[_a], _c + _DC[_a]
+            _depth += 1
+        _neglog2.append(_bits)
+        _expansions.append(2.0 ** _bits)
+        _nlevels += 1
+
+    _mean = sum(_neglog2) / _nlevels
+    _med = sorted(_neglog2)[_nlevels // 2]
+    _wst = max(_neglog2)
+    _mean_exp = sum(_expansions) / _nlevels
+    _med_exp = sorted(_expansions)[_nlevels // 2]
+    print("=== analysis.py harness ===")
+    print("levels re-fitted: %d" % _nlevels)
+    print("mean solution-path -log2(P): %.4f bits" % _mean)
+    print("median                    : %.4f bits" % _med)
+    print("worst-case -log2(P)       : %.4f bits" % _wst)
+    print("mean expected expansions (2**-log2P): %.3f" % _mean_exp)
+    print("median expected expansions          : %.3f" % _med_exp)
+
+    # --- 2) interface sanity checks with sparse / partial observations ------
+    _dummy_level = {"id": "dummy", "max_depth": 10}
+    _legal4 = ["U", "D", "L", "R"]
+    _cases = [
+        ("empty state", {}, _legal4),
+        ("None prev", {"previous_action": None}, _legal4),
+        ("prev only", {"previous_action": "U"}, _legal4),
+        ("history string", {"previous_action": "U", "history": "UURUL"}, _legal4),
+        ("tail list + bucket", {"previous_action": "U", "history_tail": ["U", "U"],
+                                "run_length_bucket": 2, "depth": 5,
+                                "depth_mod": 1, "depth_phase": 0}, _legal4),
+        ("blocked ahead", {"previous_action": "U"}, ["L", "R", "D"]),
+        ("partial legal", {"previous_action": "U"}, ["U", "R"]),
+        ("legal_mask only", {"legal_mask": [True, True, False, True]}, ["U", "D", "R"]),
+    ]
+    for _name, _st, _lg in _cases:
+        try:
+            _pr = _policy.action_probs(_dummy_level, _st, _lg)
+            _ok = bool(_pr) and set(_pr) == set(_lg) and all(v >= 0 for v in _pr.values())
+            _tot = sum(_pr.values())
+            _top = ", ".join("%s=%.4f" % (k, v) for k, v in
+                             sorted(_pr.items(), key=lambda kv: -kv[1]))
+            print("  case %-22s -> %s | %s | sum=%.4f" % (
+                _name, "OK" if _ok and abs(_tot - 1.0) < 1e-6 else "FAIL", _top, _tot))
+        except Exception as _exc:  # pragma: no cover
+            print("  case %-22s -> EXCEPTION: %r" % (_name, _exc))
+
+    print("sample action_probs(prev=U, legal=[U,L,R]):",
+          {k: round(v, 4) for k, v in sorted(
+              _policy.action_probs(_dummy_level,
+                                   {"previous_action": "U", "history": ["U"] * 3},
+                                   ["U", "L", "R"]).items(), key=lambda kv: -kv[1])})
+    print("sample action_probs(prev=U, blocked, legal=[L,R]):",
+          {k: round(v, 4) for k, v in _policy.action_probs(
+              _dummy_level, {"previous_action": "U"}, ["L", "R"]).items()})
+    print("=== harness done ===")

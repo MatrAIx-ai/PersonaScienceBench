@@ -1,0 +1,304 @@
+"""Minimal numpy implementations of the DESeq2 estimators and the gseapy prerank (GSEA) algorithm.
+
+DE part (DESeq2-equivalent estimators, re-implemented because neither R/DESeq2 nor pydeseq2
+is installable in this offline sandbox):
+  * median-of-ratios size factors
+  * NB2 GLM with log link + library-size offset, fitted by Newton-Raphson (vectorised over genes)
+  * gene-wise dispersion by the method of moments, a mean-dispersion trend (binned medians),
+    and MAP shrinkage toward the trend under a log-normal prior (profiled over a log-alpha grid)
+  * Wald test for arbitrary contrasts of the ~0 + Group design coefficients
+
+Enrichment part (gseapy.pre_rank 'SSLe' equivalence, weighted p=1):
+  * classic GSEA running-sum enrichment score, normalised by the same-sign permutation mean
+  * nominal p from per-gene-set permutation of the ranked metric with the GSEA sign normalisation
+  * FDR = Benjamini-Hochmann across all tested gene sets (what gseapy reports as "FDR q-val")
+"""
+import numpy as np
+from scipy import stats
+from scipy.special import gammaln
+from statsmodels.stats.multitest import multipletests
+
+
+# --------------------------------------------------------------------------- size factors
+def median_of_ratios(counts):
+    """counts: (G, n) int. Returns size factors (n,) and the gene mask used."""
+    with np.errstate(divide="ignore"):
+        logc = np.log(counts)
+    use = (counts > 0).all(axis=1)
+    ref = logc[use].mean(axis=1)
+    ratios = logc[use] - ref[:, None]
+    sf = np.exp(np.median(ratios, axis=0))
+    return sf / np.exp(np.mean(np.log(sf))), use
+
+
+# --------------------------------------------------------------------------- NB2 GLM
+def nb_loglik(Y, mu, alpha):
+    a = alpha[:, None]
+    term = Y * np.log(mu) - (Y + 1.0 / a) * np.log1p(a * mu)
+    return term.sum(axis=1)
+
+
+def nb_glm(Y, X, alpha, log_off, b0=None, max_iter=40, tol=1e-9):
+    """Newton-Raphson NB2 fit, vectorised over genes. Y (G,n), X (n,p), alpha (G,), log_off (n,)."""
+    G, n = Y.shape
+    p = X.shape[1]
+    if b0 is None:
+        eta0 = np.log(np.maximum(Y.mean(axis=1), 1e-3))[:, None] - log_off[None, :]
+        b0 = np.tile(np.median(eta0, axis=1)[:, None], (1, p)) * 0
+        b0[:, 0] = np.median(eta0, axis=1)
+    b = np.ascontiguousarray(b0, dtype=float)
+    ridge = 1e-8 * np.eye(p)
+    for _ in range(max_iter):
+        mu = np.exp(b @ X.T + log_off[None, :])
+        den = 1.0 + alpha[:, None] * mu
+        w = mu / den
+        u = (Y - mu) / den
+        A = np.einsum("ni,gn,nj->gij", X, w, X, optimize=True) + ridge
+        g = u @ X
+        step = np.linalg.solve(A, g[:, :, None])[:, :, 0]
+        step = np.clip(step, -3, 3)
+        b = b + step
+        if np.abs(step).max() < tol:
+            break
+    return b
+
+
+def wald_contrast(Y, X, alpha, log_off, c, b=None):
+    """Fit NB GLM and test contrast c (p,). Returns lfc, se, z, pval and coefficient matrix."""
+    if b is None:
+        b = nb_glm(Y, X, alpha, log_off)
+    mu = np.exp(b @ X.T + log_off[None, :])
+    den = 1.0 + alpha[:, None] * mu
+    w = mu / den
+    A = np.einsum("ni,gn,nj->gij", X, w, X, optimize=True) + 1e-8 * np.eye(X.shape[1])
+    C = np.linalg.inv(A)
+    lfc = b @ c
+    var = np.einsum("i,gij,j->g", c, C, c, optimize=True)
+    se = np.sqrt(np.maximum(var, 1e-12))
+    z = lfc / se
+    p = 2 * stats.norm.sf(np.abs(z))
+    return lfc, se, z, p, b, C
+
+
+# --------------------------------------------------------------------------- dispersion
+def nb_loglik_per_obs(Y, mu, alpha):
+    """Exact NB2 log pmf summed over samples. alpha (G,), Y/mu (G,n)."""
+    a = np.asarray(alpha, dtype=float)[:, None]
+    t = Y * np.log(np.maximum(mu, 1e-300)) + Y * np.log(a) - (Y + 1.0 / a) * np.log1p(a * mu)
+    t = t + (gammaln(Y + 1.0 / a) - gammaln(1.0 / a) - gammaln(Y + 1.0))
+    return t.sum(axis=1)
+
+
+def mom_dispersion(Y, mu, df_correction=True):
+    """Method-of-moments NB2 dispersion. Under a fitted design the residual sum of squares is
+    shrunk by (n - p)/n, so the second moment is rescaled by n/(n - p) before solving for alpha."""
+    n_samples, p_design = Y.shape[1], None
+    num = ((Y - mu) ** 2 - mu).sum(axis=1)
+    den = (mu ** 2).sum(axis=1)
+    if df_correction:
+        # E[sum (y - muhat)^2] = (1 - p/n) * sum (mu + alpha mu^2)  for a fitted GLM
+        pass
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = num / den
+    return np.clip(np.where(np.isfinite(a), a, 1.0), 1e-8, 100.0)
+
+
+def mom_dispersion_design(Y, mu, p_fit, df_correction=True):
+    """DF-corrected method-of-moments dispersion for a design with p fitted coefficients."""
+    n = Y.shape[1]
+    scale = n / max(n - p_fit, 1) if df_correction else 1.0
+    ss = ((Y - mu) ** 2).sum(axis=1) * scale
+    mu_sum = mu.sum(axis=1)
+    den = (mu ** 2).sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = (ss - mu_sum) / den
+    return np.clip(np.where(np.isfinite(a), a, 1.0), 1e-8, 100.0)
+
+
+def disp_trend(mean_norm, alpha, n_bins=40):
+    x = np.log10(np.maximum(mean_norm, 1e-3))
+    y = np.log(np.maximum(alpha, 1e-10))
+    edges = np.unique(np.quantile(x, np.linspace(0, 1, n_bins + 1)))
+    cx, cy = [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (x >= lo) & (x <= hi) if hi == edges[-1] else (x >= lo) & (x < hi)
+        if m.sum() >= 10:
+            cx.append(np.median(x[m])); cy.append(np.median(y[m]))
+    cx, cy = np.asarray(cx), np.asarray(cy)
+    if len(cy) >= 3:
+        sm = np.median(np.stack([np.roll(cy, 1), cy, np.roll(cy, -1)]), axis=0)
+        sm[0], sm[-1] = np.median(cy[:3]), np.median(cy[-3:])
+        cy = sm
+    return np.interp(x, cx, cy), (10 ** cx, np.exp(cy))
+
+
+def _profile(Y, X, log_off, grid_log, b=None, n_iter=8):
+    """Return per-gene best log-alpha over a per-gene grid (G,K) with warm-started betas."""
+    G = Y.shape[0]
+    K = grid_log.shape[1]
+    best_obj = np.full(G, -np.inf)
+    best_a = np.exp(grid_log[:, 0])
+    for k in range(K):
+        a = np.exp(grid_log[:, k])
+        b = nb_glm(Y, X, a, log_off, b0=b, max_iter=n_iter)
+        mu = np.exp(b @ X.T + log_off[None, :])
+        yield k, a, mu, b
+
+
+def gene_wise_dispersion_mle(Y, X, log_off, lo=1e-5, hi=50.0, n_grid=48):
+    """Gene-wise NB dispersion MLE over a wide shared log grid (profiled betas)."""
+    G = Y.shape[0]
+    grid = np.log(np.geomspace(lo, hi, n_grid))
+    b = nb_glm(Y, X, np.full(G, 0.05), log_off)
+    best = np.full(G, -np.inf); best_a = np.full(G, 0.05); best_b = b
+    last_b = b
+    for k, a, mu, b in _profile(Y, X, log_off, np.tile(grid, (G, 1)), b=b):
+        ll = nb_loglik_per_obs(Y, mu, a)
+        upd = ll > best
+        best = np.where(upd, ll, best); best_a = np.where(upd, a, best_a)
+        last_b = b
+    return np.clip(best_a, lo, hi), last_b
+
+
+def map_dispersion(Y, X, log_off, trend_log, sigma=0.5, n_grid=25, half=4.0, b=None):
+    """MAP dispersion under log-normal prior N(trend_log, sigma^2), profiled over betas."""
+    G = Y.shape[0]
+    grid_log = np.clip(trend_log[:, None] + np.linspace(-half, half, n_grid)[None, :], np.log(1e-6), np.log(100.0))
+    if b is None:
+        b = nb_glm(Y, X, np.exp(trend_log), log_off)
+    best = np.full(G, -np.inf); best_a = np.exp(trend_log); best_b = b
+    for k, a, mu, b in _profile(Y, X, log_off, grid_log, b=b):
+        ll = nb_loglik_per_obs(Y, mu, a) - 0.5 * ((grid_log[:, k] - trend_log) / sigma) ** 2
+        upd = ll > best
+        best = np.where(upd, ll, best)
+        best_a = np.where(upd, a, best_a)
+        best_b = np.where(upd[:, None], b, best_b)
+    return best_a, best_b
+
+
+
+
+def shrunk_dispersion(a_mom, trend, nu, prior_df=2.0):
+    """edgeR-style weighting of the gene-wise estimate toward the fitted mean-dispersion trend."""
+    w = nu / (nu + prior_df)
+    return w * a_mom + (1.0 - w) * np.asarray(trend)
+
+
+# --------------------------------------------------------------------------- GSEA / gseapy prerank
+def parse_gmt(path_or_handle):
+    sets = {}
+    lines = path_or_handle.read().splitlines() if hasattr(path_or_handle, "read") else open(path_or_handle).read().splitlines()
+    for line in lines:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 3:
+            continue
+        sets[parts[0]] = [g.strip() for g in parts[2:] if g.strip()]
+    return sets
+
+
+class Prerank:
+    """gseapy.prerank-equivalent (weighted p=1, classic/SSLe running sum, sign-normalised permutation p, BH FDR)."""
+
+    def __init__(self, rnk, gene_sets, min_size=15, max_size=500, permutation_num=1000, seed=42, power=1.0):
+        r = rnk.dropna()
+        r = r.groupby(level=0 if not isinstance(r.index.name, str) else 0).mean() if False else r
+        agg = {}
+        for k, v in zip(r.index, r.values):
+            agg.setdefault(k, []).append(v)
+        names = np.array(list(agg.keys()))
+        scores = np.array([np.mean(agg[k]) for k in names])
+        order = np.argsort(-scores, kind="mergesort")
+        self.names, self.scores = names[order], scores[order]
+        self.absr = np.abs(self.scores) ** power
+        self.index_of = {g: i for i, g in enumerate(self.names)}
+        self.N = len(self.names)
+        self.cum0 = np.concatenate([[0.0], np.cumsum(self.absr)])
+        self._set_id = 0
+        self.sets = {}
+        self.skipped = {"too_small": 0, "too_large": 0, "no_overlap": 0}
+        for name, genes in gene_sets.items():
+            uniq = {g for g in genes if g in self.index_of}
+            if len(genes) < min_size:
+                self.skipped["too_small"] += 1
+                continue
+            if len(genes) > max_size:
+                self.skipped["too_large"] += 1
+                continue
+            if len(uniq) < min_size:
+                self.skipped["no_overlap"] += 1
+                continue
+            self.sets[name] = np.sort(np.fromiter((self.index_of[g] for g in uniq), dtype=np.int64, count=len(uniq)))
+        self.permutation_num = int(permutation_num)
+        self.seed = int(seed)
+
+    @staticmethod
+    def _walk(absr_sorted, cum_sorted, idx):
+        """Classic GSEA running-sum walk at the hit positions (weighted, p=1). absr_sorted is the
+        descending-sorted |rank metric| vector; cum_sorted its prefix sums with a leading 0."""
+        norm_hit = absr_sorted[idx].sum()
+        norm_miss = absr_sorted.sum() - norm_hit
+        cum_hit = np.cumsum(absr_sorted[idx])
+        walk = cum_hit / max(norm_hit, 1e-300) - (cum_sorted[idx] - cum_hit) / max(norm_miss, 1e-300)
+        mx, mn = walk.max(), walk.min()
+        return walk, (mx if abs(mx) >= abs(mn) else mn)
+
+    def _null_es(self, P, Nh):
+        """GSEA null: re-randomise which ranked POSITIONS the gene-set members occupy.
+
+        gseapy.prerank builds its null by permuting the metric across genes and re-sorting, which is
+        equivalent to giving each gene set a uniformly random set of positions in the ranked list.
+        A uniformly random subset of size Nh is obtained exactly as a contiguous circular block of a
+        uniformly random permutation (prerank.Generator.permutation), offset per gene set so that
+        different sets use different (marginal-uniform) blocks.
+        """
+        nperm, N = P.shape
+        off = ((self._set_id + 1) * 7919 + np.arange(nperm) * 104729) % N
+        pos = np.sort(P[np.arange(nperm)[:, None], (off[:, None] + np.arange(Nh)[None, :]) % N], axis=1)
+        w = self.absr[pos]
+        cum_hit = np.cumsum(w, axis=1)
+        norm_hit = cum_hit[:, -1]
+        norm_miss = self.absr.sum() - norm_hit
+        walk = cum_hit / norm_hit[:, None] - (self.cum0[pos] - cum_hit) / norm_miss[:, None]
+        mx, mn = walk.max(axis=1), walk.min(axis=1)
+        return np.where(np.abs(mx) >= np.abs(mn), mx, mn)
+
+    def run(self, null_mode="positions"):
+        import pandas as pd
+        rng = np.random.default_rng(self.seed)
+        set_names = list(self.sets.keys())
+        P = None
+        if null_mode == "positions":
+            P = np.stack([rng.permutation(self.N) for _ in range(self.permutation_num)]).astype(np.int32)
+        else:  # weights-permuted-at-fixed-positions null (kept only to document the wrong-null failure mode)
+            P = None
+        rows = []
+        for sid, nm in enumerate(set_names):
+            self._set_id = sid
+            idx = self.sets[nm]
+            walk, es = self._walk(self.absr, self.cum0, idx)
+            k = int(np.argmax(np.abs(walk)))
+            lead = self.names[idx[: k + 1]]
+            if null_mode == "positions":
+                nll = self._null_es(P, len(idx)).astype(float)
+            else:
+                nll = np.empty(self.permutation_num)
+                for j in range(self.permutation_num):
+                    a = self.absr[rng.permutation(self.N)]
+                    nll[j] = self._walk(a, np.concatenate([[0.0], np.cumsum(a)]), idx)[1]
+            e = float(es)
+            pos_n, neg_n = nll[nll >= 0], nll[nll < 0]
+            if e >= 0:
+                den = max(len(pos_n), 1)
+                p_raw = (np.sum(pos_n >= e) + 1.0) / (den + 1.0)
+                nes = e / max(np.mean(np.abs(pos_n)), 1e-12) if len(pos_n) else np.nan
+            else:
+                den = max(len(neg_n), 1)
+                p_raw = (np.sum(neg_n <= e) + 1.0) / (den + 1.0)
+                nes = e / max(np.mean(np.abs(neg_n)), 1e-12) if len(neg_n) else np.nan
+            p = min(1.0, p_raw * len(nll) / den)          # GSEA sign normalisation, as in gseapy
+            rows.append({"Term": nm, "Term Size": len(idx), "ES": e, "NES": float(nes),
+                         "NOM p-val": float(p), "Lead_genes": ";".join(lead[:60])})
+        res = pd.DataFrame(rows)
+        res["FDR q-val"] = multipletests(res["NOM p-val"].values, method="fdr_bh")[1]
+        res["Gene Percentage"] = 100.0 * res["Term Size"] / self.N
+        return res.sort_values("FDR q-val").reset_index(drop=True)

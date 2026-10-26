@@ -1,0 +1,275 @@
+"""
+analysis.py -- behavioral-cloning action policy for the levin_context_grid_search task.
+
+Learned structure (verified on all 260 training trajectories):
+  * the demonstrated policy NEVER reverses (0/6204 transitions),
+  * it goes STRAIGHT whenever straight is legal (5819/5819 non-terminal steps),
+  * every turn is forced by a wall (385/385): a turn happens exactly when
+    straight is blocked,
+  * the first action and the side of the first ambiguous turn are NOT locally
+    predictable (~50/50, letters are noise ~0.31) -> represented as learned
+    soft-count priors (deterministic argmax, ~honest spread under search),
+  * with two turns they share the same relative side (134/134) -> kept as a
+    weak backoff context only.
+
+The policy is purely local: it never reads the grid / goal / position.
+Probabilities are strictly positive and sum to 1 over the provided
+legal_actions regardless of their number (epsilon floor + renormalization).
+Letters and depth-phase features are NOT used as signal (measured: noise).
+"""
+
+from __future__ import annotations
+
+
+from collections import defaultdict
+
+ACTIONS = ("U", "D", "L", "R")
+OPP = {"U": "D", "D": "U", "L": "R", "R": "L"}
+LEFT_OF = {"U": "L", "L": "D", "D": "R", "R": "U"}  # action = relative-left turn of prev
+
+# --- tunables (defaults; overridable via config) -----------------------------
+DEFAULT_CONFIG = {
+    "straight_mass": 0.98,   # mass on "continue straight" when straight is legal
+    "fold_mass": 0.02,       # total residual mass spread over other legal actions
+    "epsilon": 1e-4,         # strict positivity floor for ANY legal action
+    "reverse_floor": 1e-4,   # weight of a reversing action (never observed; floor only)
+    "smooth": 0.5,           # additive smoothing for count tables
+    "turn_temperature": 1.0, # 1.0 = calibrated soft counts; <1 sharpens turn priors
+}
+
+INTERP_WEIGHTS = (0.5, 0.3, 0.15, 0.05)  # context levels, most-specific first
+
+
+def _norm_action(x):
+    if isinstance(x, str) and x in ACTIONS:
+        return x
+    return None
+
+
+def _extract_prev(state):
+    """Defensive extraction of the previous action from any plausible state form."""
+    if not isinstance(state, dict):
+        return None
+    p = _norm_action(state.get("previous_action"))
+    if p:
+        return p
+    for key in ("history_tail", "history"):
+        hist = state.get(key)
+        if not hist:
+            continue
+        try:
+            seq = list(hist)
+        except TypeError:
+            continue
+        for item in reversed(seq):
+            if isinstance(item, dict):
+                a = _norm_action(item.get("action"))
+            else:
+                a = _norm_action(item)
+            if a:
+                return a
+    return None
+
+
+def _extract_history(state):
+    """Return the action history as a list[str] (possibly empty), defensively."""
+    if not isinstance(state, dict):
+        return []
+    for key in ("history", "history_tail"):
+        hist = state.get(key)
+        if not hist:
+            continue
+        out = []
+        try:
+            for item in hist:
+                a = _norm_action(item.get("action") if isinstance(item, dict) else item)
+                if a:
+                    out.append(a)
+        except TypeError:
+            continue
+        if out:
+            return out
+    return []
+
+
+def _turn_profile(history):
+    """(n_turns, last_relative_side) from an action history; ('', None-safe)."""
+    n, side = 0, None
+    for prev, cur in zip(history, history[1:]):
+        if cur != prev and cur != OPP[prev]:
+            n += 1
+            side = "L" if cur == LEFT_OF[prev] else "R"
+    return n, side
+
+
+class Policy:
+    def __init__(self, training_data, config=None):
+        self.cfg = dict(DEFAULT_CONFIG)
+        if isinstance(config, dict):
+            self.cfg.update(config)
+        self.action_order = list(ACTIONS)
+        levels = []
+        if isinstance(training_data, dict):
+            levels = training_data.get("levels", []) or []
+            ao = training_data.get("action_order")
+            if isinstance(ao, (list, tuple)) and all(_norm_action(a) for a in ao):
+                self.action_order = list(ao)
+        elif isinstance(training_data, (list, tuple)):
+            levels = list(training_data)
+
+        # count tables built by replaying training solutions (grid use here is
+        # TRAINING-ONLY; at inference the policy reads no spatial data at all)
+        self.first_counts = defaultdict(lambda: defaultdict(float))   # mask -> action
+        self.turn_mask_counts = defaultdict(lambda: defaultdict(float))  # (prev,mask) -> next
+        self.turn_side_counts = defaultdict(lambda: defaultdict(float))  # (prev,mask,last_side) -> next
+        self.turn_prev_counts = defaultdict(lambda: defaultdict(float))  # prev -> next
+        self.turn_global = defaultdict(float)
+        self._replay(levels)
+
+    # ------------------------------------------------------------------ train
+    @staticmethod
+    def _legal_mask(grid, r, c):
+        R, C = len(grid), len(grid[0])
+        dr = {"U": -1, "D": 1, "L": 0, "R": 0}
+        dc = {"U": 0, "D": 0, "L": -1, "R": 1}
+        out = []
+        for a in ACTIONS:
+            nr, nc = r + dr[a], c + dc[a]
+            if 0 <= nr < R and 0 <= nc < C and grid[nr][nc] != "#":
+                out.append(a)
+        return tuple(sorted(out))
+
+    def _replay(self, levels):
+        sm = self.cfg["smooth"]
+        for lv in levels:
+            try:
+                grid, start, sol = lv["grid"], lv["start"], lv["solution"]
+            except (KeyError, TypeError):
+                continue
+            r, c = start[0], start[1]
+            prev, last_side = None, None
+            for i, a in enumerate(sol):
+                mask = frozenset(self._legal_mask(grid, r, c))
+                if prev is None:
+                    self.first_counts[mask][a] += 1.0
+                elif a != prev:  # forced turn (verified: straight always blocked here)
+                    self.turn_mask_counts[(prev, mask)][a] += 1.0
+                    if last_side is not None:
+                        self.turn_side_counts[(prev, mask, last_side)][a] += 1.0
+                    self.turn_prev_counts[prev][a] += 1.0
+                    self.turn_global[a] += 1.0
+                    last_side = "L" if a == LEFT_OF[prev] else "R"
+                prev = a
+                step = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}[a]
+                r, c = r + step[0], c + step[1]
+        self._sm = sm
+
+    # ------------------------------------------------------------------ score
+    @staticmethod
+    def _dist_from_counts(counts, cand, smooth):
+        tot = smooth * len(cand)
+        vals = {a: counts.get(a, 0.0) + smooth for a in cand}
+        tot = sum(vals.values())
+        return {a: v / tot for a, v in vals.items()}
+
+    def _turn_dist(self, prev, mask, last_side, cand):
+        """Interpolated turn-choice distribution over candidates `cand`."""
+        levels = [
+            self.turn_side_counts.get((prev, mask, last_side)) if last_side else None,
+            self.turn_mask_counts.get((prev, mask)),
+            self.turn_prev_counts.get(prev),
+            self.turn_global,
+        ]
+        sm = self._sm
+        out = {a: 0.0 for a in cand}
+        for w, tab in zip(INTERP_WEIGHTS, levels):
+            tab = tab or {}
+            total = sum(tab.values())
+            # Witten-Bell-like shrink of empty contexts toward the smoother uniform
+            p_flat = self._dist_from_counts(tab, cand, sm)
+            conf = total / (total + 5.0) if total > 0 else 0.0
+            unif = 1.0 / len(cand)
+            for a in cand:
+                out[a] += w * (conf * p_flat[a] + (1.0 - conf) * unif)
+        s = sum(out.values())
+        if s <= 0:
+            return {a: 1.0 / len(cand) for a in cand}
+        out = {a: v / s for a, v in out.items()}
+        t = self.cfg.get("turn_temperature", 1.0)
+        if t != 1.0:
+            out = {a: v ** (1.0 / t) for a, v in out.items()}
+            s = sum(out.values())
+            out = {a: v / s for a, v in out.items()}
+        return out
+
+    def action_probs(self, level=None, state=None, legal_actions=None):
+        """Return strictly positive probabilities summing to 1 over legal_actions."""
+        cfg = self.cfg
+        eps = cfg["epsilon"]
+        if not legal_actions:  # last-resort fallback: never raise
+            legal_actions = list(ACTIONS)
+        legal = [a if isinstance(a, str) else str(a) for a in legal_actions]
+        # keep input multiplicity but dedupe for computation
+        seen = set()
+        uniq = [a for a in legal if not (a in seen or seen.add(a))]
+        uniq = [a for a in uniq if a in ACTIONS] or list(ACTIONS)
+
+        prev = _extract_prev(state)
+        history = _extract_history(state)
+        n = len(uniq)
+
+        if prev is None:
+            # first action: learned prior over masks, uniform backoff
+            mask = frozenset(sorted(uniq))
+            dist = self._dist_from_counts(self.first_counts.get(mask, {}), uniq, self._sm)
+            conf = sum(self.first_counts.get(mask, {}).values())
+            conf = conf / (conf + 5.0) if conf > 0 else 0.0
+            unif = 1.0 / n
+            w = {a: conf * dist[a] + (1.0 - conf) * unif for a in uniq}
+        elif prev in uniq:
+            # straight is legal -> dominant straight, folded residual elsewhere
+            others = [a for a in uniq if a != prev]
+            w = {prev: cfg["straight_mass"]}
+            if others:
+                # residual shaped by learned turn priors (reverse penalised to floor)
+                pri = self._turn_dist(prev, frozenset(sorted(uniq)), None, uniq)
+                resid = {}
+                for a in others:
+                    resid[a] = cfg["reverse_floor"] * 10 if a == OPP[prev] else max(pri[a], eps)
+                s = sum(resid.values()) or 1.0
+                for a in others:
+                    w[a] = cfg["fold_mass"] * resid[a] / s
+        else:
+            # forced turn: straight blocked. Mass on legal non-reverse turns,
+            # ordering given by soft learned counts (deterministic argmax, honest
+            # spread under search). Reverse keeps only the epsilon floor.
+            cand = [a for a in uniq if a != OPP[prev]]
+            if not cand:  # degenerate: only reverse legal -> must still emit it
+                cand = list(uniq)
+            _, last_side = _turn_profile(history)
+            dist = self._turn_dist(prev, frozenset(sorted(uniq)), last_side, cand)
+            w = {a: (1.0 - cfg["reverse_floor"]) * dist[a] for a in cand}
+            for a in uniq:
+                if a not in w:
+                    w[a] = cfg["reverse_floor"]
+
+        # epsilon floor + renormalize: sum == 1 by construction, never depends
+        # on the number of legal actions, and argmax can never be an epsilon
+        # action unless all actions are at the floor.
+        floor = eps
+        w = {a: max(w.get(a, 0.0), floor) for a in uniq}
+        s = sum(w.values())
+        probs = {a: w[a] / s for a in uniq}
+        return probs
+
+
+def make_policy(training_data: dict, config: dict | None = None):
+    return Policy(training_data, config)
+
+
+if __name__ == "__main__":
+    import json
+    with open("data/training_levels.json") as f:
+        tr = json.load(f)
+    pol = make_policy(tr)
+    print("Policy trained on", len(tr.get("levels", [])), "levels")

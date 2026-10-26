@@ -1,0 +1,290 @@
+"""
+Single-cell RNA-seq integrated analysis
+========================================
+Goal-level B3 task. Computes from a cells x genes count matrix (+ JSON metadata):
+  - cluster assignments         -> clusters.npy      int32  (n_cells,)
+  - pseudotime                  -> pseudotime.npy    float64(n_cells,)
+  - ranked marker gene indices  -> de_genes.json     {"gene_indices": [...]}
+  - TF x TF regulatory scores   -> grn_scores.npy    float64(n_tf, n_tf)
+  - per-step methods+rationale  -> method_choices.json
+
+Only NumPy + SciPy are used. All random state is fixed so the run is fully
+reproducible. grn_scores[i, j] = edge i -> j (i regulator, j target); diagonal
+is hard-zeroed.
+"""
+import os
+import json
+import numpy as np
+from scipy import sparse
+from scipy.spatial import cKDTree, distance
+from scipy.cluster.vq import kmeans2
+from scipy.sparse.csgraph import dijkstra, connected_components, minimum_spanning_tree
+from scipy.sparse.linalg import eigsh
+from scipy.stats import ttest_ind
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+RNG = np.random.default_rng(0)          # global reproducibility
+np.random.seed(0)
+
+# ----------------------------------------------------------------------
+# 0. Load inputs
+# ----------------------------------------------------------------------
+with open(os.path.join(BASE, "data", "system_info.json")) as f:
+    meta = json.load(f)
+n_tf_genes = meta["n_tf_genes"]
+n_clusters = meta["n_clusters"]
+tf_idx = np.asarray(meta["tf_gene_indices"], dtype=int)
+assert list(tf_idx) == list(range(n_tf_genes)), "TF genes must be the first columns"
+
+counts = np.load(os.path.join(BASE, "data", "counts.npy")).astype(np.float64)
+n_cells, n_genes = counts.shape
+assert n_cells == meta["n_cells"] and n_genes == meta["n_genes"]
+
+# ----------------------------------------------------------------------
+# 1. Preprocessing: library-size normalize (to median depth) then log1p
+# ----------------------------------------------------------------------
+lib_size = counts.sum(axis=1, keepdims=True)
+median_depth = np.median(lib_size)
+norm_counts = counts / lib_size * median_depth          # per cell, median depth
+X = np.log1p(norm_counts)                                # log-normalized matrix
+
+# ----------------------------------------------------------------------
+# 2. PCA embedding (denoising, input to clustering + pseudotime)
+# ----------------------------------------------------------------------
+Xc = X - X.mean(axis=0)
+U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+expl_var = S ** 2 / np.sum(S ** 2)
+cumvar = np.cumsum(expl_var)
+n_pcs = int(np.clip(int(np.searchsorted(cumvar, 0.9)) + 1, 5, 20))
+PC = U[:, :n_pcs] * S[:n_pcs]                            # (n_cells, n_pcs)
+
+# ----------------------------------------------------------------------
+# 3. kNN graph (shared by clustering and pseudotime)
+# ----------------------------------------------------------------------
+knn_k = 15
+tree = cKDTree(PC)
+dist, nn = tree.query(PC, k=knn_k + 1)                  # row 0 is self
+dist = dist[:, 1:]
+nn = nn[:, 1:]
+rows = np.repeat(np.arange(n_cells), knn_k)
+cols = nn.ravel()
+d = dist.ravel()
+# symmetrize edge set (union of both directions)
+row = np.concatenate([rows, cols])
+col = np.concatenate([cols, rows])
+val = np.concatenate([d, d])
+g = sparse.coo_matrix((val, (row, col)), shape=(n_cells, n_cells)).tocsr()
+g = g.maximum(g.T)                                      # symmetrize
+g = g.tocoo()
+keep = g.row < g.col                                     # one entry per undirected edge
+edge_rows, edge_cols, edge_d = g.row[keep], g.col[keep], g.data[keep]
+# symmetric weighted adjacency with euclidean edge weights
+sym = sparse.coo_matrix((np.concatenate([edge_d, edge_d]),
+                         (np.concatenate([edge_rows, edge_cols]),
+                          np.concatenate([edge_cols, edge_rows]))),
+                        shape=(n_cells, n_cells)).tocsr()
+
+# ensure connectivity (rare fallback): add MST edges on the complete graph
+n_comp, _ = connected_components(sym, directed=False)
+graph_needed_mst = n_comp > 1
+full_dist = None
+if graph_needed_mst:
+    full_dist = distance.squareform(distance.pdist(PC, metric="euclidean"))
+    mst = minimum_spanning_tree(sparse.csr_matrix(full_dist))
+    sym = (sym + mst).maximum((sym + mst).T)
+
+# weight matrix for spectral clustering (Gaussian kernel on distances)
+sigma = float(np.median(edge_d)) if len(edge_d) else 1.0
+W = sym.copy()
+W.data = np.exp(-(W.data ** 2) / (2.0 * sigma ** 2))     # affinity
+W = W.maximum(W.T)
+W = sparse.csr_matrix(W)
+
+# ----------------------------------------------------------------------
+# 4. Clustering: spectral (Shi-Malik) on PCA + kNN affinity graph
+# ----------------------------------------------------------------------
+deg = np.asarray(W.sum(axis=1)).ravel()
+deg_inv_sqrt = 1.0 / np.sqrt(np.maximum(deg, 1e-12))
+Dn = sparse.diags(deg_inv_sqrt)
+Adj_norm = (Dn @ W @ Dn).tocsr()                          # normalized adjacency
+k_eig = n_clusters
+evals, evecs = eigsh(Adj_norm, k=k_eig, which="LA", tol=1e-5, v0=np.ones(n_cells))
+# Shi-Malik: row-normalize eigenvectors, then k-means on rows
+Y = evecs[:, ::-1][:, :k_eig]
+Y = Y / np.maximum(np.linalg.norm(Y, axis=1, keepdims=True), 1e-12)
+centroids, labels = kmeans2(Y, k=n_clusters, minit="++", iter=100, rng=RNG)
+# relabel clusters 0..K-1 by decreasing size (deterministic ordering)
+order = np.argsort(-np.bincount(labels))
+relabel = np.empty(n_clusters, dtype=int)
+relabel[order] = np.arange(n_clusters)
+clusters = relabel[labels].astype(np.int32)
+
+# ---- silhouette (diagnostic) on PCA embedding ----
+dist_pair = distance.squareform(distance.pdist(PC, metric="euclidean"))
+sil = np.zeros(n_cells)
+for c in range(n_clusters):
+    m = clusters == c
+    idx = np.where(m)[0]
+    if len(idx) <= 1:
+        sil[idx] = 0.0
+        continue
+    a = dist_pair[np.ix_(idx, idx)].mean(axis=1)
+    b = np.full(len(idx), np.inf)
+    for c2 in range(n_clusters):
+        if c2 == c:
+            continue
+        idx2 = np.where(clusters == c2)[0]
+        b = np.minimum(b, dist_pair[np.ix_(idx, idx2)].mean(axis=1))
+    sil[idx] = (b - a) / np.maximum(np.maximum(a, b), 1e-12)
+silhouette = float(sil.mean())
+
+# ----------------------------------------------------------------------
+# 5. Pseudotime: weighted shortest path (Dijkstra) from extremal-cell root
+# ----------------------------------------------------------------------
+# edge weights = euclidean distance in PCA space (geodesic-like distance)
+graph_w = sparse.coo_matrix(
+    (np.concatenate([edge_d, edge_d]),
+     (np.concatenate([edge_rows, edge_cols]),
+      np.concatenate([edge_cols, edge_rows]))),
+    shape=(n_cells, n_cells)).tocsr()
+if graph_needed_mst:
+    graph_w = (graph_w + minimum_spanning_tree(sparse.csr_matrix(full_dist)))
+    graph_w = graph_w.maximum(graph_w.T)
+
+# all-pairs shortest paths (symmetric input -> undirected)
+sp = dijkstra(graph_w, directed=False)
+# geodesic center: node minimizing total distance to all other cells
+center = int(np.argmin(sp.sum(axis=1)))
+# extremal root: node farthest (geodesically) from the center -> trajectory start
+root = int(np.argmax(sp[center]))
+pt = sp[root].astype(np.float64)
+pt = (pt - pt.min()) / (pt.max() - pt.min() + 1e-12)
+pseudotime = pt.astype(np.float64)
+
+# ----------------------------------------------------------------------
+# 6. Ranked marker genes: per-cluster one-vs-rest Welch t-stat
+# ----------------------------------------------------------------------
+gene_scores = np.zeros(n_genes)
+for g in range(n_genes):
+    xg = X[:, g]
+    best = 0.0
+    for c in range(n_clusters):
+        m = clusters == c
+        t, p = ttest_ind(xg[m], xg[~m], equal_var=False)
+        best = max(best, abs(t))
+    gene_scores[g] = best
+ranking = np.argsort(-gene_scores)
+de_gene_indices = [int(i) for i in ranking]                 # best marker first
+
+# ----------------------------------------------------------------------
+# 7. GRN: standardized ridge regression among TF genes (grn_scores[i,j]=i->j)
+# ----------------------------------------------------------------------
+TF = X[:, :n_tf_genes]
+Z = (TF - TF.mean(axis=0)) / (TF.std(axis=0) + 1e-12)
+ridge_lambda = 1.0
+grn = np.zeros((n_tf_genes, n_tf_genes), dtype=np.float64)
+pred_cols = np.arange(n_tf_genes)
+for j in range(n_tf_genes):
+    y = Z[:, j]                                             # target (z-scored)
+    m = pred_cols != j
+    Xr = Z[:, m]                                            # regulators (z-scored)
+    XtX = Xr.T @ Xr
+    Xty = Xr.T @ y
+    beta = np.linalg.solve(XtX + ridge_lambda * np.eye(XtX.shape[0]), Xty)
+    reg_idx = pred_cols[m]                                  # map predictors -> TF idx
+    grn[reg_idx, j] = beta
+grn[np.diag_indices(n_tf_genes)] = 0.0                      # diagonal ignored
+assert np.all(np.diag(grn) == 0.0)
+
+# ----------------------------------------------------------------------
+# 8. Write outputs
+# ----------------------------------------------------------------------
+np.save(os.path.join(BASE, "clusters.npy"), clusters)
+np.save(os.path.join(BASE, "pseudotime.npy"), pseudotime)
+np.save(os.path.join(BASE, "grn_scores.npy"), grn)
+with open(os.path.join(BASE, "de_genes.json"), "w") as f:
+    json.dump({"gene_indices": de_gene_indices}, f)
+
+method_choices = {
+  "preprocessing": {
+    "method": "library-size normalization (counts / lib_size * median_depth) then log1p",
+    "rationale": ("Inspection (integer, 19% non-zero, depth spread 901..3992, 4.4x) confirms raw counts, "
+                  "so per-cell depth must be removed before PCA/DE/GRN. Scaling to median depth keeps "
+                  "expression comparable across cells; log1p stabilizes variance of sparse counts."),
+    "params": {"target_depth": "median library size"}
+  },
+  "clustering": {
+    "method": "spectral clustering (Shi-Malik) on a kNN affinity graph built from the PCA embedding",
+    "rationale": ("Graph partitioning is the standard single-cell paradigm (Louvain/Leiden); without those "
+                  "toolkits, normalized spectral clustering is the numpy/scipy equivalent. k = n_clusters is "
+                  "resolved from metadata (n_clusters=4), removing resolution ambiguity. k-means on "
+                  "PCA-normalized eigenvectors then assigns cells."),
+    "params": {"n_clusters": 4, "n_pcs": n_pcs, "knn_k": knn_k,
+               "kernel": "Gaussian (sigma=median kNN distance)", "seed": 0}
+  },
+  "pseudotime": {
+    "method": "weighted shortest-path (Dijkstra) on the same kNN graph from an extremal-cell root, normalized to [0,1]",
+    "rationale": ("Edge weights are Euclidean distances in PCA space, so the shortest path is a geodesic "
+                  "approximation along the manifold. Root = cell with maximum geodesic distance from the "
+                  "graph center (node minimizing total distance to all cells), a deterministic heuristic. "
+                  "ORIENTATION IS A CONVENTION, not biological ground truth."),
+    "params": {"graph": "kNN k=15 (+MST if disconnected)", "root_rule": "farthest from geodesic center"}
+  },
+  "de_genes": {
+    "method": "per-gene maximum over clusters of the one-vs-rest Welch t-statistic on log1p data",
+    "rationale": ("Each gene is scored by the strongest single-cluster separation from the rest "
+                  "(difference of means scaled by Welch variance), a standard DE statistic. All 250 gene "
+                  "indices are returned ranked best-first (no truncation/placeholder)."),
+    "params": {"statistic": "Welch t (equal_var=False)", "ranking": "descending max-over-cluster |t|"}
+  },
+  "grn": {
+    "method": "standardized ridge regression between TF genes on z-scored log1p-normalized TF expression",
+    "rationale": ("For each target j, regress its z-scored expression on the other 19 z-scored regulator "
+                  "genes: grn_scores[i,j] = standardized ridge beta of regulator i for target j, giving "
+                  "directed i->j scores per the required convention (positive = putatively activating, "
+                  "negative = repressive). Self-edges excluded by construction; diagonal hard-zeroed."),
+    "params": {"ridge_lambda": ridge_lambda, "features": "z-scored log1p TF columns",
+               "direction": "regulator i (predictor) -> target j (response)"}
+  },
+  "assumptions": [
+    "counts are raw-like; library-size + log1p normalization is applied",
+    "n_clusters=4 comes from system_info.json (metadata, not estimated)",
+    "first n_tf_genes=20 columns are TF genes (from tf_gene_indices)",
+    "pseudotime root/orientation is a convention (extremal-cell heuristic)",
+    "n_pcs chosen by >=90% explained variance (clipped to [5,20]); knn_k=15",
+    "de_genes returns the full ranked list of all gene indices",
+    "GRN direction derives from the ridge-regression convention; diagonal ignored"
+  ]
+}
+with open(os.path.join(BASE, "method_choices.json"), "w") as f:
+    json.dump(method_choices, f, indent=2)
+
+# ----------------------------------------------------------------------
+# 9. Diagnostics (printed, not saved)
+# ----------------------------------------------------------------------
+grn_abs = np.abs(grn)
+n_edges_t1 = int((grn_abs > 0.1).sum())
+n_edges_t2 = int((grn_abs > 0.2).sum())
+positive = int((grn > 0).sum())
+negative = int((grn < 0).sum())
+print("=== DIAGNOSTICS ===")
+print("cluster sizes:", np.bincount(clusters).tolist())
+print("silhouette (PCA space):", round(silhouette, 4))
+print("n_pcs used:", n_pcs, "| cumvar at n_pcs:", round(float(cumvar[n_pcs-1]), 4))
+print("graph needed MST fallback:", graph_needed_mst)
+print("pseudotime range: [%.4f, %.4f], mean %.4f, median %.4f" %
+      (pseudotime.min(), pseudotime.max(), pseudotime.mean(), np.median(pseudotime)))
+print("pseudotime at root cell (%d): %.4f; farthest cell (%d): %.4f" %
+      (root, pseudotime[root], int(np.argmax(pseudotime)), pseudotime.max()))
+print("top 12 DE gene indices:", de_gene_indices[:12])
+print("DE scores of top 5:", [round(float(gene_scores[i]), 2) for i in de_gene_indices[:5]])
+print("grn shape/dtype:", grn.shape, grn.dtype, "| diag all zero:", bool(np.all(np.diag(grn)==0)))
+print("grn |score|>0.1 edges:", n_edges_t1, "(of", n_tf_genes*(n_tf_genes-1), "non-diag)")
+print("grn |score|>0.2 edges:", n_edges_t2)
+print("grn sign balance: positive", positive, "negative", negative)
+print("top 5 edges (regulator -> target, score):")
+top = np.unravel_index(np.argsort(grn_abs, axis=None)[-5:], grn.shape)
+for k in range(5):
+    i, j = top[0][k], top[1][k]
+    print("  ", int(i), "->", int(j), round(float(grn[i, j]), 3))
+print("outputs written to", BASE)

@@ -1,0 +1,250 @@
+"""EQUIVALENT offline re-implementation of the DESeq2 core workflow.
+
+NOT R DESeq2, NOT pydeseq2 (runner has no network / no bioinformatics packages).
+Implemented from scratch with numpy/scipy:
+  1. median-of-ratios size factors
+  2. gene-wise NB2 dispersion MLE (log-link GLM, beta = [intercept, W-vs-K])
+  3. parametric dispersion trend disp(mu)=a0+a1/mu (robust log-scale soft-L1)
+  4. empirical-Bayes shrinkage of log-dispersion toward the trend
+     (normal-normal posterior; approximates DESeq2 Cox-Reid APL shrinkage)
+  5. Wald test on the W-vs-K coefficient from the observed information
+  6. Benjamini-Hochberg adjusted p
+  7. log2FC shrinkage, zero-centred NORMAL prior with EM-estimated sd
+     == DESeq2 lfcShrink(type="normal"); apeglm unavailable offline.
+Direction: K = baseline, W = treatment (log2FC>0 => higher in W).
+"""
+import numpy as np
+import pandas as pd
+from scipy.special import digamma, gammaln
+from scipy.stats import norm, chi2, t as tdist
+from scipy.optimize import least_squares
+
+
+def size_factors(Y):
+    with np.errstate(divide="ignore"):
+        lg = np.log(Y)
+    ref = np.nanmean(lg, axis=1)
+    ok = np.isfinite(ref) & np.isfinite(lg).all(axis=1)
+    sf = np.exp(np.median(lg[ok] - ref[ok][:, None], axis=0))
+    return sf / np.exp(np.mean(np.log(sf))), int(ok.sum())
+
+
+def fit_beta(Y, sf, x, alpha, n_iter=50, tol=1e-9, se_type='expected'):
+    """Vectorised Fisher-scoring NB2 GLM fit -> beta0, log2FC(beta1), se(beta1), mu."""
+    ls = np.log(sf)[None, :]
+    X = np.column_stack([np.ones(len(x), float), np.asarray(x, float)])
+    b = np.zeros((Y.shape[0], 2))
+    b[:, 0] = np.log(np.maximum(Y.mean(axis=1), 0.5) / np.mean(sf))
+    for _ in range(n_iter):
+        mu = np.exp(np.clip(b @ X.T + ls, -30, 30))
+        d = 1.0 + alpha[:, None] * mu
+        g = (Y - mu) / d
+        w = mu * (1.0 + alpha[:, None] * Y) / d ** 2
+        xj = X[:, 1]
+        S0, S1 = g.sum(1), (g * xj).sum(1)
+        I00 = w.sum(1); I01 = (w * xj).sum(1); I11 = (w * xj ** 2).sum(1)
+        det = I00 * I11 - I01 ** 2
+        det = np.where(np.abs(det) < 1e-300, np.nan, det)
+        step = np.column_stack([(I11 * S0 - I01 * S1) / det,
+                                (I00 * S1 - I01 * S0) / det])
+        step = np.clip(np.nan_to_num(step), -5, 5)
+        b = b + step
+        if np.nanmax(np.abs(step)) < tol:
+            break
+    mu = np.exp(np.clip(b @ X.T + ls, -30, 30))
+    d = 1.0 + alpha[:, None] * mu
+    xj = X[:, 1]
+    # observed information uses the y-dependent weight; the expected (Fisher)
+    # information replaces (1 + alpha*y) by (1 + alpha*mu) and is the better
+    # calibrated choice for n=3 vs n=3 designs (see permutation calibration).
+    w = mu / d if se_type == "expected" else mu * (1.0 + alpha[:, None] * Y) / d ** 2
+    I00 = w.sum(1); I01 = (w * xj).sum(1); I11 = (w * xj ** 2).sum(1)
+    det = I00 * I11 - I01 ** 2
+    se1 = np.sqrt(np.where(det > 0, I00 / det, np.inf))
+    return b[:, 0], b[:, 1], se1, mu
+
+
+def nb_nll_logalpha(loga, Y, mu):
+    """Profile NB2 negative log-likelihood per gene, mu fixed, alpha=exp(loga)."""
+    a = np.exp(loga)[:, None]
+    k = 1.0 / a                                   # NB size
+    # nbinom logpmf(y; size=k, p=1/(1+a*mu)) written out explicitly
+    ll = (gammaln(Y + k) - gammaln(k) - gammaln(Y + 1.0)
+          + k * np.log(k / (k + mu)) + Y * np.log(mu / (k + mu)))
+    return -ll.sum(axis=1)
+
+
+def gene_wise_alpha(Y, sf, x, n_outer=12, coarse=160, fine=61):
+    """Alternating fit: beta by Fisher scoring, alpha by log-grid search + refinement.
+    Also returns curvature of the profile NLL in log alpha (= inverse sampling var)."""
+    n = Y.shape[0]
+    rm = np.maximum(Y.mean(axis=1), 1e-8)
+    mom = (Y.var(axis=1, ddof=1) - rm) / rm ** 2
+    a_cur = np.clip(np.where(np.isfinite(mom), mom, 0.1), 1e-6, 50.0)
+    lo, hi = np.log(1e-7), np.log(50.0)
+    grid = np.linspace(lo, hi, coarse)
+    step = (hi - lo) / (coarse - 1)
+    curv = None
+    for it in range(n_outer):
+        _, _, _, mu = fit_beta(Y, sf, x, a_cur)
+        vals = np.stack([nb_nll_logalpha(np.full(n, g), Y, mu) for g in grid])
+        best = grid[vals.argmin(axis=0)]
+        fgrid = best[:, None] + np.linspace(-step, step, fine)[None, :]
+        fvals = np.stack([nb_nll_logalpha(fgrid[:, j], Y, mu) for j in range(fine)])
+        fb = fgrid[np.arange(n), fvals.argmin(axis=0)]
+        h = 0.05
+        curv = ((nb_nll_logalpha(fb + h, Y, mu) - 2 * nb_nll_logalpha(fb, Y, mu)
+                 + nb_nll_logalpha(fb - h, Y, mu)) / h ** 2)
+        curv = np.where(np.isfinite(curv) & (curv > 1e-6), curv, 1e-6)
+        a_new = np.clip(np.exp(fb), 1e-7, 50.0)
+        if np.nanmax(np.abs(np.log(a_new / a_cur))) < 1e-7:
+            a_cur = a_new
+            break
+        a_cur = a_new
+    return a_cur, curv
+
+
+def dispersion_trend(mean_norm, alpha_gw, min_mean=1.0, hi=49.0):
+    """Robust weighted fit of disp(mu)=a0+a1/mu on the log scale (DESeq2 'parametric').
+    Boundary (non-identifiable) gene-wise estimates and low-count genes are excluded."""
+    ok = ((mean_norm >= min_mean) & np.isfinite(alpha_gw)
+          & (alpha_gw > 2e-6) & (alpha_gw < hi))
+    mu, ag = mean_norm[ok], np.log(alpha_gw[ok])
+    wt = np.sqrt(mu * np.exp(ag) / (1.0 + mu * np.exp(ag)))
+    wt = wt / np.median(wt)
+
+    def resid(p):
+        a0, a1 = np.exp(p)
+        return wt * (ag - np.log(np.maximum(a0 + a1 / mu, 1e-12)))
+
+    fit = least_squares(resid, x0=np.log([0.05, 0.05]), loss="soft_l1",
+                        f_scale=0.45, method="trf", max_nfev=800)
+    a0, a1 = np.exp(fit.x)
+    return float(a0), float(a1), np.clip(a0 + a1 / np.maximum(mean_norm, 1e-8), 1e-8, 1e3), int(ok.sum())
+
+
+def shrink_alpha(alpha_gw, curv, trend, mean_norm, min_mean=1.0,
+                tau2_lo=0.05, tau2_hi=4.0):
+    """EB posterior mean of log-dispersion under a normal prior centred on the trend
+    (approximates DESeq2's Cox-Reid APL shrinkage).
+
+    v        : sampling variance of log(alpha_geneWise) = 1 / curvature of the profile NLL
+    tau2     : prior variance, trimmed method-of-moments on the trend-fit genes
+    Genes whose MLE sits at the lower boundary or whose mean is too low to identify a
+    dispersion are pulled onto the trend, exactly as DESeq2 replaces them.
+    """
+    log_t = np.log(trend)
+    at_bound = (alpha_gw <= 2e-6) | (alpha_gw >= 49.0)
+    v = 1.0 / np.maximum(curv, 1e-8)
+    v = np.clip(v, 1e-4, 25.0)
+    v = np.where(at_bound, 25.0, v)
+    loga = np.log(np.clip(alpha_gw, 1e-8, 1e3))
+    usable = (mean_norm >= min_mean) & ~at_bound & np.isfinite(v)
+    res2 = (loga - log_t)[usable]
+    tau2 = float(np.clip(np.mean(res2 ** 2) - np.mean(v[usable]), tau2_lo, tau2_hi))
+    post = (loga / v + log_t / tau2) / (1.0 / v + 1.0 / tau2)
+    weak = (mean_norm < min_mean) | at_bound
+    post = np.where(weak, log_t, post)
+    return np.exp(np.clip(post, np.log(1e-6), np.log(1e3))), tau2, int(usable.sum())
+
+
+def em_prior_sd(b, se):
+    ok = np.isfinite(b) & np.isfinite(se) & (se > 0) & (se < 1e6)
+    b, se = b[ok], se[ok]
+    s2 = max(float(np.mean(b ** 2) - np.mean(se ** 2)), 1e-4)
+    for _ in range(500):
+        tot = s2 + se ** 2
+        new = float(np.mean((s2 / tot) * b ** 2 + s2 * se ** 2 / tot))
+        if abs(new - s2) < 1e-11:
+            s2 = new
+            break
+        s2 = new
+    return float(np.sqrt(s2)), int(ok.sum())
+
+
+def bh(p):
+    p = np.asarray(p, float); o = np.argsort(p); n = len(p)
+    q = p[o] * n / (np.arange(n) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out = np.empty(n); out[o] = np.clip(q, 0, 1)
+    return out
+
+
+def run_de(Y, kcols, wcols, sample_names, se_type='expected', test='wald', t_df=None,
+           tau2_hi=4.0, disp_inflate=1.0, alpha_fixed=None):
+    x = np.array([0.0 if s in kcols else 1.0 for s in sample_names], float)
+    sf, npos = size_factors(Y)
+    mean_norm = Y / sf
+    baseMean = mean_norm.mean(axis=1)
+    alpha_gw, curv = gene_wise_alpha(Y, sf, x)
+    a0, a1, trend, nfit = dispersion_trend(baseMean, alpha_gw)
+    alpha_sh, tau2, nshr = shrink_alpha(alpha_gw, curv, trend, baseMean, tau2_hi=tau2_hi)
+    if alpha_fixed is not None:
+        alpha_sh = np.full_like(alpha_sh, float(alpha_fixed))
+    alpha_sh = alpha_sh * disp_inflate
+    _, lfc, se1, _ = fit_beta(Y, sf, x, alpha_sh, se_type=se_type)
+    with np.errstate(invalid="ignore"):
+        z = lfc / se1
+    zsafe = np.nan_to_num(z, nan=0.0)
+    if test == "lrt":
+        dev, p = lrt_pvalues(Y, sf, x, alpha_sh)
+    elif test == "t":
+        dfree = t_df if t_df else max(Y.shape[1] - 2, 2)
+        p = 2 * tdist.sf(np.abs(zsafe), dfree)
+    else:
+        p = 2 * norm.sf(np.abs(zsafe))
+    p = np.nan_to_num(p, nan=1.0)
+    lfc = np.where(np.isfinite(lfc), lfc, 0.0)
+    s0, ntested = em_prior_sd(lfc, se1)
+    tot = s0 ** 2 + se1 ** 2
+    lfc_sh = lfc * s0 ** 2 / tot
+    se_sh = np.sqrt(s0 ** 2 * se1 ** 2 / tot)
+    tab = pd.DataFrame({
+        "baseMean": baseMean, "log2FC_raw": lfc, "lfcSE_raw": se1, "stat_W": z,
+        "pvalue": p, "padj_BH": bh(p), "log2FC_shrunk": lfc_sh,
+        "lfcSE_shrunk": se_sh, "disp_geneWise": alpha_gw,
+        "disp_Trend": trend, "disp_SHR": alpha_sh,
+        "norm_mean_K": mean_norm[:, x == 0].mean(axis=1),
+        "norm_mean_W": mean_norm[:, x == 1].mean(axis=1)})
+    meta = dict(n_pos_genes_for_sf=npos, trend_a0=a0, trend_a1=a1,
+                n_genes_trend_fit=nfit, n_genes_shrunk=nshr, tau2=tau2,
+                prior_sd_normal=s0, n_genes_em_prior=ntested,
+                median_disp_SHR=float(np.median(alpha_sh[baseMean > 10])),
+                size_factors=dict(zip(sample_names, sf.tolist())))
+    return tab, meta
+
+
+def funnel_lines(tab, label):
+    b10 = tab.baseMean > 10
+    ps = tab.pvalue < 0.05
+    sl = tab.log2FC_shrunk.abs() > 1
+    rl = tab.log2FC_raw.abs() > 1
+    return {
+        "total_genes": int(len(tab)),
+        f"{label}|baseMean>10": int(b10.sum()),
+        f"{label}|+p<0.05": int((b10 & ps).sum()),
+        f"{label}|+|shrunkLFC|>1": int((b10 & ps & sl).sum()),
+        f"{label}|(|rawLFC|>1 instead)": int((b10 & ps & rl).sum()),
+        f"{label}|p<0.05_allgenes": int(ps.sum()),
+        f"{label}|shrunkLFC>1_allgenes": int(sl.sum()),
+        f"{label}|rawLFC>1_allgenes": int(rl.sum()),
+        f"{label}|padj<0.05&shrunk": int((b10 & (tab.padj_BH < 0.05) & sl).sum()),
+    }
+
+
+def nb_ll(Y, mu, alpha):
+    """NB2 log-likelihood, per gene, given means and dispersion."""
+    k = 1.0 / np.maximum(alpha, 1e-12)[:, None]
+    mu = np.maximum(mu, 1e-12)
+    return (gammaln(Y + k) - gammaln(k) - gammaln(Y + 1.0)
+            + k * np.log(k / (k + mu)) + Y * np.log(mu / (k + mu))).sum(axis=1)
+
+
+def lrt_pvalues(Y, sf, x, alpha):
+    """Likelihood-ratio test for the W-vs-K coefficient (full vs intercept-only model).
+    Better calibrated than the Wald test when there are only 3 replicates per group."""
+    _, _, _, mu_full = fit_beta(Y, sf, x, alpha)
+    b0r, _, _, mu_red = fit_beta(Y, sf, np.zeros_like(x), alpha)
+    dev = 2.0 * (nb_ll(Y, mu_full, alpha) - nb_ll(Y, mu_red, alpha))
+    dev = np.maximum(dev, 0.0)
+    return dev, chi2.sf(dev, 1)

@@ -1,0 +1,197 @@
+"""
+DESeq2-equivalent differential expression engine (offline APPROXIMATION).
+Implemented from the published DESeq2 algorithm (Love, Huber & Anders 2014,
+Genome Biology 15:550) with numpy/scipy only. Not the Bioconductor package.
+
+Pipeline (documented approximations):
+  1. Size factors: DESeq2 median-of-ratios (estimateSizeFactorsForMatrix).
+  2. baseMean: mean of normalized counts over ALL 6 samples (DESeq2 standard).
+  3. Per-gene dispersion: Cox-Reid adjusted profile likelihood (CR-APL) MLE.
+  4. Trend (robust spline on binned medians, log disp ~ log baseMean) +
+     empirical-Bayes MAP with Gaussian prior on log(dispersion)
+     [DESeq2 estimateDispersionsPriorVar + MAP approximation].
+  5. NB-GLM Wald test: log2(KL/WL), SE, two-sided p (unshrunk), BH padj.
+  6. LFC shrinkage of the MLE lfc using three documented schemes.
+  7. Filter: padj<0.05 & |shrunken lfc|>1 & baseMean>10 (direction-agnostic).
+"""
+import numpy as np
+from scipy import special, optimize, stats
+from scipy.interpolate import UnivariateSpline
+
+# ---------------------------------------------------------------- normalization
+def estimate_size_factors(counts):
+    """DESeq2 median-of-ratios size factors (n=6 samples)."""
+    counts = counts.astype(float)
+    log_c = np.log(counts)
+    if np.isinf(log_c).any():
+        log_c = np.log(counts + 0.5)          # DESeq2 behaviour with zeros
+    loggeomeans = log_c.mean(axis=1)
+    sfs = np.exp(np.median(log_c - loggeomeans[:, None], axis=0))
+    sfs = sfs / np.exp(np.mean(np.log(sfs)))  # geometric mean -> 1
+    return sfs
+
+# ---------------------------------------------------------------- dispersion
+def _group_means(counts, sfs, group):
+    mu = np.empty_like(counts)
+    for g in np.unique(group):
+        s = group == g
+        mu[s] = sfs[s] * (counts[s].sum() / sfs[s].sum())
+    return mu
+
+def cr_apl(loga, counts, sfs, group):
+    """Cox-Reid adjusted profile log-likelihood (returns -apl for minimization)."""
+    a = np.exp(loga)
+    mu = _group_means(counts, sfs, group)
+    if (mu <= 0).any():
+        return 1e12
+    ll = np.sum(special.gammaln(counts + 1.0/a) - special.gammaln(1.0/a)
+                - special.gammaln(counts + 1.0)
+                + counts * (loga + np.log(mu) - np.log1p(a * mu))
+                - (1.0/a) * np.log1p(a * mu))
+    W = mu / (1.0 + a * mu)                     # log-link working weights
+    Wk = W[group == 1].sum(); Ww = W[group == 0].sum()
+    cr = 0.5 * np.log(max(Wk * Ww, 1e-300))     # -0.5 log det(X'W X)
+    return -(ll + cr)
+
+def _mle_dispersion(counts, sfs, group):
+    """CR-APL MLE of dispersion (optimise on log scale, bounded)."""
+    try:
+        r = optimize.minimize_scalar(cr_apl, bounds=(np.log(1e-4), np.log(100)),
+                                     method='bounded',
+                                     args=(counts, sfs, group))
+        return float(np.exp(r.x))
+    except Exception:
+        return 0.05
+
+def _map_dispersion(loga, counts, sfs, group, logtrend, prior_var):
+    """Negative log-posterior: CR-APL + Gaussian prior on log(disp)."""
+    a = np.exp(loga)
+    apl = cr_apl(loga, counts, sfs, group)          # -apl(alpha)
+    prior = 0.5 * (loga - logtrend) ** 2 / prior_var
+    return apl + prior          # note: -apl already includes the sign flip
+
+def estimate_dispersions(counts, sfs, group):
+    """MLE dispersion -> robust trend -> EB-MAP shrunken dispersion."""
+    n = counts.shape[0]
+    disp_mle = np.empty(n)
+    for i in range(n):
+        disp_mle[i] = _mle_dispersion(counts[i].astype(float), sfs, group)
+    norm = counts.astype(float) / sfs[None, :]
+    baseMean = norm.mean(axis=1)
+
+    # robust trend: bin by log10(baseMean), median log-disp in each bin, spline
+    keep = (baseMean >= 1) & np.isfinite(disp_mle) & (disp_mle > 1e-4)
+    x = np.log10(baseMean[keep]); y = np.log(disp_mle[keep])
+    # binned medians
+    bin_edges = np.quantile(x, np.linspace(0, 1, 25))
+    bm_x = []; bm_y = []
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        m = (x >= lo) & (x < hi)
+        if m.sum() >= 5:
+            bm_x.append(np.median(x[m])); bm_y.append(np.median(y[m]))
+    bm_x = np.array(bm_x); bm_y = np.array(bm_y)
+    spl = UnivariateSpline(bm_x, bm_y, k=2, s=len(bm_x) * 0.6)
+
+    def trend_log(i):
+        return float(spl(max(np.log10(baseMean[i]), bm_x.min())))
+    log_trend = np.array([trend_log(i) for i in range(n)])
+
+    # empirical Bayes prior variance on log-dispersion deviation
+    detrend = np.log(np.clip(disp_mle, 1e-8, None)) - log_trend
+    hi = baseMean > np.percentile(baseMean[baseMean > 0], 50)  # informative genes
+    prior_var = max(float(np.var(detrend[hi & np.isfinite(detrend)])), 0.25)
+
+    # MAP: CR-APL + Gaussian(log prior) on log dispersion -> shrunken dispersion
+    disp_shrunk = np.empty(n)
+    for i in range(n):
+        a = disp_mle[i]
+        # if MLE hit the boundary and CR-APL is flat, the prior dominates
+        r = optimize.minimize_scalar(
+            _map_dispersion, bounds=(np.log(1e-4), np.log(100)),
+            method='bounded',
+            args=(counts[i].astype(float), sfs, group, log_trend[i], prior_var))
+        disp_shrunk[i] = float(np.exp(r.x))
+    return disp_mle, np.exp(log_trend), disp_shrunk, baseMean
+
+# ---------------------------------------------------------------- Wald test
+def wald_test(counts, sfs, group, disp):
+    """NB-GLM Wald test: log2 fold change (KL vs WL), SE, p (unshrunk)."""
+    n = counts.shape[0]
+    lfc = np.zeros(n); se = np.zeros(n); bm = np.zeros(n)
+    for i in range(n):
+        k = counts[i].astype(float); a = max(disp[i], 1e-6)
+        s0 = group == 0; s1 = group == 1
+        mg0 = k[s0].sum() / sfs[s0].sum()
+        mg1 = k[s1].sum() / sfs[s1].sum()
+        if mg0 <= 1e-9 and mg1 <= 1e-9:      # all-zero gene -> not DE
+            lfc[i] = 0.0; se[i] = 0.0; bm[i] = 0.0
+            continue
+        lfc[i] = np.log2(max(mg1, 1e-9) / max(mg0, 1e-9))
+        # delta-method variance of log(group mean) [natural log units]
+        # Var(log mg) = 1/(S*mg) + a*S2/S^2, S=sum sfs, S2=sum sfs^2
+        S0 = sfs[s0].sum(); S1 = sfs[s1].sum()
+        S20 = (sfs[s0]**2).sum(); S21 = (sfs[s1]**2).sum()
+        v0 = 1.0 / (S0 * max(mg0, 1e-9)) + a * S20 / (S0 * S0)
+        v1 = 1.0 / (S1 * max(mg1, 1e-9)) + a * S21 / (S1 * S1)
+        se[i] = float(np.sqrt(v0 + v1)) / np.log(2.0)
+        bm[i] = float((k / sfs).mean())
+    p = np.ones(n)
+    nz = se > 0
+    p[nz] = 2 * stats.norm.sf(np.abs(lfc[nz] / se[nz]))
+    return lfc, se, p, bm
+
+# ---------------------------------------------------------------- helpers
+def bh_adjust(p):
+    p = np.asarray(p, float)
+    n = len(p); order = np.argsort(p)
+    ranked = p[order]; adj = np.empty(n); runmin = 1.0
+    for i in range(n - 1, -1, -1):
+        runmin = min(runmin, ranked[i] * n / (i + 1))
+        adj[order[i]] = runmin
+    return np.clip(adj, 0, 1)
+
+
+def _cauchy_post_mode(beta_hat, se2, s0):
+    """Posterior mode of Gaussian likelihood N(beta_hat,se2) with Cauchy(0,s0)
+    prior. Solves  beta^3 - beta_hat beta^2 + (s0^2+2 se2) beta - beta_hat s0^2 = 0,
+    picking the real root nearest beta_hat. (apeglm-style heavy-tailed prior.)"""
+    if abs(beta_hat) < 1e-12:
+        return 0.0
+    a, b, c = -beta_hat, (s0*s0 + 2.0*se2), -beta_hat*s0*s0
+    # 1 + a z + b z^2 + c z^3 with root ~ beta_hat: use Newton from beta_hat
+    def f(x): return x**3 + a*x**2 + b*x + c
+    def fp(x): return 3*x**2 + 2*a*x + b
+    x = beta_hat
+    for _ in range(60):
+        fx = f(x)
+        if abs(fx) < 1e-14: break
+        dx = fx / fp(x)
+        x -= dx
+        if abs(dx) < 1e-14: break
+    return float(x)
+
+def shrink_normal(lfc, se, prior_var):
+    """DESeq2 'normal'-style EB normal-prior shrinkage:
+       posterior mean = lfc * priorVar / (se^2 + priorVar)."""
+    return lfc * prior_var / (se ** 2 + prior_var)
+
+def shrink_apeglm_approx(lfc, se, prior_var):
+    """apeglm-style approximation: empirical-Bayes Cauchy(0,s0) prior posterior
+    mode (heavy-tailed -> large/confident effects barely shrunk, small/noisy
+    effects pushed toward 0). prior_var is the squared scale s0^2."""
+    s0 = np.sqrt(max(float(prior_var), 0.01))
+    out = np.empty_like(lfc)
+    for i in range(len(lfc)):
+        se2 = float(se[i])**2
+        if se2 <= 0 or np.isnan(se2):
+            out[i] = 0.0
+        else:
+            out[i] = _cauchy_post_mode(float(lfc[i]), se2, s0)
+    return out
+
+def shrink_ashr_approx(lfc, se, prior_var, mix=0.3):
+    """ashr-style approximation: two-component prior (mass `mix` at 0 +
+    N(0,prior_var)); posterior-mean shrinkage with component weighting."""
+    s2 = prior_var
+    w1 = 1.0 / (1.0 + (mix / (1 - mix)) * np.exp(-0.5 * lfc ** 2 / (se ** 2 + s2)))
+    return w1 * (s2 / (se ** 2 + s2)) * lfc

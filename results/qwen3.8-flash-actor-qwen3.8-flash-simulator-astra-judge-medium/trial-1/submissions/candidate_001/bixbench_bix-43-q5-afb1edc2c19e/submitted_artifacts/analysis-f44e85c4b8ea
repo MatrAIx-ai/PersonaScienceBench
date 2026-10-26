@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""END-TO-END ANALYSIS SCRIPT  (bix-43-q5: CBD/cisplatin combination, Reactome_2022 enrichment)
+
+Runs, in order:
+  0. input QC / schema checks
+  1. DESeq2-equivalent NB GLM on raw counts (analysis/deseq_np.py) -> per-contrast result tables
+     + combined DEG lists (baseMean>10, |log2FC|>0.5, nominal p<0.05; padj variant = sensitivity)
+  2. calibration diagnostics: control-vs-control pseudo-nulls, label-permutation null,
+     leave-one-out on shallow replicates
+  3. enrichment step: gseapy if importable, else gseapy-equivalent hypergeometric ORA
+     (analysis/ora.py) using a REAL Reactome_2022 GMT discovered on disk / $REACTOME_GMT.
+     If no Reactome_2022 library exists the script stops that step with an explicit status
+     file - gene-set content is NEVER invented.
+  4. transparent stop-gap evidence: hand-listed marker-panel ORA + directional battery table
+     (clearly labelled NOT Reactome) and combination-specificity overlaps.
+Outputs land in results/.  Run:  python3 analysis/run_full_pipeline.py
+"""
+import sys, os, json, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, pandas as pd
+
+import deseq_np as D
+from common import load_all, group_index, annotate, CONTRASTS
+from panels import PANELS
+from ora import enrich, load_gmt
+
+OUT = 'results'
+os.makedirs(OUT, exist_ok=True)
+LOG = []
+
+
+def log(*a):
+    s = ' '.join(str(x) for x in a)
+    print(s, flush=True)
+    LOG.append(s)
+
+
+t0 = time.time()
+cnt, labels, mapdf = load_all()
+labels = np.array(labels)
+samples = list(cnt.columns)
+X = cnt.values.astype(np.int64)
+log(f'[0] counts {X.shape} genes x samples; groups: '
+    f'{ {g: int((labels == g).sum()) for g in sorted(set(labels))} }')
+
+# ---------------------------------------------------------------- 1. differential expression
+all_zero = X.sum(1) == 0
+keep = ~all_zero
+ens = cnt.index.to_numpy()[keep]
+y = X[keep].astype(float)
+sf = D.size_factors(X)
+norm = y / sf[None, :]
+baseMean = norm.mean(1)
+bidx, labs = group_index(labels)
+beta, mu = D.group_beta_means(X[keep], sf, bidx)
+alpha_gene = D.mle_alpha(y, mu, D.mom_alpha(y, mu))
+gx, gy = D.dispersion_trend(alpha_gene, baseMean)
+alpha = D.shrink_alpha(y, mu, alpha_gene, gx, gy, baseMean)[0]
+log(f'[1] genes kept {int(keep.sum())} (dropped {int(all_zero.sum())} all-zero); '
+    f'baseMean>10 universe = {int((baseMean > 10).sum())}; '
+    f'size factors {sf.min():.2f}-{sf.max():.2f}; median dispersion gene-wise {np.median(alpha_gene):.4f} '
+    f'/ shrunk {np.median(alpha):.4f} ({time.time()-t0:.0f}s)')
+
+sym_map = pd.Series(mapdf['gene_name'].values, index=mapdf['ENSG'].values)
+lab2g = {g: int(bidx[np.where(labels == g)[0][0]]) for g in labs}
+tables = {}
+deg_counts = {}
+for name, (trt, ref) in CONTRASTS.items():
+    r = D.wald_contrast(y, mu, alpha, bidx, {lab2g[trt]: 1.0, lab2g[ref]: -1.0}, beta)
+    p = np.clip(r['pvalue'], 0, 1)
+    o = np.argsort(p); q = p[o] * len(p) / (np.arange(len(p)) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]; padj = np.empty_like(q); padj[o] = np.clip(q, 0, 1)
+    tab = pd.DataFrame({'ensg': ens, 'symbol': annotate(sym_map, ens), 'baseMean': baseMean,
+                        'log2FoldChange': r['log2FoldChange'], 'lfcSE': r['lfcSE'], 'stat': r['stat'],
+                        'pvalue': p, 'padj': padj,
+                        'mean_norm_trt': norm[:, labels == trt].mean(1),
+                        'mean_norm_ref': norm[:, labels == ref].mean(1)}).fillna({'symbol': ''})
+    tables[name] = tab
+    tab.to_csv(f'{OUT}/de_results_{name}.csv.gz', index=False, compression='gzip')
+    f = (tab.baseMean > 10) & (tab.log2FoldChange.abs() > 0.5) & (tab.pvalue < 0.05)
+    deg = tab[f]
+    up, dn = deg[deg.log2FoldChange > 0], deg[deg.log2FoldChange < 0]
+    comb = pd.concat([up, dn]).sort_values('pvalue')
+    comb = comb[comb.symbol != ''].drop_duplicates('symbol')
+    comb.to_csv(f'{OUT}/DEG_{name}.csv', index=False)
+    open(f'{OUT}/DEG_{name}_symbols.txt', 'w').write('\n'.join(sorted(set(comb.symbol))) + '\n')
+    fp = (tab.baseMean > 10) & (tab.log2FoldChange.abs() > 0.5) & (tab.padj < 0.05)
+    tab[fp][tab[fp].symbol != ''].drop_duplicates('symbol').to_csv(f'{OUT}/DEG_padj_{name}.csv', index=False)
+    deg_counts[name] = dict(universe=int((tab.baseMean > 10).sum()), DEG=int(len(comb)),
+                            DEG_raw_rows=int(len(deg)), up=int(len(up)), down=int(len(dn)),
+                            DEG_padj=int(tab[fp].shape[0]))
+    log(f'    {name:21s} universe={deg_counts[name]["universe"]:5d} DEG={deg_counts[name]["DEG"]:5d} '
+        f'(up {up.shape[0]} / down {dn.shape[0]})  [padj<0.05 variant {deg_counts[name]["DEG_padj"]}]')
+
+# ------------------------------------------------------- 2. calibration / robustness diagnostics
+from de_core import de_once
+idx_of = {s: i for i, s in enumerate(samples)}
+diag = {}
+diag['pseudo_null'] = []
+for a, b in [('Untreated', 'DMSO'), ('DMSO', 'DMSO_Serum_starvation'),
+             ('Untreated', 'Serum_starvation'), ('Cisplatin_IC50', 'CBD_IC50')]:
+    _, nd, ndf, _ = de_once(X, labels, [], a, b)
+    diag['pseudo_null'].append(dict(contrast=f'{a} vs {b}', DEG_nominal=nd, DEG_padj=ndf))
+diag['loo'] = [dict(dropped=s, **dict(zip(('DEG_nominal', 'DEG_padj'),
+                     de_once(X, labels, [idx_of[s]], 'Cisplatin_IC50_CBD_IC50', 'Untreated')[1:3])))
+               for s in ['9_2', '10_1', '3_1']]
+rng = np.random.default_rng(7)
+perm = [de_once(X, labels[rng.permutation(len(labels))], [], 'Cisplatin_IC50_CBD_IC50', 'Untreated')[1]
+        for _ in range(12)]
+diag['permutation_pseudo_DEG'] = perm
+diag['permutation_summary'] = dict(mean=float(np.mean(perm)), median=float(np.median(perm)),
+                                   max=int(np.max(perm)), observed=deg_counts['combo9_vs_Untreated']['DEG'])
+json.dump(diag, open(f'{OUT}/diagnostics.json', 'w'), indent=1)
+log(f'[2] pseudo-null control-vs-control DEGs: '
+    f'{[(d["contrast"], d["DEG_nominal"]) for d in diag["pseudo_null"]]}')
+log(f'    permutation null (12x): mean {diag["permutation_summary"]["mean"]:.0f}, '
+    f'median {diag["permutation_summary"]["median"]:.0f}, max {diag["permutation_summary"]["max"]} '
+    f'vs observed {diag["permutation_summary"]["observed"]} (uniform-p expectation ~826 x P|lfc|>0.5)')
+log(f'    leave-one-out DEG counts: {[(d["dropped"], d["DEG_nominal"]) for d in diag["loo"]]} '
+    f'(full model {deg_counts["combo9_vs_Untreated"]["DEG"]})  [{time.time()-t0:.0f}s]')
+
+# ------------------------------------------------------------------------ 3. enrichment step
+status = {}
+try:
+    import gseapy
+    status['gseapy'] = gseapy.__version__
+except Exception:
+    status['gseapy'] = None
+cands = [os.environ[v] for v in ('REACTOME_GMT', 'GSEAPY_GMT') if os.environ.get(v)]
+try:
+    r = __import__('subprocess').run(['find', '/', '-xdev', '-iname', '*.gmt', '-o', '-xdev',
+                                      '-iname', '*reactome*'], capture_output=True, text=True, timeout=180)
+    cands += [l for l in r.stdout.splitlines() if l.strip() and os.path.isfile(l)]
+except Exception as e:
+    log('    GMT sweep failed:', e)
+gmt = None
+for c in dict.fromkeys(cands):
+    try:
+        s = load_gmt(c)
+        if len(s) > 100:
+            gmt = (c, s); break
+    except Exception:
+        pass
+status['gmt'] = gmt[0] if gmt else None
+bg_expr = sorted(set(tables['combo9_vs_Untreated'].query('baseMean>10 and symbol != ""').symbol))
+if gmt is None:
+    status['outcome'] = ('ENRICHMENT_NOT_RUNNABLE: no gseapy package, no network, and no '
+                         'Reactome_2022 (or any) GMT gene-set library present on this runner. '
+                         'Reactome gene sets were NOT reconstructed from memory (forbidden). '
+                         'The DEG input lists for gseapy are ready in results/DEG_*_symbols.txt; '
+                         'export $REACTOME_GMT (Reactome_2022.gmt) or install gseapy and re-run '
+                         'analysis/run_enrichment.py / this script to complete step 3 unchanged.')
+    log('[3] ' + status['outcome'])
+else:
+    for name in ['combo9_vs_Untreated', 'combo9_vs_DMSO', 'combo9_vs_Cis', 'combo9_vs_CBD']:
+        syms = [l.strip() for l in open(f'{OUT}/DEG_{name}_symbols.txt') if l.strip()]
+        for bl, b in [('gseapy_default_library', None), ('expressed_universe', bg_expr)]:
+            df = enrich(syms, gmt[1], background=b, library_name='Reactome_2022')
+            df.to_csv(f'{OUT}/enrich_{name}_{bl}.csv', index=False)
+            log(f'[3] {name} ({bl}) top5: {df.Term.head(5).tolist()}')
+    status['outcome'] = 'ok'
+json.dump(status, open(f'{OUT}/enrichment_STATUS.json', 'w'), indent=1)
+
+# ----------------------------------------------- 4. transparent stop-gap evidence (NOT Reactome)
+spec = {}
+for c, single_ref in [('combo9_vs_Untreated', 'Untreated'), ('combo9_vs_DMSO', 'DMSO')]:
+    d = set(l.strip() for l in open(f'{OUT}/DEG_{c}_symbols.txt') if l.strip())
+    cis = set(l.strip() for l in open(f'{OUT}/DEG_Cis_vs_{single_ref}_symbols.txt') if l.strip())
+    cbd = set(l.strip() for l in open(f'{OUT}/DEG_CBD_vs_{single_ref}_symbols.txt') if l.strip())
+    spec[c] = dict(combo=len(d), cis=len(cis), cbd=len(cbd), combo_and_cis=len(d & cis),
+                   combo_and_cbd=len(d & cbd), combo_only=len(d - cis - cbd),
+                   jaccard_cis=round(len(d & cis) / len(d | cis), 3),
+                   jaccard_cbd=round(len(d & cbd) / len(d | cbd), 3),
+                   shared_between_the_two_controls=len(
+                       set(l.strip() for l in open(f'{OUT}/DEG_combo9_vs_Untreated_symbols.txt') if l.strip())
+                       & set(l.strip() for l in open(f'{OUT}/DEG_combo9_vs_DMSO_symbols.txt') if l.strip())))
+json.dump(spec, open(f'{OUT}/combo_specificity.json', 'w'), indent=1)
+log('[4] combination specificity: ' + json.dumps(spec['combo9_vs_Untreated']))
+
+rows = []
+for c in ['combo9_vs_Untreated', 'combo9_vs_DMSO', 'combo9_vs_Cis', 'combo9_vs_CBD',
+          'Cis_vs_Untreated', 'CBD_vs_Untreated', 'combo10_vs_DMSO_SS']:
+    syms = [l.strip() for l in open(f'{OUT}/DEG_{c}_symbols.txt') if l.strip()]
+    df = enrich(syms, PANELS, background=bg_expr, library_name='hand_listed_marker_panels_NOT_REACTOME')
+    df.insert(0, 'Contrast', c); rows.append(df)
+pd.concat(rows).to_csv(f'{OUT}/marker_panel_ORA.csv', index=False)
+bat = []
+for c in ['combo9_vs_Untreated', 'combo9_vs_DMSO', 'combo9_vs_Cis', 'combo9_vs_CBD',
+          'Cis_vs_Untreated', 'CBD_vs_Untreated', 'combo10_vs_DMSO_SS']:
+    t = tables[c].query('baseMean>10 and symbol != ""')
+    for pname, gl in PANELS.items():
+        s = t[t.symbol.isin(set(gl))]
+        if not len(s):
+            continue
+        d = (s.log2FoldChange.abs() > 0.5) & (s.pvalue < 0.05)
+        bat.append(dict(contrast=c, panel=pname, n=len(s), median_lfc=round(float(s.log2FoldChange.median()), 3),
+                        n_DEG=int(d.sum()), n_up=int(((s.log2FoldChange > 0.5) & (s.pvalue < 0.05)).sum()),
+                        n_down=int(((s.log2FoldChange < -0.5) & (s.pvalue < 0.05)).sum())))
+B = pd.DataFrame(bat)
+B.to_csv(f'{OUT}/battery_table.csv', index=False)
+piv = B.pivot(index='panel', columns='contrast', values='n_DEG')
+log('[4] marker-panel DEG support (NOT Reactome), panels ranked by combo-vs-DMSO support:')
+log(piv.sort_values('combo9_vs_DMSO', ascending=False).to_string())
+open(f'{OUT}/run_full_log.txt', 'w').write('\n'.join(LOG) + f'\n(total {time.time()-t0:.0f}s)\n')
+log(f'done in {time.time()-t0:.0f}s')

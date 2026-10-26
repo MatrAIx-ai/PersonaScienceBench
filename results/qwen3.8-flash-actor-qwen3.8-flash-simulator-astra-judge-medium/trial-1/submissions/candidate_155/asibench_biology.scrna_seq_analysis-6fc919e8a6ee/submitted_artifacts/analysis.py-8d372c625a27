@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Single-cell RNA-seq integrated analysis (NumPy/SciPy only).
+
+Pipeline (as approved):
+ 1. CPM (median-library scaling) + log1p normalization.
+ 2. HVG selection (mean-binned log-variance z-score) + PCA denoising.
+ 3. kNN graph in PCA space, shared-nearest-neighbour (SNN) re-normalization.
+ 4. Spectral clustering (k = n_clusters from system_info.json).
+ 5. Geodesic (Dijkstra) pseudotime from root (diameter endpoint with higher
+    local kNN density), min-max normalized to [0, 1].
+ 6. Markers: per-cluster Welch t vs rest; gene score = max over clusters;
+    top-50 unique indices, descending score, ties -> ascending index.
+ 7. Directed TF->TF GRN: per-target LASSO (FISTA, BIC lambda);
+    score[i, j] = |beta_ij| + 0.2 * |partial Spearman corr(i, j | other TFs)|,
+    edge i -> j, diagonal zero.
+Outputs: clusters.npy, pseudotime.npy, de_genes.json, grn_scores.npy,
+         method_choices.json, diagnostics.json
+"""
+import json
+import numpy as np
+from scipy.sparse import coo_matrix, csr_matrix, csgraph
+from scipy.sparse.csgraph import connected_components, dijkstra
+from scipy.cluster.vq import kmeans2
+from scipy.spatial.distance import cdist
+from scipy.stats import rankdata
+
+# ---------------------------------------------------------------- load inputs
+with open("data/system_info.json") as fh:
+    info = json.load(fh)
+counts = np.asarray(np.load("data/counts.npy"), dtype=np.float64)
+n_cells, n_genes = counts.shape
+assert n_cells == int(info["n_cells"]) and n_genes == int(info["n_genes"])
+n_clusters = int(info["n_clusters"])
+n_tf = int(info["n_tf_genes"])
+tf_idx = np.asarray(info.get("tf_gene_indices", list(range(n_tf))), dtype=int)
+
+# ------------------------------------------------------------- 1. normalize
+lib = counts.sum(axis=1)
+cpm = counts / lib[:, None] * np.median(lib)
+lg = np.log1p(cpm)
+
+# ------------------------------------------------------------- 2. HVG + PCA
+mean_g, var_g = lg.mean(axis=0), lg.var(axis=0)
+bins = np.array_split(np.argsort(mean_g), 20)
+hvg_score = np.zeros(n_genes)
+for b in bins:
+    v = np.log(var_g[b] + 1e-9)
+    hvg_score[b] = (v - v.mean()) / (v.std() + 1e-12)
+n_hvg = min(100, n_genes)
+hvg = np.sort(np.argsort(hvg_score)[-n_hvg:])
+X = lg[:, hvg]
+Xs = (X - X.mean(0)) / (X.std(0) + 1e-9)
+U, S, Vt = np.linalg.svd(Xs - Xs.mean(0), full_matrices=False)
+pcs = U * S
+var_expl = 100.0 * S**2 / np.sum(S**2)
+
+# -------------------------------------------------- 3. kNN + SNN graph utils
+def build_snn(P, k):
+    n = P.shape[0]
+    D = cdist(P, P)
+    knn = np.argsort(D, axis=1)[:, 1 : k + 1]
+    rows = np.repeat(np.arange(n), k)
+    cols = knn.ravel()
+    W = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n)).tocsr()
+    W = ((W + W.T) > 0).astype(np.float64)                # symmetrized kNN
+    A = (W @ W.T).toarray()                                # shared-NN counts
+    np.fill_diagonal(A, 0.0)
+    return A, D
+
+def ensure_connected(A, D):
+    """Connect SNN components with shortest PCA-space links (for Dijkstra)."""
+    A = A.copy()
+    ncomp, lab = connected_components(csr_matrix(A), directed=False)
+    links = []
+    while ncomp > 1:
+        best = None
+        for ci in range(ncomp):
+            for cj in range(ci + 1, ncomp):
+                i_idx, j_idx = np.where(lab == ci)[0], np.where(lab == cj)[0]
+                sub = D[np.ix_(i_idx, j_idx)]
+                p = np.unravel_index(np.argmin(sub), sub.shape)
+                if best is None or sub[p] < best[0]:
+                    best = (float(sub[p]), int(i_idx[p[0]]), int(j_idx[p[1]]))
+        d, i, j = best
+        A[i, j] = A[j, i] = max(A[i, j], 1.0)
+        links.append((i, j, d))
+        ncomp, lab = connected_components(csr_matrix(A), directed=False)
+    return A, links
+
+# ----------------------------------------------------- 4. spectral clustering
+def spectral_cluster(A, k, seed=0):
+    L = csgraph.laplacian(csr_matrix(A), normed=True).toarray()
+    w, V = np.linalg.eigh(L)
+    emb = V[:, :k]
+    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+    best_lab, best_obj = None, np.inf
+    for t in range(10):
+        cent, lab = kmeans2(np.ascontiguousarray(emb), k, seed=seed + t, minit="++")
+        lab = np.asarray(lab, dtype=np.int64)
+        obj = ((emb - cent[lab]) ** 2).sum()
+        if obj < best_obj:
+            best_obj, best_lab = obj, lab
+    return best_lab
+
+# ------------------------------------------------------------- main clustering
+K_NEIGH, N_PC = 15, 10
+A_main, D_pc = build_snn(pcs[:, :N_PC], K_NEIGH)
+A_main, comp_links = ensure_connected(A_main, D_pc)
+clusters = spectral_cluster(A_main, n_clusters).astype(np.int32)
+
+# ------------------------------------------------------------- 5. pseudotime
+def geodesic(A):
+    Wd = csr_matrix(np.where(A > 0, 1.0 / np.maximum(A, 1e-9), 0.0))
+    return dijkstra(Wd, directed=False, indices=None, return_predecessors=False)
+
+Geo = geodesic(A_main)
+flat = np.arange(n_cells)
+iu = np.triu_indices(n_cells, k=1)
+pair_pos = int(np.argmax(Geo[iu]))
+ia, ib = int(iu[0][pair_pos]), int(iu[1][pair_pos])   # geodesic diameter pair
+
+# local density = mean SNN weight within the k nearest PCA neighbours
+nbrs = np.argsort(D_pc, axis=1)[:, 1 : K_NEIGH + 1]
+dens = A_main[flat[:, None], nbrs].mean(axis=1)
+
+dens_ia, dens_ib = dens[clusters == clusters[ia]].mean(), dens[clusters == clusters[ib]].mean()
+root_cell, tip_cell = (ia, ib) if dens_ia >= dens_ib else (ib, ia)
+root_cluster = int(clusters[root_cell])
+tip_cluster = int(clusters[tip_cell])
+root_final = int(np.argmax(np.where(clusters == root_cluster, dens, -np.inf)))
+
+pt = Geo[root_final]
+pseudotime = np.clip((pt - pt.min()) / (pt.max() - pt.min() + 1e-12), 0.0, 1.0)
+pt_alt = Geo[tip_cell]
+pseudotime_alt = np.clip((pt_alt - pt_alt.min()) / (pt_alt.max() - pt_alt.min() + 1e-12), 0.0, 1.0)
+
+# ------------------------------------------------------------- 6. DE markers
+def welch_t(mat, mask_c):
+    a, b = mat[mask_c], mat[~mask_c]
+    n1, n2 = a.shape[0], b.shape[0]
+    se = np.sqrt(a.var(0, ddof=1) / n1 + b.var(0, ddof=1) / n2) + 1e-12
+    return (a.mean(0) - b.mean(0)) / se
+
+tmax = np.full(n_genes, -np.inf)
+for c in range(n_clusters):
+    tmax = np.maximum(tmax, np.abs(welch_t(lg, clusters == c)))
+order = np.lexsort((np.arange(n_genes), -tmax))
+de_indices = [int(g) for g in order[:50]]
+
+# ------------------------------------------------------------- 7. TF GRN
+def fista_lasso(Xf, y, lam, n_iter=1500, x0=None):
+    n, p = Xf.shape
+    step = 1.0 / (np.linalg.norm(Xf, 2) ** 2)
+    x = np.zeros(p) if x0 is None else x0.copy()
+    z, t = x.copy(), 1.0
+    for _ in range(n_iter):
+        xn = z - step * (Xf.T @ (Xf @ z - y))
+        xn = np.sign(xn) * np.maximum(np.abs(xn) - step * lam, 0.0)
+        tn = (1.0 + np.sqrt(1.0 + 4.0 * t * t)) / 2.0
+        z = xn + ((t - 1.0) / tn) * (xn - x)
+        x, t = xn, tn
+    return x
+
+TF = lg[:, tf_idx]
+TFz = (TF - TF.mean(0)) / (TF.std(0) + 1e-12)
+B = np.zeros((n_tf, n_tf))            # B[i, j] = |beta_i| in LASSO of target j
+lam_used = np.zeros(n_tf)
+for j in range(n_tf):
+    feats = [i for i in range(n_tf) if i != j]
+    Xf, y = TFz[:, feats], TFz[:, j]
+    lam_max = np.max(np.abs(Xf.T @ y)) / len(y)
+    grid = lam_max * np.geomspace(1.0, 1e-3, 25)
+    x_warm, best = None, (np.inf, None, 0.0)
+    for lam in grid:
+        x_warm = fista_lasso(Xf, y, lam, x0=x_warm)
+        rss = float(np.sum((y - Xf @ x_warm) ** 2))
+        df = int(np.sum(np.abs(x_warm) > 1e-8))
+        bic = len(y) * np.log(rss / len(y) + 1e-12) + df * np.log(len(y))
+        if bic < best[0]:
+            best = (bic, x_warm.copy(), float(lam))
+    lam_used[j] = best[2]
+    B[np.ix_(feats, [j])] = np.abs(best[1])[:, None]
+
+R = np.corrcoef(np.column_stack([rankdata(TF[:, i]) for i in range(n_tf)]).T)
+Pm = np.linalg.pinv(R)
+den = np.sqrt(np.outer(np.diag(Pm), np.diag(Pm))) + 1e-12
+pcorr = np.clip(np.abs(-Pm / den), 0.0, 1.0)
+
+W_PARTIAL = 0.2                        # heuristic tie-breaker weight (assumption)
+grn = B + W_PARTIAL * pcorr
+np.fill_diagonal(grn, 0.0)
+grn = np.asarray(grn, dtype=np.float64)
+
+# ------------------------------------------------- robustness / stability check
+def ari(l1, l2):
+    u1, u2 = np.unique(l1), np.unique(l2)
+    M = np.zeros((len(u1), len(u2)))
+    for a_ in range(len(u1)):
+        for b_ in range(len(u2)):
+            M[a_, b_] = np.sum((l1 == u1[a_]) & (l2 == u2[b_]))
+    C = lambda m: np.sum(m * (m - 1) / 2.0)
+    s_ab = C(M)
+    s_a = C(M.sum(axis=1))
+    s_b = C(M.sum(axis=0))
+    n = M.sum()
+    cn2 = n * (n - 1) / 2.0
+    expected = s_a * s_b / cn2
+    denom = 0.5 * (s_a + s_b) - expected
+    return 1.0 if abs(denom) < 1e-12 else float((s_ab - expected) / denom)
+
+stab = {}
+ref = clusters.astype(np.int64)
+for npc in (5, 10):
+    for kk in (10, 15, 20):
+        Ak, Dk = build_snn(pcs[:, :npc], kk)
+        Ak, _ = ensure_connected(Ak, Dk)
+        labk = spectral_cluster(Ak, n_clusters).astype(np.int64)
+        stab[f"npc{npc}_k{kk}"] = round(ari(ref, labk), 3)
+
+# ----------------------------------------------------------- save + validate
+clusters_out = np.asarray(clusters, dtype=np.int32)
+assert clusters_out.shape == (n_cells,) and clusters_out.min() >= 0 and clusters_out.max() < n_clusters
+pseudotime_out = np.asarray(pseudotime, dtype=np.float64)
+assert pseudotime_out.shape == (n_cells,) and np.isfinite(pseudotime_out).all()
+assert pseudotime_out.min() >= 0.0 and pseudotime_out.max() <= 1.0
+assert len(de_indices) == len(set(de_indices))
+assert all(isinstance(g, int) and 0 <= g < n_genes for g in de_indices)
+assert grn.shape == (n_tf, n_tf) and np.isfinite(grn).all() and (grn >= 0).all()
+np.testing.assert_allclose(np.diag(grn), 0.0)
+
+np.save("clusters.npy", clusters_out)
+np.save("pseudotime.npy", pseudotime_out)
+with open("de_genes.json", "w") as fh:
+    json.dump({"gene_indices": de_indices}, fh, indent=2)
+np.save("grn_scores.npy", grn)
+
+method_choices = {
+    "normalization": {"method": "CPM to median library size + log1p",
+                      "justification": "library sizes vary 901-3992; log1p stabilizes count variance."},
+    "feature_selection": {"method": "top-100 HVG by mean-binned (20 bins) z-scored log variance",
+                          "justification": "denoising; DE scoring still uses all 250 genes."},
+    "dimensionality_reduction": {"method": "PCA (SVD) on z-scored HVGs, first 10 PCs",
+                                 "justification": "spectrum flat (PC1 ~8.6%); PC10 heuristic, stability checked over n_PC in {5,10}."},
+    "graph_construction": {"method": "symmetrized kNN (k=15) in PC space re-normalized by shared-nearest-neighbour counts; disconnected components linked by nearest PCA pairs",
+                           "justification": "SNN corrects density heterogeneity; connectivity needed for geodesics."},
+    "clustering": {"method": "spectral clustering (Ng-Jordan-Weiss), k=4",
+                   "justification": "k = n_clusters from public metadata; spectral splits chain-like structure, unlike Euclidean k-means (which spuriously favored k=2, silhouette 0.41 vs 0.32)."},
+    "pseudotime": {"method": "Dijkstra geodesic on 1/SNN-weight edge lengths from root cell; min-max normalized to [0,1]",
+                   "root_selection": "diameter = cell pair with maximal geodesic distance; endpoint whose cluster has higher mean local density (mean SNN weight to its 15 PCA neighbours; heuristic: dense = early proliferating state) gives the root region; root cell = densest cell in that endpoint's cluster. Orientation is assumption-based (no time labels).",
+                   "reflection_check": "pseudotime_alt from opposite endpoint reported in diagnostics.json; sensitivity expected to be reflection-only."},
+    "marker_genes": {"method": "Welch t-statistic per cluster vs rest on log1p-CPM over all 250 genes; gene score = max |t| over clusters; top-50 unique indices ranked by descending score, ties by ascending index",
+                     "justification": "ranked marker POOL aggregated over ALL clusters, not a single cluster; plain Python ints in 0..249, deduplicated."},
+    "grn": {"method": "per-target LASSO (FISTA) on z-scored log1p-CPM TF columns 0-19, lambda on 25-point geometric grid chosen by BIC; score[i,j] = |beta_i->j| + 0.2 * |partial Spearman corr(i,j | remaining TFs)| from rank precision matrix; diagonal = 0",
+            "justification": "direction given by regression target j (conditional, asymmetric); symmetric partial-correlation term keeps matrix dense, non-negative, continuous so LASSO zeros do not collapse ranking.",
+            "assumption": "0.2 weight of the partial-correlation term is heuristic, not tuned against ground truth."},
+    "robustness": {"method": "ARI of each clustering (k in {10,15,20} x n_PC in {5,10}) vs main solution (k=15, n_PC=10)",
+                   "agreement_ari": stab},
+}
+with open("method_choices.json", "w") as fh:
+    json.dump(method_choices, fh, indent=2)
+
+diag = {
+    "cluster_sizes": [int(x) for x in np.bincount(clusters, minlength=n_clusters)],
+    "var_explained_first5_pc_pct": [round(float(v), 2) for v in var_expl[:5]],
+    "diameter_pair_cells": [ia, ib],
+    "root_cell": root_final, "root_cluster": root_cluster,
+    "tip_cell": int(tip_cell), "tip_cluster": tip_cluster,
+    "component_links_added": comp_links,
+    "pseudotime_mean_by_cluster": [round(float(pseudotime[clusters == c].mean()), 3) for c in range(n_clusters)],
+    "spearman_pt_vs_1_minus_pt_alt": round(float(np.corrcoef(rankdata(pseudotime), rankdata(-pseudotime_alt))[0, 1]), 4),
+    "spearman_pt_vs_pt_alt": round(float(np.corrcoef(rankdata(pseudotime), rankdata(pseudotime_alt))[0, 1]), 4),
+    "lasso_nonzero_frac": round(float(np.mean(B > 0)), 3),
+    "grn_stats": {"min": round(float(grn.min()), 4), "max": round(float(grn.max()), 4),
+                  "mean": round(float(grn.mean()), 4),
+                  "exact_zeros_offdiag": int(np.sum((grn == 0) & ~np.eye(n_tf, dtype=bool)))},
+    "stability_ari": stab,
+    "top10_de_genes": de_indices[:10],
+    "top10_de_abs_t": [round(float(tmax[g]), 2) for g in de_indices[:10]],
+}
+with open("diagnostics.json", "w") as fh:
+    json.dump(diag, fh, indent=2)
+
+print(json.dumps(diag, indent=2))
+print("Saved: clusters.npy pseudotime.npy de_genes.json grn_scores.npy method_choices.json diagnostics.json")

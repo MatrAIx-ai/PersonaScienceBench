@@ -1,0 +1,262 @@
+"""
+NLS: At what SES levels is the Black-vs-White position in BA completion comparatively best?
+
+Design (pre-specified, see plan):
+  * Outcome  : BA DEGREE COMPLETED (bool -> 0/1). Only outcome column in the file.
+  * Strata   : full-sample SES quartiles (primary), + tertiles/quintiles, pooled upper-half,
+               top quartile, and SES>1.0 (support/sensitivity only).
+  * Contrast : Black vs White (Hispanic a model covariate, descriptive only)
+               risk difference (pp) and risk ratio, unadjusted AND adjusted.
+  * Adjusted : logistic  BA ~ SES quartile * Black + Hispanic + ASVAB_z + classPct_z + Female + FamSize_z
+               adjusted rates by g-computation (race flipped, own covariates), stratified bootstrap CIs.
+  * Gradient : within-race SES slope (logit, per 1 SD) + high-vs-low quartile contrast.
+  * Robustness: Firth penalized logistic, common-support restriction, Hispanic pooled with White.
+"""
+import sys, json, numpy as np, pandas as pd
+sys.path.insert(0, "analysis")
+from stats_lib import wilson, newcombe_rd_ci, rr_and_ci, fisher_p, irls_logit, firth_logit, predict
+from scipy import stats
+
+pd.set_option("display.width", 250); pd.set_option("display.max_columns", 60)
+RNG = np.random.default_rng(20261022)
+NBOOT = 1000
+
+df = pd.read_csv("data/nls_ses_processed.csv")
+RACE, BA, SES, ASVAB, PCT, FAM = ("SAMPLE_RACE", "BA DEGREE COMPLETED", "SES",
+    "ABILITY: COMPOSITE OF ASVAB SCORE", "PERCENTILE IN CLASS", "FAMILY SIZE OF SAMPLE")
+d = pd.DataFrame({
+    "ba": df[BA].astype(int).to_numpy(),
+    "black": (df[RACE] == "Black").astype(int).to_numpy(),
+    "hisp": (df[RACE] == "Hispanic").astype(int).to_numpy(),
+    "white": (df[RACE] == "White").astype(int).to_numpy(),
+    "ses": df[SES].to_numpy(),
+    "asvab_z": ((df[ASVAB] - df[ASVAB].mean())/df[ASVAB].std()).to_numpy(),
+    "pct_z": ((df[PCT] - df[PCT].mean())/df[PCT].std()).to_numpy(),
+    "female": (df["SAMPLE_SEX"] == "Female").astype(int).to_numpy(),
+    "fam_z": ((df[FAM] - df[FAM].mean())/df[FAM].std()).to_numpy(),
+})
+SD_SES = d.ses.std()
+Q_EDGES = np.quantile(d.ses, [0, .25, .5, .75, 1.0])          # fixed, full sample
+D_EDGES = np.quantile(d.ses, [0, .2, .4, .6, .8, 1.0])
+T_EDGES = np.quantile(d.ses, [0, 1/3, 2/3, 1.0])
+d["q"] = np.clip(np.searchsorted(Q_EDGES[1:-1], d.ses, side="right"), 0, 3)   # 0..3 = Q1..Q4
+
+def region_masks(d, k=4, edges=None):
+    """label -> boolean mask for every contrast region we report."""
+    ed = Q_EDGES if edges is None else edges
+    s = d.ses.to_numpy()
+    m = {f"Q{i+1} (SES {lo:.2f} to {hi:.2f}]": (d.q.to_numpy() == i) for i, (lo, hi)
+         in enumerate(zip(ed[:-1], ed[1:]))}
+    m["Upper half (SES >= median %.2f)" % ed[2]] = s >= ed[2]
+    m["Top quartile (SES >= %.2f)" % ed[3]] = s >= ed[3]   # 4-level primary view
+    m["Bottom half (SES < median)"] = s < ed[2]
+    m["SES > +1.0 (extreme, support only)"] = s > 1.0
+    m["Full sample"] = np.ones(len(d), bool)
+    return m
+
+# ---------------- unadjusted ----------------
+def unadjusted(d, masks):
+    rows = []
+    for lab, m in masks.items():
+        sub = d[m]
+        kb, nb = int(sub.ba[sub.black == 1].sum()), int(sub.black.sum())
+        kw, nw = int(sub.ba[sub.white == 1].sum()), int(sub.white.sum())
+        kh, nh = int(sub.ba[sub.hisp == 1].sum()), int(sub.hisp.sum())
+        rd = kb/nb - kw/nw
+        rlo, rhi = newcombe_rd_ci(kb, nb, kw, nw)
+        rr, rl, rh = rr_and_ci(kb, nb, kw, nw)
+        rows.append(dict(region=lab, n_black=nb, ev_black=kb, rate_black=100*kb/nb,
+                         rate_black_lo=100*wilson(kb, nb)[0], rate_black_hi=100*wilson(kb, nb)[1],
+                         n_white=nw, ev_white=kw, rate_white=100*kw/nw,
+                         rate_white_lo=100*wilson(kw, nw)[0], rate_white_hi=100*wilson(kw, nw)[1],
+                         n_hisp=nh, ev_hisp=kh, rate_hisp=100*kh/nh if nh else np.nan,
+                         RD_pp=100*rd, RD_lo=100*rlo, RD_hi=100*rhi,
+                         RR=rr, RR_lo=rl, RR_hi=rh, fisher_p=fisher_p(kb, nb, kw, nw)))
+    return pd.DataFrame(rows)
+
+# ---------------- adjusted model ----------------
+COVS = ["asvab_z", "pct_z", "female", "fam_z"]
+
+def model_matrix(dd, include_hisp=True):
+    """[const, Q2,Q3,Q4, Black, (Hispanic), Black*Q2..4] + covariates."""
+    q = dd.q.to_numpy(); b = dd.black.to_numpy().astype(float)
+    names = ["const", "Q2", "Q3", "Q4", "Black"]
+    cols = [np.ones(len(dd))] + [(q == i).astype(float) for i in (1, 2, 3)] + [b]
+    if include_hisp:
+        names.append("Hispanic"); cols.append(dd.hisp.to_numpy().astype(float))
+    for i in (1, 2, 3):
+        names.append(f"Black:Q{i+1}"); cols.append(b*(q == i).astype(float))
+    names += COVS; cols += [dd[c].to_numpy(float) for c in COVS]
+    return np.column_stack(cols), names
+
+def fit(dd, include_hisp=True):
+    X, names = model_matrix(dd, include_hisp)
+    return irls_logit(X, dd.ba.to_numpy(float)), names
+
+def flip(beta, names, dd, mask, black_val):
+    """g-computation: mean predicted prob in rows(mask) with Black flipped to black_val."""
+    sub = dd[mask]
+    X, _ = model_matrix(sub, include_hisp=("Hispanic" in names))
+    q = sub.q.to_numpy()
+    X[:, names.index("Black")] = float(black_val)
+    for i in (1, 2, 3):
+        X[:, names.index(f"Black:Q{i+1}")] = (q == i)*float(black_val)
+    if "Hispanic" in names:
+        X[:, names.index("Hispanic")] = 0.0     # reference row = White (Hispanic = 0)
+    return 100*float(predict(beta, X).mean())
+
+def adjusted(d, masks, beta, names):
+    rows = []
+    for lab, m in masks.items():
+        ab = flip(beta, names, d, m, 1); aw = flip(beta, names, d, m, 0)
+        rows.append(dict(region=lab, adj_rate_black=ab, adj_rate_white=aw,
+                         adj_RD_pp=ab-aw, adj_RR=ab/aw if aw > 0 else np.nan))
+    return pd.DataFrame(rows)
+
+def boot_adjusted(d, masks, nboot=NBOOT):
+    """Stratified bootstrap: resample within race x SES-quartile cells (cell sizes fixed)."""
+    labs = list(masks.keys())
+    keys = (d.black.to_numpy()*2 + d.white.to_numpy())*4 + d.q.to_numpy()   # 0=Hisp,1=White,2=Black
+    cells = [np.flatnonzero(keys == k) for k in np.unique(keys) if (keys == k).sum() > 0]
+    out = {l: [] for l in labs}
+    arr = {c: d[c].to_numpy() for c in ["ba", "black", "hisp", "white", "ses",
+                                        "asvab_z", "pct_z", "female", "fam_z", "q"]}
+    ok = 0
+    for r in range(nboot):
+        idx = np.concatenate([RNG.choice(c, c.size, replace=True) for c in cells])
+        bs = pd.DataFrame({k: v[idx] for k, v in arr.items()})
+        beta, names_b = fit(bs)
+        msk = {l: masks[l][idx] for l in labs}
+        good = True
+        for l in labs:
+            ab, aw = flip(beta, names_b, bs, msk[l], 1), flip(beta, names_b, bs, msk[l], 0)
+            v = [ab, aw, ab-aw, ab/aw if aw > 0 else np.nan]
+            out[l].append(v); good &= np.isfinite(v).all()
+        ok += int(good)
+    rows = []
+    for l in labs:
+        A = np.array(out[l])
+        rows.append(dict(region=l,
+                         adj_rate_black_lo=np.percentile(A[:, 0], 2.5), adj_rate_black_hi=np.percentile(A[:, 0], 97.5),
+                         adj_rate_white_lo=np.percentile(A[:, 1], 2.5), adj_rate_white_hi=np.percentile(A[:, 1], 97.5),
+                         adj_RD_lo=np.percentile(A[:, 2], 2.5), adj_RD_hi=np.percentile(A[:, 2], 97.5),
+                         adj_RR_lo=np.percentile(A[:, 3], 2.5), adj_RR_hi=np.percentile(A[:, 3], 97.5),
+                         boot_p_RD_le0=float(np.mean(A[:, 2] <= 0)), boot_p_RR_le1=float(np.mean(A[:, 3] <= 1)),
+                         n_boot=len(A), n_boot_ok=ok))
+    return pd.DataFrame(rows)
+
+# ---------------- gradients ----------------
+def logit_slope(y, x):
+    X = np.column_stack([np.ones(len(x)), x])
+    b = irls_logit(X, y.astype(float), ridge=1e-4)
+    mu = predict(b, X); W = mu*(1-mu)
+    cov = np.linalg.inv(X.T @ (X*W[:, None]) + 1e-6*np.eye(2))
+    return b[1], np.sqrt(cov[1, 1])
+
+def gradients(d):
+    rows = []
+    for race, col in [("Black", "black"), ("White", "white"), ("Hispanic", "hisp")]:
+        s = d[d[col] == 1]
+        sl, se = logit_slope(s.ba.to_numpy(), (s.ses.to_numpy() - d.ses.mean())/SD_SES)
+        lo_q, hi_q = s[s.q == 0], s[s.q == 3]
+        k1, n1 = int(hi_q.ba.sum()), len(hi_q); k0, n0 = int(lo_q.ba.sum()), len(lo_q)
+        rd = k1/n1 - k0/n0; rlo, rhi = newcombe_rd_ci(k1, n1, k0, n0)
+        rr, rl, rh = rr_and_ci(k1, n1, k0, n0)
+        qv = s.q.to_numpy(); sc = np.arange(4)
+        nq = np.array([(qv == i).sum() for i in sc], float)
+        eq = np.array([s.ba[qv == i].sum() for i in sc], float)
+        p_bar = eq.sum()/nq.sum(); qbar = np.sum(nq*sc)/nq.sum()
+        den = np.sqrt(p_bar*(1-p_bar)*np.sum(nq*(sc-qbar)**2))
+        z_tr = np.sum(nq*(sc-qbar)*(eq/nq - p_bar))/den if den > 0 else np.nan
+        rows.append(dict(race=race, n=len(s), events=int(s.ba.sum()),
+                         logit_slope_per_SD=sl, slope_se=se, OR_per_SD=np.exp(sl),
+                         OR_lo=np.exp(sl-1.96*se), OR_hi=np.exp(sl+1.96*se),
+                         low_q_rate=100*k0/n0, high_q_rate=100*k1/n1,
+                         high_minus_low_pp=100*rd, hml_lo=100*rlo, hml_hi=100*rhi,
+                         high_over_low=rr, hol_lo=rl, hol_hi=rh,
+                         trend_z=z_tr, trend_p=2*(1-stats.norm.cdf(abs(z_tr)))))
+    return pd.DataFrame(rows)
+
+def interaction_test(d, firth=False):
+    """BA ~ ses_z * Black + Hispanic + covariates: does the Black-White logit gap change with SES?"""
+    z = (d.ses.to_numpy() - d.ses.mean())/SD_SES
+    b = d.black.to_numpy().astype(float)
+    cols = [np.ones(len(d)), z, b, z*b, d.hisp.to_numpy(float)] + [d[c].to_numpy(float) for c in COVS]
+    X = np.column_stack(cols)
+    names = ["const", "ses_z", "Black", "Black:ses_z", "Hispanic"] + COVS
+    beta = firth_logit(X, d.ba.to_numpy(float))[0] if firth else irls_logit(X, d.ba.to_numpy(float))
+    mu = predict(beta, X); W = mu*(1-mu)
+    se = np.sqrt(np.diag(np.linalg.inv(X.T @ (X*W[:, None]) + 1e-8*np.eye(X.shape[1]))))
+    return dict(zip(names, beta)), dict(zip(names, se)), dict(zip(names, beta/se))
+
+# ---------------- run ----------------
+masks = region_masks(d)
+una = unadjusted(d, masks)
+beta, names = fit(d)
+X, names_f = model_matrix(d)
+beta_f, _fr = firth_logit(X, d.ba.to_numpy(float))
+adj = adjusted(d, masks, beta, names)
+adj_f = adjusted(d, masks, beta_f, names_f)
+boot = boot_adjusted(d, masks)
+res = pd.concat([una, adj.drop(columns="region"), boot.drop(columns="region")], axis=1)
+grad = gradients(d)
+coefs = pd.DataFrame({"term": names, "beta": beta, "OR": np.exp(beta)})
+inter_b, inter_se, inter_z = interaction_test(d)
+inter_f, _, _ = interaction_test(d, firth=True)
+
+print("=" * 110)
+print("A. UNADJUSTED race x SES strata (Black vs White; Hispanic descriptive). Rates in %.")
+print(res[["region", "n_black", "ev_black", "rate_black", "n_white", "ev_white", "rate_white",
+           "RD_pp", "RD_lo", "RD_hi", "RR", "RR_lo", "RR_hi", "fisher_p", "rate_hisp"]].round(3).to_string(index=False))
+print("\nA2. Wilson 95% CIs on stratum rates (%).")
+print(res[["region", "rate_black", "rate_black_lo", "rate_black_hi", "rate_white", "rate_white_lo", "rate_white_hi"]].round(2).to_string(index=False))
+print("\n" + "=" * 110)
+print("B. ADJUSTED contrasts: g-computed rates from logistic (Black x SES quartile + Hispanic + ASVAB + class% + sex + family size)")
+print(pd.concat([res[["region"]], adj.drop(columns="region").round(3),
+                 boot.drop(columns=["region", "n_boot", "n_boot_ok"]).round(3)], axis=1).to_string(index=False))
+print("\nB2. Firth penalized-likelihood sensitivity (adjusted):")
+print(pd.concat([res[["region"]], adj_f[["adj_rate_black", "adj_rate_white", "adj_RD_pp", "adj_RR"]].round(3)], axis=1).to_string(index=False))
+print("\n" + "=" * 110)
+print("C. WITHIN-RACE SES GRADIENT (slope per 1 SD of SES = %.3f)" % SD_SES)
+print(grad.round(3).to_string(index=False))
+print("\nD. Black x SES(z) interaction on the logit scale (adjusted for Hispanic + covariates):")
+print(pd.DataFrame({"term": ["ses_z", "Black", "Black:ses_z"],
+                    "beta": [inter_b["ses_z"], inter_b["Black"], inter_b["Black:ses_z"]],
+                    "se": [inter_se["ses_z"], inter_se["Black"], inter_se["Black:ses_z"]],
+                    "z": [inter_z["ses_z"], inter_z["Black"], inter_z["Black:ses_z"]],
+                    "beta_firth": [inter_f["ses_z"], inter_f["Black"], inter_f["Black:ses_z"]]}).round(4).to_string(index=False))
+print("\nMain adjusted model coefficients:")
+print(coefs.round(4).to_string(index=False))
+res.to_csv("analysis/results_strata.csv", index=False)
+grad.to_csv("analysis/results_gradient.csv", index=False)
+coefs.to_csv("analysis/results_model.csv", index=False)
+
+# ---------------- sensitivity ----------------
+print("\n" + "=" * 110)
+print("E. SENSITIVITY")
+cs = d[(d.ses >= -1.5) & (d.ses <= 1.5)].reset_index(drop=True)
+print("common support SES in [-1.5,+1.5]: n=%d | Black %d obs / %d events | White %d obs / %d events" %
+      (len(cs), cs.black.sum(), cs.ba[cs.black == 1].sum(), cs.white.sum(), cs.ba[cs.white == 1].sum()))
+mcs = region_masks(cs)
+bs_cs, ns_cs = fit(cs)
+r_cs = pd.concat([unadjusted(cs, mcs), adjusted(cs, mcs, bs_cs, ns_cs).drop(columns="region")], axis=1)
+print(r_cs[["region", "n_black", "ev_black", "rate_black", "n_white", "ev_white", "rate_white",
+            "RD_pp", "RR", "adj_rate_black", "adj_rate_white", "adj_RD_pp", "adj_RR"]].round(3).to_string(index=False))
+d2 = d.copy(); d2["hisp"] = 0
+b2, n2 = fit(d2, include_hisp=False)
+print("\nHispanic pooled WITH White as reference -> adjusted contrast:")
+print(adjusted(d2, masks, b2, n2)[["region", "adj_rate_black", "adj_rate_white", "adj_RD_pp", "adj_RR"]].round(3).to_string(index=False))
+for nm, ed in [("quintile", D_EDGES), ("tertile", T_EDGES)]:
+    d3 = d.copy(); d3["q"] = np.clip(np.searchsorted(ed[1:-1], d3.ses, side="right"), 0, len(ed)-2)
+    kk = len(ed)-1
+    t = unadjusted(d3, {k: v for k, v in region_masks(d3, kk, ed).items() if k.startswith("Q")})
+    print(f"\n{nm}-level unadjusted (edges {np.round(ed, 2).tolist()}):")
+    print(t[["region", "n_black", "ev_black", "rate_black", "n_white", "ev_white", "rate_white",
+             "RD_pp", "RD_lo", "RD_hi", "RR", "RR_lo", "RR_hi"]].round(3).to_string(index=False))
+json.dump({"SD_SES": float(SD_SES), "Q_EDGES": Q_EDGES.tolist(),
+           "interaction_Black_by_sesz": float(inter_b["Black:ses_z"]),
+           "interaction_se": float(inter_se["Black:ses_z"]),
+           "interaction_z": float(inter_z["Black:ses_z"]),
+           "interaction_beta_firth": float(inter_f["Black:ses_z"]),
+           "NBOOT": NBOOT}, open("analysis/scalars.json", "w"), indent=1)
+print("\nwrote analysis/results_strata.csv, results_gradient.csv, results_model.csv, scalars.json")

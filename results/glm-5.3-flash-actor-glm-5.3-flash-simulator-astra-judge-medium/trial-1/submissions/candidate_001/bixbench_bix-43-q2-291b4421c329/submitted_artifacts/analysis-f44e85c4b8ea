@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""BixBench bix-43-q2: DE (CBD/cisplatin combination vs DMSO) + Reactome_2022 enrichment.
+DE = DESeq2-equivalent NB GLM on ALL 30 samples, design ~ group (10 levels),
+contrast Group9 (Cisplatin_IC50_CBD_IC50) vs Group3 (DMSO). Median-of-ratios size
+factors, method-of-moments -> trended -> Cox-Reid gene-wise MLE + MAP-shrinkage
+dispersions, Wald test. Filters: p<0.05, |log2FC|>0.5, baseMean>10.
+Enrichment: (1) gseapy.enrichr w/ Reactome_2022; (2) fallback: Enrichr GMT download;
+(3) offline fallback: curated p53 cell-cycle set + Enrichr-style 2x2 OR."""
+import csv, json, math, os, urllib.request
+import numpy as np, pandas as pd
+from scipy import optimize, special, stats
+
+OUT = "/workspace/out"; os.makedirs(OUT, exist_ok=True)
+LOG = []
+def log(m):
+    print(m, flush=True); LOG.append(str(m))
+
+# ---------------------------------------------------------------- load inputs
+with open("/workspace/data/counts_raw_unfiltered.csv") as f:
+    rd = csv.reader(f); header = next(rd)
+    samples = [c.strip('"') for c in header[1:]]
+    ids = []; rows = []
+    for row in rd:
+        ids.append(row[0]); rows.append([float(x) for x in row[1:]])
+Y_all = np.array(rows); ids = np.array(ids)
+layout = {}
+with open("/workspace/data/sample_layout.csv") as f:
+    for r in csv.DictReader(f):
+        layout[r["SampleID"].strip().replace("-", "_")] = r["Group"].strip()
+gnum = np.array([int(s.split("_")[0]) for s in samples])
+gname = [layout[s] for s in samples]
+log(f"counts: {Y_all.shape[0]} genes x {Y_all.shape[1]} samples; groups: "
+    f"{sorted(set(zip(gnum, [layout[s] for s in samples])))}")
+
+COMBO, DMSO = 9, 3
+# design: intercept + dummies for groups 2..10 (reference = group 1)
+n = len(samples); G0 = Y_all.shape[0]
+D = np.zeros((n, 9))
+for j, g in enumerate(range(2, 11)):
+    D[:, j] = (gnum == g).astype(float)
+X = np.column_stack([np.ones(n), D])          # (30, 10)
+i_g1 = 1 + (1 - 1); i_g3 = 1 + (3 - 1); i_g9 = 1 + (9 - 1)   # columns for groups 1,3,9
+contrast = np.zeros(10); contrast[i_g9] = 1; contrast[i_g3] = -1
+np.savez(f"{OUT}/stage_inputs.npz", Y_all=Y_all, ids=ids, X=X, gnum=gnum,
+         contrast=contrast, samples=np.array(samples))
+
+# ------------------------------------------------- median-of-ratios size factors
+gm = np.exp(np.mean(np.log(Y_all + 0.5), axis=1))
+ref = gm > 0
+rat = Y_all[ref] / gm[ref][:, None]
+sf = np.array([np.median(rat[:, j][rat[:, j] > 0]) for j in range(rat.shape[1])])
+sf = sf / np.exp(np.mean(np.log(sf)))
+log("size factors (30 samples): " + str(np.round(sf, 4).tolist()))
+
+norm = Y_all / sf[None, :]
+base_mean = norm.mean(1)
+keep = base_mean > 10
+log(f"genes with baseMean>10: {int(keep.sum())} of {G0}")
+Yk = Y_all[keep]; bmk = base_mean[keep]; G = Yk.shape[0]
+off = np.log(sf)[None, :]
+np.savez(f"{OUT}/stage1.npz", Yk=Yk, bmk=bmk, kept_ids=ids[keep], sf=sf)
+
+# ---------------------------------------------------------- vectorized NB IRLS
+def fit_beta(y, alpha, X, off, beta0, ridge=1e-6, iters=60, tol=1e-10):
+    G, n = y.shape; p = X.shape[1]
+    beta = beta0.copy()
+    Xt = X.T
+    for _ in range(iters):
+        mu = np.exp(beta @ Xt + off)
+        w = mu / (1.0 + alpha[:, None] * mu)
+        z = np.log(mu) - off + (y - mu) / mu
+        WX = w[:, :, None] * X[None, :, :]
+        A = np.einsum('gni,nj->gij', WX, X)
+        A += np.eye(p)[None] * ridge
+        b = np.einsum('gni,gn->gi', WX, z)
+        beta_new = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+        if np.max(np.abs(beta_new - beta) / (1 + np.abs(beta))) < tol:
+            beta = beta_new; break
+        beta = beta_new
+    return beta
+
+def nb_loglik(y, mu, alpha, cr=None):
+    a = alpha[:, None]
+    ll = (special.gammaln(y + 1.0 / a) - special.gammaln(1.0 / a)
+          - special.gammaln(y + 1.0)
+          + y * (np.log(a) + np.log(mu) - np.log1p(a * mu))
+          - np.log1p(a * mu) / a)
+    out = ll.sum(1)
+    if cr == "det":
+        w = mu / (1.0 + alpha[:, None] * mu)
+        WX = w[:, :, None] * X[None, :, :]
+        A = np.einsum('gni,nj->gij', WX, X)
+        out -= 0.5 * np.linalg.slogdet(A)[1]
+    return out
+
+np.savez(f"{OUT}/stage1b.npz", X=X, off=off)
+
+# ------------------------------------------------------ dispersion estimation
+G, n = Yk.shape; p = X.shape[1]
+m0 = Yk[:, gnum[idx0] == 1] if False else None
+gmean = np.maximum(Yk.mean(1), 0.5)
+beta_init = np.zeros((G, p))
+beta_init[:, 0] = np.log(gmean) - off[0, 0]
+
+beta_p = fit_beta(Yk, np.zeros(G), X, off, beta_init)      # Poisson start
+mu_p = np.exp(beta_p @ X.T + off)
+res2 = ((Yk - mu_p) ** 2).sum(1); s1 = mu_p.sum(1); s2 = (mu_p ** 2).sum(1)
+alpha_mom = np.maximum((res2 - s1) / np.maximum(s2, 1e-12), 1e-8)
+log(f"MoM dispersion: median={np.median(alpha_mom):.4g}")
+
+lm = np.log(np.maximum(mu_p.mean(1), 1e-3)); la = np.log(alpha_mom)
+def trend_resid(pp):
+    return la - np.log(np.exp(pp[0]) / np.maximum(np.exp(lm), 1e-3) + np.exp(pp[1]))
+try:
+    tr = optimize.least_squares(trend_resid, x0=[0.0, np.log(np.exp(la).mean() / 2 + 1e-3)])
+    a1, a0 = np.exp(tr.x[0]), np.exp(tr.x[1])
+except Exception:
+    a1, a0 = 0.0, float(np.exp(la.mean()))
+log(f"dispersion trend: a1={a1:.4g}, a0={a0:.4g}")
+mu_gene = mu_p.mean(1)
+alpha_trend = np.clip(a1 / np.maximum(mu_gene, 1e-3) + a0, 1e-8, 100.0)
+
+# Cox-Reid adjusted gene-wise MLE over log-alpha grid (warm-started IRLS)
+la_grid = np.linspace(np.log(1e-4), np.log(20.0), 30)
+crll = np.empty((G, la_grid.size)); beta_w = beta_init.copy()
+for j, lv in enumerate(la_grid):
+    beta_w = fit_beta(Yk, np.full(G, np.exp(lv)), X, off, beta_w, iters=40)
+    mu = np.exp(beta_w @ X.T + off)
+    crll[:, j] = nb_loglik(Yk, mu, np.full(G, np.exp(lv)), cr="det")
+jmax = crll.argmax(1)
+def refine(jm, la_grid, crll, pc=None, pw=None):
+    M = la_grid.size
+    lo = np.clip(jm-1, 0, M-1); hi = np.clip(jm+1, 0, M-1)
+    pts = np.vstack([la_grid[lo], la_grid[jm], la_grid[hi]])        # (3, G)
+    vals = crll[np.arange(G), [lo, jm, hi]].copy()                  # (3, G)
+    if pc is not None:
+        vals -= (pts - pc[None, :])**2 * pw[None, :] / 2
+    num = pts[0]**2*(vals[1]-vals[2]) + pts[1]**2*(vals[2]-vals[0]) + pts[2]**2*(vals[0]-vals[1])
+    den = pts[0]*(vals[1]-vals[2]) + pts[1]*(vals[2]-vals[0]) + pts[2]*(vals[0]-vals[1])
+    ok = np.abs(den) > 1e-12
+    out = np.where(ok, num/np.where(ok, den, 1.0), pts[1])
+    return np.clip(out, pts[0], pts[2])
+log_alpha_mle = refine(jmax, la_grid, crll)
+alpha_mle = np.exp(log_alpha_mle)
+
+# MAP shrinkage of log dispersion toward trend
+r2 = (np.log(alpha_mle) - np.log(alpha_trend)) ** 2
+order = np.argsort(lm); sig2 = np.empty(G)
+for b in range(30):
+    sel = order[b*G//30:(b+1)*G//30]
+    sig2[sel] = max(np.median(r2[sel]), 1e-4)
+log_alpha_map = refine(jmax, la_grid, crll, pc=np.log(alpha_trend), pw=1.0/sig2)
+alpha_final = np.exp(log_alpha_map)
+log(f"alpha: trend med={np.median(alpha_trend):.4g}, MLE med={np.median(alpha_mle):.4g}, final med={np.median(alpha_final):.4g}")
+
+# ------------------------------------------------------------- final fit + Wald
+beta_f = fit_beta(Yk, alpha_final, X, off, beta_init, iters=100)
+mu_f = np.exp(beta_f @ X.T + off)
+w = mu_f / (1.0 + alpha_final[:, None] * mu_f)
+WX = w[:, :, None] * X[None, :, :]
+A = np.einsum('gni,nj->gij', WX, X) + np.eye(p)[None]*1e-8
+Ainv = np.linalg.inv(A)
+c = contrast
+var_c = np.einsum('i,j,gij->g', c, c, Ainv)
+se = np.sqrt(np.maximum(var_c, 1e-300))
+lfc = (beta_f @ c) / math.log(2)
+z = (beta_f @ c) / se
+pval = 2 * stats.norm.sf(np.abs(z))
+de_mask = (pval < 0.05) & (np.abs(lfc) > 0.5) & (bmk > 10)
+n_de = int(de_mask.sum())
+log(f"DE genes (p<0.05, |lfc|>0.5, baseMean>10): {n_de} "
+    f"(up={int((de_mask & (lfc>0)).sum())}, down={int((de_mask & (lfc<0)).sum())})")
+
+df = pd.DataFrame({"ENSG": ids[keep], "baseMean": bmk, "log2FC": lfc,
+                   "lfcSE": se/math.log(2), "stat": z, "pvalue": pval,
+                   "padj_BH": stats.false_discovery_control(pval, method="bh"),
+                   "DE": de_mask, "alpha_final": alpha_final})
+df.to_csv(f"{OUT}/de_results_group9_vs_group3.csv", index=False)
+df.to_pickle(f"{OUT}/de_df.pkl")
+np.save(f"{OUT}/log.txt.npy", np.array(LOG))
+print("STAGE_DE_DONE")
+
+# ------------------------------------------------- ENSG -> symbol, collapse 1:1
+emap = {}
+with open("/workspace/data/ensg_to_gene_name.tsv") as f:
+    rd = csv.reader(f, delimiter="\t"); next(rd)
+    for row in rd:
+        emap[row[0]] = row[1]
+df["gene_name"] = [emap.get(e, "") for e in df["ENSG"]]
+ded = df[df["DE"]].sort_values("baseMean", ascending=False)
+n_de_all = len(ded)
+mapped = ded[ded["gene_name"] != ""]
+n_unmapped = n_de_all - len(mapped)
+collapsed = mapped.drop_duplicates("gene_name", keep="first")
+log(f"DE genes (ENSG level)={n_de_all}; no symbol mapping={n_unmapped}; "
+    f"after 1:1 collapse (kept highest-baseMean ENSG per symbol)={len(collapsed)}; "
+    f"dropped duplicate-symbol ENSGs={len(mapped)-len(collapsed)}")
+gene_list = collapsed["gene_name"].tolist()
+with open(f"{OUT}/de_genes_symbols.txt", "w") as f:
+    f.write("\n".join(gene_list))
+log(f"enrichment input: {len(gene_list)} symbols")
+
+# ------------------------------------------------------------------ enrichment
+def enrichr_or(gene_sets, universe, gene_list):
+    """Enrichr-style OR: a=k(overlap), b=Q-k, c=N-k, d=U-N-Q+k; OR=a*d/(b*c)."""
+    Q = len(gene_list); q = set(gene_list); out = []
+    for term, genes in gene_sets.items():
+        s = set(genes); k = len(q & s); N = len(s)
+        b, c_, d_ = Q - k, N - k, U - N - Q + k
+        orv = (k * max(d_, 0)) / (max(b, 1) * max(c_, 1)) if k else 0.0
+        pv = stats.fisher_exact([[k, b], [c_, max(d_, 0)]], "two-sided")[1] if k else 1.0
+        out.append((term, N, k, orv, pv))
+    return out
+
+enrich_mode = None; rows = None
+try:
+    import gseapy as gp
+    enr = gp.enrichr(gene_list=gene_list, gene_sets="Reactome_2022", organism="human",
+                     outdir=f"{OUT}/enrichr", no_plot=True)
+    enr.res2d.to_csv(f"{OUT}/gseapy_reactome2022.csv", index=False)
+    enrich_mode = "gseapy.enrichr(Reactome_2022)"
+except Exception as e:
+    log(f"gseapy unavailable: {type(e).__name__}: {e}")
+    try:
+        url = "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=Reactome_2022"
+        txt = urllib.request.urlopen(url, timeout=60).read().decode()
+        gsets = {ln.split("\t")[0]: ln.split("\t")[2:] for ln in txt.splitlines() if ln.count("\t") > 2}
+        U = len(set(g for gs in gsets.values() for g in gs))
+        log(f"downloaded Reactome_2022 GMT: {len(gsets)} sets, universe={U}")
+        rows = enrichr_or(gsets, U, gene_list)
+        enrich_mode = f"manual GMT ({len(gsets)} sets, Enrichr universe)"
+    except Exception as e2:
+        log(f"GMT download failed: {type(e2).__name__}: {e2}")
+        p53_cc = ["CDKN1A","CDKN1C","MDM2","GADD45A","GADD45G","BTG2","SFN","RRM2B",
+                  "SESN1","E2F7","E2F8","CABLES1","CCNG1","CCNG2","PLK3","DYRK2",
+                  "GAS1","IGFBP3","PHLDA3","CDIP1","LATS2","WEE1","CDC25C","DDB2"]
+        U = int((df["gene_name"] != "").sum())
+        log(f"FALLBACK universe (unique symbols among baseMean>10 genes)={U}")
+        rows = enrichr_or({"p53-mediated cell cycle gene regulation (FALLBACK set)": p53_cc},
+                          U, gene_list)
+        enrich_mode = "OFFLINE FALLBACK: curated p53 cell-cycle set"
+
+if rows is not None:
+    rdf = pd.DataFrame(rows, columns=["Term","GeneSetSize","Overlap","OddsRatio","Pvalue"])
+    rdf.sort_values("Pvalue").to_csv(f"{OUT}/enrichment_results.csv", index=False)
+    hit = rdf[rdf["Term"].str.contains("p53", case=False)]
+    log("p53 term rows:\n" + hit.to_string(index=False))
+
+log("ENRICH_MODE=" + str(enrich_mode))
+json.dump({"mode": enrich_mode, "n_de_genes": int(n_de), "log": LOG},
+          open(f"{OUT}/summary.json", "w"), indent=1)
+print("ALL_DONE")

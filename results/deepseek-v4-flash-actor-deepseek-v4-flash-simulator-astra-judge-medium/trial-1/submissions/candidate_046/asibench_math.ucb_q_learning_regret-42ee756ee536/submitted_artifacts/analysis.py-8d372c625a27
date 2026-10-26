@@ -1,0 +1,248 @@
+"""
+analysis.py — Optimistic finite-horizon tabular Q-learning agent
+================================================================
+Online, model-free, `O(H*S*A)` storage.  Two statistically distinct
+estimates are combined with a single shared configuration:
+
+  (A) a one-step bootstrap Q (optimistic value iteration style) with an
+      explicit Bernstein-style confidence bonus, whose *variance* is
+      estimated in two ways and blended;
+
+  (B) a bounded multi-step (episode-trace) return estimate that propagates
+      deferred credit along the observed episode without depending on the
+      drifting one-step downstream values, used both as a continuation-
+      variance reference and as a credit-propagation term.
+
+No transition model, no next-state count tensors, no replay/planning, no
+posterior sampling, no H*S*A*S tensor.  One shared configuration for all
+MDPs; no branching on case_id/dimensions/actions.
+
+Interface (per problem_setup.json / public_calibration_runner.py):
+    make_agent(env_spec, seed) -> agent
+    act(h, state) -> int            # h in 1..H, returns action in {0..A-1}
+    observe(h, state, action, reward, next_state, done) -> None
+The agent may implement optional reset_episode / end_episode hooks but does
+NOT depend on them (episode boundaries are also detected from act/observe
+calls: act(h=1) after a completed episode starts a new one).
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Shared hyper-parameters (single configuration, tuned only on the public
+# calibration MDPs; used unchanged for every hidden family).
+# ---------------------------------------------------------------------------
+_CFG = {
+    # --- Bernstein (variance-aware) bonus ---------------------------------
+    "bern": 0.5938596728982521,  # c1: scale of sqrt(var * log / n) term
+    "hoeff": 0.42067305283044565,  # c2: worst-case Hoeffding term scale (burn)
+    "log_scale": 0.5,   # log(K) scale exponent; log_eff = 1 + log_scale*log(K+t)
+    # --- variance blending between one-step and trace-return variance -----
+    "blend_max_wT": 0.2765122679947324,  # max weight of one-step variance
+    "blend_min_wT": 0.130112497725279,   # min weight of one-step variance
+    "trace_gamma": 1.274877300931148,    # shrink factor for trace variance
+    # --- correction term b = c3 * H * log_eff / n --------------------------
+    "corr": 0.10708831507720512,
+    # --- multi-step credit propagation -------------------------------------
+    "trace_step": 0.42026329145084707,   # step size for the trace-return Q2
+    "trace_w": 0.257594058874533,        # weight of trace credit in combined
+    # --- update schedule ----------------------------------------------------
+    "alpha_pow": 1.0,     # alpha = 1 / n^alpha_pow (1 -> sample average)
+    "alpha_min": 0.02241396599326024,    # floor on the update gain
+    # --- exploration budget decay (K known from env_spec) -------------------
+    "decay_pow": 1.544098500524995,  # factor = max(decay_min, (1 - ep/K)**pow)
+    "decay_min": 0.24293327414013635,  # floor of the exploration budget factor
+}
+
+
+def make_agent(env_spec, seed):
+    return _Agent(env_spec, dict(_CFG), int(seed))
+
+
+class _Agent:
+    __slots__ = (
+        "S", "A", "H", "seed", "cfg",
+        "Q", "n", "muT", "M2T", "muG", "M2G", "nG",
+        "ep", "e_trace", "episode", "_in_episode", "K",
+    )
+
+    def __init__(self, env_spec, cfg, seed):
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.H = int(env_spec["H"])
+        self.seed = seed
+        self.cfg = cfg
+
+        Hp = self.H + 1
+        S, A = self.S, self.A
+        self.K = int(env_spec.get("K", 1000))
+        # optimistic values, clipped to the valid remaining-horizon range:
+        # Q[h] starts at the maximum achievable remaining reward (H-h+1),
+        # so unvisited actions remain optimistically attractive and get tried.
+        self.Q = np.zeros((Hp, S, A), dtype=np.float64)
+        for h in range(1, Hp):
+            self.Q[h] = self.H - h + 1.0
+        self.n = np.zeros((Hp, S, A), dtype=np.float64)
+        self.muT = np.zeros((Hp, S, A), dtype=np.float64)   # Welford mean (1-step targets)
+        self.M2T = np.zeros((Hp, S, A), dtype=np.float64)   # Welford M2 (1-step targets)
+        self.muG = np.zeros((Hp, S, A), dtype=np.float64)   # Welford mean (episode returns)
+        self.M2G = np.zeros((Hp, S, A), dtype=np.float64)   # Welford M2 (episode returns)
+        self.nG = np.zeros((Hp, S, A), dtype=np.float64)
+        # per-episode trace (bounded, one episode in memory; dropped after use)
+        self.ep = 0
+        self.e_trace = []      # list of (h, s, a, r)
+        self.episode = None
+        self._in_episode = False
+
+    # -- helpers ------------------------------------------------------------
+    def _remaining(self, h):
+        return self.H - h + 1
+
+    def _log_eff(self):
+        return 1.0 + self.cfg["log_scale"] * math.log(self.ep + math.e)
+
+    def _welford(self, m, m2, n, x):
+        """Increment Welford mean/M2; returns (m, m2, n+1)."""
+        n1 = n + 1.0
+        delta = x - m
+        m1 = m + delta / n1
+        m2 = m2 + delta * (x - m1)
+        return m1, m2, n1
+
+    def _bonus(self, h, s, a):
+        """Explicit confidence bonus for (h,s,a): Bernstein + Hoeffding + corr."""
+        n = self.n[h, s, a]
+        if n <= 0:
+            return float(self._remaining(h))
+        logt = self._log_eff()
+
+        # one-step target variance (sample variance, protected)
+        varT = self.M2T[h, s, a] / (n - 1.0) if n > 1.0 else 0.0
+        # trace-return variance (continuation proxy)
+        ng = self.nG[h, s, a]
+        varG = self.M2G[h, s, a] / (ng - 1.0) if ng > 1.0 else 0.0
+
+        # blend: early -> trace variance (honest, low burn-in); late -> one-step
+        wT = self.cfg["blend_max_wT"] - (self.cfg["blend_max_wT"] - self.cfg["blend_min_wT"]) \
+            * math.exp(-n / 12.0)
+        varT_capped = min(varT, self._remaining(h + 1) ** 2 * 4.0)
+        var_blend = wT * varT_capped + (1.0 - wT) * (varG / self.cfg["trace_gamma"])
+
+        rem = float(self._remaining(h))
+        c_b, c_h, c_c = self.cfg["bern"], self.cfg["hoeff"], self.cfg["corr"]
+        bern = c_b * math.sqrt(max(var_blend, 0.0) * logt / n)
+        hoeff = c_h * rem * math.sqrt(logt / n)
+        corr = c_c * rem * logt / n
+        b = min(bern + corr, hoeff + corr)   # min of two valid confidence routes
+        # exploration-wind-down over the known episode budget: early episodes
+        # explore (confidence-driven), later episodes exploit the sharpened
+        # estimates.  This is a model-free, budget-consistent schedule.
+        frac = min(1.0, max(0.0, (self.ep - 1) / max(1, self.K)))
+        fac = max(self.cfg["decay_min"], (1.0 - frac) ** self.cfg["decay_pow"])
+        return b * fac
+
+    def _Vnext(self, h, sprime, done):
+        if done or h >= self.H:
+            return 0.0      # no continuation beyond the horizon
+        return float(np.max(self.Q[h + 1, sprime]))
+
+    # -- interface ----------------------------------------------------------
+    def reset_episode(self, episode, state):
+        self.episode = episode
+        self._new_episode()
+
+    def start_episode(self, episode, state):
+        self.reset_episode(episode, state)
+
+    def new_episode(self, episode, state):
+        self.reset_episode(episode, state)
+
+    def _new_episode(self):
+        self._in_episode = True
+        self.ep += 1
+        self.e_trace = []
+
+    def act(self, h, state):
+        # Episode-boundary detection that does NOT rely on the optional
+        # reset_episode hook: once a completed episode has been flushed,
+        # _in_episode is False, so an act(h=1) starts a fresh episode here
+        # (idempotent with the reset hook when it is called by the runner).
+        if h == 1:
+            if self.e_trace:          # leftover trace from a previous episode
+                self._flush_trace()
+            if not self._in_episode:
+                self._new_episode()
+        s = int(state)
+        a = int(np.argmax(self.Q[h, s]))
+        return a
+
+    def observe(self, h, state, action, reward, next_state, done):
+        h = int(h); s = int(state); a = int(action)
+        r = float(reward); sp = int(next_state)
+
+        # collect the bounded episode trace for credit propagation
+        self.e_trace.append((h, s, a, r))
+
+        # --- one-step bootstrap update (estimate A) ------------------------
+        n_old = self.n[h, s, a]
+        self.n[h, s, a] = n_old + 1.0
+        n = self.n[h, s, a]
+
+        vnext = self._Vnext(h, sp, done)
+        target = r + vnext
+        self.muT[h, s, a], self.M2T[h, s, a], _ = self._welford(
+            self.muT[h, s, a], self.M2T[h, s, a], n_old, target)
+
+        b = self._bonus(h, s, a)
+        alpha = max(1.0 / n ** self.cfg["alpha_pow"], self.cfg["alpha_min"])
+        qnew = (1.0 - alpha) * self.Q[h, s, a] + alpha * (target + b)
+        self.Q[h, s, a] = float(min(max(qnew, 0.0), self._remaining(h)))
+
+        if done:
+            self._flush_trace()
+
+    def _flush_trace(self):
+        """Episode ended: propagate bounded multi-step credit (estimate B).
+
+        For each visited (h,s,a) the *observed remaining return* from that
+        point along the episode is a direct sample of the continuation value;
+        it does not depend on the drifting one-step downstream estimates, so
+        it provides low burn-in credit.  We also record its variance (used as
+        a conservative continuation-variance reference for the bonuses).
+        """
+        trace = self.e_trace
+        if not trace:
+            return
+        cfg = self.cfg
+        # remaining return from each position: G_h = r_h + ... + r_H
+        G = 0.0
+        for i in range(len(trace) - 1, -1, -1):
+            h, s, a, r = trace[i]
+            G += r
+            n_old = self.nG[h, s, a]
+            self.nG[h, s, a] = n_old + 1.0
+            self.muG[h, s, a], self.M2G[h, s, a], _ = self._welford(
+                self.muG[h, s, a], self.M2G[h, s, a], n_old, G)
+
+        # credit-propagation update on Q using the trace returns (small step,
+        # careful weight: episodic returns are biased toward the exploratory
+        # policy early on; the one-step optimistic value keeps asympt. optimism)
+        step = cfg["trace_step"]
+        w = cfg["trace_w"]
+        for h, s, a, r in trace:
+            Gcur = self.muG[h, s, a]      # smoothed episodic return
+            q = self.Q[h, s, a]
+            qnew = (1.0 - step) * q + step * ((1.0 - w) * q + w * Gcur)
+            self.Q[h, s, a] = float(min(max(qnew, 0.0), self._remaining(h)))
+        self.e_trace = []
+        self._in_episode = False
+
+    def end_episode(self, episode, reward):
+        self._flush_trace()
+
+    def finish_episode(self, episode, reward):
+        self.end_episode(episode, reward)

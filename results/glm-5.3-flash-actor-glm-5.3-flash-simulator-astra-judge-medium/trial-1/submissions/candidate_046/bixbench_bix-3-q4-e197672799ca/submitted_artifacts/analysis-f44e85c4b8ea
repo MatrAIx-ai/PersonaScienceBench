@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""
+DESeq2-style differential expression analysis (faithful Python reimplementation).
+
+Data: data/Data_deposition_RNAseq_Paroxetine_2017.xlsx, sheet "NormCount".
+- 25,402 genes (MGI IDs) x 90 samples (3 Response groups x 3 tissues x 10).
+- Values are NORMALIZED (non-integer) counts -> rounded to integers for DESeq2.
+Design (primary, approved): ~ Tissue, baseline_blood reference, Response groups pooled
+(30 samples per tissue). Comparisons: final vs baseline, dentate gyrus (DG) vs baseline,
+DG vs final. "DE in all comparisons" = padj < 0.05 in all three (primary); directional
+variants reported as sensitivity.
+
+Pipeline (mirrors DESeq2 defaults; simplifications documented in the report):
+1. size factors: median-of-ratios on rounded counts
+2. gene-wise dispersion: NB GLM profile MLE. For the saturated one-way design (~Tissue)
+   the coefficient MLEs are closed form (group sum of counts / sum of size factors), so
+   the profile likelihood over phi=1/alpha is maximized exactly by damped Newton steps.
+   For the additive sensitivity design (~Tissue+Response) a robust IRLS (step halving on
+   the deviance) is used inside the same block-coordinate scheme.
+3. dispersion trend: parametric alpha = a1/mu + a0 fitted on the log scale
+4. MAP shrinkage toward trend (Gaussian prior in log space, prior variance estimated
+   from the spread of gene-wise estimates above the trend, capped to [0.25, 1]);
+   final dispersion = max(MAP, trend), as in DESeq2
+5. Wald test (standard normal), Benjamini-Hochberg, DESeq2-style independent filtering
+   on the mean of normalized counts (threshold chosen to maximize rejections)
+"""
+import json, time
+import numpy as np
+import pandas as pd
+import openpyxl
+from scipy import stats
+from scipy.special import digamma, polygamma, gammaln
+
+T0 = time.time()
+PATH = '/workspace/data/Data_deposition_RNAseq_Paroxetine_2017.xlsx'
+OUT = '/workspace/out'
+TISSUES = ['baseline_blood', 'dentate_gyrus', 'final_blood']
+
+# ---------------------------------------------------------------- load data
+wb = openpyxl.load_workbook(PATH, read_only=True, data_only=True)
+ws = wb['NormCount']
+rows = list(ws.iter_rows(values_only=True))
+header = rows[3]
+sample_names = [header[j] for j in range(2, 92)]
+body = rows[4:]
+gene_ids = [r[1] for r in body]
+assert len(set(gene_ids)) == len(gene_ids), 'duplicate GeneIDs found'
+counts_raw = np.array([[float(r[j]) for j in range(2, 92)] for r in body])
+assert counts_raw.shape == (25402, 90)
+
+tissue_of, response_of = [], []
+for s in sample_names:
+    t = next(t for t in TISSUES if t in s)
+    tissue_of.append(t)
+    response_of.append(s[: s.index(t) - 1])
+tissue_of = np.array(tissue_of); response_of = np.array(response_of)
+
+counts = np.floor(counts_raw + 0.5).astype(np.int64)   # documented rounding step
+rowsum = counts.sum(1)
+keep = rowsum >= 10
+n_removed = int((~keep).sum())
+counts = counts[keep]
+gene_ids_f = [g for g, k in zip(gene_ids, keep) if k]
+G, N = counts.shape
+print(f'genes loaded={len(gene_ids)}  removed by prefilter(sum<10)={n_removed}  kept={G}')
+
+# ---------------------------------------------------------------- size factors
+pos = np.all(counts > 0, axis=1)
+geom = np.exp(np.log(counts[pos]).mean(1))
+sf = np.median(counts[pos] / geom[:, None], axis=0)
+sf /= np.exp(np.mean(np.log(sf)))
+logsf = np.log(sf)
+print('size factors: min=%.4f max=%.4f' % (sf.min(), sf.max()))
+normc = counts / sf[None, :]
+mean_norm = normc.mean(1)
+
+MU_FLOOR = 1e-10
+MINMU = 0.5   # DESeq2 default: fitted mu is bounded below by 0.5 in GLM fits/tests
+
+def nb_deviance(y, mu, r):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t1 = np.where(y > 0, y * np.log(np.maximum(y, 1e-12) / mu), 0.0)
+    t2 = (y + r) * np.log((y + r) / (mu + r))
+    return 2.0 * np.sum(t1 - t2, axis=1)
+
+def nb_loglik(y, mu, phi):
+    r = phi
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t_y = np.where(y > 0, y * (np.log(np.maximum(mu, MU_FLOOR)) - np.log(phi + mu)), 0.0)
+    return (gammaln(y + phi) - gammaln(phi) - gammaln(y + 1.0)
+            + t_y + phi * (np.log(phi) - np.log(phi + mu)))
+
+def disp_score_hess(y, mu, phi):
+    """score and Hessian (wrt phi, summed over samples) of the NB log-likelihood at fixed mu."""
+    s = digamma(y + phi) - digamma(phi) + np.log(phi / (phi + mu)) + (mu - y) / (phi + mu)
+    H = (polygamma(1, y + phi) - polygamma(1, phi)
+         + mu / (phi * (phi + mu)) - (mu - y) / (phi + mu) ** 2)
+    return s.sum(1), H.sum(1)
+
+def newton_phi(y, mu, phi0, n_iter=25):
+    """Damped Newton on t=log(phi); returns phi, var(log phi). mu fixed (G,n)."""
+    phi = phi0.copy()                       # (G,1)
+    t = np.log(phi[:, 0])
+    for it in range(n_iter):
+        s, H = disp_score_hess(y, mu, phi)
+        f = phi[:, 0] * s                   # dL/dt
+        fp = phi[:, 0] * s + (phi[:, 0] ** 2) * H   # d2L/dt2
+        step = np.where(fp < -1e-10, f / np.where(np.abs(fp) < 1e-10, -1e-10, fp),
+                        0.5 * np.sign(f))   # Newton, or damped if not concave
+        step = np.clip(step, -1.0, 1.0)
+        t_new = np.clip(t - step, np.log(1e-8), np.log(1e7))
+        if np.max(np.abs(t_new - t)) < 1e-8:
+            t = t_new
+            phi = np.exp(t)[:, None]
+            break
+        t = t_new
+        phi = np.exp(t)[:, None]
+    s, H = disp_score_hess(y, mu, phi)
+    f = phi[:, 0] * s
+    fp = phi[:, 0] * s + (phi[:, 0] ** 2) * H
+    var_t = np.clip(1.0 / np.maximum(-fp, 1e-12), 1e-6, 1e6)
+    return phi, var_t
+
+def closed_form_fit(y, X, logoff):
+    """Saturated one-way design: exact MLE of mu (group sums / size-factor sums)."""
+    patterns, inverse = np.unique(X, axis=0, return_inverse=True)
+    mu = np.full(y.shape, MU_FLOOR)
+    beta = np.zeros((y.shape[0], X.shape[1]))
+    ref_pat = int(np.argmax((patterns == 1).all(1) * (patterns[:, 1:] == 0).all(1))) if True else 0
+    # baseline pattern = row with intercept 1 and all dummies 0
+    base_idx = [i for i, p in enumerate(patterns) if p[0] == 1 and p[1:].sum() == 0]
+    base_idx = base_idx[0]
+    log_ratio = {}
+    for gi, pat in enumerate(patterns):
+        cols = np.where(inverse == gi)[0]
+        sy = y[:, cols].sum(1)
+        sfo = np.exp(logoff[cols]).sum()
+        lr = np.log(np.maximum(sy, 1e-6) / sfo)
+        log_ratio[gi] = lr
+        mu[:, cols] = np.maximum(np.exp(logoff[cols])[None, :] * np.exp(lr)[:, None], MINMU)
+    beta[:, 0] = log_ratio[base_idx]
+    for j in range(1, X.shape[1]):
+        gi = int(np.argmax((patterns[:, 0] == 1) & (patterns[:, j] == 1)
+                           & (patterns[:, [k for k in range(1, X.shape[1]) if k != j]] == 0).all(1)))
+        beta[:, j] = log_ratio[gi] - log_ratio[base_idx]
+    return beta, mu
+
+def robust_irls(y, X, logoff, alpha, beta0, maxit=40, tol=1e-9):
+    """IRLS with per-gene step halving on the deviance (for non-saturated designs)."""
+    beta = beta0.copy()
+    def devfun(b):
+        eta = np.clip(b @ X.T + logoff[None, :], -30.0, 30.0)
+        mu = np.maximum(np.exp(eta), MINMU)
+        return nb_deviance(y, mu, 1.0 / alpha), mu, eta
+    dev, mu, eta = devfun(beta)
+    for it in range(maxit):
+        W = mu / (1.0 + alpha * mu)
+        XtWX = np.einsum('np,gn,nq->gpq', X, W, X)
+        z = eta + (y - mu) / mu
+        XtWz = np.einsum('np,gn,gn->gp', X, W, z)
+        try:
+            step = np.linalg.solve(XtWX, XtWz[..., None])[..., 0]
+        except np.linalg.LinAlgError:
+            step = np.einsum('gpq,gp->gq', np.linalg.pinv(XtWX), XtWz)
+        step = np.clip(step, -2.0, 2.0)
+        lam = np.ones(y.shape[0])
+        for _ in range(10):
+            d2, m2, e2 = devfun(beta + lam[:, None] * step)
+            worse = d2 > dev + 1e-9
+            if not worse.any():
+                break
+            lam[worse] /= 2.0
+        beta = beta + lam[:, None] * step
+        dev, mu, eta = devfun(beta)
+        if np.max(lam * np.abs(step).max(1)) < tol:
+            break
+    return beta, mu
+
+# ---------------------------------------------------------------- trend / MAP / tests
+def fit_trend(mean_norm, alpha_hat):
+    """Parametric trend alpha = a1/mu + a0; if the parametric fit is poor (residual sd>1 on
+    the log scale, as judged on central genes) fall back to DESeq2's nonparametric style:
+    a running median of the gene-wise dispersions along log(mean)."""
+    from scipy.optimize import least_squares
+    from scipy.ndimage import median_filter
+    def parametric():
+        sel = np.isfinite(alpha_hat) & (alpha_hat > 0) & (alpha_hat < 50) & (mean_norm > 0)
+        m = mean_norm[sel]; a = alpha_hat[sel]
+        def resid(p):
+            return np.log(np.exp(p[0]) / m + p[1]) - np.log(a)
+        sol = least_squares(resid, x0=[np.log(0.1), 1e-3], method='lm', max_nfev=1000)
+        a1, a0 = float(np.exp(sol.x[0])), float(sol.x[1])
+        r = resid(sol.x)
+        central = (m > np.quantile(m, 0.1)) & (m < np.quantile(m, 0.9))
+        sd = float(np.nanstd(r[central]))
+        print('trend (parametric): a1=%.4g a0=%.4g  central residual sd(log)=%.3f' % (a1, a0, sd))
+        def tf(mu_):
+            return np.maximum(a1 / np.maximum(mu_, 1e-8) + a0, 1e-8)
+        return tf, (a1, a0), sd
+    tf, pars, sd = parametric()
+    if sd <= 1.0:
+        return tf, pars, 'parametric'
+    # running-median fallback
+    lm = np.log(np.maximum(mean_norm, 1e-8))
+    la = np.where(np.isfinite(alpha_hat) & (alpha_hat > 0) & (alpha_hat < 1e5),
+                  alpha_hat, np.nanmedian(alpha_hat[np.isfinite(alpha_hat) & (alpha_hat>0)]))
+    o = np.argsort(lm)
+    med_sorted = median_filter(la[o], size=1001, mode='nearest')
+    med_sorted = np.maximum(med_sorted, 1e-8)
+    def tf(mu_):
+        return np.maximum(np.exp(np.interp(np.log(np.maximum(mu_, 1e-8)), lm[o], np.log(med_sorted))), 1e-8)
+    print('trend (running median fallback, window=1001 genes)')
+    return tf, None, 'running_median'
+
+def map_shrink(alpha_hat, var_logphi, trend_fn, mean_norm):
+    trend = trend_fn(mean_norm)
+    r = np.log(alpha_hat) - np.log(trend)
+    sel = np.isfinite(r) & (alpha_hat < 50)
+    r_pos = r[sel & (r > 0)]
+    sigma2 = float(np.clip(np.var(r_pos) if r_pos.size > 10 else 1.0, 0.25, 1.0))
+    v = np.clip(var_logphi, 1e-6, 1e4)
+    w = v / (v + sigma2)
+    alpha_map = np.exp(w * np.log(alpha_hat) + (1 - w) * np.log(trend))
+    alpha_final = np.minimum(np.maximum(alpha_map, trend), 1e6)   # DESeq2: max(MAP, trend)
+    print('prior sigma2=%.3f  alpha_final: median=%.4f q90=%.4f' %
+          (sigma2, np.median(alpha_final), np.quantile(alpha_final, 0.9)))
+    return alpha_final
+
+def bh(pv):
+    pv = np.asarray(pv, float); n = pv.size
+    o = np.argsort(pv, kind='stable')
+    r = pv[o] * n / np.arange(1, n + 1)
+    r = np.minimum.accumulate(r[::-1])[::-1]
+    out = np.empty(n); out[o] = np.clip(r, 0, 1)
+    return out
+
+def independent_filter(pvals, mean_norm):
+    qs = np.quantile(mean_norm, np.linspace(0.0, 0.9, 19))
+    best_q, best_n, best_p = 0.0, -1, None
+    for q in qs:
+        p = np.full(pvals.size, 1.0)
+        keep = mean_norm >= q
+        p[keep] = bh(pvals[keep])
+        nrej = int((p < 0.05).sum())
+        if nrej > best_n:
+            best_q, best_n, best_p = q, nrej, p
+    return best_p, best_q
+
+def wald(beta, X, mu, alpha_final, contrasts):
+    W = mu / (1.0 + alpha_final[:, None] * mu)
+    XtWX = np.einsum('np,gn,nq->gpq', X, W, X)
+    cov = np.linalg.inv(XtWX)                                  # (G,p,p)
+    res = []
+    for name, l in contrasts:
+        l = np.asarray(l, float)
+        b = beta @ l
+        var = np.einsum('...pq,...p,...q->...', cov, l, l)
+        se = np.sqrt(np.maximum(var, 1e-18))
+        zstat = b / se
+        pval = 2.0 * stats.norm.sf(np.abs(zstat))
+        res.append((name, b / np.log(2), zstat, pval))
+    return res, dict(alpha_final=alpha_final)
+
+def run_design_saturated(X, contrasts, label):
+    print(f'\n===== design {label} =====')
+    beta, mu = closed_form_fit(counts, X, logsf)               # exact MLE (saturated design)
+    phi0 = np.full((G, 1), 10.0)
+    phi, var_logphi = newton_phi(counts, mu, phi0)             # profile MLE of dispersion
+    alpha_hat = (1.0 / phi)[:, 0]
+    print('alpha_hat: median=%.4f q10=%.4f q90=%.4f' %
+          (np.median(alpha_hat), np.quantile(alpha_hat, .1), np.quantile(alpha_hat, .9)))
+    trend_fn, pars, trend_kind = fit_trend(mean_norm, alpha_hat)
+    alpha_final = map_shrink(alpha_hat, var_logphi, trend_fn, mean_norm)
+    res, diag = wald(beta, X, mu, alpha_final, contrasts)
+    out = {}
+    for name, lfc2, z, p in res:
+        padj, q = independent_filter(p, mean_norm)
+        out[name] = dict(lfc=lfc2, padj=padj, pval=p, z=z, filter_q=q)
+        print(f'contrast {name}: padj<0.05 (ind. filtered) = {int((padj < 0.05).sum())}   '
+              f'(no filtering: {int((bh(p) < 0.05).sum())})')
+    return out, alpha_final, diag["alpha_final"]
+
+def run_design_additive(X, contrasts, label):
+    print(f'\n===== design {label} =====')
+    beta_cf, _ = closed_form_fit(counts, X1, logsf)            # warm start from saturated fit
+    beta0 = np.zeros((G, X.shape[1]))
+    beta0[:, :X1.shape[1]] = beta_cf
+    beta = beta0.copy()
+    alpha = np.full((G, 1), 0.1)
+    phi = 1.0 / alpha
+    for outer in range(5):                                     # block-coordinate MLE
+        beta, mu = robust_irls(counts, X, logsf, 1.0 / phi, beta, maxit=25)
+        phi, var_logphi = newton_phi(counts, mu, phi, n_iter=10)
+    alpha_hat = (1.0 / phi)[:, 0]
+    print('alpha_hat: median=%.4f q90=%.4f' % (np.median(alpha_hat), np.quantile(alpha_hat, .9)))
+    trend_fn, pars, trend_kind = fit_trend(mean_norm, alpha_hat)
+    alpha_final = map_shrink(alpha_hat, var_logphi, trend_fn, mean_norm)
+    beta, mu = robust_irls(counts, X, logsf, alpha_final[:, None], beta, maxit=50)
+    res, diag = wald(beta, X, mu, alpha_final, contrasts)
+    out = {}
+    for name, lfc2, z, p in res:
+        padj, q = independent_filter(p, mean_norm)
+        out[name] = dict(lfc=lfc2, padj=padj, pval=p, z=z, filter_q=q)
+        print(f'contrast {name}: padj<0.05 (ind. filtered) = {int((padj < 0.05).sum())}   '
+              f'(no filtering: {int((bh(p) < 0.05).sum())})')
+    return out, alpha_final, diag["alpha_final"]
+
+# ---------------------------------------------------------------- designs
+X1 = np.column_stack([np.ones(N), (tissue_of == 'dentate_gyrus').astype(float),
+                      (tissue_of == 'final_blood').astype(float)])
+C1 = [('final_vs_baseline', [0, 0, 1]),
+      ('DG_vs_baseline',   [0, 1, 0]),
+      ('DG_vs_final',      [0, 1, -1])]
+X2 = np.column_stack([X1, (response_of == 'good_responder').astype(float),
+                       (response_of == 'bad_responder').astype(float)])
+
+prim, alpha_final1, diag_alpha = run_design_saturated(X1, C1, '~ Tissue (primary)')
+C2 = [('final_vs_baseline', [0, 0, 1, 0, 0]),
+      ('DG_vs_baseline',   [0, 1, 0, 0, 0]),
+      ('DG_vs_final',      [0, 1, -1, 0, 0])]
+sens, alpha_final2, _ = run_design_additive(X2, C2, '~ Tissue + Response (sensitivity)')
+
+# ---------------------------------------------------------------- "all comparisons" sets
+c_names = ['final_vs_baseline', 'DG_vs_baseline', 'DG_vs_final']
+sig = {n: set(np.where(prim[n]['padj'] < 0.05)[0]) for n in c_names}
+inter = np.array(sorted(sig[c_names[0]] & sig[c_names[1]] & sig[c_names[2]]))
+lfc = {n: prim[n]['lfc'] for n in c_names}
+if inter.size:
+    sgnA = np.sign(lfc['DG_vs_baseline'][inter]); sgnB = np.sign(lfc['DG_vs_final'][inter])
+    sgnC = np.sign(lfc['final_vs_baseline'][inter])
+    coherent_DG = (sgnA == sgnB) & (sgnA != 0)      # DG effect same direction vs both blood states
+    all_same = coherent_DG & (sgnA == sgnC) & (sgnC != 0)
+else:
+    coherent_DG = np.array([], bool); all_same = np.array([], bool)
+nA, nB, nC = len(inter), int(np.sum(coherent_DG)), int(np.sum(all_same))
+per_comp = {n: len(sig[n]) for n in c_names}
+print('\n================= FINAL COUNTS (primary design ~Tissue) =================')
+print(f'Primary (padj<0.05 in all 3 comparisons): {nA}')
+print(f'Variant B (+ coherent DG-vs-blood direction): {nB}')
+print(f'Variant C (+ same sign in all 3 comparisons): {nC}')
+print('per comparison:', per_comp)
+sig2 = {n: set(np.where(sens[n]['padj'] < 0.05)[0]) for n in c_names}
+inter2 = sig2[c_names[0]] & sig2[c_names[1]] & sig2[c_names[2]]
+print('Sensitivity ~Tissue+Response intersection:', len(inter2))
+
+# ---------------------------------------------------------------- save results (before optional cross-check)
+res_df = pd.DataFrame({'GeneID': gene_ids_f, 'meanNorm': mean_norm})
+for n in c_names:
+    res_df[f'lfc2_{n}'] = prim[n]['lfc']
+    res_df[f'padj_{n}'] = prim[n]['padj']
+    res_df[f'z_{n}'] = prim[n]['z']
+    res_df[f'pval_{n}'] = prim[n]['pval']
+res_df['alpha_final'] = diag_alpha
+is_inter = np.zeros(G, bool); is_inter[inter] = True
+res_df['DE_all3'] = is_inter
+is_B = np.zeros(G, bool)
+if nB: is_B[inter[coherent_DG]] = True
+is_C = np.zeros(G, bool)
+if nC: is_C[inter[all_same]] = True
+res_df['DE_all3_coherentDG'] = is_B
+res_df['DE_all3_samesign'] = is_C
+res_df.to_csv(f'{OUT}/deseq2_results_primary.csv', index=False)
+
+# ---------------------------------------------------------------- sanity cross-check vs authors' blocks (optional)
+def to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return np.nan
+
+try:
+    groups = ['Control', 'good_responder', 'bad_responder']
+    subsets = {}
+    for g in groups:
+        for t in TISSUES:
+            subsets[(g, t)] = [j for j, s in enumerate(sample_names) if s.startswith(g + '_' + t)]
+    # author foldChange / log2FC / DEG flags per block
+    fc_author = np.array([[to_float(r[101 + 9 * b]) for b in range(9)] for r in rows[4:]])
+    lfc_author = np.array([[to_float(r[102 + 9 * b]) for b in range(9)] for r in rows[4:]])
+    flags = np.array([[r[179 + b] for b in range(9)] for r in rows[4:]], dtype=object)
+    auth_U = [int((flags[:, b] == 'U').sum()) for b in range(9)]
+    auth_D = [int((flags[:, b] == 'D').sum()) for b in range(9)]
+    print('Author DEG counts per block (U/D):', list(zip(auth_U, auth_D)))
+
+    # identify each author block by correlating its foldChange with candidate group-level
+    # mean ratios (3 response groups x 3 tissue pairs); direction resolved by sign of corr
+    cand = {}
+    for g in groups:
+        mb = {t: normc[:, subsets[(g, t)]].mean(1) for t in TISSUES}
+        cand[(g, 'final_vs_baseline')] = np.log(np.maximum(mb['final_blood'], 1e-8) / np.maximum(mb['baseline_blood'], 1e-8))
+        cand[(g, 'DG_vs_baseline')] = np.log(np.maximum(mb['dentate_gyrus'], 1e-8) / np.maximum(mb['baseline_blood'], 1e-8))
+        cand[(g, 'DG_vs_final')] = np.log(np.maximum(mb['dentate_gyrus'], 1e-8) / np.maximum(mb['final_blood'], 1e-8))
+    block_id = []
+    for b in range(9):
+        la = np.log(np.maximum(fc_author[keep, b], 1e-8))
+        best, best_rho = None, 0.0
+        for key, v in cand.items():
+            m = np.isfinite(la) & np.isfinite(v)
+            rho = stats.spearmanr(la[m], v[m]).statistic
+            if best is None or abs(rho) > abs(best_rho):
+                best, best_rho = (key, rho), rho
+        block_id.append((b + 1, best[0], float(best[1])))
+    print('Author block identification (block -> (group, tissue-pair), |Spearman|):')
+    for b, key, rho in block_id:
+        print(f'  Comparison {b}: {key}  rho={rho:.3f}')
+
+    print('Spearman corr of our pooled log2FC vs author block log2FC (abs value, sign-free):')
+    for n in c_names:
+        row = f'  {n:20s}'
+        for b in range(9):
+            la_b = lfc_author[keep, b]
+            m = np.isfinite(la_b)
+            rho = stats.spearmanr(lfc[n][m], la_b[m]).statistic
+            row += f'{rho:7.3f} '
+        print(row)
+    author_info = dict(blocks=[[int(b), f'{k[0]}|{k[1]}', round(float(r), 3)] for b, k, r in block_id],
+                       deg_U=auth_U, deg_D=auth_D)
+except Exception as e:
+    print('cross-check failed (non-blocking):', repr(e))
+    author_info = None
+
+summary = dict(
+    method='DESeq2-style reimplementation in Python: median-of-ratios size factors, NB GLM '
+           '(exact saturated MLE for ~Tissue; robust IRLS for ~Tissue+Response), gene-wise '
+           'dispersion profile MLE, dispersion trend (running-median fallback), MAP shrinkage '
+           'max(MAP,trend), Wald test with DESeq2 default minmu=0.5 bound on fitted mu, BH, independent filtering. Counts rounded from '
+           'normalized values to integers.',
+    n_genes_loaded=25402, n_removed_prefilter=n_removed, n_kept=int(G),
+    size_factors=[float(x) for x in sf],
+    per_comparison={k: int(v) for k, v in per_comp.items()},
+    all3_primary=int(nA), all3_coherentDG=int(nB), all3_samesign=int(nC),
+    sensitivity_tissue_response_intersection=int(len(inter2)),
+    author_crosscheck=author_info,
+    runtime_s=round(time.time() - T0, 1),
+)
+with open(f'{OUT}/summary.json', 'w') as f:
+    json.dump(summary, f, indent=2, default=str)
+print('\nsaved results to /workspace/out ; runtime %.1f s' % (time.time() - T0))

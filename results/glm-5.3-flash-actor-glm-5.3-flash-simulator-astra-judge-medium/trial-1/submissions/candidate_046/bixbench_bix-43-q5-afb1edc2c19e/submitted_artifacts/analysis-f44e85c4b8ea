@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-43-q5: DE (Cisplatin_IC50_CBD_IC50 vs DMSO) + Reactome_2022 enrichment prep.
+
+DESeq2-equivalent pipeline implemented locally (R/DESeq2 and PyDESeq2 unavailable, no
+network in sandbox): median-of-ratios size factors -> NB GLM (log link) fitted by IRLS
+with method-of-moments gene-wise dispersion shrunk to a parametric trend -> Wald test.
+DEG filters: raw p < 0.05, |log2FC| > 0.5, baseMean > 10. ENSG -> symbol mapping via the
+supplied TSV. gseapy.enrichr(gene_sets='Reactome_2022') is attempted; if gseapy or
+network access is unavailable, the enrichment call is left as a documented pending step
+and the DEG symbol list is saved for that purpose.
+"""
+import numpy as np, pandas as pd, os, json, traceback
+from math import erf, sqrt
+
+DATA = "/workspace/data"; OUT = "/workspace/results"
+os.makedirs(OUT, exist_ok=True)
+log = lambda *a: print(*a, flush=True)
+COMBO, CTRL = "Cisplatin_IC50_CBD_IC50", "DMSO"
+
+# ---------------- 1. Load inputs ----------------
+counts = pd.read_csv(f"{DATA}/counts_raw_unfiltered.csv", index_col=0).astype(np.int64)
+layout = pd.read_csv(f"{DATA}/sample_layout.csv")
+layout["sid"] = layout.SampleID.str.replace("-", "_", regex=False)
+layout = layout.set_index("sid").loc[counts.columns]
+groups = np.asarray(layout.Group.values)
+log(f"counts {counts.shape}; samples {counts.shape[1]}; groups {len(set(groups))}")
+
+# ---------------- 2. Size factors (median of ratios, DESeq2) ----------------
+K = counts.values.astype(float)
+pos = (K > 0).all(axis=1)                  # genes usable for geometric means
+geo = np.exp(np.log(K[pos]).mean(axis=1))
+sf = np.median(K[pos] / geo[:, None], axis=0)
+sf = sf / np.exp(np.log(sf).mean())
+norm = K / sf[None, :]
+baseMean_all = norm.mean(axis=1)           # baseMean over all 30 samples (DESeq2 convention)
+log(f"size factors: min {sf.min():.3f} max {sf.max():.3f} (genes used: {pos.sum()})")
+
+# ---------------- 3. Design (~ group, reference = DMSO) ----------------
+levels = sorted(set(groups))
+cols = [g for g in levels if g != CTRL]
+X = np.column_stack([np.ones(len(groups))] + [(groups == g).astype(float) for g in cols])
+c_ctrl, c_combo = 0, 1 + cols.index(COMBO)   # intercept = DMSO reference
+log(f"design: intercept (={CTRL}) + {len(cols)} dummies; contrast col {c_combo} vs intercept")
+
+fit_idx = np.where(baseMean_all > 10)[0]     # only these genes can pass baseMean>10
+log(f"genes fitted (baseMean>10): {len(fit_idx)}")
+
+# ---------------- 4. Dispersion: MoM gene-est -> parametric trend -> shrinkage ----------------
+Yn = norm[fit_idx]                           # genes x samples, normalized
+Gn, Sn = Yn.shape
+mu_grp = np.column_stack([Yn[:, groups == g].mean(axis=1) for g in levels])
+mu_hat = mu_grp[:, np.array([levels.index(g) for g in groups])]
+v = ((Yn - mu_hat) ** 2).sum(axis=1) / (Sn - len(levels))
+mb = mu_hat.mean(axis=1)
+a_r = np.maximum(0.0, (v - mb) / np.maximum(mb, 1e-12) ** 2)
+mu_g = Yn.mean(axis=1)
+log(f"rough dispersion>0: {(a_r>0).sum()} genes; median {np.median(a_r[a_r>0]):.4f}")
+
+sel = (a_r > 0) & np.isfinite(a_r) & np.isfinite(mu_g)
+u, yv = 1.0 / mu_g[sel], a_r[sel]
+w = mu_g[sel] ** 2
+def wls1(x, y, wt):                          # closed-form weighted LS: y = a1*x + a0
+    Sw = wt.sum(); mx = (wt * x).sum() / Sw; my = (wt * y).sum() / Sw
+    a1 = (wt * (x - mx) * (y - my)).sum() / max((wt * (x - mx) ** 2).sum(), 1e-30)
+    return a1, my - a1 * mx
+for _ in range(5):                           # weighted LS + iterative trimming -> trend fit
+    a1, a0 = wls1(u, yv, w); a1 = max(a1, 0.0)
+    r = yv - (a1 * u + a0)
+    s = np.median(np.abs(r - np.median(r))) * 1.4826 + 1e-12
+    w = mu_g[sel] ** 2 * (np.abs(r) < 3 * s)
+if a0 < 0:
+    a1, a0 = 0.0, max(np.median(a_r[sel]), 1e-4)
+trend = a1 / np.maximum(mu_g, 1e-12) + a0
+log(f"dispersion trend: a1={a1:.3e} a0={a0:.4e}")
+
+df_r = Sn - len(levels)
+alpha_final = np.exp((df_r * np.log(np.maximum(a_r, 1e-12)) + np.log(np.maximum(trend, 1e-12)))
+                     / (df_r + 1.0))
+alpha_final = np.maximum(alpha_final, 1e-8)
+
+# ---------------- 5. NB GLM (log link, per-gene IRLS) + Wald test ----------------
+beta0 = np.log(np.maximum(Yn, 1e-4)).mean(axis=1)
+lfc2 = np.zeros(Gn); pval = np.ones(Gn)
+Xt = X.T; p_c = X.shape[1]
+eye = np.eye(p_c)
+for i in range(Gn):
+    y = Yn[i]
+    if y.max() <= 0:
+        continue
+    a = float(alpha_final[i])
+    b = np.zeros(p_c); b[0] = beta0[i]
+    for _ in range(50):
+        p_mu = np.maximum(np.exp(X @ b), 1e-8)
+        Wv = p_mu / (1.0 + a * p_mu)
+        # correct GLM working response: z = eta + (y-mu)/mu  (eta = X @ b)
+        z = (X @ b) + (y - p_mu) / p_mu
+        H = Xt @ (X * Wv[:, None]) + 1e-10 * eye
+        b_new = np.linalg.solve(H, Xt @ (z * Wv))
+        step = np.max(np.abs(b_new - b))
+        b = b_new
+        if step < 1e-7:
+            break
+    p_mu = np.maximum(np.exp(X @ b), 1e-8)
+    Wv = p_mu / (1.0 + a * p_mu)
+    cov = np.linalg.inv(Xt @ (X * Wv[:, None]) + 1e-10 * eye)
+    d = b[c_combo]              # reference coding: combo vs DMSO = combo coefficient
+    se = sqrt(max(cov[c_combo, c_combo], 1e-18))
+    lfc2[i] = d / np.log(2)
+    zstat = d / se
+    pval[i] = 2 * (1 - 0.5 * (1 + erf(abs(zstat) / sqrt(2))))
+log("IRLS/Wald done")
+
+res = pd.DataFrame({"ENSG": counts.index[fit_idx], "baseMean": baseMean_all[fit_idx],
+                    "log2FC": lfc2, "pvalue": pval})
+res.to_csv(f"{OUT}/de_results_combo_vs_dmso.csv", index=False)
+
+deg = res[(res.pvalue < 0.05) & (res.log2FC.abs() > 0.5) & (res.baseMean > 10)]
+log(f"DEGs after filters: {len(deg)} (up {(deg.log2FC>0).sum()}, down {(deg.log2FC<0).sum()})")
+deg.to_csv(f"{OUT}/deg_combo_vs_dmso.csv", index=False)
+
+# ---------------- 6. ENSG -> symbol mapping ----------------
+mp = pd.read_csv(f"{DATA}/ensg_to_gene_name.tsv", sep="\t")
+m = dict(zip(mp.ENSG, mp.gene_name))
+deg2 = deg.copy(); deg2["gene_name"] = deg2.ENSG.map(m)
+unmapped = int(deg2.gene_name.isna().sum())
+symbols = deg2.gene_name.dropna().unique().tolist()
+log(f"DEGs mapped: {len(symbols)} unique symbols (unmapped {unmapped})")
+deg2.to_csv(f"{OUT}/deg_combo_vs_dmso_mapped.csv", index=False)
+with open(f"{OUT}/deg_symbols_for_enrichr.txt", "w") as f:
+    f.write("\n".join(symbols))
+
+# ---------------- 7. Enrichment: gseapy.enrichr / Reactome_2022 ----------------
+enrich_status = {"gseapy_available": False, "enrichr_run": False, "note": ""}
+try:
+    import gseapy
+    enrich_status["gseapy_available"] = True
+    enr = gseapy.enrichr(gene_list=symbols, gene_sets="Reactome_2022",
+                         organism="Human", outdir=f"{OUT}/enrichr_reactome2022", cutoff=1.0)
+    tab = enr.results.sort_values("Adjusted P-value")
+    tab.to_csv(f"{OUT}/enrichr_reactome2022_results.csv", index=False)
+    enrich_status["enrichr_run"] = True
+    enrich_status["top_term"] = tab.iloc[0].to_dict()
+    log("PRIMARY TERM:", tab.iloc[0]["Term"])
+except Exception as e:
+    enrich_status["note"] = f"gseapy/Enrichr unavailable in sandbox: {type(e).__name__}: {e}"
+    with open(f"{OUT}/pending_enrichr_step.md", "w") as f:
+        f.write(f"""# Pending final step: gseapy.enrichr (Reactome_2022)
+
+Environment lacks gseapy, PyDESeq2, R, and any network access (DNS/pip both fail;
+verified). All local computation is complete. To finish, in a networked environment
+with gseapy installed:
+
+```python
+import gseapy
+symbols = [l.strip() for l in open('{OUT}/deg_symbols_for_enrichr.txt') if l.strip()]
+enr = gseapy.enrichr(gene_list=symbols, gene_sets='Reactome_2022', organism='Human',
+                     outdir='{OUT}/enrichr_reactome2022', cutoff=1.0)
+top = enr.results.sort_values('Adjusted P-value').iloc[0]
+print(top[['Term','Overlap','P-value','Adjusted P-value','Combined Score','Genes']])
+```
+
+DEG gene list ({len(symbols)} symbols) saved to {OUT}/deg_symbols_for_enrichr.txt
+Exception: {type(e).__name__}: {e}
+""")
+    log("Enrichr pending:", enrich_status["note"])
+
+with open(f"{OUT}/run_summary.json", "w") as f:
+    json.dump({"n_genes_total": int(counts.shape[0]), "n_genes_fitted": int(Gn),
+               "n_degs": int(len(deg)), "n_degs_up": int((deg.log2FC > 0).sum()),
+               "n_degs_down": int((deg.log2FC < 0).sum()),
+               "n_degs_mapped_symbols": int(len(symbols)),
+               "enrichment_status": enrich_status}, f, indent=2, default=str)
+log("DONE")
+
+# ---------------- 8. Evidence-based mechanism scoring (offline substitute for the
+# pending gseapy/Reactome_2022 call; NOT an Enrichr equivalent - curated gene sets
+# from domain knowledge, hypergeometric ORA against the tested background) ----------
+from math import comb
+sets = {
+"p53/DNA damage response": "TP53 CDKN1A CDKN2A MDM2 MDM4 GADD45A GADD45B GADD45G BBC3 PMAIP1 BAX BCL2L11 RRM2B DDB2 XPC SESN1 SESN2 SESN3 ZMAT3 FDXR BTG2 BTG3 CHEK1 CHEK2 ATM ATR PHPT1 TIGAR STEAP3 SLC7A11 ATF3 EGR1 FOS JUN JUNB IER3 PERP".split(),
+"DNA repair (core)": "BRCA1 BRCA2 ATM ATR CHEK1 CHEK2 RAD51 RAD52 RAD54L XRCC1 XRCC2 XRCC3 XRCC4 XRCC5 XRCC6 ERCC1 ERCC2 ERCC3 ERCC4 ERCC5 ERCC6 ERCC8 DDB1 DDB2 XPA XPC LIG1 LIG4 PARP1 PARP2 PARP3 FANCA FANCC BRIP1 MRE11A RAD50 NBN".split(),
+"Apoptosis / programmed cell death": "CASP1 CASP2 CASP3 CASP4 CASP6 CASP7 CASP8 CASP9 CASP10 BAX BAK1 BCL2 BCL2L1 MCL1 BCL2L11 BCL2A1 BBC3 PMAIP1 BID APAF1 CYCS FAS FASLG TNFRSF10A TNFRSF10B TNFRSF1A TNFSF10 TNF FADD TRADD RIPK1 XIAP BIRC2 BIRC3 BIRC5 DFFB".split(),
+"Cell cycle / proliferation": "CDK1 CDK2 CDK4 CDK6 CCNA2 CCNB1 CCNB2 CCND1 CCND2 CCNE1 CCNE2 E2F1 E2F2 E2F3 TFDP1 PCNA MCM2 MCM3 MCM4 MCM5 MCM6 MCM7 MCM10 CDC6 CDC20 CDC25A CDC25B CDC25C CDC45 ORC1 ORC2 GINS1 RB1 CDKN1B MKI67 TOP2A AURKA AURKB PLK1 BUB1 BUB1B MAD2L1".split(),
+"ER stress / UPR": "HSPA5 DDIT3 ATF4 ATF6 XBP1 ERN1 HYOU1 DNAJB9 CHAC1 TRIB3 PPP1R15A DDIT4 HERPUD1 ERDJ4 CALR HSP90B1 PDIA4 PDIA6 EDEM1 EDEM2 EIF2AK3 EIF2S1 ATF5 SLC7A5 ASNS CBS VEGFA".split(),
+"Autophagy": "ATG3 ATG4A ATG4B ATG4C ATG5 ATG7 ATG9A ATG10 ATG12 ATG13 ATG14 ATG16L1 BECN1 MAP1LC3A MAP1LC3B SQSTM1 ULK1 ULK2 WIPI1 WIPI2 BNIP3 BNIP3L FUNDC1 GABARAP GABARAPL1 GABARAPL2 PIK3C3 RUBCN NBR1 PINK1 PARK2 OPTN".split(),
+"Inflammatory/cytokine/interferon": "IL1A IL1B IL6 CXCL8 CXCL1 CXCL2 CXCL10 CCL2 CCL3 CCL4 CCL5 CCL20 TNF LTA IFNA1 IFNB1 IFNG IFIT1 IFIT2 IFIT3 IFI6 IFI16 IFI27 IFI44 ISG15 ISG20 OAS1 OAS2 OAS3 MX1 MX2 IRF1 IRF7 IRF9 STAT1 NFKB1 NFKBIA RELA JAK1 JAK2 SOCS1 SOCS3 CXCR4 IL1R1".split(),
+"Oxidative stress / NRF2": "NFE2L2 KEAP1 HMOX1 NQO1 GCLC GCLM GSR SOD1 SOD2 CAT GPX1 GPX3 GPX4 PRDX1 PRDX2 TXNRD1 GLRX FTL FTH1 SLC7A11 SLC3A2 G6PD PGD IDH1 ME1 ABCB6 HIF1A VHL EGLN1 EGLN3 BNIP3 CA9".split(),
+"Metabolism/lipid": "ACACA ACACB FASN SCD CPT1A CPT2 ACADM ACADS HADHA HADHB ACLY PPARG CEBPA SREBF1 SREBF2 INSIG1 FADS1 FADS2 ELOVL1 ELOVL5 ELOVL6 LPCAT1 PCYT1A CHKA MPC1 MPC2 LDHA LDHB PKM PFKFB3 HK2 GLS GLUL".split(),
+}
+res_g = pd.read_csv(f"{OUT}/de_results_combo_vs_dmso.csv")
+res_g["gene"] = res_g.ENSG.map(m)
+bg = set(res_g.gene.dropna()); N = len(bg)
+upS = set(deg2.gene_name.dropna()[deg2.log2FC > 0]); dnS = set(deg2.gene_name.dropna()[deg2.log2FC < 0])
+rows = []
+for name, genes in sets.items():
+    g = set(genes) & bg; K = len(g)
+    for label, S in (("up", upS), ("down", dnS)):
+        k = len(g & S)
+        if K == 0: continue
+        p = sum(comb(K, i) * comb(N - K, len(S) - i) for i in range(k, min(K, len(S)) + 1)) / comb(N, len(S))
+        rows.append((name, label, K, k, float(p), sorted(g & S)))
+tab = pd.DataFrame(rows, columns=["mechanism", "dir", "set_size", "hits", "hyper_p", "hit_genes"])
+tab.sort_values("hyper_p").to_csv(f"{OUT}/evidence_based_mechanism_scores.csv", index=False)
+top = tab.sort_values("hyper_p").iloc[0]
+log(f"Evidence-based top mechanism: {top.mechanism} ({top.dir}) hits={top.hits}/{top.set_size} p={top.hyper_p}")
+log("hit genes:", top.hit_genes)
+with open(f"{OUT}/run_summary.json", "w") as f:
+    json.dump({"n_genes_total": int(counts.shape[0]), "n_genes_fitted": int(Gn),
+               "n_degs": int(len(deg)), "n_degs_up": int((deg.log2FC > 0).sum()),
+               "n_degs_down": int((deg.log2FC < 0).sum()),
+               "n_degs_mapped_symbols": int(len(symbols)),
+               "evidence_based_top_mechanism": {"mechanism": top.mechanism, "dir": top.dir,
+                                                 "hits": int(top.hits), "set_size": int(top.set_size),
+                                                 "hyper_p": top.hyper_p, "genes": top.hit_genes},
+               "enrichment_status": enrich_status}, f, indent=2, default=str)
+log("DONE (incl. section 8)")

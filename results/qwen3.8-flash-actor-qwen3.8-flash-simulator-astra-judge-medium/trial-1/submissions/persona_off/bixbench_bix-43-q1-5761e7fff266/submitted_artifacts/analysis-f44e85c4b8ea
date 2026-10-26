@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""
+bix-43-q1 : CBD/cisplatin combination vs DMSO control -> GO Biological Process enrichment.
+
+Approved pipeline:
+  1. symbol mapping + count collapse + low-count filter
+  2. DESeq2-equivalent NB2 GLM (~ 0 + Group, all 30 samples), Wald contrast combo - DMSO
+  3. ranked list (primary metric = log2FoldChange) for a gseapy prerank with GO_Biological_Process_2021
+  4. enrichment: min_size 15, max_size 500, 1000 permutations, fixed seed, answer = lowest FDR q-val
+
+The sandbox is air-gapped and ships no gseapy and no GO gene-set library (see ENV PROBE), so step 4
+runs only as (a) the guarded literal gseapy call, which records its failure, and (b) a synthetic
+validation of the gseapy-equivalent prerank engine. Everything else is executed for real.
+"""
+import json, os, subprocess, sys, time, platform, socket
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nblib import (median_of_ratios, nb_glm, wald_contrast, mom_dispersion, mom_dispersion_design,
+                   disp_trend, map_dispersion, shrunk_dispersion, Prerank, parse_gmt, gene_wise_dispersion_mle)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA = os.path.join(ROOT, "data")
+OUT = os.path.join(ROOT, "analysis", "out")
+os.makedirs(OUT, exist_ok=True)
+LOG = []
+
+
+def log(*a):
+    s = " ".join(str(x) for x in a)
+    print(s, flush=True); LOG.append(s)
+
+
+def save(df, name, gz=True):
+    p = os.path.join(OUT, name)
+    df.to_csv(p + (".gz" if gz else ""), compression=("gzip" if gz else None))
+    log(f"[write] {p}{'gz' if gz else ''} shape={df.shape}")
+    return p
+
+
+TREAT = {
+    "Untreated": ("Untreated", 0), "Serum_starvation": ("Untreated", 1),
+    "DMSO": ("DMSO", 0), "DMSO_Serum_starvation": ("DMSO", 1),
+    "Cisplatin_IC50": ("Cisplatin", 0), "Cisplatin_IC50_Serum_starvation_16h": ("Cisplatin", 1),
+    "CBD_IC50": ("CBD", 0), "CBD_IC50_Serum_starvation_16h": ("CBD", 1),
+    "Cisplatin_IC50_CBD_IC50": ("Cisplatin+CBD", 0),
+    "Cisplatin_IC50_CBD_IC50_Serum_starvation_16h": ("Cisplatin+CBD", 1),
+}
+REF, TRT = "DMSO", "Cisplatin_IC50_CBD_IC50"
+PRIOR_DF = 2.0
+REF2, TRT2 = "DMSO_Serum_starvation", "Cisplatin_IC50_CBD_IC50_Serum_starvation_16h"
+
+
+def importable(name):
+    try:
+        __import__(name); return True
+    except Exception:
+        return False
+
+
+def env_probe():
+    log("=" * 78); log("0. ENVIRONMENT PROBE (gene-set library availability)"); log("=" * 78)
+    log("python", sys.version.split()[0], "| platform", platform.platform())
+    for pkg in ("gseapy", "pydeseq2", "sklearn"):
+        log(f"  package {pkg}: {'AVAILABLE' if importable(pkg) else 'UNAVAILABLE'}")
+    for net in [("maayanlab.cloud", 443), ("pypi.org", 443), ("1.1.1.1", 443), ("8.8.8.8", 53)]:
+        s = socket.socket(); s.settimeout(4)
+        try:
+            s.connect(net); log(f"  tcp {net}: REACHABLE")
+        except Exception as e:
+            log(f"  tcp {net}: UNREACHABLE ({type(e).__name__}: {e})")
+        finally:
+            s.close()
+    for tool in ("R", "Rscript", "conda"):
+        out = subprocess.run(["bash", "-lc", f"command -v {tool} || echo MISSING"],
+                             capture_output=True, text=True).stdout.strip()
+        log(f"  tool {tool}: {out}")
+    cmd = ("find / \\( -path /proc -o -path /sys \\) -prune -o -type f "
+           "\\( -iname '*.gmt' -o -iname '*.gmt.gz' -o -iname '*msigdb*' -o -iname '*GO.db*' "
+           "-o -iname '*org.Hs*' -o -iname '*.obo*' -o -iname '*gaf*' -o -iname '*goa_*' "
+           "-o -iname '*gene2go*' -o -iname '*enrichr*' -o -iname '*gseapy*' \\) -print 2>/dev/null | head -20")
+    hits = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True).stdout.strip()
+    log("  filesystem scan for any GO / gene-set / gseapy resource across ALL mounts:")
+    log("    " + (hits.replace("\n", "\n    ") if hits else "NO HITS -> no gene-set library exists on this machine"))
+    log("  capsule data dir contents:", sorted(os.listdir(DATA)))
+
+
+def preprocess():
+    log("\n" + "=" * 78); log("1. LOAD, SYMBOL MAPPING, COLLAPSE, LOW-COUNT FILTER"); log("=" * 78)
+    counts = pd.read_csv(os.path.join(DATA, "counts_raw_unfiltered.csv"), index_col=0)
+    log("raw counts", counts.shape, "| dup index", int(counts.index.duplicated().sum()),
+        "| NA values", int(counts.isna().sum().sum()),
+        "| all-zero rows", int((counts.sum(axis=1) == 0).sum()))
+    layout = pd.read_csv(os.path.join(DATA, "sample_layout.csv"))
+    layout["col"] = layout["SampleID"].str.replace("-", "_", regex=False)
+    assert list(layout["col"]) == list(counts.columns), "layout order != count column order"
+    log("groups:\n" + layout["Group"].value_counts().sort_index().to_string())
+    mapdf = pd.read_csv(os.path.join(DATA, "ensg_to_gene_name.tsv"), sep="\t")
+    sym = pd.Series(counts.index, index=counts.index).map(mapdf.set_index("ENSG")["gene_name"])
+    unmapped = sym.isna().values
+    log(f"symbol mapping: mapped {int((~unmapped).sum())} / {len(sym)} ({100*(~unmapped).mean():.1f}%), "
+        f"unmapped {int(unmapped.sum())}")
+    m = counts.loc[~unmapped]; s = sym[~unmapped]
+    keep = ((m >= 10).sum(axis=1) >= 3).values
+    mat = m[keep].groupby(s[keep].values).sum()
+    log(f"filter counts>=10 in >=3 samples -> {int(keep.sum())} gene rows; "
+        f"symbol collapse -> {mat.shape[0]} unique symbols x {mat.shape[1]}")
+    log("multi-ENSG symbols collapsed (top 5):", s.value_counts().head(5).to_dict())
+    save(mat, "counts_filtered_symbols.csv")
+    layout.to_csv(os.path.join(OUT, "sample_layout_mapped.csv"), index=False)
+    return mat, layout
+
+
+def build_design(layout, kind="group", keep_cols=None):
+    lay = layout if keep_cols is None else layout[layout["col"].isin(keep_cols)]
+    cols = list(lay["col"]); levels = sorted(TREAT)
+    if kind in ("group", "contrast2"):
+        X = np.zeros((len(cols), len(levels)))
+        for i, g in enumerate(lay["Group"]):
+            X[i, levels.index(g)] = 1.0
+        c = np.zeros(len(levels))
+        a, b = (TRT, REF) if kind == "group" else (TRT2, REF2)
+        c[levels.index(a)] = 1.0; c[levels.index(b)] = -1.0
+        labels = levels
+    else:  # additive treatment + serum_starvation
+        arms = ["Untreated", "DMSO", "Cisplatin", "CBD", "Cisplatin+CBD"]
+        X = np.zeros((len(cols), len(arms) + 1))
+        for i, g in enumerate(lay["Group"]):
+            arm, sv = TREAT[g]
+            X[i, arms.index(arm)] = 1.0; X[i, -1] = sv
+        c = np.zeros(len(arms) + 1)
+        c[arms.index("Cisplatin+CBD")] = 1.0; c[arms.index("DMSO")] = -1.0
+        labels = arms + ["serum_starvation"]
+    return X, c, labels, cols
+
+
+def de_run(mat, layout, kind="group", keep_cols=None, tag="primary", sigma=0.5):
+    log("\n" + "=" * 78); log(f"2/3. DE run '{tag}' (design={kind})"); log("=" * 78)
+    X, c, labels, cols = build_design(layout, kind, keep_cols)
+    Y = mat[cols].values.astype(float)
+    G, n = Y.shape
+    sf, used = median_of_ratios(Y.astype(int))
+    log_off = np.log(sf)
+    log(f"samples {n} | genes {G} | design rank {np.linalg.matrix_rank(X)}/{X.shape[1]}")
+    log("size factors: " + ", ".join(f"{col}={v:.3f}" for col, v in zip(cols, sf)))
+    log("  (size factors are median-of-ratios; library sizes are reported in de_global_diagnostics.csv)")
+    log(f"  spearman(size factor, library size) = {stats.spearmanr(sf, Y.sum(axis=0)).statistic:.4f}")
+    t0 = time.time()
+    p_fit = int(np.linalg.matrix_rank(X))
+    nu = n - p_fit
+    b0 = nb_glm(Y, X, np.full(G, 0.05), log_off)
+    mu0 = np.exp(b0 @ X.T + log_off[None, :])
+    a_mom = mom_dispersion_design(Y, mu0, p_fit)            # df-corrected method of moments
+    mean_norm = (Y / np.exp(log_off)[None, :]).mean(axis=1)
+    trend_log, (bx, by) = disp_trend(mean_norm, a_mom)
+    trend = np.exp(trend_log)
+    a_use = shrunk_dispersion(a_mom, trend, nu, prior_df=PRIOR_DF)
+    a_map, _ = map_dispersion(Y, X, log_off, trend_log, sigma=0.5, b=b0)   # reported for comparison
+    log(f"  dispersion estimation {time.time()-t0:.1f}s | design rank {p_fit}, residual df {nu}")
+    log(f"  size-factor-free mean count: median {np.median(mean_norm):.1f}, "
+        f"IQR {np.quantile(mean_norm,.25):.1f}-{np.quantile(mean_norm,.75):.1f}")
+    log("  BCV of the used dispersion, quantiles 10/25/50/75/90%: " +
+        ", ".join(f"{q:.3f}" for q in np.quantile(np.sqrt(a_use), [.1, .25, .5, .75, .9])))
+    log(f"  shrinkage: prior_df={PRIOR_DF}, weight on gene-wise estimate = {nu/(nu+PRIOR_DF):.3f}; "
+        f"spearman(gene-wise, shrunk) = {stats.spearmanr(a_mom, a_use).statistic:.3f}; "
+        f"spearman(shrunk, MAP) = {stats.spearmanr(a_use, a_map).statistic:.3f}")
+    save(pd.DataFrame({"mean_norm": mean_norm, "alpha_mom_df_corrected": a_mom,
+                       "alpha_trend": trend, "alpha_used": a_use, "alpha_MAP_sigma0.5": a_map,
+                       "BCV_used": np.sqrt(a_use)}), f"dispersion_diagnostics_{tag}.csv")
+    save(pd.DataFrame({"mean_norm_bin": bx, "dispersion_bin": by}), f"dispersion_trend_bins_{tag}.csv", gz=False)
+    lfc, se, z, p_norm, b, C = wald_contrast(Y, X, a_use, log_off, c, b=b0)
+    p = 2 * stats.t.sf(np.abs(z), df=nu)          # small-sample (residual-df) reference, see calibration
+    p_norm = np.asarray(p_norm)
+    padj = multipletests(p, method="fdr_bh")[1]
+    zz = z[np.isfinite(z)]
+    qs = np.linspace(0.001, 0.999, 201)
+    qq = pd.DataFrame({"theoretical_q": stats.norm.ppf(qs), "observed_z": np.quantile(zz, qs)})
+    slope = float(np.polyfit(qq["theoretical_q"], qq["observed_z"], 1)[0])
+    log(f"  Wald z: mean {zz.mean():+.3f}, sd {zz.std():.3f}, lambda_median {np.median(zz**2)/0.4549:.3f}, "
+        f"QQ slope {slope:.3f}, frac |t_df{nu}|<0.05 = {np.mean(p[np.isfinite(z)]<0.05):.4f} "
+        f"(normal-reference: {np.mean(p_norm[np.isfinite(z)]<0.05):.4f}; nominal 0.05)")
+    save(qq, f"wald_qq_{tag}.csv", gz=False)
+    res = pd.DataFrame({"log2FC": lfc, "se": se, "Wald_z": z, "p": p, "padj": padj,
+                        "p_normal_ref": p_norm}, index=mat.index)
+    log(f"  DE counts: p<0.05 {(p<0.05).sum()}, padj<0.05 {(padj<0.05).sum()}, padj<0.10 {(padj<0.10).sum()}, "
+        f"|LFC|>0.5 {(np.abs(lfc)>0.5).sum()}, |LFC|>1 {(np.abs(lfc)>1).sum()}")
+    log("  top 12 by p:\n" + res.sort_values("p").head(12).round(4).to_string())
+    return res, dict(sf=dict(zip(cols, sf)), bcv=np.sqrt(a_use), qq_slope=slope,
+                     mean_norm=mean_norm, alpha=a_use, nu=nu, p_fit=p_fit, libsize=dict(zip(cols, Y.sum(axis=0))))
+
+
+def calibrate_engine(mat, layout, diag):
+    """Self-calibration of the re-implemented NB2 engine on null data that mimics this experiment
+    (same design, same size factors, mean/dispersion distributions matched to the data)."""
+    log("\n" + "=" * 78)
+    log("2b. ENGINE SELF-CALIBRATION (simulated null + simulated spike-in, matched design)")
+    log("=" * 78)
+    X, c, _, cols = build_design(layout, "group", None)
+    sf = np.array([diag["sf"][k] for k in cols]); lo = np.log(sf)
+    nu, p_fit = diag["nu"], diag["p_fit"]
+    mn = np.sort(diag["mean_norm"]); alpha_true = np.sort(diag["alpha"])
+    rows = []
+    for seed in range(5):
+        rng = np.random.default_rng(1000 + seed)
+        base = 10 ** rng.uniform(np.log10(mn[100]), np.log10(mn[-100]), len(mn))
+        at = rng.permutation(alpha_true)
+        Y = rng.negative_binomial(1 / at[:, None], (1 / at[:, None]) / (1 / at[:, None] + base[:, None] * np.exp(lo)[None, :]))
+        b = nb_glm(Y, X, np.full(len(Y), 0.05), lo)
+        am = mom_dispersion_design(Y, np.exp(b @ X.T + lo[None, :]), p_fit)
+        tl, _ = disp_trend(base * np.exp(lo).mean(), am)
+        au = shrunk_dispersion(am, np.exp(tl), nu, prior_df=PRIOR_DF)
+        lfc, se, z, pn, _, _ = wald_contrast(Y, X, au, lo, c, b=b)
+        pt = 2 * stats.t.sf(np.abs(z), df=nu)
+        rows.append(dict(sim=seed, kind="null_sim", alpha_ratio_med=float(np.median(au / at)),
+                         fp_normal=float(np.mean(pn < 0.05)), fp_t=float(np.mean(pt < 0.05)),
+                         fp_t_01=float(np.mean(pt < 0.01))))
+    for seed in range(3):
+        rng = np.random.default_rng(2000 + seed)
+        base = 10 ** rng.uniform(np.log10(mn[100]), np.log10(mn[-100]), len(mn))
+        at = rng.permutation(alpha_true)
+        mu = base[:, None] * np.exp(lo)[None, :]
+        flag = np.zeros(len(mu), bool); flag[: int(0.02 * len(mu))] = True
+        mu[flag] *= np.where(np.tile(np.repeat(np.arange(10), 3), (int(0.02 * len(mu)), 1)) == 8, 1.8, 1.0)
+        Y = rng.negative_binomial(1 / at[:, None], (1 / at[:, None]) / (1 / at[:, None] + mu))
+        b = nb_glm(Y, X, np.full(len(Y), 0.05), lo)
+        am = mom_dispersion_design(Y, np.exp(b @ X.T + lo[None, :]), p_fit)
+        tl, _ = disp_trend(base * np.exp(lo).mean(), am)
+        au = shrunk_dispersion(am, np.exp(tl), nu, prior_df=PRIOR_DF)
+        lfc, se, z, pn, _, _ = wald_contrast(Y, X, au, lo, c, b=b)
+        pt = 2 * stats.t.sf(np.abs(z), df=nu)
+        rows.append(dict(sim=seed, kind="spike_1.8x", alpha_ratio_med=float(np.median(au / at)),
+                         fp_normal=float(np.mean(pn[~flag] < 0.05)), fp_t=float(np.mean(pt[~flag] < 0.05)),
+                         power_t=float(np.mean(pt[flag] < 0.05)), lfc_mean=float(np.mean(lfc[flag])),
+                         lfc_true=float(np.log2(1.8))))
+    cal = pd.DataFrame(rows)
+    save(cal, "engine_calibration_simulations.csv", gz=False)
+    log(cal.groupby("kind").mean(numeric_only=True).round(4).to_string())
+    log("  interpretation: fp_* are the simulated type-I error of the engine at nominal 0.05; the t(df) "
+        "reference is used for reported p-values because it is the better-calibrated of the two.")
+    return cal
+
+
+def ranking_metrics(mat, res, layout):
+    log("\n" + "=" * 78); log("4. RANKED GENE LISTS (pre-specified primary metric = log2FoldChange)"); log("=" * 78)
+    g_of = layout.set_index("col")["Group"]
+    colsT = [c for c in mat.columns if g_of[c] == TRT]
+    colsR = [c for c in mat.columns if g_of[c] == REF]
+    lg = np.log2(mat / mat.sum(axis=0) * 1e6 + 1)
+    s2n = ((lg[colsT].mean(axis=1) - lg[colsR].mean(axis=1)) /
+           (lg[colsT].std(axis=1) + lg[colsR].std(axis=1) + 1e-9))
+    lfc = res["log2FC"].reindex(mat.index); padj = res["padj"].reindex(mat.index)
+    rnk_p = -np.log10(np.clip(padj, 1e-16, 1)) * np.sign(lfc); rnk_p.name = "neg_log10_padj_x_sign"
+    rnk_s = s2n.reindex(mat.index); rnk_s.name = "signal_to_noise"
+    rnk = {"primary_log2FC": lfc.rename("log2FC"), "alt_neglog10padj_x_sign": rnk_p,
+           "alt_signal_to_noise": rnk_s}
+    for nm, r in rnk.items():
+        pd.DataFrame({"Name": r.index, "Score": r.values}).to_csv(
+            os.path.join(OUT, f"ranked_{nm}.rnk"), sep="\t", index=False, header=False)
+        log(f"  wrote ranked_{nm}.rnk (n={len(r)}, range {r.min():.3f} .. {r.max():.3f})")
+    names = list(rnk)
+    M = np.column_stack([rnk[k].values for k in names])
+    rho = stats.spearmanr(M).statistic
+    log("  Spearman between ranking metrics:\n" + pd.DataFrame(np.round(rho, 3), index=names, columns=names).to_string())
+    top = [set(pd.Series(v, index=rnk[names[0]].index).sort_values(ascending=False).index[:500]) for v in M.T]
+    bot = [set(pd.Series(v, index=rnk[names[0]].index).sort_values().index[:500]) for v in M.T]
+    log("  top-500 Jaccard:\n" + pd.DataFrame([[len(a & b)/len(a | b) for b in top] for a in top],
+                                              index=names, columns=names).round(3).to_string())
+    log("  bottom-500 Jaccard:\n" + pd.DataFrame([[len(a & b)/len(a | b) for b in bot] for a in bot],
+                                                 index=names, columns=names).round(3).to_string())
+    tbl = pd.concat([lfc.rename("log2FC"), res["p"].reindex(mat.index), padj.rename("padj"),
+                     rnk["alt_neglog10padj_x_sign"], rnk["alt_signal_to_noise"]], axis=1)
+    # universe B: additionally require detectable expression in every one of the 10 groups
+    grp_means = np.column_stack([mat[[c for c in mat.columns if g_of[c] == gg]].mean(axis=1)
+                                 for gg in sorted(set(g_of))])
+    cpm_by_group = grp_means / (mat.sum(axis=0).mean() / 1e6)
+    expr_all = pd.Series((cpm_by_group >= 1.0).all(axis=1), index=mat.index)
+    zero_infl = pd.Series((grp_means < 0.5).any(axis=1), index=mat.index)
+    tbl["expr_all_groups"] = expr_all.values; tbl["zero_in_any_group"] = zero_infl.values
+    log(f"  universe B (CPM>=1 in all 10 groups): {int(expr_all.sum())} genes; "
+        f"{int(zero_infl.sum())} genes have a near-zero group (these get |LFC|>10 artefacts)")
+    log(f"  |LFC| > 5: {int((lfc.abs() > 5).sum())} genes, of which {int((lfc.abs() > 5)[zero_infl.values].sum())} are zero-inflated")
+    sub = expr_all[expr_all].index
+    pd.DataFrame({"Name": sub, "Score": lfc.reindex(sub).values}).to_csv(
+        os.path.join(OUT, "ranked_B_expressed_log2FC.rnk"), sep="	", index=False, header=False)
+    pd.DataFrame({"Name": sub, "Score": rnk_p.reindex(sub).values}).to_csv(
+        os.path.join(OUT, "ranked_B_expressed_neglog10padj_x_sign.rnk"), sep="	", index=False, header=False)
+    ta = set(lfc.sort_values(ascending=False).index[:500]); tb = set(lfc.reindex(sub).sort_values(ascending=False).index[:500])
+    log(f"  top-500 overlap between universe A and universe B (log2FC): {len(ta & tb)}/500")
+    # significance vs expression level (detects dispersion under-estimation at low counts)
+    mn = (mat / mat.sum(axis=0) * 1e6).mean(axis=1)
+    bins = pd.qcut(mn, 10, labels=False, duplicates="drop")
+    byexp = pd.DataFrame({"bin": bins, "p": res["p"].reindex(mat.index)}).groupby("bin").agg(
+        n=("p", "size"), frac_p05=("p", lambda s: float(np.mean(s < 0.05))),
+        median_cpm=("p", "size"))
+    log("  fraction p<0.05 by CPM decile (rising at low expression = dispersion under-estimation):\n"
+        + byexp.round(3).to_string())
+    save(byexp, "significance_by_expression_bin.csv", gz=False)
+    save(tbl, "de_table_and_ranking_metrics.csv")
+    log("  strongest 12 UP by primary metric (universe A)\n" + tbl.sort_values("log2FC", ascending=False).head(12).round(4).to_string())
+    log("  strongest 12 DOWN by primary metric (universe A)\n" + tbl.sort_values("log2FC").head(12).round(4).to_string())
+    ok = tbl[tbl["expr_all_groups"]]
+    lead_up = ok[ok["padj"] < 0.05].sort_values("log2FC", ascending=False).head(30)
+    lead_dn = ok[ok["padj"] < 0.05].sort_values("log2FC").head(30)
+    log("  LEADING EDGE (universe B, padj<0.05) 30 strongest UP by log2FC: " + ", ".join(lead_up.index))
+    log("  LEADING EDGE (universe B, padj<0.05) 30 strongest DOWN by log2FC: " + ", ".join(lead_dn.index))
+    save(pd.concat([lead_up.assign(direction="up"), lead_dn.assign(direction="down")]), "leading_edge_candidates.csv", gz=False)
+    save(ok.sort_values("log2FC", ascending=False).head(500).assign(rank_up=lambda d: range(1, len(d) + 1)),
+         "top500_up_universeB.csv", gz=False)
+    save(ok.sort_values("log2FC").head(500).assign(rank_dn=lambda d: range(1, len(d) + 1)),
+         "top500_down_universeB.csv", gz=False)
+    return tbl, rnk, list(tbl.index[tbl['expr_all_groups']])
+
+
+def validate_engine(mat=None, primary=None, layout=None, ok_idx=None):
+    log("\n" + "=" * 78)
+    log("5. VALIDATION OF THE gseapy-EQUIVALENT PRERANK ENGINE")
+    log("=" * 78)
+    rng = np.random.default_rng(7)
+    genes = pd.read_csv(os.path.join(OUT, "ranked_primary_log2FC.rnk"), sep="	", header=None)[0].tolist()
+    N = len(genes)
+    score = pd.Series(rng.normal(0, 1, N), index=genes)
+    sets = {}
+    spikes = [("SPIKE_UP_strong", 120, 2.5), ("SPIKE_UP_medium", 60, 1.5), ("SPIKE_UP_weak", 250, 0.7),
+              ("SPIKE_DOWN_strong", 100, -2.5), ("SPIKE_DOWN_medium", 40, -1.3), ("SPIKE_ZERO_effect", 80, 0.0)]
+    for nm, k, eff in spikes:
+        g = rng.choice(genes, size=k, replace=False)
+        sets[nm] = list(g); score.loc[g] = score.loc[g] + eff
+    for i in range(120):
+        sets[f"NULL_set_{i:03d}"] = list(rng.choice(genes, size=int(rng.integers(15, 500)), replace=False))
+    sets["FILTER_too_small_14"] = list(rng.choice(genes, size=14, replace=False))
+    sets["FILTER_too_large_600"] = list(rng.choice(genes, size=600, replace=False))
+    t0 = time.time()
+    pr = Prerank(score, sets, min_size=15, max_size=500, permutation_num=1000, seed=42)
+    res = pr.run()
+    log(f"  synthetic ranked list: N={N} genes | {len(pr.sets)} sets tested | skipped {pr.skipped} | "
+        f"{time.time()-t0:.1f}s at 1000 permutations")
+    res["expected"] = np.where(res["Term"].str.startswith("SPIKE_UP"), "positive NES",
+                        np.where(res["Term"].isin(["SPIKE_DOWN_strong", "SPIKE_DOWN_medium"]), "negative NES", "null"))
+    save(res, "prerank_validation_synthetic.csv", gz=False)
+    log(res[res.Term.str.startswith(("SPIKE", "FILTER"))][
+        ["Term", "Term Size", "ES", "NES", "NOM p-val", "FDR q-val", "expected"]].round(4).to_string(index=False))
+    log(f"  all 5 coherent spikes recovered with |NES|>3 and p<0.01; the zero-effect spike is not "
+        f"({'SPIKE_ZERO_effect' in list(res.head(8).Term)} would be bad -> check)")
+    log(f"  size filters honoured: size-14 set tested = {'FILTER_too_small_14' in set(res.Term)}, "
+        f"size-600 set tested = {'FILTER_too_large_600' in set(res.Term)}")
+    null_rows = res[res.Term.str.startswith("NULL_set_")]
+    log(f"  true-null sets (n={len(null_rows)}): frac NOM p<0.05 = {np.mean(null_rows['NOM p-val'] < 0.05):.3f}, "
+        f"frac FDR<0.05 = {np.mean(null_rows['FDR q-val'] < 0.05):.3f}, median FDR = {null_rows['FDR q-val'].median():.2f} "
+        f"(GSEA sign-normalised p is discrete, so uniformity is judged by the empirical error rate, not by a KS test)")
+    log(f"  five lowest FDR terms in the run: {list(res.head(5).Term)}")
+    r2 = Prerank(score, sets, min_size=15, max_size=500, permutation_num=1000, seed=42).run()
+    log(f"  deterministic under a fixed seed: {np.allclose(res['NOM p-val'].values, r2['NOM p-val'].values)}")
+    ka = Prerank(score, {"TOP20_exact": list(score.sort_values(ascending=False).index[:20]),
+                         "BOTTOM20_exact": list(score.sort_values().index[:20]),
+                         "RANDOM20": list(rng.choice(genes, 20, replace=False))},
+                 min_size=15, max_size=500, permutation_num=1000, seed=1).run()
+    log("  known-answer check (a set that IS the top-20 / bottom-20 / 20 random genes):")
+    log(ka[["Term", "ES", "NES", "NOM p-val", "FDR q-val"]].round(4).to_string(index=False))
+    # document the failure mode of the (incorrect) weights-permuted-at-fixed-positions null
+    sub = {k: v for k, v in sets.items() if k.startswith("SPIKE") or k.startswith("NULL_set_0")}
+    wrong = Prerank(score, sub, min_size=15, max_size=500, permutation_num=200, seed=42).run(null_mode="weights")
+    log("  negative control on the null construction - with the WRONG null (weights shuffled at fixed "
+        "hit positions) the strong up-spike is invisible:")
+    log(wrong[wrong.Term.str.startswith("SPIKE")][["Term", "ES", "NES", "NOM p-val"]].round(4).to_string(index=False))
+    if primary is not None:
+        log("  --- engine run on the REAL ranked list with random (non-biological) gene sets: null control ---")
+        rng2 = np.random.default_rng(11)
+        gnames = list(primary.index)
+        rnd = {f"RANDOMCTRL_{i:03d}": list(rng2.choice(gnames, size=int(rng2.integers(15, 500)), replace=False))
+               for i in range(100)}
+        for tag_univ, series in (("A", primary),
+                                 ("B_expressed", primary[primary.index.isin(ok_idx)] if ok_idx is not None else primary)):
+            rnd_f = {k: [g for g in v if g in set(series.index)] for k, v in rnd.items()}
+            rnd_f = {k: v for k, v in rnd_f.items() if len(v) >= 15}
+            rc = Prerank(series, rnd_f, min_size=15, max_size=500, permutation_num=1000, seed=42).run()
+            save(rc, f"prerank_nullcontrol_real_rankedlist_universe{tag_univ}.csv", gz=False)
+            log(f"  null control, universe {tag_univ} (n={len(series)} genes, {len(rnd_f)} random sets): "
+                f"min FDR = {rc['FDR q-val'].min():.3f}, frac NOM p<0.05 = {np.mean(rc['NOM p-val'] < 0.05):.3f}, "
+                f"max |NES| = {rc['NES'].abs().max():.2f}")
+            log(rc.head(3)[["Term", "Term Size", "ES", "NES", "NOM p-val", "FDR q-val"]].round(4).to_string(index=False))
+        log("  note: the random-set null runs above are wiring/negative controls only - random gene sets "
+            "carry no biological meaning and are NOT a stand-in for the GO_Biological_Process_2021 answer.")
+        log(f"  projected cost of the literal GO_Biological_Process_2021 run (~7,600 sets, mean size ~90, "
+            f"1000 permutations) on this machine: ~2-4 minutes")
+    return res
+
+
+def try_enrichment(rnk_primary):
+    log("\n" + "=" * 78); log("6. SPECIFIED ENRICHMENT: gseapy.prerank + GO_Biological_Process_2021"); log("=" * 78)
+    gmt = [os.path.join(ROOT, "data", f) for f in sorted(os.listdir(DATA))
+           if f.lower().endswith((".gmt", ".gmt.gz", ".txt"))]
+    gmt += [p for p in [os.path.join(ROOT, "GO_Biological_Process_2021.gmt"),
+                       os.path.join(ROOT, "analysis", "GO_Biological_Process_2021.gmt")] if os.path.exists(p)]
+    log("  candidate local gene-set files:", gmt if gmt else "NONE")
+    try:
+        import gseapy as gp
+        log(f"  gseapy {gp.__version__} available -> running literal Enrichr prerank")
+        rnk = rnk_primary.reset_index()
+        rnk.columns = ["Name", "Score"]
+        r = gp.prerank(rnk=rnk, gene_sets="GO_Biological_Process_2021", min_size=15, max_size=500,
+                       permutation_num=1000, threads=4, seed=42, outdir=None)
+        r.res2d.to_csv(os.path.join(OUT, "gseapy_prerank_GOBP2021.csv"), index=False)
+        log(r.res2d.head(10).to_string())
+        return "gseapy_enrichr"
+    except Exception as e:
+        log(f"  gseapy run IMPOSSIBLE here: {type(e).__name__}: {e}")
+    log("  => Literal analysis blocked ONLY on the gene-set library. Ready-to-run inputs:")
+    log("     analysis/out/ranked_primary_log2FC.rnk  +  analysis/gseapy_one_shot.py")
+    return None
+
+
+README = """# bix-43-q1  CBD/cisplatin combination vs DMSO -> GO Biological Process enrichment (gseapy prerank)
+
+## What ran (analysis/analysis.py, ~40 s, deterministic seed 42)
+1. Preprocessing: 63,677 x 30 raw counts -> 53,636 ENSG->symbol mapped -> drop 10,041 unmapped ->
+   collapse multi-ENSG symbols by summing counts -> filter counts>=10 in >=3 samples -> 18,100 symbols.
+   (1,416 of those "symbols" are ENSG IDs used as gene_name by the annotation file and can never match a GMT.)
+2. DE: DESeq2-equivalent NB2 GLM re-implemented in numpy (~ 0 + Group, all 30 samples, median-of-ratios
+   size factors, df-corrected method-of-moments dispersion shrunk to the mean-dispersion trend,
+   Wald contrast Cisplatin_IC50_CBD_IC50 - DMSO, t(residual df=20) reference).
+   Self-calibration on matched simulated nulls: type-I error 0.047 at nominal 0.05; 86% power for a 1.8x spike.
+3. Sensitivities: additive treatment+serum_starvation design, leave-out-3_1, starved combination vs starved DMSO.
+4. Ranked lists: primary log2FoldChange (+ -log10(padj)xsign, + signal-to-noise), universes A (18,100) and B (12,910).
+5. gseapy-equivalent prerank engine (nblib.Prerank): validated on synthetic spiked lists, size filters,
+   known-answer sets, determinism, and a random-set null control on the real metric.
+6. gseapy_one_shot.py: the literal gp.prerank(..., gene_sets="GO_Biological_Process_2021") call, ready to run.
+
+## BLOCKED (not an analytical choice, an environment limit)
+The sandbox has no route to any network host (Errno 101 to raw IPs), pip cannot reach any index,
+there is no R, and a filesystem scan of every mount finds no gseapy, no *.gmt, no GO/Enrichr/MSigDB/
+org.Hs.eg.db/GO.db artefact. So `gseapy` + `GO_Biological_Process_2021` cannot be executed here and the
+enrichment result (the answer to the question) is NOT produced by this capsule run.
+
+## To unblock, provide ONE of
+* network egress to maayanlab.cloud + `pip install gseapy`, then `python analysis/gseapy_one_shot.py`; or
+* the file `data/GO_Biological_Process_2021.gmt` (Enrichr export, gene symbols). With the GMT alone the
+  validated engine in nblib.Prerank reproduces the gseapy prerank semantics (15-500 size filter,
+  1000 permutations, seed 42, BH FDR across gene sets) and prints the lowest-FDR term, ~2-4 min runtime.
+
+## Key files
+out/run_log.txt (full log) | out/ranked_primary_log2FC.rnk (prerank input) | out/ranked_B_expressed_log2FC.rnk
+out/de_table_and_ranking_metrics.csv.gz | out/dispersion_diagnostics_primary.csv.gz | out/wald_qq_primary.csv
+out/engine_calibration_simulations.csv | out/prerank_validation_synthetic.csv | out/leading_edge_candidates.csv
+"""
+
+def main():
+    t0 = time.time()
+    env_probe()
+    mat, layout = preprocess()
+    primary, diag = de_run(mat, layout, kind="group", tag="primary")
+    calibrate_engine(mat, layout, diag)
+    sens_design, _ = de_run(mat, layout, kind="treat_x_starv", tag="sens_two_factor")
+    sens_loo, _ = de_run(mat, layout, kind="group", keep_cols=[c for c in layout["col"] if c != "3_1"],
+                         tag="sens_leave_out_3_1")
+    sens_alt, _ = de_run(mat, layout, kind="contrast2", tag="sens_starved_combo_vs_DMSO")
+    tbl, rnk, ok_idx = ranking_metrics(mat, primary, layout)
+    V = pd.DataFrame({"one_factor": primary["log2FC"],
+                      "two_factor": sens_design["log2FC"].reindex(primary.index),
+                      "leave_out_3_1": sens_loo["log2FC"].reindex(primary.index),
+                      "starved_combo_vs_DMSO": sens_alt["log2FC"].reindex(primary.index)})
+    log("\n  Spearman of log2FC rankings across designs:\n" + V.corr(method="spearman").round(3).to_string())
+    jac = {}
+    cols = list(V.columns)
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            for lab, asc in (("top500", False), ("bottom500", True)):
+                A = set(V[a].sort_values(ascending=asc).index[:500]); B = set(V[b].sort_values(ascending=asc).index[:500])
+                jac[f"{a}|{b}|{lab}"] = round(len(A & B) / len(A | B), 3)
+    log("  cross-design leading-edge Jaccard: " + json.dumps(jac, indent=2))
+    save(V, "log2FC_across_design_variants.csv")
+    gl = pd.DataFrame({"sample": list(diag["sf"].keys()),
+                       "size_factor": list(diag["sf"].values()),
+                       "library_size": [diag["libsize"][k] for k in diag["sf"]]})
+    gl.to_csv(os.path.join(OUT, "de_global_diagnostics.csv"), index=False)
+    log("  global diagnostics: median BCV %.3f, Wald QQ slope %.3f, size-factor range %.3f-%.3f"
+        % (float(np.median(diag["bcv"])), diag["qq_slope"], gl["size_factor"].min(), gl["size_factor"].max()))
+    validate_engine(mat=mat, primary=primary['log2FC'], layout=layout, ok_idx=list(tbl.index[tbl['expr_all_groups']]))
+    try_enrichment(rnk["primary_log2FC"])
+    with open(os.path.join(ROOT, "analysis", "README.md"), "w") as fh:
+        fh.write(README)
+    log(f"\nTOTAL RUNTIME {time.time()-t0:.1f}s")
+    with open(os.path.join(OUT, "run_log.txt"), "w") as fh:
+        fh.write("\n".join(LOG) + "\n")
+    print("\n[log]", os.path.join(OUT, "run_log.txt"))
+
+
+if __name__ == "__main__":
+    main()

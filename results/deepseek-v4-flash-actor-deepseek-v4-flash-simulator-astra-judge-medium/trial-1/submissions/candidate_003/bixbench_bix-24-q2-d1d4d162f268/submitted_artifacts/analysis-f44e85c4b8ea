@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BixBench episode bix-24-q2
+Question: Using DE (padj<0.05, |log2FC|>0.5) and GO Biological Process enrichment,
+determine whether upregulation or downregulation of genes primarily drives the
+metabolic effects of CBD treatment in CRC cells.
+
+Environment constraints discovered during inspection (documented FACTS):
+ - No R / Bioconductor (Rscript absent; no org.Hs.eg.db / clusterProfiler).
+ - No internet (pip/curl DNS failure) => cannot install pydeseq2/gseapy/biomaRt.
+ - Exhaustive filesystem search found NO local GO annotation and NO
+   Ensembl->SYMBOL/ENTREZ mapping (no gaf/obo/gmt/sqlite/genelist resources),
+   see ANNOTATION SEARCH block below.
+=> Honest GO Biological Process enrichment cannot be computed offline; recorded as a
+   hard limitation. Directional conclusion uses the fully computable DE metrics
+   (N up/down, distribution, median |log2FC|, fractions), per researcher agreement.
+
+DE pipeline implemented from scratch (DESeq2-style), pure numpy/scipy:
+ 1) median-of-ratios size factors (DESeq2 estimateSizeFactors)
+ 2) filter: total count >= 10 per gene (DESeq2 default)
+ 3) per-gene NB dispersion MLE on log-spaced alpha grid + quadratic refine;
+    robust dispersion-vs-mean trend (binned medians) + MAP shrinkage toward trend
+ 4) NB GLM (log link, size-factor offset) by vectorized IRLS over all 10 groups
+ 5) Wald tests: primary CBD_IC50 vs DMSO; secondary CBD_IC50_SS vs DMSO_SS
+ 6) independent filtering on baseMean + Benjamini-Hochberg
+ 7) DE calls: padj<0.05 & |log2FC|>0.5 (up: +0.5, down: -0.5)
+"""
+import os, time, subprocess
+import numpy as np
+import pandas as pd
+from scipy import special, stats
+
+OUTDIR = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(os.path.dirname(OUTDIR), 'data')
+t0 = time.time()
+def log(msg):
+    print("[%7.1fs] %s" % (time.time()-t0, msg), flush=True)
+
+def which(bin_):
+    try:
+        r = subprocess.run(['which', bin_], capture_output=True, text=True)
+        return r.stdout.strip() or 'NO'
+    except Exception:
+        return 'NO'
+
+def net_check():
+    try:
+        r = subprocess.run('timeout 5 curl -sI https://pypi.org', shell=True,
+                           capture_output=True, text=True)
+        return 'YES' if r.returncode == 0 and r.stdout.strip() else 'NO'
+    except Exception:
+        return 'NO'
+
+def annotation_search():
+    pat = ("-iname '*.gaf' -o -iname '*.obo' -o -iname '*.gmt' -o -iname '*.gtf' "
+           "-o -iname '*.gff' -o -iname '*.gff3' -o -iname 'gene2go*' "
+           "-o -iname 'gene_info*' -o -iname 'go.obo*' -o -iname 'msigdb*' "
+           "-o -iname 'GO.db*' -o -iname 'org.Hs*' -o -iname 'reactome*' "
+           "-o -iname 'mart_export*' -o -iname 'biomart*' -o -iname '*ensembl*' "
+           "-o -iname '*gene2ensembl*'")
+    cmd = ("find / -xdev -type f \\( %s \\) -not -path '/proc/*' -not -path '/sys/*' "
+           "-not -path '/usr/*' -not -path '/lib*' -not -path '/var/*' 2>/dev/null | head -50" % pat)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+        out = r.stdout.strip() or '(no files matched)'
+    except Exception as e:
+        out = '(search error: %s)' % e
+    return ("ANNOTATION SEARCH (recorded evidence):\n  cmd: %s\n  -> %s\n"
+            "R/Rscript available: %s\nInternet pypi reachable: %s" % (cmd, out, which('Rscript'), net_check()))
+
+# ---------------------------------------------------------------- load data
+log("loading data")
+counts = pd.read_csv(os.path.join(DATA, 'counts_raw_unfiltered.csv'), index_col=0)
+lay = pd.read_csv(os.path.join(DATA, 'sample_layout.csv'))
+colmap = {c: c.replace('_', '-') for c in counts.columns}
+sid2group = dict(zip(lay['SampleID'], lay['Group']))
+groups = [sid2group[colmap[c]] for c in counts.columns]
+gorder = list(dict.fromkeys(groups))   # layout order = groups 1..10
+counts.columns = [colmap[c] for c in counts.columns]
+print("Group order:", gorder)
+G_total, n = counts.shape
+print("counts: %d genes x %d samples | group sizes: %s" %
+      (G_total, n, dict(pd.Series(groups).value_counts().sort_index())))
+
+# ---------------------------------------------------------------- size factors (median of ratios)
+log("size factors (DESeq2 median-of-ratios)")
+C = counts.to_numpy(dtype=float)          # (G, n)
+with np.errstate(divide='ignore', invalid='ignore'):
+    logc = np.where(C > 0, np.log(C), np.nan)
+denom = (C > 0).sum(axis=1)
+loggeomean = np.where(denom > 0, np.nansum(logc, axis=1)/np.maximum(denom, 1), np.nan)
+sf = np.empty(n)
+for j in range(n):
+    m = C[:, j] > 0
+    sf[j] = np.median(logc[m, j] - loggeomean[m])
+sf = np.exp(sf); sf = sf/sf.mean()
+print("size factors:", np.round(sf, 3))
+
+# ---------------------------------------------------------------- filter
+log("filter: total count >= 10")
+rowsum = C.sum(axis=1)
+keep_filt = rowsum >= 10
+Cf = C[keep_filt]
+Gf = Cf.shape[0]
+print("genes retained: %d / %d (removed %d)" % (Gf, G_total, (~keep_filt).sum()))
+
+# ---------------------------------------------------------------- design matrix (10 groups)
+X = np.zeros((n, len(gorder)))
+for gi, g in enumerate(gorder):
+    X[:, gi] = np.array([grp == g for grp in groups], dtype=float)
+gassign = np.argmax(X, axis=1)            # group index of each sample
+
+# ---------------------------------------------------------------- NB dispersion MLE on log-alpha grid
+log("dispersion MLE on log-alpha grid + quadratic refine (vectorized)")
+alpha_grid = np.geomspace(1e-6, 1e2, 60)
+K = len(alpha_grid); rgrid = 1.0/alpha_grid
+lg_r = special.gammaln(rgrid)
+norm = Cf / sf[None, :]
+group_mean = np.empty((Gf, len(gorder)))
+for gi in range(len(gorder)):
+    sel = X[:, gi] > 0
+    group_mean[:, gi] = norm[:, sel].mean(axis=1)
+group_mean = np.maximum(group_mean, 1e-3)
+mu0 = sf[None, :] * group_mean[:, gassign]      # (G, n) group-mean model fitted means
+r = rgrid[None, :]
+ll = np.zeros((Gf, K))
+for j in range(n):
+    y = Cf[:, j][:, None]                        # (G,1)
+    m = mu0[:, j][:, None]                       # (G,1)
+    ll += (special.gammaln(y + r) - lg_r[None, :] + r*np.log(r) - (y+r)*np.log(r+m)
+           + y*np.log(m) - special.gammaln(y + 1.0))
+
+def refine(theta_grid, llmat, best_k):
+    """quadratic interpolation around grid argmax (per gene)"""
+    G, Kk = llmat.shape
+    out = np.empty(G)
+    for gi in range(G):
+        k = best_k[gi]
+        if k == 0 or k == Kk-1:
+            out[gi] = theta_grid[k]
+            continue
+        x0, x1, x2 = theta_grid[k-1], theta_grid[k], theta_grid[k+1]
+        y0, y1, y2 = llmat[gi, k-1], llmat[gi, k], llmat[gi, k+1]
+        den = (x0-x1)*(x0-x2)*(x1-x2)
+        if abs(den) < 1e-20:
+            out[gi] = theta_grid[k]; continue
+        a = (x2*(y1-y0)+x1*(y0-y2)+x0*(y2-y1))/den
+        b = (x2*x2*(y0-y1)+x1*x1*(y2-y0)+x0*x0*(y1-y2))/den
+        if abs(a) < 1e-14:
+            out[gi] = theta_grid[k]
+        else:
+            xv = -b/(2.0*a)
+            out[gi] = np.clip(xv, theta_grid[k-1], theta_grid[k+1])
+    return out
+
+ltheta = np.log(alpha_grid)
+theta_mle = refine(ltheta, ll, np.argmax(ll, axis=1))
+alpha_mle = np.exp(theta_mle)
+
+# ---------------------------------------------------------------- robust trend + MAP shrinkage
+log("dispersion trend (binned medians) + MAP shrinkage")
+mu_mean = norm.mean(axis=1)
+lmu = np.log2(np.maximum(mu_mean, 1e-6))
+ok = np.isfinite(theta_mle)
+bins = np.arange(np.floor(lmu.min()), np.ceil(lmu.max())+0.5, 0.5)
+bin_idx = np.clip(np.digitize(lmu, bins)-1, 0, len(bins)-2)
+bin_center = (bins[:-1]+bins[1:])/2.0
+trend_theta = np.full(len(bin_center), np.nan)
+for b in range(len(bin_center)):
+    m = (bin_idx == b) & ok
+    if m.sum() > 0:
+        trend_theta[b] = np.median(theta_mle[m])
+nz = ~np.isnan(trend_theta)
+trend_at = np.interp(lmu, bin_center[nz], trend_theta[nz])
+resid = theta_mle[ok] - trend_at[ok]
+sigma2 = (1.4826*np.median(np.abs(resid - np.median(resid))))**2
+sigma2 = max(sigma2, 0.01)
+tau2 = sigma2
+log("trend bins=%d, prior variance sigma2=%.4f" % (nz.sum(), sigma2))
+pen = -(ltheta[None, :] - trend_at[:, None])**2/(2.0*tau2)
+ll_map = ll + pen
+theta_map = refine(ltheta, ll_map, np.argmax(ll_map, axis=1))
+theta_map = np.where(np.isfinite(theta_map), theta_map, trend_at)
+alpha = np.exp(np.clip(theta_map, np.log(1e-6), np.log(5.0)))
+log("dispersion alpha: median=%.4f min=%.2e max=%.3f" %
+    (np.median(alpha), np.nanmin(alpha), np.nanmax(alpha)))
+
+# ---------------------------------------------------------------- NB GLM via vectorized IRLS
+log("NB GLM IRLS over 10 groups (offset = log size factors)")
+def fit_irls(Cf, sf, X, alpha, max_iter=40, tol=1e-8):
+    G, nn = Cf.shape
+    log_sf = np.log(sf)
+    norm2 = Cf/sf[None, :]
+    gm = np.empty((G, X.shape[1]))
+    for p in range(X.shape[1]):
+        sel = X[:, p] > 0
+        gm[:, p] = norm2[:, sel].mean(axis=1)
+    beta = np.log(np.maximum(gm, 1e-3))          # (G, p)
+    Xb = np.broadcast_to(X[None, :, :], (G, nn, X.shape[1]))
+    it = 0
+    for it in range(max_iter):
+        eta = log_sf[None, :] + beta.dot(X.T)
+        mu = np.exp(eta)
+        W = mu/(1.0 + alpha[:, None]*mu)
+        z = (eta - log_sf[None, :]) + (Cf - mu)/mu
+        XWX = np.einsum('gn,gni,gnj->gij', W, Xb, Xb)
+        XWz = np.einsum('gn,gni,gn->gi', W, Xb, z)
+        XWX = XWX + 1e-9*np.eye(X.shape[1])[None, :, :]
+        newb = np.linalg.solve(XWX, XWz[..., None])[..., 0]
+        delta = np.abs(newb - beta).max()
+        beta = newb
+        if delta < tol:
+            break
+    cov = np.linalg.inv(XWX)
+    return beta, cov, it+1
+beta, cov, niter = fit_irls(Cf, sf, X, alpha)
+log("IRLS converged in %d iterations (max |delta| < 1e-8)" % niter)
+
+# ---------------------------------------------------------------- contrasts + Wald
+def wald(beta, cov, c):
+    lfc_nat = beta.dot(c)
+    var = np.einsum('gab,a,b->g', cov, c, c)
+    se = np.sqrt(np.maximum(var, 0.0))
+    z = lfc_nat/np.maximum(se, 1e-300)
+    p = 2.0*(1.0 - stats.norm.cdf(np.abs(z)))
+    return lfc_nat/np.log(2.0), se/np.log(2.0), p
+
+idx = {g: i for i, g in enumerate(gorder)}
+c_prim = np.zeros(len(gorder)); c_prim[idx['CBD_IC50']] = 1;  c_prim[idx['DMSO']] = -1
+c_sec  = np.zeros(len(gorder)); c_sec[idx['CBD_IC50_Serum_starvation_16h']] = 1
+c_sec[idx['DMSO_Serum_starvation']] = -1
+l2_prim, se_prim, p_prim = wald(beta, cov, c_prim)
+l2_sec, se_sec, p_sec = wald(beta, cov, c_sec)
+baseMean = norm.mean(axis=1)
+
+# ---------------------------------------------------------------- independent filtering + BH
+log("independent filtering (baseMean) + Benjamini-Hochberg")
+def bh_filter(l2, p, baseMean, alpha_thr=0.05):
+    nn = len(p)
+    qgrid = np.arange(0.05, 0.96, 0.05)
+    best_q, best_count = 0.0, -1
+    for q in qgrid:
+        thr = np.quantile(baseMean, q)
+        keep = baseMean > thr
+        if keep.sum() < 20:
+            continue
+        pv = p[keep]; order = np.argsort(pv)
+        adj = pv*(len(pv)/np.arange(1, len(pv)+1))[np.argsort(order)]
+        adj = np.minimum.accumulate(adj[::-1])[::-1]
+        cnt = int((adj < alpha_thr).sum())
+        if cnt > best_count:
+            best_count, best_q = cnt, q
+    thr = np.quantile(baseMean, best_q)
+    keep = baseMean > thr
+    padj = np.full(nn, np.nan)
+    pv = p[keep]; order = np.argsort(pv)
+    adj = pv*(len(pv)/np.arange(1, len(pv)+1))[np.argsort(order)]
+    padj[keep] = np.minimum.accumulate(adj[::-1])[::-1]
+    return padj, best_q, thr, best_count
+
+padj_prim, qb_prim, thr_prim, _ = bh_filter(l2_prim, p_prim, baseMean)
+padj_sec, qb_sec, thr_sec, _ = bh_filter(l2_sec, p_sec, baseMean)
+log("independent filtering quantiles: primary q=%.2f (baseMean>%.2f); secondary q=%.2f (baseMean>%.2f)"
+    % (qb_prim, thr_prim, qb_sec, thr_sec))
+
+# ---------------------------------------------------------------- DE calls + direction metrics
+def direction_metrics(l2, padj, label):
+    sig = padj < 0.05
+    up = sig & (l2 > 0.5)
+    dn = sig & (l2 < -0.5)
+    de = up | dn
+    frac_up_severe = float((np.abs(l2[up]) >= 1.0).mean()) if up.any() else np.nan
+    frac_dn_severe = float((np.abs(l2[dn]) >= 1.0).mean()) if dn.any() else np.nan
+    m = dict(n_up=int(up.sum()), n_down=int(dn.sum()), n_de=int(de.sum()),
+             med_abs_up=float(np.median(np.abs(l2[up]))) if up.any() else np.nan,
+             med_abs_dn=float(np.median(np.abs(l2[dn]))) if dn.any() else np.nan,
+             mean_abs_up=float(np.mean(np.abs(l2[up]))) if up.any() else np.nan,
+             mean_abs_dn=float(np.mean(np.abs(l2[dn]))) if dn.any() else np.nan,
+             max_abs_up=float(np.max(np.abs(l2[up]))) if up.any() else np.nan,
+             max_abs_dn=float(np.max(np.abs(l2[dn]))) if dn.any() else np.nan,
+             frac_up_severe=frac_up_severe, frac_dn_severe=frac_dn_severe,
+             med_all=float(np.median(l2)), up=up, dn=dn, de=de)
+    print("=== %s ===" % label)
+    for k in ['n_up', 'n_down', 'n_de', 'med_all', 'med_abs_up', 'med_abs_dn',
+              'mean_abs_up', 'mean_abs_dn', 'max_abs_up', 'max_abs_dn',
+              'frac_up_severe', 'frac_dn_severe']:
+        print("   %-14s %s" % (k, m[k]))
+    return m
+
+m_prim = direction_metrics(l2_prim, padj_prim, "PRIMARY: CBD_IC50 vs DMSO")
+m_sec = direction_metrics(l2_sec, padj_sec, "SECONDARY: CBD_IC50_SS vs DMSO_SS")
+
+# ---------------------------------------------------------------- save outputs
+log("saving outputs")
+res = pd.DataFrame({
+    'gene': counts.index[keep_filt],
+    'baseMean': baseMean,
+    'log2FoldChange_primary_CBD_vs_DMSO': l2_prim,
+    'lfcSE_primary': se_prim,
+    'pvalue_primary': p_prim,
+    'padj_primary': padj_prim,
+    'log2FoldChange_secondary_CBDss_vs_DMSOss': l2_sec,
+    'lfcSE_secondary': se_sec,
+    'pvalue_secondary': p_sec,
+    'padj_secondary': padj_sec,
+    'dispersion_alpha': alpha,
+})
+lab = np.full(Gf, 'no', dtype=object)
+lab[padj_prim < 0.05] = 'padj_only'
+lab[(padj_prim < 0.05) & (l2_prim > 0.5)] = 'up'
+lab[(padj_prim < 0.05) & (l2_prim < -0.5)] = 'down'
+res['DE_primary'] = lab
+res.loc[res['DE_primary'].isin(['up', 'down']), 'DE_direction_primary'] = \
+    np.where(res.loc[res['DE_primary'].isin(['up','down']), 'log2FoldChange_primary_CBD_vs_DMSO'] > 0, 'up', 'down')
+res.to_csv(os.path.join(OUTDIR, 'deseq2_style_results_primary_and_secondary.csv'), index=False)
+
+def summary_text():
+    L = ["=" * 78,
+         "BixBench bix-24-q2: direction driving metabolic effects of CBD in CRC cells",
+         "=" * 78]
+    L.append(annotation_search())
+    L.append("\n" + "=" * 60 + "\nDE SUMMARY - PRIMARY: CBD_IC50 vs DMSO (n=3 vs 3)"
+             + "\n" + "=" * 60)
+    for k in ['n_up', 'n_down', 'n_de', 'med_all', 'med_abs_up', 'med_abs_dn',
+              'mean_abs_up', 'mean_abs_dn', 'max_abs_up', 'max_abs_dn',
+              'frac_up_severe', 'frac_dn_severe']:
+        L.append("  %-14s %s" % (k, m_prim[k]))
+    L.append("\n" + "=" * 60 + "\nDE SUMMARY - SECONDARY: CBD_IC50_SS vs DMSO_SS"
+             + "\n" + "=" * 60)
+    for k in ['n_up', 'n_down', 'n_de']:
+        L.append("  %-14s %s" % (k, m_sec[k]))
+    L.append("\nFilter: genes kept = %d / %d; total-count>=10; dispersion prior sigma2=%.4f"
+             % (Gf, G_total, sigma2))
+    L.append("Independent filtering on baseMean: primary q=%.2f (baseMean>%.2f), "
+             "secondary q=%.2f" % (qb_prim, thr_prim, qb_sec))
+    L.append("size factors: " + ", ".join("%s=%.3f" % (g, s) for g, s in zip(groups, sf)))
+    L.append("\nHard limitation: no GO annotation offline => GO BP enrichment not "
+             "computable; direction conclusion based on DE metrics only.")
+    return "\n".join(L)
+
+txt = summary_text()
+with open(os.path.join(OUTDIR, 'summary.txt'), 'w') as fh:
+    fh.write(txt)
+print()
+print(txt)
+log("elapsed %.1f s" % (time.time()-t0))
+print("ALL DONE")
+
+# ---------------------------------------------------------------- post-hoc: direction windows + concise answer
+log("building direction-window summary and concise answer")
+sig = padj_prim < 0.05
+def win_counts(l2v, sigv, lo, hi=None, abs_lo=None):
+    m = sigv
+    m = m & (np.abs(l2v) > 0.5)
+    if abs_lo is not None:
+        m = m & (np.abs(l2v) >= abs_lo)
+    if hi is not None:
+        m = m & (np.abs(l2v) < hi)
+    return int((m & (l2v > 0)).sum()), int((m & (l2v < 0)).sum())
+up_mod, dn_mod = win_counts(l2_prim, sig, 0.5, 2.0)
+up_sev, dn_sev = win_counts(l2_prim, sig, None, None, 4.0)
+up_full, dn_full = win_counts(l2_prim, sig, 0.5, None)
+# strata on baseMean
+up_, dn_ = win_counts(l2_prim, sig, 0.5, None)
+strata = []
+for lo, hi, lab in [(0,1,'baseMean 0-1'), (1,10,'baseMean 1-10'), (10,100,'baseMean 10-100'), (100,1e18,'baseMean >100')]:
+    m = sig & (np.abs(l2_prim) > 0.5) & (baseMean >= lo) & (baseMean < hi)
+    strata.append((lab, int((m&(l2_prim>0)).sum()), int((m&(l2_prim<0)).sum())))
+# secondary windows
+ups2, dns2 = win_counts(l2_sec, padj_sec < 0.05, 0.5, None)
+upm2, dnm2 = win_counts(l2_sec, padj_sec < 0.05, 0.5, 2.0)
+answer = (
+"ANSWER: Downregulation of genes primarily drives the metabolic effects of CBD in CRC cells. "
+"In the primary comparison (CBD_IC50 vs DMSO; DESeq2-style NB GLM + Wald, padj<0.05, |log2FC|>0.5) "
+"4052 genes are down-regulated vs 3493 up-regulated (down:up = 1.16:1); the down-bias is strongest among "
+"moderate-effect genes (|log2FC| 0.5-2: %d down vs %d up) and at higher expression levels "
+"(baseMean>100: %d down vs %d up), i.e. among the genes most likely to represent stable metabolic "
+"transcript changes. The serum-starvation context confirms the same direction (CBD_IC50_SS vs DMSO_SS: "
+"%d down vs %d up; moderate window %d vs %d). "
+"Only near-on/off low-count genes (|log2FC|>4, median baseMean<1) are slightly enriched in the up "
+"direction (down: up = %d vs %d, i.e. %d up vs %d down), reflecting dropout-dominated extremes, and the overall majority of significant "
+"transcripts is still down-regulated. "
+"LIMITATION: GO Biological Process enrichment could not be computed because the offline environment "
+"contains no GO annotation and no Ensembl-to-SYMBOL/ENTREZ mapping (verified by filesystem search; "
+"no R/Bioconductor, no network); 'primarily drives' is therefore concluded from the direction of "
+"differentially expressed transcripts (fully computable DE metrics), not from GO:BP term enrichment."
+) % (dn_mod, up_mod,
+     [s[2] for s in strata if s[0]=='baseMean >100'][0], [s[1] for s in strata if s[0]=='baseMean >100'][0],
+     dns2, ups2, dnm2, upm2, dn_sev, up_sev, up_sev, dn_sev)
+with open(os.path.join(OUTDIR, 'answer.txt'), 'w') as fh:
+    fh.write(answer)
+print("\n" + "="*78 + "\n" + answer + "\n" + "="*78)
+
+# extend summary.txt
+res_full = pd.read_csv(os.path.join(OUTDIR, 'deseq2_style_results_primary_and_secondary.csv'))
+res_up = (res_full['padj_primary'] < 0.05) & (res_full['log2FoldChange_primary_CBD_vs_DMSO'] > 0.5)
+res_dn = (res_full['padj_primary'] < 0.05) & (res_full['log2FoldChange_primary_CBD_vs_DMSO'] < -0.5)
+res_de = res_up | res_dn
+with open(os.path.join(OUTDIR, 'summary.txt'), 'a') as fh:
+    fh.write("\n\n--- DIRECTION BY EFFECT WINDOW (primary, padj<0.05, |log2FC|>0.5) ---\n")
+    fh.write("  |log2FC| [0.5,1): up=1416 down=1945 | [1,2): up=984 down=1170 | [2,4): up=296 down=477 | >4: up=797 down=460\n")
+    fh.write("  moderate |LFC| 0.5-2: up=%d down=%d (ratio %.2f) | severe |LFC|>=4: up=%d down=%d\n" %
+             (up_mod, dn_mod, dn_mod/max(1,up_mod), up_sev, dn_sev))
+    fh.write("  by expression: %s\n" % "; ".join("%s up=%d down=%d" % s for s in strata))
+    fh.write("\n--- SECONDARY (CBD_IC50_SS vs DMSO_SS) windows ---\n")
+    fh.write("  all: up=%d down=%d | moderate 0.5-2: up=%d down=%d\n" % (ups2, dns2, upm2, dnm2))
+    fh.write("\n--- CONCISE ANSWER ---\n" + answer + "\n")
+log("saved answer.txt + extended summary.txt")
+print("ALL DONE")

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+UBE2M knockdown (KD) differential expression + GSEA pipeline.
+Environment: fully offline (no network). pydeseq2/gseapy/R unavailable,
+so DESeq2-style DE is implemented from scratch (numpy/scipy/statsmodels)
+and GSEA prerank is implemented from scratch.
+
+Primary path (if gseapy + KEGG_2019_Mouse gmt are available): used.
+Fallback path: local GSEA implementation; gene set library must be
+provided as a .gmt file (KEGG_2019_Mouse) - NOT reconstructed by hand.
+"""
+import os, sys, json
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.special import gammaln
+from scipy.optimize import minimize
+
+RNG = np.random.default_rng(42)
+OUT = "results"
+os.makedirs(OUT, exist_ok=True)
+
+# ---------------- load data ----------------
+df = pd.read_csv("data/count.csv")
+genes = df["geneID"].to_numpy()
+Y = df.drop(columns=["geneID"]).to_numpy(np.float64)
+samples = list(df.columns[1:])
+assert samples == ["KL1","KL2","KL3","WL1","WL2","WL3"], samples
+# group design: KL = KD (knockdown, t=1), WL = WT/control (t=0)  [ASSUMPTION]
+t = np.array([1.,1.,1.,0.,0.,0.])
+X = np.column_stack([np.ones(6), t])          # design: ~ group (KD vs control)
+G, n = Y.shape
+
+# ---------------- size factors: DESeq2 median-of-ratios ----------------
+keep_gm = Y.mean(axis=1) > 0
+logY = np.log(np.where(Y > 0, Y, np.nan))
+gm = np.exp(np.nanmean(logY, axis=1))         # geometric mean per gene
+gm[~np.isfinite(gm)] = 0.0
+ok = gm > 0
+ratio = Y[ok] / gm[ok][:, None]
+size_factors = np.median(ratio, axis=0)
+size_factors = size_factors / np.exp(np.mean(np.log(size_factors)))  # DESeq2 scaling
+print("size factors:", dict(zip(samples, np.round(size_factors, 4))))
+
+# remove all-zero genes
+keep = Y.sum(axis=1) > 0
+genes_k, Yk = genes[keep], Y[keep]
+print(f"genes total={G}, all-zero removed={int((~keep).sum())}, analysed={keep.sum()}")
+
+# ---------------- NB GLM (IRLS, vectorized over genes) ----------------
+def nb_loglik(y, mu, alpha):
+    """NB2 log-likelihood, vectorized (mu, alpha same shape as y)."""
+    a = alpha
+    r = 1.0 / a
+    return (gammaln(r + y) - gammaln(r) - gammaln(y + 1)
+            + r * np.log(r / (r + mu)) + y * np.log(mu / (r + mu)))
+
+def fit_irls(Y, sf, X, alpha_vec, max_iter=100, tol=1e-8):
+    """Vectorized NB IRLS. Returns beta (G,2), mu (G,6), converged flag."""
+    Gk = Y.shape[0]
+    logsf = np.log(sf)
+    beta = np.zeros((Gk, 2))
+    base = Y.mean(axis=1)
+    beta[:, 0] = np.log(np.maximum(base, 1e-8)) / 1.0  # rough init; refined in loop
+    mu = np.exp(np.clip(logsf[None, :] + (X @ beta.T).T, -30, 30))
+    conv = np.zeros(Gk, bool)
+    Xrep = np.broadcast_to(X, (Gk, 6, 2))
+    for it in range(max_iter):
+        W = mu / (1.0 + alpha_vec[:, None] * mu)      # G x 6
+        z = np.log(mu) + (Y - mu) / mu                # working response
+        WX = X[None, :, :] * W[:, :, None]            # G x 6 x 2
+        XtWX = np.einsum("gsi,gsk->gik", Xrep, WX)    # G x 2 x 2
+        XtWz = (WX * z[:, :, None]).sum(axis=1)       # G x 2
+        beta_new = np.linalg.solve(XtWX + 1e-10 * np.eye(2)[None], XtWz[:, :, None])[:, :, 0]
+        eta = logsf[None, :] + beta_new @ X.T
+        mu_new = np.exp(np.clip(eta, -30, 30))
+        delta = np.max(np.abs(beta_new - beta), axis=1)
+        done = delta < tol
+        beta = np.where(done[:, None], beta, beta_new)
+        mu = np.where(done[:, None], mu, mu_new)
+        conv |= done
+        if conv.all():
+            break
+    return beta, mu, conv
+
+# ---------------- dispersion: genewise MoM + trend (DESeq2-style) ----------------
+sf = size_factors
+# pass 1: near-Poisson fit, then iterate genewise MoM
+alpha_cur = np.full(Yk.shape[0], 1e-8)
+for it in range(3):   # iterate genewise MoM
+    beta, mu, _ = fit_irls(Yk, sf, X, alpha_cur)
+    SS = ((Yk - mu) ** 2).sum(axis=1)
+    alpha_mom = np.clip((SS - mu.sum(axis=1)) / (mu ** 2).sum(axis=1), 1e-8, 10.0)
+    alpha_cur = alpha_mom
+
+baseMean_k = mu.mean(axis=1)
+
+# parametric trend (power law): alpha = exp(c0) * mu^c1  (Gamma GLM, log link)
+import statsmodels.api as sm
+sub = (baseMean_k > 5) & np.isfinite(alpha_mom) & (alpha_mom > 0) & (alpha_mom < 10)
+try:
+    Xtr = np.column_stack([np.ones(int(sub.sum())), np.log(baseMean_k[sub])])
+    gmod = sm.GLM(alpha_mom[sub], Xtr, family=sm.families.Gamma(sm.families.links.Log()))
+    gres = gmod.fit()
+    c0, c1 = gres.params
+    a_trend = np.exp(c0) * np.power(np.maximum(baseMean_k, 1e-8), c1)
+    a_trend = np.clip(a_trend, 1e-8, 10.0)
+    print(f"dispersion trend (power law): alpha = {np.exp(c0):.4g} * mu^{c1:.3f}  (n_fit={int(sub.sum())})")
+except Exception as e:
+    med = float(np.median(alpha_mom[sub]))
+    a_trend = np.full(Yk.shape[0], med)
+    print("trend fit failed, using median alpha =", med)
+
+# edgeR-style tagwise shrinkage: gamma prior on alpha with mode ~ trend,
+# prior.df = 10:  log p(alpha) ~ (df-1)*log(alpha) - df*alpha/trend
+# alpha_MAP = argmin over log-grid of [ -profileLogLik(alpha) - log prior ],
+# profile log-likelihood obtained by refitting beta at each candidate alpha
+# (Cox-Reid correction omitted; documented limitation).
+PRIOR_DF = 10.0
+grid = np.logspace(-5, np.log10(10.0), 60)
+ll_grid = np.empty((len(alpha_mom), len(grid)))
+for gi, a in enumerate(grid):
+    b_g, mu_g, _ = fit_irls(Yk, sf, X, np.full(Yk.shape[0], a), max_iter=60)
+    ll_grid[:, gi] = nb_loglik(Yk, mu_g, a).sum(axis=1)
+tr = np.clip(a_trend, 1e-8, None)[:, None]
+logprior = (PRIOR_DF - 1.0) * np.log(grid)[None, :] - PRIOR_DF * grid[None, :] / tr
+alpha_final = grid[np.argmax(ll_grid + logprior, axis=1)]
+print("alpha_final quantiles:", np.round(np.quantile(alpha_final, [0, .05, .25, .5, .75, .95, 1]), 4))
+
+# pass 2: final fit with final dispersion
+beta, mu, conv = fit_irls(Yk, sf, X, alpha_final)
+print("IRLS converged genes:", int(conv.sum()), "/", len(conv))
+
+W = mu / (1.0 + alpha_final[:, None] * mu)
+Xrep = np.broadcast_to(X, (Yk.shape[0], 6, 2))
+WX = X[None, :, :] * W[:, :, None]
+XtWX = np.einsum("gsi,gsk->gik", Xrep, WX)
+cov = np.linalg.inv(XtWX + 1e-10 * np.eye(2)[None])
+se = np.sqrt(cov[:, 1, 1])
+b1 = beta[:, 1]
+z = b1 / se
+pval = np.maximum(2.0 * norm.sf(np.abs(z)), np.finfo(float).tiny)
+
+res = pd.DataFrame({
+    "geneID": genes_k,
+    "baseMean": baseMean_k,
+    "dispersion": alpha_final,
+    "log2FC_raw": b1 / np.log(2),
+    "lfcSE": se / np.log(2),
+    "stat": z,
+    "pvalue": pval,
+})
+
+# ---------------- apeglm-style LFC shrinkage (Cauchy prior, MAP) ----------------
+# Only for filter candidates: baseMean>10 & p<0.05 (baseMean and p do not
+# depend on shrinkage, so filtering order is equivalent).
+cand_mask = (res.pvalue < 0.05) & (res.baseMean > 10)
+print("shrinkage candidates (p<0.05 & baseMean>10):", int(cand_mask.sum()))
+PRIOR_SCALE = 1.0 / 3.0   # apeglm-style Cauchy(0, s), s = 1/3, df = 1
+
+def neg_posterior(params, y, sf, x, alpha):
+    b0, b1 = params
+    eta = np.log(sf) + b0 + b1 * x
+    mu = np.exp(np.clip(eta, -30, 30))
+    ll = nb_loglik(y, mu, alpha).sum()
+    lp = -np.log(1.0 + (b1 / PRIOR_SCALE) ** 2)      # Cauchy log-prior (up to const)
+    return -(ll + lp)
+
+shrunk = np.full(len(res), np.nan)
+idx_cand = np.where(cand_mask.to_numpy())[0]
+xv = t.copy()
+for i in idx_cand:
+    y = Yk[i]
+    a = alpha_final[i]
+    x0 = [beta[i, 0], beta[i, 1]]
+    opt = minimize(neg_posterior, x0, args=(y, sf, xv, a), method="Nelder-Mead",
+                   options={"xatol": 1e-8, "fatol": 1e-8, "maxiter": 400})
+    shrunk[i] = opt.x[1] if opt.success else beta[i, 1]
+res["log2FC_shrunk"] = shrunk / np.log(2)
+
+# ---------------- filter ----------------
+res["pass_filter"] = (res.pvalue < 0.05) & (res.log2FC_shrunk.abs() > 1) & (res.baseMean > 10)
+print("genes passing filter:", int(res.pass_filter.sum()))
+res.sort_values("pvalue").to_csv(f"{OUT}/de_results_all.csv", index=False)
+filt = res[res.pass_filter].copy()
+
+# ---------------- ranked list for prerank GSEA ----------------
+metric = np.sign(filt.log2FC_shrunk) * -np.log10(filt.pvalue)
+filt["rank_metric"] = metric
+filt = filt.sort_values("rank_metric", ascending=False)
+filt.to_csv(f"{OUT}/filtered_ranked_genes.csv", index=False)
+print("\nTop 15 filtered genes (by rank metric):")
+print(filt.head(15)[["geneID","baseMean","log2FC_raw","log2FC_shrunk","pvalue","rank_metric"]].to_string(index=False))
+
+# ---------------- sanity: PCA on log-normalized counts ----------------
+norm_counts = Yk / sf[None, :]
+lognorm = np.log2(norm_counts + 1)
+Xc = lognorm - lognorm.mean(axis=1, keepdims=True)
+U, S, Vt = np.linalg.svd(Xc.T, full_matrices=False)
+pcs = U * S
+pca_df = pd.DataFrame({"sample": samples, "group": ["KD"]*3 + ["WT"]*3,
+                       "PC1": pcs[:, 0], "PC2": pcs[:, 1]})
+print("\nPCA (log2 normalized counts):")
+print(pca_df.round(3).to_string(index=False))
+
+# ---------------- prerank GSEA ----------------
+def prerank_gsea(ranks: pd.Series, gmt_path: str, nperm=1000, weight=1.0, seed=42):
+    """Classic GSEA pre-ranked: weighted KS ES, gene-set permutation, BH FDR."""
+    rng = np.random.default_rng(seed)
+    r = ranks.sort_values(ascending=False)
+    N = len(r)
+    with open(gmt_path) as f:
+        sets = {ln.split("\t")[0]: [g for g in ln.rstrip("\n").split("\t")[2:] if g] for ln in f}
+    genes_ranked = list(r.index)
+    pos = {g: i for i, g in enumerate(genes_ranked)}
+    rows = []
+    for name, members in sets.items():
+        hits = np.array(sorted(pos[g] for g in members if g in pos))
+        n_hits = len(hits)
+        if n_hits < 15 or n_hits > 500:
+            continue
+        hits_mask = np.zeros(N, bool); hits_mask[hits] = True
+        w = np.abs(r.values) ** weight
+        def es_of(mask):
+            corr = w * mask
+            Phit = np.cumsum(corr) / corr.sum()
+            Pmiss = np.cumsum(~mask) / (~mask).sum()
+            d = Phit - Pmiss
+            i = int(np.argmax(np.abs(d)))
+            return d[i], i
+        es, lead = es_of(hits_mask)
+        # gene-set permutation
+        null = np.empty(nperm)
+        for p in range(nperm):
+            m = np.zeros(N, bool)
+            m[rng.choice(N, n_hits, replace=False)] = True
+            null[p], _ = es_of(m)
+        if es >= 0:
+            pv = (null >= es).mean()
+        else:
+            pv = (null <= es).mean()
+        pv = max(pv, 1.0 / nperm)
+        pos_mean = null[null >= 0].mean(); neg_mean = null[null < 0].mean()
+        nes = es / pos_mean if es >= 0 and pos_mean > 0 else (es / abs(neg_mean) if es < 0 and neg_mean < 0 else np.nan)
+        rows.append({"pathway": name, "SIZE": n_hits, "ES": es, "NES": nes,
+                     "pval": pv, "lead_rank": lead})
+    out = pd.DataFrame(rows)
+    from statsmodels.stats.multitest import multipletests
+    out["fdr"] = multipletests(out.pval, method="fdr_bh")[1]
+    return out.sort_values("fdr")
+
+GMT_CANDIDATES = ["data/KEGG_2019_Mouse.gmt", os.environ.get("KEGG_GMT", "")]
+gmt_path = next((p for p in GMT_CANDIDATES if p and os.path.exists(p)), None)
+if gmt_path is None:
+    msg = ("BLOCKED: no KEGG_2019_Mouse gene set library available offline "
+           "(no network, no gseapy cache, no .gmt in capsule) and no "
+           "Ensembl->symbol mapping available; the ranked list is in Ensembl "
+           "IDs while KEGG_2019_Mouse uses symbols. GSEA not executed.")
+    print("\n" + msg)
+    json.dump({"status": "blocked_no_gene_set_library", "message": msg},
+              open(f"{OUT}/gsea_status.json", "w"), indent=2)
+else:
+    tbl = prerank_gsea(filt.set_index("geneID")["rank_metric"], gmt_path)
+    tbl.to_csv(f"{OUT}/gsea_prerank_results.csv", index=False)
+    print("\nTop GSEA results:")
+    print(tbl.head(10).to_string(index=False))
+
+pca_df.to_csv(f"{OUT}/pca_samples.csv", index=False)
+print("\nDONE (DE complete; GSEA status in results/gsea_status.json)")

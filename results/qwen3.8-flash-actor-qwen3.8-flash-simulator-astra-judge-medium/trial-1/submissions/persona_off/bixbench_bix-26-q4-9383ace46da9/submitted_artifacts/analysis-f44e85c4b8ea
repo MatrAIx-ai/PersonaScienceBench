@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""KEGG over-representation analysis (ORA) of significantly downregulated genes
+in two P. aeruginosa media contrasts, and the number of enriched pathways common
+to both conditions.
+
+Design (approved):
+  * down filter : log2FoldChange <= -1.5 AND padj < 0.05, per contrast, independently
+  * test        : one-sided hypergeometric (greater) over-representation
+  * correction  : Benjamini-Hochberg within each contrast over all tested pathways
+  * enriched    : adjusted p < 0.05
+  * primary background : the shared tested universe (5828 genes) restricted to genes
+    annotated to >=1 KEGG pathway; identical for both contrasts
+  * sensitivity backgrounds: all KEGG genes of the mapping organism
+  * sensitivity filter: clusterProfiler-style minGSSize=10 / maxGSSize=500
+  * common      : intersection of enriched KEGG pathway IDs (paXXXXXX)
+
+The pathway->gene mapping MUST come from a verifiable data artifact:
+  1. --mapping FILE : user-supplied KEGG link table (path:paXXXXXX<TAB>org:gene)
+                      or GMT; provenance (path, sha256, mtime) recorded.
+  2. live KEGG REST : rest.kegg.jp /link/<org>/pathway, /list/<org>,
+                      /list/pathway/<org>; raw responses cached + hashed.
+  3. otherwise      : raise NotComputableError. Remembered / hand-curated pathway
+                      memberships are NEVER substituted.
+"""
+from __future__ import annotations
+import argparse, datetime, hashlib, json, os, re, socket, sys
+import urllib.request
+
+import pandas as pd
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from rds_extract import read_de_rds                       # noqa: E402
+
+CONTRASTS = {
+    'GluFevsGluFePlus': 'data/res_GluFevsGluFePlus.rds',
+    'SuccvsGluFePlus': 'data/res_SuccvsGluFePlus.rds',
+}
+LFC_CUT, PADJ_CUT, Q_CUT = -1.5, 0.05, 0.05
+KEGG_BASE = 'https://rest.kegg.jp'
+LOCAL_CANDIDATES = ['data/kegg_link_paer_pathway.txt', 'data/kegg_link_pau_pathway.txt',
+                    'data/paer.gmt', 'data/kegg_paer.gmt', 'data/paer_pathway2genes.gmt']
+
+
+class NotComputableError(RuntimeError):
+    """Raised when no verifiable pathway->gene mapping source is available."""
+
+
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def kegg_get(path, raw_dir):
+    url = KEGG_BASE + path
+    os.makedirs(raw_dir, exist_ok=True)
+    with urllib.request.urlopen(url, timeout=60) as r:
+        body = r.read()
+    fp = os.path.join(raw_dir, path.strip('/').replace('/', '_') + '.txt')
+    with open(fp, 'wb') as fh:
+        fh.write(body)
+    return body.decode('utf-8', 'replace'), {'url': url, 'retrieved_utc': utcnow(),
+                                             'bytes': len(body), 'sha256': sha256_bytes(body),
+                                             'cache': fp}
+
+
+# ------------------------------------------------------------------ mapping ingest
+def parse_link_table(text):
+    """KEGG `link <org> pathway` output: 'path:pa00020\tpaer:PA0002' per line."""
+    p2g = {}
+    for line in text.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        m = re.fullmatch(r'path:(pa\d{5})', parts[0].strip())
+        if not m:
+            continue
+        p2g.setdefault(m.group(1), set()).add(parts[1].strip())
+    return p2g
+
+
+def parse_gmt(text):
+    """GMT: name <TAB> description <TAB> gene...; pathway key = column 1."""
+    p2g = {}
+    for line in text.rstrip('\n').split('\n'):
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        p2g[parts[0].strip()] = {g.strip() for g in parts[2:] if g.strip()}
+    return p2g
+
+
+def parse_pathway_titles(text):
+    """`list pathway <org>` / `list <org>` -> {paXXXXXX: title}."""
+    titles = {}
+    for line in text.splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2:
+            key = parts[0].strip().split(':')[-1]
+            if re.fullmatch(r'pa\d{5}', key):
+                titles[key] = parts[1].strip().lstrip('; ')
+    return titles
+
+
+def parse_kegg_gene_list(text):
+    """`list <org>`: 'org:gene\\tname[, name...]\\tfunction' -> alias -> gene id.
+
+    KEGG bacterial gene records list the primary locus tag plus secondary locus
+    tags (other strains / systematic names) as extra names; that is the legitimate
+    PA14_xxxxx <-> KEGG gene-id route when those tags are present.
+    """
+    alias = {}
+    for line in text.splitlines():
+        parts = line.split('\t')
+        if not parts or ':' not in parts[0]:
+            continue
+        gid = parts[0].strip()
+        keys = {gid, gid.split(':', 1)[-1]}
+        if len(parts) > 1:
+            keys |= {n.strip() for n in parts[1].split(',') if n.strip()}
+        for k in keys:
+            alias.setdefault(k, gid)
+    return alias
+
+
+def alias_forms(gene):
+    """Lookup forms for a locus tag (PA14_03450 / PA14_3450 / lower case ...)."""
+    out = {gene, gene.upper(), gene.lower()}
+    m = re.fullmatch(r'PA14_(\d+)', gene.upper())
+    if m:
+        n = int(m.group(1))
+        out |= {f'PA14_{n}', f'PA14_{n:05d}', f'P14_{n:05d}', f'PA14_0{n}'}
+    return out
+
+
+def map_ids(genes, alias):
+    mapped, dropped = {}, []
+    for g in genes:
+        hit = next((alias[c] for c in alias_forms(g) if c in alias), None)
+        if hit:
+            mapped[g] = hit
+        else:
+            dropped.append(g)
+    return mapped, dropped
+
+
+def build_mapping(args, raw_dir):
+    """Return (pathway2genes, alias, titles, provenance, route)."""
+    prov = {'organism_requested': args.org, 'acquired_utc': utcnow(), 'sources': []}
+    path = args.mapping
+    if path is None:
+        path = next((c for c in LOCAL_CANDIDATES if os.path.exists(c)), None)
+
+    if path:                                        # ---- route 1: local artifact
+        if not os.path.exists(path):
+            raise NotComputableError(f'--mapping {path} does not exist')
+        text = open(path, encoding='utf-8', errors='replace').read()
+        fmt = 'link_table' if re.search(r'path:pa\d{5}', text) else 'gmt'
+        p2g = parse_link_table(text) if fmt == 'link_table' else parse_gmt(text)
+        if not p2g:
+            raise NotComputableError(f'{path}: parsed 0 pathways (format {fmt})')
+        genes = sorted(set().union(*p2g.values()))
+        alias = {}
+        for g in genes:
+            for c in alias_forms(g):
+                alias.setdefault(c, g)
+        titles = {}
+        for cand in (re.sub(r'\.(txt|gmt)$', '', path) + '.titles.tsv', 'data/kegg_pathway_titles.tsv'):
+            if os.path.exists(cand):
+                titles = parse_pathway_titles(open(cand, encoding='utf-8', errors='replace').read())
+                prov['sources'].append({'kind': 'local_titles', 'path': os.path.abspath(cand),
+                                        'sha256': sha256_file(cand)})
+                break
+        prov['sources'].append({'kind': 'local_artifact', 'path': os.path.abspath(path),
+                                'sha256': sha256_file(path), 'format': fmt,
+                                'mtime_utc': datetime.datetime.fromtimestamp(
+                                    os.path.getmtime(path), datetime.timezone.utc
+                                ).strftime('%Y-%m-%dT%H:%M:%SZ')})
+        return p2g, alias, titles, prov, f'local_artifact:{os.path.basename(path)} ({fmt})'
+
+    try:                                            # ---- route 2: live KEGG REST
+        socket.gethostbyname('rest.kegg.jp')
+    except Exception as e:
+        prov['network_failure'] = f'{type(e).__name__}: {e}'
+        raise NotComputableError(
+            'no verifiable pathway->gene mapping available: no local KEGG artifact among '
+            f'{LOCAL_CANDIDATES} and KEGG REST unreachable at {utcnow()} ({e}). '
+            'Refusing to substitute remembered pathway memberships.')
+
+    p2g, alias, titles = {}, {}, {}
+    orgs = list(dict.fromkeys([args.org] + (['pau'] if args.org == 'paer' else [])))
+    for org in orgs:
+        txt, pr = kegg_get(f'/link/{org}/pathway', raw_dir)
+        prov['sources'].append(pr)
+        for pw, gs in parse_link_table(txt).items():
+            p2g.setdefault(pw, set()).update(gs)
+        txt, pr = kegg_get(f'/list/{org}', raw_dir)
+        prov['sources'].append(pr)
+        al = parse_kegg_gene_list(txt)
+        for g in al.values():
+            for c in alias_forms(g):
+                alias.setdefault(c, g)
+        alias.update({k: v for k, v in al.items() if k not in alias})
+        txt, pr = kegg_get(f'/list/pathway/{org}', raw_dir)
+        prov['sources'].append(pr)
+        titles.update(parse_pathway_titles(txt))
+    if not p2g:
+        raise NotComputableError('KEGG REST returned an empty pathway->gene mapping')
+    return p2g, alias, titles, prov, f'kegg_rest:{KEGG_BASE} orgs={orgs}'
+
+
+# ---------------------------------------------------------------------------- ORA core
+def ora(query_genes, background_genes, pathway2genes, titles):
+    """One-sided hypergeometric ORA + BH. p = P[X >= k] = sf(k-1; N, K, n)."""
+    bg, q = set(background_genes), set(query_genes) & set(background_genes)
+    N, n = len(bg), len(q)
+    rows = []
+    for pw, gs in pathway2genes.items():
+        K_set = gs & bg
+        K, k = len(K_set), len(q & K_set)
+        if K == 0:
+            continue
+        p = float(hypergeom.sf(k - 1, N, K, n)) if k > 0 else 1.0
+        rows.append({'pathway': pw, 'name': titles.get(pw, ''), 'bg_size': K,
+                     'query_size': n, 'overlap': k, 'bg_universe': N, 'pvalue': p})
+    df = pd.DataFrame(rows)
+    if len(df):
+        df['padj'] = multipletests(df.pvalue.values, method='fdr_bh')[1]
+        df = df.sort_values('pvalue', kind='mergesort').reset_index(drop=True)
+    return df
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mapping', default=None, help='local KEGG link table or GMT')
+    ap.add_argument('--org', default='paer')
+    ap.add_argument('--outdir', default='out')
+    ap.add_argument('--rawdir', default='out/raw_kegg')
+    args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    de, down = {}, {}
+    for name, f in CONTRASTS.items():
+        de[name], _ = read_de_rds(f, verbose=False)
+        down[name] = sorted(de[name].index[(de[name].log2FoldChange <= LFC_CUT)
+                                           & (de[name].padj < PADJ_CUT)])
+    universe = sorted(set.intersection(*[set(d.index) for d in de.values()]))
+    print(f'tested universe shared by both contrasts: {len(universe)} genes')
+    for k, v in down.items():
+        print(f'  {k}: {len(v)} significantly downregulated (lfc<=-1.5 & padj<0.05)')
+
+    try:
+        p2g, alias, titles, prov, route = build_mapping(args, args.rawdir)
+    except NotComputableError as e:
+        prov = {'status': 'NOT_COMPUTABLE', 'utc': utcnow(), 'reason': str(e),
+                'looked_for_local_artifacts': LOCAL_CANDIDATES,
+                'kegg_base_tried': KEGG_BASE, 'organism': args.org,
+                'tested_universe': len(universe), 'down_counts': {k: len(v) for k, v in down.items()},
+                'down_gene_lists_written': [f'out/down_{k}.txt' for k in down]}
+        for k, v in down.items():
+            open(f'{args.outdir}/down_{k}.txt', 'w').write('\n'.join(v) + '\n')
+        # deliverable files are emitted with headers only so downstream tooling can see
+        # the schema; they are EMPTY BY ABORT, not 'no significant pathways'.
+        cols = ['contrast', 'pathway', 'name', 'bg_size', 'query_size', 'overlap',
+                'bg_universe', 'pvalue', 'padj', 'enriched']
+        for k in down:
+            pd.DataFrame(columns=cols).to_csv(
+                os.path.join(args.outdir, f'enrichment_{k}.csv'), index=False)
+        pd.DataFrame(columns=cols + ['common_to_both']).to_csv(
+            os.path.join(args.outdir, 'enrichment_all.csv'), index=False)
+        pd.DataFrame(columns=cols + ['common_to_both']).to_csv(
+            os.path.join(args.outdir, 'common_pathways.csv'), index=False)
+        prov['empty_deliverables_note'] = ('enrichment_*.csv / common_pathways.csv contain a '
+                                          'header and zero rows because the analysis aborted; '
+                                          'zero rows does NOT mean zero enriched pathways')
+        json.dump(prov, open(os.path.join(args.outdir, 'mapping_provenance.json'), 'w'), indent=1)
+        open(os.path.join(args.outdir, 'ANSWER.txt'), 'w').write(
+            'NOT COMPUTABLE - no verifiable KEGG pathway->gene mapping source reachable\n\n' + str(e) + '\n')
+        print('\n*** NOT COMPUTABLE ***\n' + str(e))
+        return 3
+
+    print(f'\nmapping route   : {route}')
+    print(f'pathways in map : {len(p2g)}   genes in map: {len(set().union(*p2g.values()))}')
+    all_kegg = set().union(*p2g.values())
+
+    results, maprep = {}, {}
+    for name in de:
+        mapped, dropped = map_ids(universe, alias)
+        bg_genes = sorted(set(mapped.values()))
+        q_genes = sorted({mapped[g] for g in down[name] if g in mapped})
+        print(f'\n== {name}\n   mapped {len(mapped)}/{len(universe)} tested genes '
+              f'({len(dropped)} unmappable, dropped from query AND background)')
+        print(f'   down genes mapped {len(q_genes)}/{len(down[name])}; background N={len(bg_genes)}')
+        res = ora(q_genes, bg_genes, p2g, titles)
+        res.insert(0, 'contrast', name)
+        res['enriched'] = res.padj < Q_CUT
+        results[name] = res
+        maprep[name] = {'n_tested_universe': len(universe), 'n_mapped': len(mapped),
+                        'n_dropped_unmappable': len(dropped), 'n_down': len(down[name]),
+                        'n_down_mapped': len(q_genes), 'background_N': len(bg_genes),
+                        'unmappable_examples': dropped[:10]}
+        res.to_csv(os.path.join(args.outdir, f'enrichment_{name}.csv'), index=False)
+
+    sig = {k: set(r.loc[r.padj < Q_CUT, 'pathway']) for k, r in results.items()}
+    common = sorted(set.intersection(*sig.values()))
+    allrows = pd.concat(results.values(), ignore_index=True)
+    allrows['common_to_both'] = allrows.pathway.isin(common)
+    allrows.to_csv(os.path.join(args.outdir, 'enrichment_all.csv'), index=False)
+    allrows[allrows.common_to_both].drop_duplicates('pathway').to_csv(
+        os.path.join(args.outdir, 'common_pathways.csv'), index=False)
+
+    # ---- sensitivity checks ------------------------------------------------------
+    sens = []
+    for name, res in results.items():
+        mapped, _ = map_ids(universe, alias)
+        q_genes = sorted({mapped[g] for g in down[name] if g in mapped})
+        bg_annot = sorted(set(mapped.values()))
+        variants = {
+            'primary_annotated_background': (q_genes, bg_annot, p2g),
+            'all_kegg_genes_background': (q_genes, sorted(all_kegg | set(bg_annot)), p2g),
+            'primary_minGSSize10_max500': (q_genes, bg_annot,
+                                           {k: v for k, v in p2g.items() if 10 <= len(v) <= 500}),
+        }
+        for label, (q, bg, pw) in variants.items():
+            r = ora(q, bg, pw, titles)
+            s = set(r.loc[r.padj < Q_CUT, 'pathway'])
+            sens.append({'contrast': name, 'variant': label, 'n_enriched': len(s),
+                         'pathways': ';'.join(sorted(s))})
+    sdf = pd.DataFrame(sens)
+    sdf.to_csv(os.path.join(args.outdir, 'sensitivity.csv'), index=False)
+
+    def common_of(variant):
+        sets = [set(r.pathways.split(';')) - {''} for _, r in sdf.iterrows() if r.variant == variant]
+        return sorted(set.intersection(*sets)) if len(sets) == 2 else []
+    sens_common = {v: common_of(v) for v in sdf.variant.unique()}
+
+    prov.update({'status': 'OK', 'route': route,
+                 'filters': {'log2FoldChange': '<= -1.5', 'padj': '< 0.05',
+                             'pathway_enriched_padj': '< 0.05'},
+                 'test': 'one-sided hypergeometric (greater), BH within contrast',
+                 'background_definition': 'KEGG-annotated subset of the shared tested universe',
+                 'gene_mapping': maprep,
+                 'n_enriched': {k: len(v) for k, v in sig.items()},
+                 'common_pathways': common, 'n_common': len(common),
+                 'sensitivity_common': {k: {'n': len(v), 'pathways': v}
+                                        for k, v in sens_common.items()}})
+    json.dump(prov, open(os.path.join(args.outdir, 'mapping_provenance.json'), 'w'), indent=1)
+    with open(os.path.join(args.outdir, 'ANSWER.txt'), 'w') as fh:
+        fh.write(f'{len(common)}\n')
+        for pw in common:
+            fh.write(f'  {pw}  {titles.get(pw, "")}\n')
+    print('\n=== enriched pathways per contrast:', {k: len(v) for k, v in sig.items()})
+    print(f'=== pathways COMMON to both contrasts: {len(common)}')
+    for pw in common:
+        print(f'    {pw}  {titles.get(pw, "")}')
+    print('=== sensitivity common counts:', {k: len(v) for k, v in sens_common.items()})
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+"""
+Deterministic target-tracking audit from data/measurements.npz.
+
+Data structure (established by inspection):
+  Y    float64 (95, 2)  : channel 0 = range (strictly positive, U-shaped),
+                          channel 1 = bearing in (-pi, pi]
+  t    float64 (95, )   : uniform grid, dt = 1.0
+  mask bool    (95, 2)  : valid-observation flags (NaN in Y exactly where mask is False)
+
+Estimator: bootstrap particle filter (N = 1200 <= 1500), fixed seed, log-domain weights.
+State (6-D): [x, y, vx, vy, beta_b, beta_r]
+  - (x, y, vx, vy): Cartesian target state in the sensor frame (sensor at origin).
+  - beta_b: slowly drifting additive bearing bias (random walk).
+  - beta_r: slowly drifting additive range bias (random walk).
+Motion: constant velocity + switching process noise (2-mode Markov chain per particle:
+nominal / maneuver) plus a small i.i.d. "kick" probability per particle per step, so that
+sharp regime changes (the encounter around t=32..54) can be captured by weight competition.
+Measurement likelihood: per-channel, skipped entirely when the channel is masked.
+  range   : r_meas = hypot(x, y) + beta_r + nu_r        (mixture Gaussian / wide tail)
+  bearing : th_meas = atan2(y, x) + beta_b + nu_theta   (mixture WRAPPED normal / wide tail)
+Angle wrapping: all bearing innovations are wrapped to (-pi, pi]; wrap events are counted
+on the OBSERVATIONS with the criterion |consecutive bearing difference| > pi.
+
+DIAGNOSTIC PROXIES (documented): the true state trajectory is NOT public, therefore
+  rmse_pos = RMS position-equivalent measurement residual
+             (range residual; bearing residual x predicted range), 0.0 fallback
+             when no channel is available at a step.
+  rmse_vel = dynamics-consistency velocity proxy
+             ( || v_est(t) - (p_est(t) - p_est(t-1)) / dt || ; ||v_est(0)|| at t=0 ).
+  nees     = NEES-style proxy implemented as the normalized innovation squared (NIS)
+             of the available channels against the predicted measurement covariance
+             (0.0 fallback when no channel is available at a step).
+These are filter-internal consistency/fit proxies, NOT true tracking errors.
+
+No replacement observations are generated anywhere: masked channels are skipped in the
+likelihood, never filled.
+"""
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+SEED = 42
+N_PARTICLES = 1200          # <= 1500 (contract cap)
+DT = 1.0
+
+SIG_R0 = 0.08               # nominal range noise std
+SIG_B0 = 0.02               # nominal bearing noise std
+TAIL_SCALE = 15.0           # wide-tail multiplier for the outlier mixture
+MIX_MAIN = 0.9              # Gaussian mixture weight of the main component
+
+Q_POS_NOM = 0.01            # nominal per-step position noise std
+Q_VEL_NOM = 0.01            # nominal per-step velocity noise std
+Q_POS_MAN = 0.06            # maneuver-mode per-step position noise std
+Q_VEL_MAN = 0.10            # maneuver-mode per-step velocity noise std
+KICK_PROB = 0.02            # i.i.d. per-particle probability of a strong kick
+Q_POS_KICK = 0.35
+Q_VEL_KICK = 0.35
+
+Q_BETA_B = 0.002            # per-step bearing-bias random-walk std
+Q_BETA_R = 0.010            # per-step range-bias random-walk std
+
+P_ENTER = 0.05              # nominal -> maneuver switching probability
+P_EXIT = 0.30               # maneuver -> nominal switching probability
+
+ESS_RESAMPLE = 0.5          # resample when ESS < fraction of N
+ESS_INFLATE = 0.15          # trigger mild sigma inflation below this ESS fraction
+INFLATE_STEP = 1.5
+INFLATE_MAX = 4.0
+
+COV_FLOOR = 1e-8            # covariance floor for degenerate particle spreads
+W_CLAMP = 1e-300            # clamp for normalized weights (keeps logs finite)
+
+RNG = np.random.default_rng(SEED)
+RESULT_DIR = "results"
+
+
+def wrap(a):
+    """Wrap angles to (-pi, pi]."""
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def logsumexp(a):
+    m = np.max(a)
+    return m + np.log(np.sum(np.exp(a - m)))
+
+
+def log_normal(x, sigma):
+    return -0.5 * (x / sigma) ** 2 - np.log(sigma) - 0.5 * np.log(2.0 * np.pi)
+
+
+def log_mixture(d, sigma):
+    """log density of MIX_MAIN*N(0,sigma) + (1-MIX_MAIN)*N(0,TAIL_SCALE*sigma)."""
+    main = np.log(MIX_MAIN) + log_normal(d, sigma)
+    tail = np.log(1.0 - MIX_MAIN) + log_normal(d, TAIL_SCALE * sigma)
+    return np.logaddexp(main, tail)
+
+
+def log_wrapped_mixture(d, sigma):
+    """log density of a wrapped normal mixture (3-term wrap sum is ample here)."""
+    total = None
+    for k in (-1.0, 0.0, 1.0):
+        lk = log_mixture(d + 2.0 * np.pi * k, sigma)
+        total = lk if total is None else np.logaddexp(total, lk)
+    return total
+
+
+# ----------------------------------------------------------------------------
+# Load data
+# ----------------------------------------------------------------------------
+data = np.load("data/measurements.npz", allow_pickle=True)
+Y = np.asarray(data["Y"], dtype=float)
+t = np.asarray(data["t"], dtype=float)
+mask = np.asarray(data["mask"], dtype=bool)
+n_steps = len(t)
+
+assert Y.shape == (n_steps, 2) and mask.shape == (n_steps, 2)
+assert np.all(np.isfinite(t)) and np.all(np.diff(t) > 0)
+
+r_meas = np.where(mask[:, 0], Y[:, 0], np.nan)
+b_meas = np.where(mask[:, 1], Y[:, 1], np.nan)
+b_unwrapped = np.unwrap(np.where(mask[:, 1], b_meas, np.nan))
+
+# Angle-wrap events counted on the OBSERVATIONS: |consecutive bearing diff| > pi.
+bv = b_meas[mask[:, 1]]
+wrap_events = int(np.sum(np.abs(np.diff(bv)) > np.pi))
+
+# ----------------------------------------------------------------------------
+# Particle filter
+# ----------------------------------------------------------------------------
+# Initial particle cloud around the first implied (range, bearing) fix.
+r0, b0 = Y[0, 0], Y[0, 1]
+p0 = np.array([r0 * np.cos(b0), r0 * np.sin(b0)])
+
+particles = np.empty((N_PARTICLES, 6))
+particles[:, 0] = p0[0] + Q_POS_KICK * RNG.standard_normal(N_PARTICLES)
+particles[:, 1] = p0[1] + Q_POS_KICK * RNG.standard_normal(N_PARTICLES)
+particles[:, 2] = 0.02 + 0.08 * RNG.standard_normal(N_PARTICLES)   # vx prior
+particles[:, 3] = 0.00 + 0.08 * RNG.standard_normal(N_PARTICLES)   # vy prior
+particles[:, 4] = 0.00 + 0.05 * RNG.standard_normal(N_PARTICLES)   # beta_b
+particles[:, 5] = 0.00 + 0.15 * RNG.standard_normal(N_PARTICLES)   # beta_r
+
+log_w = np.full(N_PARTICLES, -np.log(N_PARTICLES))
+maneuver = np.zeros(N_PARTICLES, dtype=bool)
+
+inflate = 1.0
+est_hist = np.full((n_steps, 4), np.nan)
+cov_hist = np.full((n_steps, 4), np.nan)
+ess_hist = np.full(n_steps, np.nan)
+resampled_hist = np.zeros(n_steps, dtype=int)
+entropy_hist = np.full(n_steps, np.nan)
+maxlw_hist = np.full(n_steps, np.nan)
+minlw_hist = np.full(n_steps, np.nan)
+bres_mean_hist = np.full(n_steps, np.nan)
+bres_std_hist = np.full(n_steps, np.nan)
+rmse_pos_hist = np.full(n_steps, np.nan)
+rmse_vel_hist = np.full(n_steps, np.nan)
+nees_hist = np.full(n_steps, np.nan)
+n_resample_total = 0
+max_weight_seen = 0.0
+
+for k in range(n_steps):
+    # ---------------- prediction ----------------
+    pos_std = np.where(maneuver, Q_POS_MAN, Q_POS_NOM)
+    vel_std = np.where(maneuver, Q_VEL_MAN, Q_VEL_NOM)
+
+    particles[:, 0] += particles[:, 2] * DT + pos_std * RNG.standard_normal(N_PARTICLES)
+    particles[:, 1] += particles[:, 3] * DT + pos_std * RNG.standard_normal(N_PARTICLES)
+    particles[:, 2] += vel_std * RNG.standard_normal(N_PARTICLES)
+    particles[:, 3] += vel_std * RNG.standard_normal(N_PARTICLES)
+    particles[:, 4] += Q_BETA_B * RNG.standard_normal(N_PARTICLES)
+    particles[:, 5] += Q_BETA_R * RNG.standard_normal(N_PARTICLES)
+
+    # mode switching (Markov chain) + small i.i.d. kick fraction
+    u = RNG.random(N_PARTICLES)
+    enter = (~maneuver) & (u < P_ENTER)
+    exitm = maneuver & (u > 1.0 - P_EXIT)
+    maneuver = (maneuver & ~exitm) | enter
+    kick = RNG.random(N_PARTICLES) < KICK_PROB
+    if np.any(kick):
+        particles[kick, 0] += Q_POS_KICK * RNG.standard_normal(int(kick.sum()))
+        particles[kick, 1] += Q_POS_KICK * RNG.standard_normal(int(kick.sum()))
+        particles[kick, 2] += Q_VEL_KICK * RNG.standard_normal(int(kick.sum()))
+        particles[kick, 3] += Q_VEL_KICK * RNG.standard_normal(int(kick.sum()))
+
+    # ---------------- predicted measurements ----------------
+    r_pred = np.hypot(particles[:, 0], particles[:, 1])
+    th_pred = np.arctan2(particles[:, 1], particles[:, 0])
+
+    sig_r = SIG_R0 * inflate
+    sig_b = SIG_B0 * inflate
+
+    # ---------------- per-channel likelihood (masked channels skipped) --------
+    ll = np.zeros(N_PARTICLES)
+    ch_available = 0
+    innov_r = None
+    innov_b = None
+
+    if mask[k, 0]:
+        d_r = r_meas[k] - (r_pred + particles[:, 5])
+        ll = ll + log_mixture(d_r, sig_r)
+        ch_available += 1
+        innov_r = d_r
+    if mask[k, 1]:
+        d_b = wrap(b_meas[k] - (th_pred + particles[:, 4]))
+        ll = ll + log_wrapped_mixture(d_b, sig_b)
+        ch_available += 1
+        innov_b = d_b
+
+    log_w = log_w + ll
+    log_w -= logsumexp(log_w)
+    w = np.exp(log_w)
+    w = np.maximum(w, W_CLAMP)
+    w /= w.sum()
+    log_w = np.log(w)
+
+    # ---------------- weighted statistics ----------------
+    ess = 1.0 / np.sum(w ** 2)
+    ess_hist[k] = ess
+    entropy_hist[k] = -np.sum(w * np.log(w))
+    maxlw_hist[k] = np.max(log_w)
+    minlw_hist[k] = np.min(log_w)
+    max_weight_seen = max(max_weight_seen, float(np.max(w)))
+
+    mean = w @ particles[:, :4]
+    centered = particles[:, :4] - mean
+    cov = (centered * w[:, None]).T @ centered
+    denom = max(1.0 - np.sum(w ** 2), 1e-3)
+    cov = cov / denom
+    cov = cov + np.eye(4) * COV_FLOOR
+    est_hist[k] = mean
+    cov_hist[k] = np.clip(np.diag(cov), COV_FLOOR, None)
+
+    # ---------------- diagnostic proxies ----------------
+    res_pos = []
+    nis_terms = []
+    if mask[k, 0]:
+        dr = float(np.sum(w * innov_r))
+        res_pos.append(dr)
+        var_r = float(np.sum(w * (innov_r - dr) ** 2)) + sig_r ** 2
+        nis_terms.append(dr ** 2 / max(var_r, 1e-12))
+    if mask[k, 1]:
+        db = float(np.sum(w * innov_b))
+        r_ref = float(np.sum(w * r_pred))
+        res_pos.append(db * r_ref)
+        var_b = float(np.sum(w * (innov_b - db) ** 2)) + sig_b ** 2
+        nis_terms.append(db ** 2 / max(var_b, 1e-12))
+        bres_mean_hist[k] = db
+        bres_std_hist[k] = float(np.sqrt(max(var_b - sig_b ** 2, 0.0)))
+    else:
+        # documented finite fallback: bearing channel unavailable at this step
+        bres_mean_hist[k] = 0.0
+        bres_std_hist[k] = 0.0
+
+    rmse_pos_hist[k] = float(np.sqrt(np.mean(np.square(res_pos)))) if res_pos else 0.0
+    nees_hist[k] = float(np.mean(nis_terms)) if nis_terms else 0.0
+
+    if k == 0:
+        rmse_vel_hist[k] = float(np.hypot(mean[2], mean[3]))
+    else:
+        v_dyn = mean[2:4] - (mean[0:2] - est_hist[k - 1, 0:2]) / DT
+        rmse_vel_hist[k] = float(np.hypot(v_dyn[0], v_dyn[1]))
+
+    # ---------------- resampling ----------------
+    do_resample = ess < ESS_RESAMPLE * N_PARTICLES
+    resampled_hist[k] = int(do_resample)
+    if do_resample:
+        positions = (RNG.random() + np.arange(N_PARTICLES)) / N_PARTICLES
+        idx = np.searchsorted(np.cumsum(w), positions)
+        idx = np.clip(idx, 0, N_PARTICLES - 1)
+        particles = particles[idx].copy()
+        maneuver = maneuver[idx].copy()
+        log_w = np.full(N_PARTICLES, -np.log(N_PARTICLES))
+        n_resample_total += 1
+
+    # mild adaptive sigma inflation instead of lowering the resample threshold
+    if ess < ESS_INFLATE * N_PARTICLES:
+        inflate = min(inflate * INFLATE_STEP, INFLATE_MAX)
+    else:
+        inflate = max(1.0, inflate / 1.2)
+
+# ----------------------------------------------------------------------------
+# Finiteness assertions before writing anything
+# ----------------------------------------------------------------------------
+def assert_finite(name, arr):
+    if not np.all(np.isfinite(arr)):
+        raise RuntimeError(f"non-finite values produced in {name}")
+
+
+assert_finite("state estimates", est_hist)
+assert_finite("covariances", cov_hist)
+for arr in (ess_hist, entropy_hist, maxlw_hist, minlw_hist, bres_mean_hist,
+            bres_std_hist, rmse_pos_hist, rmse_vel_hist, nees_hist):
+    assert_finite("diagnostics", arr)
+
+# ----------------------------------------------------------------------------
+# state_estimates.csv
+# ----------------------------------------------------------------------------
+state_df = pd.DataFrame({
+    "t": t,
+    "px": est_hist[:, 0],
+    "py": est_hist[:, 1],
+    "vx": est_hist[:, 2],
+    "vy": est_hist[:, 3],
+    "cov_px": cov_hist[:, 0],
+    "cov_py": cov_hist[:, 1],
+    "cov_vx": cov_hist[:, 2],
+    "cov_vy": cov_hist[:, 3],
+})
+state_df.to_csv(os.path.join(RESULT_DIR, "state_estimates.csv"), index=False)
+
+# ----------------------------------------------------------------------------
+# filter_diagnostics.csv
+# ----------------------------------------------------------------------------
+diag_df = pd.DataFrame({
+    "t": t,
+    "rmse_pos": rmse_pos_hist,
+    "rmse_vel": rmse_vel_hist,
+    "nees": nees_hist,
+    "ess": ess_hist,
+    "resampled": resampled_hist,
+    "weight_entropy": entropy_hist,
+    "max_log_weight": maxlw_hist,
+    "min_log_weight": minlw_hist,
+    "bearing_residual_mean": bres_mean_hist,
+    "bearing_residual_std": bres_std_hist,
+})
+diag_df.to_csv(os.path.join(RESULT_DIR, "filter_diagnostics.csv"), index=False)
+
+# ----------------------------------------------------------------------------
+# summary.json
+# ----------------------------------------------------------------------------
+steps_with_channels = rmse_pos_hist > 0.0
+if not np.any(steps_with_channels):
+    steps_with_channels = np.ones(n_steps, dtype=bool)
+
+summary = {
+    "pos_rmse": float(np.mean(rmse_pos_hist[steps_with_channels])),
+    "vel_rmse": float(np.mean(rmse_vel_hist)),
+    "mean_nees": float(np.mean(nees_hist[steps_with_channels])),
+    "median_nees": float(np.median(nees_hist[steps_with_channels])),
+    "ess_min": float(np.min(ess_hist)),
+    "ess_mean": float(np.mean(ess_hist)),
+    "resampling_count": int(n_resample_total),
+    "weight_degeneracy_detected": bool(np.min(ess_hist) < 0.1 * N_PARTICLES
+                                       or max_weight_seen > 0.99),
+    "used_log_weights": True,
+    "angle_wrapping_detected": bool(wrap_events > 0),
+    "angle_wrap_event_count": wrap_events,
+}
+assert all(np.isfinite(v) for v in summary.values() if isinstance(v, float))
+with open(os.path.join(RESULT_DIR, "summary.json"), "w") as fh:
+    json.dump(summary, fh, indent=2)
+
+# ----------------------------------------------------------------------------
+# overview.png  (matplotlib if available, otherwise a stdlib-only renderer)
+# ----------------------------------------------------------------------------
+OVERVIEW_PATH = os.path.join(RESULT_DIR, "overview.png")
+valid_both = mask[:, 0] & mask[:, 1]
+implied = np.column_stack([r_meas * np.cos(b_unwrapped),
+                           r_meas * np.sin(b_unwrapped)])
+r_pred_mean = np.hypot(est_hist[:, 0], est_hist[:, 1])
+pred_b_unwrap = np.unwrap(np.where(mask[:, 1],
+                                   np.arctan2(est_hist[:, 1], est_hist[:, 0]),
+                                   np.nan))
+
+if HAVE_MPL:
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+
+    ax = axes[0, 0]
+    ax.plot(implied[valid_both, 0], implied[valid_both, 1], ".", ms=4,
+            color="0.6", label="implied by measurements (r, theta)")
+    ax.plot(est_hist[:, 0], est_hist[:, 1], "-", color="tab:red", lw=1.5,
+            label="PF estimate")
+    ax.plot(est_hist[0, 0], est_hist[0, 1], "g^", label="start")
+    ax.plot(est_hist[-1, 0], est_hist[-1, 1], "bv", label="end")
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_title("Estimated trajectory vs measurement-implied positions")
+    ax.legend(fontsize=8); ax.set_aspect("equal", adjustable="datalim")
+
+    ax = axes[0, 1]
+    ax.plot(t, r_meas, ".", color="tab:blue", ms=4, label="range observations")
+    ax.plot(t, r_pred_mean, "-", color="tab:red", lw=1.2, label="PF predicted range")
+    ax.set_xlabel("t"); ax.set_ylabel("range")
+    ax.set_title("Range channel (gap t=22..31 skipped, not filled)")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 0]
+    ax.plot(t, b_unwrapped, ".", color="tab:purple", ms=4,
+            label="bearing observations (unwrapped)")
+    ax.plot(t, pred_b_unwrap, "-", color="tab:red", lw=1.2,
+            label="PF predicted bearing (unwrapped)")
+    ax.set_xlabel("t"); ax.set_ylabel("unwrapped bearing [rad]")
+    ax.set_title("Bearing channel: one +/-pi wrap at t=5->6; gap t=55..63 skipped")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    ax2 = ax.twinx()
+    ax.plot(t, ess_hist, "-", color="tab:green", label="ESS")
+    ax.axhline(0.5 * N_PARTICLES, ls="--", color="0.5", lw=0.8)
+    ax.set_xlabel("t"); ax.set_ylabel("ESS", color="tab:green")
+    ax2.plot(t, nees_hist, "-", color="tab:orange", label="NIS (NEES proxy)")
+    ax2.set_ylabel("NIS proxy", color="tab:orange")
+    ax.set_title("ESS / resampling and normalized-innovation proxy")
+
+    fig.suptitle("Particle-filter target tracking audit (N=1200, seed=42)", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(OVERVIEW_PATH, dpi=130)
+    plt.close(fig)
+else:
+    # ------------------- stdlib-only fallback renderer -------------------------
+    import struct as _struct
+    import zlib as _zlib
+
+    _FONT = {
+        'A': ("0XXX0","X000X","X000X","XXXXX","X000X","X000X","X000X"),
+        'B': ("XXXX0","X000X","X000X","XXXX0","X000X","X000X","XXXX0"),
+        'C': ("0XXX0","X000X","X0000","X0000","X0000","X000X","0XXX0"),
+        'D': ("XXXX0","X000X","X000X","X000X","X000X","X000X","XXXX0"),
+        'E': ("XXXXX","X0000","X0000","XXXX0","X0000","X0000","XXXXX"),
+        'F': ("XXXXX","X0000","X0000","XXXX0","X0000","X0000","X0000"),
+        'G': ("0XXX0","X0000","X0000","X00XX","X000X","X000X","0XXX0"),
+        'H': ("X000X","X000X","X000X","XXXXX","X000X","X000X","X000X"),
+        'I': ("XXXXX","00X00","00X00","00X00","00X00","00X00","XXXXX"),
+        'K': ("X000X","X00X0","X0X00","XX000","X0X00","X00X0","X000X"),
+        'L': ("X0000","X0000","X0000","X0000","X0000","X0000","XXXXX"),
+        'M': ("X000X","XX0XX","X0X0X","X0X0X","X000X","X000X","X000X"),
+        'N': ("X000X","XX00X","X0X0X","X00XX","X000X","X000X","X000X"),
+        'O': ("0XXX0","X000X","X000X","X000X","X000X","X000X","0XXX0"),
+        'P': ("XXXX0","X000X","X000X","XXXX0","X0000","X0000","X0000"),
+        'R': ("XXXX0","X000X","X000X","XXXX0","X0X00","X00X0","X000X"),
+        'S': ("0XXXX","X0000","X0000","0XXX0","00000","0000X","XXXX0"),
+        'T': ("XXXXX","00X00","00X00","00X00","00X00","00X00","00X00"),
+        'U': ("X000X","X000X","X000X","X000X","X000X","X000X","0XXX0"),
+        'V': ("X000X","X000X","X000X","X000X","0X0X0","0X0X0","00X00"),
+        'W': ("X000X","X000X","X000X","X0X0X","X0X0X","XX0XX","X000X"),
+        'X': ("X000X","X000X","0X0X0","00X00","0X0X0","X000X","X000X"),
+        'Y': ("X000X","X000X","0X0X0","00X00","00X00","00X00","00X00"),
+        'Z': ("XXXXX","0000X","000X0","00X00","0X000","X0000","XXXXX"),
+        '0': ("0XXX0","X000X","X00XX","X0X0X","XX00X","X000X","0XXX0"),
+        '1': ("00X00","0XX00","00X00","00X00","00X00","00X00","0XXX0"),
+        '2': ("0XXX0","X000X","0000X","000X0","00X00","0X000","XXXXX"),
+        '3': ("XXXX0","0000X","0000X","0XXX0","0000X","0000X","XXXX0"),
+        '4': ("000X0","00XX0","0X0X0","X00X0","XXXXX","000X0","000X0"),
+        '5': ("XXXXX","X0000","XXXX0","0000X","0000X","X000X","0XXX0"),
+        '6': ("0XXX0","X0000","X0000","XXXX0","X000X","X000X","0XXX0"),
+        '7': ("XXXXX","0000X","000X0","00X00","0X000","0X000","0X000"),
+        '8': ("0XXX0","X000X","X000X","0XXX0","X000X","X000X","0XXX0"),
+        '9': ("0XXX0","X000X","X000X","0XXXX","0000X","0000X","0XXX0"),
+        '-': ("00000","00000","00000","0XXX0","00000","00000","00000"),
+        '+': ("00000","00X00","00X00","XXXXX","00X00","00X00","00000"),
+        '=': ("00000","00000","XXXXX","00000","XXXXX","00000","00000"),
+        '.': ("00000","00000","00000","00000","00000","00000","00X00"),
+        ',': ("00000","00000","00000","00000","00000","00X00","0X000"),
+        ':': ("00000","00X00","00X00","00000","00X00","00X00","00000"),
+        '(': ("00X00","0X000","X0000","X0000","X0000","0X000","00X00"),
+        ')': ("0X000","00X00","0000X","0000X","0000X","00X00","0X000"),
+        '/': ("0000X","0000X","000X0","00X00","0X000","X0000","X0000"),
+        '>': ("X0000","0X000","000X0","0000X","000X0","0X000","X0000"),
+        ' ': ("00000","00000","00000","00000","00000","00000","00000"),
+    }
+
+    BLACK = (0, 0, 0); GRAY = (150, 150, 150)
+    RED = (204, 26, 26); BLUE = (30, 60, 200); PURPLE = (130, 40, 170)
+    GREEN = (20, 140, 60); ORANGE = (235, 130, 20)
+
+    _W, _H = 1600, 1200
+    img = np.full((_H, _W, 3), 255, dtype=np.uint8)
+
+    def _blit(x, y, col):
+        if 0 <= int(y) < _H and 0 <= int(x) < _W:
+            img[int(y), int(x)] = col
+
+    def _dot(x, y, col, rad=2):
+        cx, cy = int(round(x)), int(round(y))
+        for yy in range(cy - rad, cy + rad + 1):
+            for xx in range(cx - rad, cx + rad + 1):
+                _blit(xx, yy, col)
+
+    def _line(x0, y0, x1, y1, col):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx = abs(x1 - x0); dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1; sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            _blit(x0, y0, col)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x0 += sx
+            if e2 <= dx:
+                err += dx; y0 += sy
+
+    def _text(x, y, s, col, scale=2):
+        cx = int(x)
+        for ch in str(s).upper():
+            g = _FONT.get(ch, _FONT[' '])
+            for r in range(7):
+                row = g[r]
+                for c in range(5):
+                    if row[c] == 'X':
+                        ys = int(y) + r * scale; xs = cx + c * scale
+                        img[max(0, ys):min(_H, ys + scale),
+                            max(0, xs):min(_W, xs + scale)] = col
+            cx += 6 * scale
+
+    def _fmt(v, step):
+        if step >= 1:
+            return f"{v:.0f}"
+        dec = max(0, int(np.ceil(-np.log10(step))))
+        return f"{v:.{dec}f}"
+
+    def _ticks(lo, hi, n=5):
+        span = hi - lo
+        if not np.isfinite(span) or span <= 0:
+            span = 1.0
+        raw = span / max(n, 1)
+        mag = 10.0 ** np.floor(np.log10(raw))
+        step = mag
+        for m in (1, 2, 5, 10):
+            if raw <= m * mag:
+                step = m * mag
+                break
+        t0 = np.ceil(lo / step) * step
+        return np.arange(t0, hi + step * 1e-6, step), step
+
+    def _panel(px0, py0, px1, py1, title, series, xlabel, ylabel, legend,
+               equal=False, y2series=None, y2label=None):
+        allx = np.concatenate([np.asarray(s[0], dtype=float) for s in series])
+        ally = np.concatenate([np.asarray(s[1], dtype=float) for s in series])
+        ok = np.isfinite(allx) & np.isfinite(ally)
+        allx, ally = allx[ok], ally[ok]
+        lx0, lx1 = allx.min(), allx.max()
+        ly0, ly1 = ally.min(), ally.max()
+        padx = 0.05 * (lx1 - lx0 if lx1 > lx0 else 1.0)
+        pady = 0.08 * (ly1 - ly0 if ly1 > ly0 else 1.0)
+        lx0, lx1, ly0, ly1 = lx0 - padx, lx1 + padx, ly0 - pady, ly1 + pady
+        ax0, ay0 = px0 + 90, py0 + 70
+        ax1, ay1 = px1 - 20, py1 - 70
+        if equal:
+            xr, yr = lx1 - lx0, ly1 - ly0
+            sx_, sy_ = xr / max(ax1 - ax0, 1), yr / max(ay1 - ay0, 1)
+            if sx_ > sy_:
+                c = 0.5 * (ly0 + ly1); half = 0.5 * yr * (sx_ / sy_)
+                ly0, ly1 = c - half, c + half
+            else:
+                c = 0.5 * (lx0 + lx1); half = 0.5 * xr * (sy_ / sx_)
+                lx0, lx1 = c - half, c + half
+
+        def mx(x):
+            return ax0 + (x - lx0) / (lx1 - lx0) * (ax1 - ax0)
+
+        def my(y):
+            return ay1 - (y - ly0) / (ly1 - ly0) * (ay1 - ay0)
+
+        _line(ax0, ay0, ax1, ay0, BLACK); _line(ax1, ay0, ax1, ay1, BLACK)
+        _line(ax0, ay1, ax1, ay1, BLACK); _line(ax0, ay0, ax0, ay1, BLACK)
+
+        ts, st = _ticks(lx0, lx1)
+        for v in ts:
+            X = mx(v)
+            _line(X, ay1, X, ay1 + 5, BLACK)
+            _text(X - 3 * len(_fmt(v, st)), ay1 + 10, _fmt(v, st), BLACK, 1)
+        _text(0.5 * (ax0 + ax1) - 6 * len(xlabel), py1 - 40, xlabel, BLACK, 2)
+
+        ts, st = _ticks(ly0, ly1)
+        for v in ts:
+            Yp = my(v)
+            _line(ax0 - 5, Yp, ax0, Yp, BLACK)
+            lab = _fmt(v, st)
+            _text(ax0 - 12 - 6 * len(lab), Yp - 5, lab, BLACK, 1)
+        _text(ax0 + 4, py0 + 32, "Y-AXIS: " + ylabel, BLACK, 1)
+
+        _text(0.5 * (ax0 + ax1) - 6 * len(title), py0 + 6, title, BLACK, 2)
+
+        ly = py0 + 46
+        for col, lab in legend:
+            _dot(ax0 + 12, ly + 4, col, 3)
+            _text(ax0 + 22, ly, lab, BLACK, 1)
+            ly += 13
+
+        for xs, ys, col, mode in series:
+            xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+            okm = np.isfinite(xs) & np.isfinite(ys)
+            xs, ys = xs[okm], ys[okm]
+            if mode == 'line':
+                for i in range(len(xs) - 1):
+                    _line(mx(xs[i]), my(ys[i]), mx(xs[i + 1]), my(ys[i + 1]), col)
+            else:
+                for X, Yp in zip(xs, ys):
+                    _dot(mx(X), my(Yp), col, 2)
+
+        if y2series is not None:
+            ys2 = np.asarray(y2series[1], dtype=float)
+            ok2 = np.isfinite(ys2)
+            y2lo, y2hi = np.min(ys2[ok2]), np.max(ys2[ok2])
+            _text(ax1 - 230, py0 + 32, "2ND AXIS: " + y2label, BLACK, 1)
+            for i in range(len(ys2) - 1):
+                if not (np.isfinite(ys2[i]) and np.isfinite(ys2[i + 1])):
+                    continue
+                u0 = (ys2[i] - y2lo) / max(y2hi - y2lo, 1e-12)
+                u1 = (ys2[i + 1] - y2lo) / max(y2hi - y2lo, 1e-12)
+                _line(mx(y2series[0][i]), ay1 - u0 * (ay1 - ay0),
+                      mx(y2series[0][i + 1]), ay1 - u1 * (ay1 - ay0), ORANGE)
+
+    _text(0.5 * _W - 6 * 33, 14,
+          "PARTICLE-FILTER TARGET-TRACKING AUDIT (N=1200, SEED=42)", BLACK, 2)
+
+    _panel(20, 50, 790, 590,
+           "TRAJECTORY: IMPLIED (GRAY) VS PF ESTIMATE (RED)",
+           [(implied[:, 0], implied[:, 1], GRAY, 'dot'),
+            (est_hist[:, 0], est_hist[:, 1], RED, 'line')],
+           "X", "Y",
+           [(GRAY, "IMPLIED BY (R,THETA)"), (RED, "PF ESTIMATE")], equal=True)
+
+    _panel(810, 50, 1580, 590, "RANGE CHANNEL (GAP T=22..31 SKIPPED, NOT FILLED)",
+           [(t, r_meas, BLUE, 'dot'), (t, r_pred_mean, RED, 'line')],
+           "T", "RANGE",
+           [(BLUE, "OBSERVATIONS"), (RED, "PF PREDICTED RANGE")])
+
+    _panel(20, 610, 790, 1150,
+           "BEARING UNWRAPPED: WRAP AT T=5>6, GAP T=55..63 SKIPPED",
+           [(t, b_unwrapped, PURPLE, 'dot'), (t, pred_b_unwrap, RED, 'line')],
+           "T", "BEARING RAD",
+           [(PURPLE, "OBSERVATIONS"), (RED, "PF PREDICTED")])
+
+    ess_arr = np.asarray(ess_hist, dtype=float)
+    nis_arr = np.asarray(nees_hist, dtype=float)
+    nis_scale = 1000.0 / max(np.nanmax(nis_arr), 1e-9)
+    _panel(810, 610, 1580, 1150,
+           "ESS AND NIS (NEES-STYLE PROXY) VS T",
+           [(t, ess_arr, GREEN, 'line')],
+           "T", f"ESS  (NIS X {nis_scale:.3g})",
+           [(GREEN, "ESS (THRESHOLD N/2)"), (ORANGE, "NIS PROXY, 2ND AXIS")],
+           y2series=(t, nis_arr), y2label="NIS")
+
+    raw = np.zeros((_H, 1 + _W * 3), dtype=np.uint8)
+    raw[:, 0] = 0
+    raw[:, 1:] = img.reshape(_H, _W * 3)
+    comp = _zlib.compress(raw.tobytes(), 6)
+
+    def _chunk(typ, payload):
+        return (_struct.pack(">I", len(payload)) + typ + payload
+                + _struct.pack(">I", _zlib.crc32(typ + payload) & 0xFFFFFFFF))
+
+    ihdr = _struct.pack(">IIBBBBB", _W, _H, 8, 2, 0, 0, 0)
+    with open(OVERVIEW_PATH, "wb") as fh:
+        fh.write(b"\x89PNG\r\n\x1a\n")
+        fh.write(_chunk(b"IHDR", ihdr))
+        fh.write(_chunk(b"IDAT", comp))
+        fh.write(_chunk(b"IEND", b""))
+
+# ----------------------------------------------------------------------------
+# conclusion.txt
+# ----------------------------------------------------------------------------
+bias_b_est = float(np.sum(np.exp(log_w) * particles[:, 4]))
+bias_r_est = float(np.sum(np.exp(log_w) * particles[:, 5]))
+
+lines = [
+    "Deterministic target-tracking audit - conclusion",
+    "=================================================",
+    "",
+    "Data: data/measurements.npz - 95 uniform time steps (dt = 1.0), two channels:",
+    "channel 0 = range (strictly positive, U-shaped, minimum 0.523 at t=36),",
+    "channel 1 = bearing in (-pi, pi] with exactly one +/-pi wrap (t=5->6).",
+    "Masked (missing) blocks: range t=22..31, bearing t=55..63. These blocks are",
+    "SKIPPED in the likelihood; no replacement observations are generated.",
+    "",
+    "Method: bootstrap particle filter, N=1200 (cap 1500), fixed seed 42, log-domain",
+    "weights, systematic resampling when ESS < N/2. State = [x, y, vx, vy, beta_b,",
+    "beta_r]; beta_* are slowly drifting additive sensor-bias random walks. Motion is",
+    "constant velocity with switching process noise (nominal/maneuver Markov chain per",
+    "particle plus a 2% i.i.d. strong-kick fraction) so maneuvering intervals are",
+    "absorbed by weight competition instead of a fixed clean model. Likelihood is",
+    "per-channel: Gaussian mixture (0.9 main / 0.1 wide tail) for range and for the",
+    "WRAPPED bearing innovation, which makes the five correlated two-channel outlier",
+    "steps (t ~ 17, 41, 49, 72, 79) non-destructive without measurement editing.",
+    "Mild adaptive sigma inflation (max 4x) is applied if ESS drops below 15% of N;",
+    "the resampling threshold was NOT lowered.",
+    "",
+    "IMPORTANT - diagnostic semantics: the true state trajectory is not public, so the",
+    "rmse_pos / rmse_vel / nees columns are FILTER-INTERNAL PROXIES, not true errors:",
+    "  rmse_pos = RMS position-equivalent measurement residual (range residual and",
+    "             bearing residual times predicted range);",
+    "  rmse_vel = dynamics-consistency proxy || v_est(t) - (p_est(t)-p_est(t-1))/dt ||;",
+    "  nees     = normalized innovation squared (NIS) of the available channels",
+    "             against the predicted measurement covariance.",
+    "bearing_residual_mean/std use a documented finite fallback of 0.0 at t=55..63,",
+    "where the bearing channel is masked.",
+    "",
+    "Key findings:",
+    f"  - Angle wrap events detected on the OBSERVATIONS (|d bearing| > pi criterion):",
+    f"    {wrap_events} (at t=5->6); angle_wrapping_detected = {summary['angle_wrapping_detected']}.",
+    f"  - Resampling performed {n_resample_total} times; ESS min = {summary['ess_min']:.1f},",
+    f"    ESS mean = {summary['ess_mean']:.1f}; weight degeneracy detected =",
+    f"    {summary['weight_degeneracy_detected']}.",
+    f"  - Mean position-fit proxy {summary['pos_rmse']:.4f}, mean velocity-consistency",
+    f"    proxy {summary['vel_rmse']:.4f}, mean/median NIS proxy "
+    f"{summary['mean_nees']:.3f}/{summary['median_nees']:.3f}.",
+    f"  - Final bias-state estimates: bearing bias {bias_b_est:+.4f} rad, range bias",
+    f"    {bias_r_est:+.4f} (slow drift tracked, bounded).",
+    "  - The record is not one global constant-velocity motion: per-segment CV fits",
+    "    fit at noise level for t=0..21 and t=64..94 but are rejected for t=32..54,",
+    "    where the implied trajectory swings around the sensor (bearing rate peaks",
+    "    near 0.45 rad/step) and the unwrapped bearing rate reverses sign afterwards.",
+    "    The filter's switching process noise covers this maneuvering interval.",
+    "",
+    "Uncertainties: bearing reference axis/sign and the sensor origin are assumed",
+    "(+x axis, CCW, origin), not inferable from the file alone; the split between",
+    "target maneuvering and slow bias drift is only partially identifiable with a",
+    "single sensor, and both effects are modeled rather than resolved.",
+]
+
+with open(os.path.join(RESULT_DIR, "conclusion.txt"), "w") as fh:
+    fh.write("\n".join(lines) + "\n")
+
+print("summary:", json.dumps(summary))
+print("final bias (b, r):", bias_b_est, bias_r_est)
+print("outputs written to", RESULT_DIR)

@@ -1,0 +1,280 @@
+"""
+Differential expression analysis: P. aeruginosa quorum-sensing mutants vs JBX1.
+
+DESeq2 algorithm (PyDESeq2-equivalent), implemented from scratch because R/DESeq2
+is not provisioned in this runtime (no R binary, no rpy2, no network, no conda).
+
+Pipeline (mirrors DESeq2 defaults):
+  1. median-of-ratios size factors
+  2. NB GLM (log link) fitted by dispersion-weighted IRLS, design ~ Strain
+     (primary) and ~ Media + Strain (sensitivity)
+  3. gene-wise profile-MLE dispersions (grid + local refinement)
+  4. parametric dispersion trend  alpha(mu) = a1/mu + a0
+  5. MAP dispersion shrinkage toward the trend (DESeq2-style prior)
+  6. Wald test, Benjamini-Hochberg FDR with independent filtering (DESeq2 default)
+"""
+import csv, math, json
+import numpy as np
+from scipy.special import gammaln, ndtr
+from scipy.optimize import least_squares
+
+# ---------------------------------------------------------------- data loading
+meta = {}
+with open('data/experiment_metadata.csv') as f:
+    for row in csv.DictReader(f):
+        meta[row['AzentaName']] = (int(row['Strain']), row['Media'])
+
+with open('data/raw_counts.csv') as f:
+    rows = list(csv.reader(f))
+genes = [r[0] for r in rows[1:]]
+hdr = rows[0][1:]
+Y = np.array([[float(v) for v in r[1:]] for r in rows[1:]])   # genes x samples
+order = np.argsort([int(s.split('-')[1]) for s in hdr])       # resub-N order
+hdr = [hdr[i] for i in order]
+Y = Y[:, order]
+strains = np.array([meta[s][0] for s in hdr])
+media = np.array([meta[s][1] for s in hdr])
+nG, nS = Y.shape
+assert nS == 36 and set(strains) == {1, 97, 98, 99}
+
+REF = 1; D_M = 99; SINGLES = [97, 98]          # working assumptions (inferred)
+
+# ------------------------------------------------------- median-of-ratios size factors
+with np.errstate(divide='ignore'):
+    loggeo = np.mean(np.log(Y), axis=1)        # genes with any zero excluded
+finite = np.isfinite(loggeo)
+ratios = Y[finite] / np.exp(loggeo[finite])[:, None]
+size_factors = np.exp(np.median(np.log(ratios), axis=0))
+sf = size_factors
+log_sf = np.log(sf)
+baseMean_all = np.mean(Y / sf, axis=1)
+
+# ---------------------------------------------------------------- design matrices
+def design(design_name):
+    if design_name == 'strain':
+        cols = [('strain_97', strains == 97), ('strain_98', strains == 98),
+                ('strain_99', strains == 99)]
+        cc = {'97': 1, '98': 2, '99': 3}      # coefficients vs intercept (strain 1)
+    else:  # media + strain
+        cols = [('media_MMGluFePlus', media == 'MMGluFePlus'),
+                ('media_Succinate', media == 'Succinate'),
+                ('strain_97', strains == 97), ('strain_98', strains == 98),
+                ('strain_99', strains == 99)]
+        cc = {'97': 3, '98': 4, '99': 5}
+    X = np.column_stack([np.ones(nS)] + [c.astype(float) for _, c in cols])
+    return X, cc
+
+# ---------------------------------------------------------------- NB GLM machinery
+LOG_A_MIN, LOG_A_MAX = math.log(1e-8), math.log(10.0)
+
+def irls(X, Y, log_sf, alpha, beta, max_iter=60, tol=1e-8):
+    """Vectorized dispersion-weighted IRLS. alpha: (G,), beta: (G, p)."""
+    offset = np.broadcast_to(log_sf, (nG, nS))
+    for it in range(max_iter):
+        eta = beta @ X.T + offset
+        mu = np.exp(np.clip(eta, -30, 30))
+        w = 1.0 / (1.0 + alpha[:, None] * mu)
+        z = eta + (Y - mu) / mu
+        XtWX = np.einsum('sp,gs,sq->gpq', X, w, X, optimize=True)
+        XtWz = np.einsum('sp,gs,gs->gp', X, w, z, optimize=True)
+        XtWX = XtWX + 1e-10 * np.eye(X.shape[1])[None]
+        beta_new = np.linalg.solve(XtWX, XtWz[..., None])[..., 0]
+        if np.max(np.abs(beta_new - beta) / (1 + np.abs(beta_new))) < tol:
+            beta = beta_new; break
+        beta = beta_new
+    eta = beta @ X.T + offset
+    mu = np.exp(np.clip(eta, -30, 30))
+    return beta, mu
+
+def nb_loglik(Y, mu, alpha):
+    # NB parameterization: mean mu, variance mu + alpha*mu^2  =>  NB size r = 1/alpha
+    r = 1.0 / alpha[:, None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t1 = r * (np.log(r) - np.log(r + mu))
+        t2 = Y * (np.log(mu) - np.log(r + mu))
+        t1 = np.where(r == 0, 0.0, np.nan_to_num(t1, neginf=-1e30))
+        t2 = np.where(Y == 0, 0.0, np.nan_to_num(t2, neginf=-1e30))
+        return (gammaln(Y + r) - gammaln(r) - gammaln(Y + 1) + t1 + t2).sum(axis=1)
+
+def cr_loglik(Y, X, mu, alpha):
+    """Cox-Reid adjusted profile loglik: subtracts 0.5*log|I(beta)| (DESeq2-style)."""
+    w = mu / (1.0 + alpha[:, None] * mu)
+    XtWX = np.einsum('sp,gs,sq->gpq', X, w, X, optimize=True) + 1e-10 * np.eye(X.shape[1])[None]
+    _, logdet = np.linalg.slogdet(XtWX)
+    return nb_loglik(Y, mu, alpha) - 0.5 * logdet
+
+def init_beta(X, Y, log_sf):
+    ly = np.log(Y + 0.5) - log_sf
+    XtX = X.T @ X + 1e-10 * np.eye(X.shape[1])
+    return np.linalg.solve(XtX, (ly @ X).T).T      # (G, p)
+
+# grid of log-alphas used for gene-wise profile MLE / MAP
+GRID = np.linspace(LOG_A_MIN, LOG_A_MAX, 41)
+
+def profile_mle(X, Y, log_sf):
+    beta = init_beta(X, Y, log_sf)
+    LL = np.empty((nG, len(GRID)))
+    for j, la in enumerate(GRID):
+        alpha = np.full(nG, math.exp(la))
+        beta, mu = irls(X, Y, log_sf, alpha, beta, max_iter=40)
+        LL[:, j] = cr_loglik(Y, X, mu, alpha)
+    idx = LL.argmax(axis=1)
+    offs = np.linspace(-0.5, 0.5, 9)                 # local refinement
+    LLref = np.empty((nG, 9)); alphas_ref = np.empty((nG, 9))
+    for k, o in enumerate(offs):
+        la = GRID[idx] + o
+        alpha = np.exp(np.clip(la, LOG_A_MIN, LOG_A_MAX))
+        beta, mu = irls(X, Y, log_sf, alpha, beta, max_iter=40)
+        LLref[:, k] = cr_loglik(Y, X, mu, alpha)
+        alphas_ref[:, k] = alpha
+    best = LLref.argmax(axis=1)
+    alpha_mle = alphas_ref[np.arange(nG), best]
+    return alpha_mle, beta
+
+def fit_trend(baseMean, alpha_mle):
+    """DESeq2 parametric trend alpha = a1/mu + a0 fitted in log space."""
+    use = (baseMean > 5) & np.isfinite(alpha_mle)
+    mu, al = baseMean[use], np.maximum(alpha_mle[use], 1e-8)
+    def resid(p):
+        a0, a1 = p
+        return np.log(al) - np.log(np.clip(a0 + a1 / mu, 1e-9, None))
+    try:
+        sol = least_squares(resid, x0=[1e-4, 0.1], bounds=([0, 0], [1, 100]))
+        a0, a1 = sol.x
+        if a0 + a1 / np.median(mu) > 0:
+            return float(a0), float(a1)
+    except Exception:
+        pass
+    return float(np.median(al)), 0.0
+
+def fit_prior_var(baseMean, alpha_mle, trend):
+    a0, a1 = trend
+    use = baseMean > np.median(baseMean)       # DESeq2: genes above median mean
+    logt = np.log(np.clip(a0 + a1 / baseMean[use], 1e-9, None))
+    r = np.log(np.maximum(alpha_mle[use], 1e-8)) - logt
+    r = np.sort(r)
+    r = r[int(len(r)*0.05): int(len(r)*0.95)]  # trimmed variance
+    return max(float(np.var(r)), 1e-3)
+
+def map_dispersion(X, Y, log_sf, alpha_mle, trend, prior_var, beta):
+    a0, a1 = trend
+    log_trend = np.log(np.clip(a0 + a1 / baseMean_all, 1e-9, None))
+    def obj(la, beta):
+        alpha = np.exp(np.clip(la, LOG_A_MIN, LOG_A_MAX))
+        beta, mu = irls(X, Y, log_sf, alpha, beta, max_iter=40)
+        return -cr_loglik(Y, X, mu, alpha) + (la - log_trend)**2 / (2 * prior_var), beta
+    lo = np.clip(np.log(alpha_mle) - 1.0, LOG_A_MIN, LOG_A_MAX)
+    hi = np.clip(np.log(alpha_mle) + 1.0, LOG_A_MIN, LOG_A_MAX)
+    best_obj, best_la = None, None
+    for t in np.linspace(0, 1, 11):
+        la = lo + t * (hi - lo)
+        o, beta = obj(la, beta)
+        if best_obj is None:
+            best_obj, best_la = o.copy(), la.copy()
+        else:
+            m = o < best_obj; best_obj[m] = o[m]; best_la[m] = la[m]
+    alpha_map = np.exp(np.clip(best_la, LOG_A_MIN, LOG_A_MAX))
+    beta, mu = irls(X, Y, log_sf, alpha_map, beta, max_iter=60)
+    return alpha_map, beta, mu
+
+def wald(beta, mu, alpha, X, col):
+    # Fisher information weights for NB log-link: w = mu / (1 + alpha*mu)
+    w = mu / (1.0 + alpha[:, None] * mu)
+    XtWX = np.einsum('sp,gs,sq->gpq', X, w, X, optimize=True) + 1e-10 * np.eye(X.shape[1])[None]
+    cov = np.linalg.inv(XtWX)
+    se = np.sqrt(cov[:, col, col])
+    z = beta[:, col] / se
+    p = 2.0 * ndtr(-np.abs(z))
+    return beta[:, col] / np.log(2), p
+
+def bh(p):
+    p = np.asarray(p); n = len(p)
+    o = np.argsort(p); ps = p[o]
+    q = ps * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out = np.empty(n); out[o] = np.minimum(q, 1.0)
+    return out
+
+def independent_filtering(baseMean, pvals, alpha=0.05):
+    """DESeq2-style independent filtering: threshold maximizing rejections."""
+    best = (-1, 0.0, None)
+    for t in np.linspace(0.05, 0.95, 19):
+        thr = np.quantile(baseMean, t)
+        keep = baseMean >= thr
+        if keep.sum() < 2: continue
+        padj = bh(pvals[keep])
+        nrej = int((padj < alpha).sum())
+        if nrej > best[0]:
+            best = (nrej, t, (thr, keep, padj))
+    nrej, t, (thr, keep, padj_k) = best
+    out = np.ones(len(pvals)); out[keep] = padj_k
+    return out, thr, keep.sum(), nrej
+
+# ---------------------------------------------------------------- run a design
+def run_design(design_name):
+    X, cc = design(design_name)
+    a_mle, beta0 = profile_mle(X, Y, log_sf)
+    trend = fit_trend(baseMean_all, a_mle)
+    prior_var = fit_prior_var(baseMean_all, a_mle, trend)
+    a_map, beta, mu = map_dispersion(X, Y, log_sf, a_mle, trend, prior_var, beta0.copy())
+    res = {}
+    for k, col in cc.items():
+        l2fc, p = wald(beta, mu, a_map, X, col)
+        padj, thr, nkeep, nrej = independent_filtering(baseMean_all, p)
+        res[k] = dict(l2fc=l2fc, p=p, padj=padj, padj_raw=bh(p))
+    info = dict(trend=trend, prior_var=prior_var,
+                alpha_map_median=float(np.median(a_map)),
+                alpha_mle_median=float(np.median(a_mle)),
+                size_factors=[float(x) for x in sf],
+                n_filtered_kept=int(nkeep), n_rejections=nrej, thr=float(thr))
+    return res, info, X
+
+res_primary, info_primary, _ = run_design('strain')
+res_media,  info_media,  _ = run_design('media_strain')
+
+# ---------------------------------------------------------------- set logic
+def sets(res):
+    return {k: set(np.where(v['padj'] < 0.05)[0]) for k, v in res.items()}
+
+def report(res, label):
+    S = sets(res)
+    s1, s2, d = S['97'], S['98'], S['99']
+    uniq = (s1 | s2) - d
+    print(f"\n===== {label} =====")
+    print(f"DE (padj<0.05) counts: single_97={len(s1)}  single_98={len(s2)}  double_99={len(d)}")
+    print(f"|union of singles|={len(s1 | s2)}  |double|={len(d)}")
+    print(f"UNIQUE count (in >=1 single, NOT in double): {len(uniq)}")
+    return len(uniq), S
+
+n_primary, S_primary = report(res_primary, "PRIMARY design ~ Strain")
+n_media, S_media = report(res_media, "SENSITIVITY design ~ Media + Strain")
+
+alt_uniq = (S_primary['97'] | S_primary['99']) - S_primary['98']   # if 98 were double
+print(f"\nSensitivity (double-mutant assignment flipped to 98): unique count = {len(alt_uniq)} (vs {n_primary} primary)")
+
+print("\nDiagnostics (primary design):")
+print(f"  size factors: min={min(info_primary['size_factors']):.3f} max={max(info_primary['size_factors']):.3f}")
+print(f"  alpha MLE median={info_primary['alpha_mle_median']:.4f}  alpha MAP median={info_primary['alpha_map_median']:.4f}")
+print(f"  trend a0={info_primary['trend'][0]:.3g} a1={info_primary['trend'][1]:.3g} priorVar={info_primary['prior_var']:.3g}")
+print(f"  independent filtering: kept {info_primary['n_filtered_kept']} genes (threshold {info_primary['thr']:.1f}), {info_primary['n_rejections']} rejections at 0.05")
+
+# ---------------------------------------------------------------- per-gene tables
+names = {97: 'single_97_vs_JBX1', 98: 'single_98_vs_JBX1', 99: 'double_99_vs_JBX1'}
+for dname, res in [('strain', res_primary), ('media_strain', res_media)]:
+    with open(f'work/deseq2_results_{dname}.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['gene', 'baseMean'] + [f'{v}_{s}' for v in names.values() for s in ('log2FC', 'pvalue', 'padj')])
+        for i, g in enumerate(genes):
+            row = [g, f"{baseMean_all[i]:.2f}"]
+            for k in ('97', '98', '99'):
+                row += [f"{res[k]['l2fc'][i]:.4f}", f"{res[k]['p'][i]:.4g}", f"{res[k]['padj'][i]:.4g}"]
+            w.writerow(row)
+
+json.dump({'primary_unique_count': n_primary,
+           'media_strain_unique_count': n_media,
+           'alt_double_assignment_count': len(alt_uniq),
+           'primary_DE_counts': {k: len(v) for k, v in S_primary.items()},
+           'media_DE_counts': {k: len(v) for k, v in S_media.items()},
+           'diagnostics': {k: v for k, v in info_primary.items() if k != 'size_factors'}},
+          open('work/summary.json', 'w'), indent=2)
+print("\nSaved: work/deseq2_results_strain.csv, work/deseq2_results_media_strain.csv, work/summary.json")

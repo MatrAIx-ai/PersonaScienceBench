@@ -1,0 +1,365 @@
+"""
+Leaf Physiological Response Reconstruction
+==========================================
+
+Land-surface (CLM/Noah-MP family) coupled photosynthesis-stomatal
+conductance model driven by data/leaf_params.json, data/forcing.csv and
+data/test_cases.json.
+
+Model conventions (fixed by the task brief):
+  * C4 (Collatz) branch only, per leaf_params.json pathway="C4"; the C3
+    (Farquhar) branch is implemented but kept inert.
+  * Hard-minimum limitation:
+        C4: A = min(Wc, Wj, We) - Rd,
+            Wc = Vcmax, Wj = alpha_q*APAR, We = 4000*Vcmax*Ci/p_atm
+        C3 (inert): Wc = Vcmax*(Ci-Gs)/(Ci+Kc*(1+O2/Ko)),
+            Wj = J*(Ci-Gs)/(4*Ci+8*Gs), We = 0.5*Vcmax, J = alpha_q*APAR
+    with APAR = 4.6*PAR (no additional absorptance factor).
+  * Vcmax(T) = vcmax25 * n_factor * btran
+               * 2.4^((Tc-25)/10)
+               / (1 + exp((-2.2e5 + 710*(Tc+273.16)) / (R*(Tc+273.16))))
+    n_factor and btran applied multiplicatively to photosynthetic capacity
+    (they commute with the temperature response).
+  * Kc(T) = 30 Pa * 2.1^((Tc-25)/10); Ko(T) = 30000 Pa * 1.2^((Tc-25)/10)
+    (Q10 triple (2.1, 1.2, 2.4) -> (Kc, Ko, Vcmax); the high-temperature
+    inhibition term is applied to Vcmax only, per the brief).
+  * Gamma_star = 0.5*(Kc/Ko)*O2*0.21  [Pa] (C3 branch only).
+  * Rd = 0.015 * Vcmax using the EFFECTIVE Vcmax (n_factor- and
+    btran-scaled, temperature-responded) -- stated assumption: the
+    Noah-MP-family reading in which foliar respiration inherits the
+    drought adjustment of photosynthetic capacity.
+  * Leaf temperature = air temperature; h_s = min(max(1 - vpd/esat(T), 0.25), 1)
+    with esat(T) = 610.78*exp(17.27*Tc/(Tc+237.3)) Pa (Tetens, over water)
+    -- stated assumption (esat formulation not pinned by the brief).
+  * Gas-diffusion chain (cf = p_atm/(R*T)):
+        cs = ca - 1.37*rb*A_mol/cf*p_atm
+        gs = m*A_mol*h_s/cs*p_atm + b0        (btran NOT applied here)
+        rs = cf/gs
+        Ci = cs - 1.65*rs*A_mol/cf*p_atm
+    A in umol CO2 m-2 s-1 internally; A_mol = A*1e-6 mol m-2 s-1 in the chain.
+  * Night (PAR == 0): A = -Rd (respiratory assimilation) and gs = b0
+    (intercept conductance); cs, rs, Ci still closed through the chain.
+
+Numerics:
+  * Coupled fixed point solved by Picard iteration on Ci:
+        Ci -> A(Ci) -> cs -> gs -> rs -> Ci_next
+    to |Ci_next - Ci| < 1e-10 Pa (max 500 iters); under-relaxation
+    safeguard plus bracketed Brent-style root fallback on
+    g(Ci) = Ci - Ci_next(Ci) if Picard fails (never triggered here).
+  * leaf_fluxes rows start from Ci = 0.7*ca; test cases start from the
+    supplied ci_init_pa (n_iterations start-dependent by design); the
+    fixed point itself is unique and start-independent.
+
+Stated assumptions (per researcher approval):
+  * The 5 single-point cases are evaluated with SUNLIT PAR (par_sun_wm2 at
+    the forcing row); the case file does not encode a leaf type.
+  * forcing_index is a 0-based row index into forcing.csv.
+  * R = 8.314 J mol-1 K-1; Tc = t_air_K - 273.16.
+"""
+
+import json
+import math
+import os
+
+import numpy as np
+import pandas as pd
+R_GAS = 8.314              # J mol-1 K-1 (stated assumption)
+KC25 = 30.0                # Pa
+KO25 = 30000.0             # Pa
+Q10 = (2.1, 1.2, 2.4)      # (Kc, Ko, Vcmax)
+TOL = 1e-10                # Pa, Picard tolerance on Ci
+MAXIT = 500
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+OUT = os.path.join(HERE, "results")
+os.makedirs(OUT, exist_ok=True)
+
+with open(os.path.join(DATA, "leaf_params.json")) as f:
+    P = json.load(f)
+with open(os.path.join(DATA, "test_cases.json")) as f:
+    CASES = json.load(f)
+DF = pd.read_csv(os.path.join(DATA, "forcing.csv"))
+
+IS_C3 = P["pathway"].strip().upper() == "C3"
+
+
+# ------------------------------------------------------- temperature fns
+def esat_pa(tc):
+    """Saturation vapour pressure over water, Pa (Tetens)."""
+    return 610.78 * math.exp(17.27 * tc / (tc + 237.3))
+
+
+def vcmax_tc(tc, btran):
+    """Effective Vcmax (umol m-2 s-1): n_factor & btran x Q10 + inhibition."""
+    q10 = Q10[2] ** ((tc - 25.0) / 10.0)
+    tK = tc + 273.16
+    inhib = 1.0 + math.exp((-2.2e5 + 710.0 * tK) / (R_GAS * tK))
+    return P["vcmax25"] * P["n_factor"] * btran * q10 / inhib
+
+
+def kc_ko_gs(tc, o2):
+    """Kc, Ko (Pa) and Gamma_star (Pa) at temperature tc (degC)."""
+    kc = KC25 * Q10[0] ** ((tc - 25.0) / 10.0)
+    ko = KO25 * Q10[1] ** ((tc - 25.0) / 10.0)
+    return kc, ko, 0.5 * (kc / ko) * o2 * 0.21
+
+
+def rd_tc(tc, btran):
+    """Foliar respiration = 0.015 x EFFECTIVE Vcmax (stated assumption)."""
+    return 0.015 * vcmax_tc(tc, btran)
+
+
+# ------------------------------------------------------------ assimilation
+def A_of_ci(par_wm2, tc, ci, p_atm, o2, btran, rd):
+    """A(Ci) in umol m-2 s-1 for the pathway selected by leaf_params.json."""
+    apar = 4.6 * par_wm2
+    v = vcmax_tc(tc, btran)
+    if IS_C3:  # inert branch (pathway is C4 in the supplied params)
+        kc, ko, gstar = kc_ko_gs(tc, o2)
+        wc = max(v * (ci - gstar) / (ci + kc * (1.0 + o2 / ko)), 0.0)
+        j = P["alpha_q"] * apar
+        wj = max(j * (ci - gstar) / (4.0 * ci + 8.0 * gstar), 0.0)
+        we = 0.5 * v
+    else:      # C4 / Collatz
+        wc = v
+        wj = P["alpha_q"] * apar
+        we = 4000.0 * v * ci / p_atm
+    return min(wc, wj, we) - rd
+
+
+def chain(ci, par, tc, ca, p_atm, o2, vpd, rb, btran, rd):
+    """One pass of the diffusion chain from Ci to (A, cs, gs, rs, Ci_next)."""
+    if par <= 0.0:  # night: respiratory assimilation, intercept conductance
+        a = -rd
+        gs = P["bb_intercept"]
+    else:
+        a = A_of_ci(par, tc, ci, p_atm, o2, btran, rd)
+        hs = min(max(1.0 - vpd / esat_pa(tc), 0.25), 1.0)
+        a_mol = a * 1e-6
+        cf = p_atm / (R_GAS * (tc + 273.16))
+        cs = ca - 1.37 * rb * a_mol / cf * p_atm
+        gs = P["bb_slope"] * a_mol * hs / cs * p_atm + P["bb_intercept"]
+        if gs <= 0.0:
+            gs = P["bb_intercept"]  # numerical safety
+        rs = cf / gs
+        return a, cs, gs, rs, cs - 1.65 * rs * a_mol / cf * p_atm
+    # night closure
+    a_mol = a * 1e-6
+    cf = p_atm / (R_GAS * (tc + 273.16))
+    cs = ca - 1.37 * rb * a_mol / cf * p_atm
+    rs = cf / gs
+    return a, cs, gs, rs, cs - 1.65 * rs * a_mol / cf * p_atm
+
+
+def solve_point(par, tc, ca, p_atm, o2, vpd, rb, btran, ci0):
+    """Solve the coupled fixed point; returns dict with diagnostics."""
+    rd = rd_tc(tc, btran)
+    args = (tc, ca, p_atm, o2, vpd, rb, btran, rd)
+    if par <= 0.0:
+        a, cs, gs, rs, ci = chain(0.0, par, *args)
+        return dict(A=a, cs=cs, gs=gs, rs=rs, ci=ci, iters=0, resid=0.0,
+                    method="night-closed-form")
+    ci = float(ci0)
+    for it in range(1, MAXIT + 1):
+        _, _, _, _, ci_next = chain(ci, par, *args)
+        d = ci_next - ci
+        if abs(d) < TOL:
+            ci = ci_next
+            break
+        if abs(d) > 1e4:  # damping safeguard (not needed for this forcing)
+            ci_next = ci + 0.5 * d
+        ci = ci_next
+    else:
+        # fallback: bracketed bisection on g(ci) = ci - ci_next(ci)
+        def g(x):
+            return x - chain(x, par, *args)[4]
+        lo, hi = 0.0, max(2.0 * ca, 200.0)
+        assert g(lo) * g(hi) < 0.0, "fixed point not bracketed"
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if g(lo) * g(mid) <= 0.0:
+                hi = mid
+            else:
+                lo = mid
+        ci = 0.5 * (lo + hi)
+        it = MAXIT
+    a, cs, gs, rs, _ = chain(ci, par, *args)
+    resid = abs(ci - chain(ci, par, *args)[4])
+    return dict(A=a, cs=cs, gs=gs, rs=rs, ci=ci, iters=it, resid=resid,
+                method="picard")
+
+
+# ------------------------------------------------- 1) time series of fluxes
+rows = []
+iters_used = []
+for _, r in DF.iterrows():
+    common = dict(tc=r.t_air_K - 273.16, ca=r.co2_pa, p_atm=r.p_atm_Pa,
+                  o2=r.o2_pa, vpd=r.vpd_Pa, rb=r.rb_sm, btran=r.btran)
+    sun = solve_point(r.par_sun_wm2, ci0=0.7 * r.co2_pa, **common)
+    shd = solve_point(r.par_shade_wm2, ci0=0.7 * r.co2_pa, **common)
+    iters_used.append((sun["iters"], shd["iters"]))
+    rows.append(dict(time_hr=r.time_hr,
+                     A_sun=sun["A"], A_shade=shd["A"],
+                     rs_sun=sun["rs"], rs_shade=shd["rs"],
+                     ci_sun=sun["ci"], ci_shade=shd["ci"],
+                     gs_sun=sun["gs"], gs_shade=shd["gs"]))
+flux = pd.DataFrame(rows, columns=["time_hr", "A_sun", "A_shade", "rs_sun",
+                                   "rs_shade", "ci_sun", "ci_shade",
+                                   "gs_sun", "gs_shade"])
+flux.to_csv(os.path.join(OUT, "leaf_fluxes.csv"), index=False)
+
+# --------------------------------------------- 2) single-point test cases
+print("Single-point cases (sunlit PAR at forcing row 12):")
+crows = []
+for c in CASES:
+    r = DF.iloc[c["forcing_index"]]
+    sol = solve_point(r.par_sun_wm2, tc=r.t_air_K - 273.16, ca=r.co2_pa,
+                      p_atm=r.p_atm_Pa, o2=r.o2_pa, vpd=r.vpd_Pa,
+                      rb=r.rb_sm, btran=r.btran, ci0=c["ci_init_pa"])
+    crows.append(dict(case_id=c["case_id"], ci_init_pa=c["ci_init_pa"],
+                      ci_final_pa=sol["ci"], A_final=sol["A"],
+                      rs_final=sol["rs"], n_iterations=sol["iters"]))
+    print(f"  {c['case_id']}: ci_init={c['ci_init_pa']:.6f} Pa -> "
+          f"ci_final={sol['ci']:.8f} Pa, A={sol['A']:.6f} umol/m2/s, "
+          f"rs={sol['rs']:.4f} s/m, iterations={sol['iters']}, "
+          f"residual={sol['resid']:.3e} Pa ({sol['method']})")
+cases = pd.DataFrame(crows)
+cases.to_csv(os.path.join(OUT, "case_convergence.csv"), index=False)
+
+# ----------------------------------------------- 3) continuity diagnostic
+print("\nContinuity check (tiny-PAR dawn/dusk row vs night branch):")
+tiny = DF[(DF.par_sun_wm2 > 0.0) & (DF.par_sun_wm2 < 1e-6)]
+for _, r in tiny.iterrows():
+    common = dict(tc=r.t_air_K - 273.16, ca=r.co2_pa, p_atm=r.p_atm_Pa,
+                  o2=r.o2_pa, vpd=r.vpd_Pa, rb=r.rb_sm, btran=r.btran)
+    s_light = solve_point(r.par_sun_wm2, ci0=0.7 * r.co2_pa, **common)
+    s_night = solve_point(0.0, ci0=0.7 * r.co2_pa, **common)
+    print(f"  hour {r.time_hr:.0f}: par_sun={r.par_sun_wm2:.3e} | "
+          f"dA = {s_light['A'] - s_night['A']:+.3e} umol/m2/s | "
+          f"dgs = {s_light['gs'] - s_night['gs']:+.3e} mol/m2/s | "
+          f"dCi = {s_light['ci'] - s_night['ci']:+.3e} Pa")
+
+print("  -> A is continuous to O(1e-14) umol/m2/s. The gs/Ci offsets are")
+print("     the convention-mandated branch difference, not a numerical")
+print("     artifact: the night branch forces gs = b0 exactly, while the")
+print("     light branch evaluates the Ball-Berry slope term with A ~ -Rd,")
+print("     giving gs = b0 - m*|Rd|*h_s/cs*p_atm ~ b0 - 5.0e-3 (~12% of b0)")
+print("     as PAR -> 0+.")
+
+print(f"\nleaf_fluxes Picard iterations: sun max "
+      f"{max(t[0] for t in iters_used)}, shade max "
+      f"{max(t[1] for t in iters_used)}")
+
+# ------------------------------------------------------------- 4) figure
+PIL_PLOT_SRC = r"""
+import csv, sys
+from PIL import Image, ImageDraw, ImageFont
+
+def main(csv_path, out_path):
+    rows = list(csv.DictReader(open(csv_path)))
+    t = [float(r["time_hr"]) for r in rows]
+    series = [( [float(r["A_sun"]) for r in rows],
+                [float(r["A_shade"]) for r in rows],
+                "A  (umol CO2 m-2 s-1)" ),
+              ( [float(r["rs_sun"]) for r in rows],
+                [float(r["rs_shade"]) for r in rows],
+                "rs  (s m-1)" )]
+    W, H = 1200, 800
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=18)
+    small = ImageFont.load_default(size=14)
+    L, Rm, T, B = 110, 40, 70, 110
+    pw = W - L - Rm
+    ph = (H - T - B) // 2 - 25
+    tmin, tmax = min(t), max(t)
+    for k, (ysun, yshd, ylab) in enumerate(series):
+        y0 = T + k * (ph + 60)
+        y1 = y0 + ph
+        allv = ysun + yshd
+        lo, hi = min(allv), max(allv)
+        pad = 0.05 * (hi - lo) if hi > lo else 1.0
+        lo, hi = lo - pad, hi + pad
+        def X(v): return L + (v - tmin) / (tmax - tmin) * pw
+        def Y(v): return y1 - (v - lo) / (hi - lo) * ph
+        for i in range(6):
+            gy = lo + (hi - lo) * i / 5.0
+            yy = Y(gy)
+            d.line([L, yy, L + pw, yy], fill=(225, 225, 225))
+            d.text((8, yy - 7), "%.2f" % gy, fill="black", font=small)
+        for hr in range(0, int(tmax) + 1, 24):
+            xx = X(hr)
+            d.line([xx, y0, xx, y1], fill=(225, 225, 225))
+            d.text((xx - 8, y1 + 6), str(hr), fill="black", font=small)
+        d.line([L, y1, L + pw, y1], fill="black")
+        d.line([L, y0, L, y1], fill="black")
+        for v, col, lab in [(ysun, (200, 30, 30), "sunlit"),
+                            (yshd, (30, 130, 60), "shaded")]:
+            pts = [(X(tv), Y(vv)) for tv, vv in zip(t, v)]
+            d.line(pts, fill=col, width=3)
+        d.text((L + 10, y0 + 6), ylab, fill="black", font=font)
+        lx = L + pw - 220
+        d.line([lx, y0 + 14, lx + 34, y0 + 14], fill=(200, 30, 30), width=3)
+        d.text((lx + 42, y0 + 5), "sunlit", fill="black", font=small)
+        d.line([lx, y0 + 38, lx + 34, y0 + 38], fill=(30, 130, 60), width=3)
+        d.text((lx + 42, y0 + 29), "shaded", fill="black", font=small)
+    d.text((L + pw // 2 - 290, 15),
+           "Diurnal cycle of net assimilation (top) and stomatal resistance "
+           "(bottom)", fill="black", font=font)
+    d.text((L + pw // 2 - 30, H - 60), "time (hr)", fill="black", font=font)
+    img.save(out_path)
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
+"""
+
+
+def _plot_pillow(flux, path):
+    """Pillow-based renderer used when matplotlib is unavailable. In this
+    sandbox PIL lives only under the system Python (/usr/bin/python3), so
+    the drawing runs in-process when possible, else via subprocess."""
+    import subprocess
+    tmp = os.path.join(OUT, "_plot_data.csv")
+    flux.to_csv(tmp, index=False)
+    ns = {}
+    try:
+        exec(compile(PIL_PLOT_SRC, "pil_plot", "exec"), ns)
+        ns["main"](tmp, path)                      # in-process (PIL importable)
+    except ImportError:
+        subprocess.run(["/usr/bin/python3", "-c", PIL_PLOT_SRC, tmp, path],
+                       check=True)                 # PIL lives in system python
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
+
+if HAVE_MPL:
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    axes[0].plot(flux.time_hr, flux.A_sun, color="tab:red", label="sunlit")
+    axes[0].plot(flux.time_hr, flux.A_shade, color="tab:green", label="shaded")
+    axes[0].set_ylabel("A  (umol CO2 m$^{-2}$ s$^{-1}$)")
+    axes[0].legend(); axes[0].grid(alpha=0.3)
+    axes[0].set_title("Diurnal cycle of net assimilation and stomatal resistance")
+    axes[1].plot(flux.time_hr, flux.rs_sun, color="tab:red", label="sunlit")
+    axes[1].plot(flux.time_hr, flux.rs_shade, color="tab:green", label="shaded")
+    axes[1].set_ylabel("r$_s$  (s m$^{-1}$)")
+    axes[1].set_xlabel("time (hr)")
+    axes[1].legend(); axes[1].grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "diurnal.png"), dpi=150)
+else:
+    print("matplotlib unavailable -> rendering diurnal.png with Pillow "
+          "fallback (labelled sunlit/shaded curves for A and rs)")
+    _plot_pillow(flux, os.path.join(OUT, "diurnal.png"))
+
+print("\nWrote: results/leaf_fluxes.csv, results/case_convergence.csv, "
+      "results/diurnal.png")

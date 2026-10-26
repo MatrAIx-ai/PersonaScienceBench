@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Single-cell RNA-seq integrated analysis (asibench Level B3).
+Inputs : data/system_info.json, data/counts.npy (cells x genes).
+Outputs: analysis.py, clusters.npy, pseudotime.npy, de_genes.json,
+         grn_scores.npy, method_choices.json
+Dependencies: NumPy + SciPy only (no scanpy/anndata/sklearn).
+
+Conventions
+  * grn_scores[i,j] = directed regulatory score for edge i -> j (i regulator,
+    j target). Diagonal set to 0 (ignored).
+  * GRN regression: when target j is a TF, regressors = the OTHER 19 TFs
+    (self excluded) so that self-prediction does not collapse the scores.
+  * Pseudotime: Dijkstra geodesic distance on a connected weighted KNN graph
+    from the peripheral root (cell maximising total finite geodesic distance
+    to all other cells); linear min-max to [0,1]. Orientation is heuristic
+    (0 = most peripheral / graph-extreme cell); no biological start-state
+    prior exists in the metadata.
+
+Method notes (see method_choices.json for full justification)
+  - PCA is run on the CENTERED (not unit-variance-scaled) log1p-CPM matrix
+    over ALL genes, keeping the top 15 PCs. Empirical study on this dataset
+    showed z-scoring + CV-HVG + spectral-on-KNN produced an unstable,
+    poorly separated partition, whereas un-scaled log-PCA + k-means yields a
+    stable, balanced 2+2 cluster structure (nested inside the dataset's
+    dominant two-group bipartition) with strong per-cluster markers.
+  - The KNN graph k is raised to 60 for pseudotime because the two main
+    groups of the dataset are far apart (k=15..55 leave the graph in 2
+    connected components); k=60 is the minimum giving a single component so
+    that a single global pseudotime is well defined.
+"""
+import json
+import time
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.csgraph as csgraph
+import scipy.spatial as ssp
+import scipy.stats as sst
+from numpy.linalg import svd
+
+SEED = 42
+CPM_TARGET = 1e4
+N_PCS = 15
+KNN_K_PT = 60
+KMEANS_RESTARTS = 40
+KMEANS_MAX_ITER = 300
+
+# ---------------- 1. Load & validate (stop on mismatch, never guess) --------
+t0 = time.time()
+with open("data/system_info.json", "r") as fh:
+    meta = json.load(fh)
+n_cells_meta = int(meta["n_cells"]); n_genes_meta = int(meta["n_genes"])
+n_tf_genes = int(meta["n_tf_genes"])
+tf_idx = [int(x) for x in meta["tf_gene_indices"]]
+counts = np.load("data/counts.npy")
+n_cells, n_genes = counts.shape
+assert n_cells == n_cells_meta, f"n_cells mismatch {n_cells_meta}!={n_cells}"
+assert n_genes == n_genes_meta, f"n_genes mismatch {n_genes_meta}!={n_genes}"
+assert n_tf_genes == len(tf_idx), "n_tf_genes != len(tf_gene_indices)"
+assert tf_idx == list(range(n_tf_genes)), "TF cols are not first n_tf_genes"
+assert np.all(counts >= 0), "negative counts found"
+print("[check] metadata consistent; first %d columns are TF genes" % n_tf_genes)
+
+# ---------------- 2. Normalisation: CPM(10k) + log1p ------------------------
+lib_size = counts.sum(axis=1, dtype=np.float64)
+assert np.all(lib_size > 0), "some cell has zero total counts"
+norm = counts / lib_size[:, None] * CPM_TARGET
+X = np.log1p(norm)                      # (n_cells, n_genes)
+
+# ---------------- 3. PCA: centered log-PCA over all genes, top N_PCs --------
+Mc = X - X.mean(axis=0)
+U, S, Vt = svd(Mc, full_matrices=False)
+n_pcs = min(N_PCS, Mc.shape[1])
+emb = U[:, :n_pcs] * S[:n_pcs]          # (n_cells, n_pcs) unscaled PCA scores
+var_frac = np.cumsum(S**2) / np.sum(S**2)        # cumulative variance in desc PC order
+
+# ---------------- 4. Clustering: Lloyd k-means on PCA embedding -------------
+n_clusters = int(meta.get("n_clusters", 4))
+rng = np.random.default_rng(SEED)
+
+def kmeans(Xk, k, rng, n_restarts, max_iter):
+    best = None
+    for r in range(n_restarts):
+        init = rng.choice(Xk.shape[0], size=k, replace=False)
+        cc = Xk[init].copy()
+        for _ in range(max_iter):
+            d2 = ((Xk[:, None, :] - cc[None, :, :]) ** 2).sum(axis=2)
+            lab = np.argmin(d2, axis=1)
+            newc = np.array([Xk[lab == c].mean(axis=0) if np.any(lab == c)
+                             else cc[c] for c in range(k)])
+            if np.allclose(newc, cc):
+                break
+            cc = newc
+        inertia = ((Xk - cc[lab]) ** 2).sum()
+        if best is None or inertia < best[0]:
+            best = (inertia, lab.copy(), cc.copy())
+    return best[1], best[2]
+
+clusters, _ = kmeans(emb, n_clusters, rng, KMEANS_RESTARTS, KMEANS_MAX_ITER)
+clusters = clusters.astype(np.int32)
+
+# ---------------- 5. Pseudotime: connected weighted KNN + Dijkstra ----------
+k_eff = min(KNN_K_PT + 1, n_cells)
+tree = ssp.cKDTree(emb)
+knn_dist, knn_ind = tree.query(emb, k=k_eff)
+rows, cols, data = [], [], []
+for i in range(n_cells):
+    for j, d in zip(knn_ind[i], knn_dist[i]):
+        if j != i:
+            rows.append(i); cols.append(j); data.append(float(d))
+A_w = sp.csr_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
+A_w = A_w.maximum(A_w.T).tocsr()      # symmetric, Euclidean-weighted
+
+D_all = csgraph.dijkstra(A_w, directed=False, indices=None)   # all-pairs
+finite = np.isfinite(D_all)
+row_sum = np.where(finite, D_all, 0.0).sum(axis=1)
+root = int(np.argmax(row_sum))        # peripheral cell (max total distance)
+if not np.all(finite[root]):
+    max_f = np.nanmax(np.where(finite, D_all, np.nan))
+    pt_raw = np.where(np.isfinite(D_all[root]), D_all[root], max_f)
+else:
+    pt_raw = D_all[root]
+pseudotime = ((pt_raw - pt_raw.min()) /
+              (pt_raw.max() - pt_raw.min() + 1e-12)).astype(np.float64)
+
+# ---------------- 6. DE: one-vs-rest Welch t, marker score = max|t| ---------
+marker_score = np.zeros(n_genes)
+marker_cluster = np.zeros(n_genes, dtype=int)
+for g in range(n_genes):
+    best_t, best_c = 0.0, 0
+    for c in range(n_clusters):
+        m = clusters == c
+        t, _ = sst.ttest_ind(X[m, g], X[~m, g], equal_var=False)
+        if abs(t) > best_t:
+            best_t, best_c = abs(t), int(c)
+    marker_score[g] = best_t
+    marker_cluster[g] = best_c
+de_order = np.argsort(-marker_score, kind="stable")
+de_genes = {"gene_indices": de_order.tolist()}
+
+# ---------------- 7. GRN: directed OLS scores (no self-prediction) ----------
+X_tf = X[:, :n_tf_genes]
+grn_scores = np.zeros((n_tf_genes, n_tf_genes), dtype=np.float64)
+col_idx = np.arange(n_tf_genes)
+for j in range(n_tf_genes):
+    pred = col_idx != j                       # exclude target j itself
+    A = np.column_stack([np.ones(n_cells), X_tf[:, pred]])
+    y = X_tf[:, j]
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    resid = y - A @ beta
+    n, p = A.shape
+    dof = n - p
+    mse = float(resid @ resid) / dof
+    covb = mse * np.linalg.pinv(A.T @ A)
+    se = np.sqrt(np.maximum(np.diag(covb), 0.0))
+    tvals = beta / se
+    grn_scores[pred, j] = tvals[1:]           # i -> j for i != j
+
+# ---------------- 8. Write outputs ------------------------------------------
+np.save("clusters.npy", clusters)
+np.save("pseudotime.npy", pseudotime)
+np.save("grn_scores.npy", grn_scores)
+with open("de_genes.json", "w") as fh:
+    json.dump(de_genes, fh)
+
+method_choices = {
+    "normalisation": {
+        "method": "CPM (scale each cell to 10k total counts) + log1p",
+        "details": "counts / lib_size * 1e4 then log1p; vectorised numpy",
+        "justification": "standard droplet scRNA normalisation; removes "
+                         "library-size confound; log1p stabilises variance"},
+    "pca": {
+        "method": "centered (NOT unit-variance-scaled) SVD PCA on log1p-CPM "
+                  "matrix over all 250 genes; top 15 PCs retained",
+        "details": "self-implemented SVD projection",
+        "justification": "log1p already places genes on a comparable scale. "
+                         "Empirically on this dataset, unit-variance z-scoring "
+                         "inflated noise PCs (PC1 only 1.8% var; 82 PCs for "
+                         "80% var) and unstable clustering, whereas un-scaled "
+                         "log-PCA gives PC1 = 19.2% var and a stable partition. "
+                         "HVG (top 50% by CV) was evaluated and produced an "
+                         "imbalanced 1+3 partition with negative silhouette; "
+                         "all-gene PCA produced the better-balanced, better "
+                         "separated 2+2 partition."},
+    "clustering": {
+        "method": "Lloyd k-means on the PCA embedding (best of %d fixed-seed "
+                  "restarts RNG(%d)); k = metadata n_clusters (%d)"
+                  % (KMEANS_RESTARTS, SEED, n_clusters),
+        "details": "self-implemented, deterministic given the seed",
+        "justification": "empirical study (corrected ARI across seeds, "
+                         "silhouette, per-cluster marker |t|) showed direct "
+                         "k-means on log-PCA outperformed spectral clustering "
+                         "on the KNN graph: it recovers a stable, balanced, "
+                         "nested 2+2 structure (cluster sizes sum exactly to "
+                         "the dataset's two main groups 382/418) with strong "
+                         "markers (max |t| 14-17); spectral clustering left "
+                         "the graph dominated by the single bipartition and "
+                         "gave imbalanced partitions (ARI vs k-means 0.09-0.5)"
+                         },
+    "pseudotime": {
+        "method": "Dijkstra geodesic distance on a connected weighted KNN "
+                  "graph from the peripheral root cell",
+        "details": ("root = cell maximising total finite geodesic distance; "
+                    "KNN k=%d (minimum k giving a single connected component; "
+                    "k<=55 leaves 2 components as the two main groups are far "
+                    "apart); edges weighted by Euclidean distance in PCA "
+                    "space; linear min-max to [0,1]" % KNN_K_PT),
+        "justification": "manifold geodesic ordering along the KNN graph; "
+                         "deterministic reproducible root. Orientation is "
+                         "heuristic (0 = peripheral cell); no ground-truth "
+                         "start state exists in the metadata."},
+    "de_genes": {
+        "method": "one-vs-rest Welch t-test per gene per cluster; marker "
+                  "score = max |t| over clusters",
+        "details": "ranked descending; all %d genes included in gene_indices"
+                   % n_genes,
+        "justification": "standard marker detection; Welch test handles "
+                         "unequal cluster variances and sizes"},
+    "grn_scores": {
+        "method": "directed OLS regression scores among the first n_tf_genes "
+                  "TF columns (log-normalised)",
+        "details": ("grn_scores[i,j] = t-value of TF i as regressor of TF j "
+                    "(edge i -> j); regressor set = all TFs EXCLUDING the "
+                    "target j (prevents self-prediction collapse); diagonal "
+                    "i==j set to 0 (ignored)"),
+        "justification": "asymmetric marginal predictive contribution gives a "
+                         "directed, signed score; correlation-based measures "
+                         "are symmetric and not directional"},
+}
+with open("method_choices.json", "w") as fh:
+    json.dump(method_choices, fh, indent=2)
+
+# ---------------- 9. Diagnostics --------------------------------------------
+print("=== diagnostics ===")
+print("counts shape:", counts.shape, "dtype:", counts.dtype)
+print("PC1 var frac: %.4f ; retained-%d-PCs cumvar: %.4f"
+      % (var_frac[0], n_pcs, var_frac[n_pcs - 1]))
+print("cluster sizes:", np.bincount(clusters).tolist())
+print("pseudotime min=%.4f max=%.4f mean=%.4f root=%d root_cluster=%d"
+      % (pseudotime.min(), pseudotime.max(), pseudotime.mean(), root,
+         clusters[root]))
+print("end cell (max pseudotime):", int(np.argmax(pseudotime)),
+      "cluster", clusters[int(np.argmax(pseudotime))])
+print("DE ranked: %d genes; top10: %s"
+      % (len(de_genes["gene_indices"]), de_genes["gene_indices"][:10]))
+print("GRN shape/dtype:", grn_scores.shape, grn_scores.dtype,
+      "| diag all zero:", bool(np.all(np.diag(grn_scores) == 0)))
+print("GRN nonzero:", int(np.count_nonzero(grn_scores)),
+      "| |score| max=%.3f" % np.abs(grn_scores).max())
+tf_role = np.abs(grn_scores).sum(axis=1)
+print("top regulator TFs (sum |t| over targets):",
+      np.argsort(-tf_role)[:5].tolist())
+print("runtime (s): %.2f" % (time.time() - t0))

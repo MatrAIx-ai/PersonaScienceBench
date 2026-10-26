@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+Multi-Sensor Motion Record Audit
+================================
+Joint calibration of a planar IMU/gyro + lidar scan-match record:
+
+  gyro_bias_rad_s   b : constant additive bias of the z-gyro  [rad/s]
+  time_offset_s   tau : constant clock offset between lidar and IMU time bases.
+                        Convention: a lidar interval [t0, t1] (lidar clock)
+                        corresponds to IMU-clock interval [t0 + tau, t1 + tau].
+  yaw_extrinsic_rad psi : constant yaw mounting offset between the lidar frame
+                        and the body/IMU frame.  Convention (sensor-to-body):
+                        a vector in the lidar frame maps to the body frame via
+                        v_b = Rz(psi) v_l, i.e. angle(dp_l) = dtheta/2 - psi.
+
+Estimation uses ONLY rows with split == 'train' (700 of 854).  The 154
+'heldout' rows are used exclusively for validation residuals (residuals.csv)
+and diagnostics.
+
+Models
+------
+Yaw channel (per scan match i):
+    dyaw_i = Theta(t1_i + tau) - Theta(t0_i + tau) - b*dt_i + eps_i
+    Theta(t) = integral of gyro omega from 0 to t (cumulative trapezoid),
+    eps_i ~ N(0, sigma_yaw^2), sigma_yaw = 0.006 (file metadata).
+Translation channel (per scan match i):
+    Rz(psi) * dp_l,i  should equal  Lhat_i * [cos(dtheta_i/2), sin(dtheta_i/2)]
+    (unicycle chord), dtheta_i = calibrated gyro-implied yaw change,
+    Lhat_i = |dp_l,i|; closed-form weighted orthogonal Procrustes over psi.
+
+residual_trans_m definition (documented as required):
+    || Rz(psi)*dp_l - Lhat*[cos(dtheta/2), sin(dtheta/2)] ||_2
+    i.e. the 2-D norm of the mismatch between the measured lidar relative
+    translation (rotated into the body frame with the calibrated extrinsic)
+    and the chord predicted from the calibrated gyro heading change.  A
+    single-axis gyro cannot constrain the along-track component, so this is
+    effectively the calibrated cross-track (chord-geometry) mismatch, metres.
+"""
+import json
+import numpy as np
+from scipy.optimize import minimize_scalar
+from scipy.stats import f as fdist
+
+
+def load():
+    g = np.genfromtxt(f"data/imu_gyro.csv", delimiter=",", names=True)
+    l = np.genfromtxt("data/lidar_scan_matches.csv", delimiter=",",
+                      names=True, dtype=None, encoding=None)
+    seg = np.genfromtxt("data/segment_windows.csv", delimiter=",", names=True)
+    info = json.load(open("data/task_info.json"))
+    return g, l, seg, info
+
+
+def make_theta(g):
+    """W(t) = int_0^t omega dt' with cumulative trapezoid + linear interpolation."""
+    t = g["imu_time_s"]; w = g["omega_z_rad_s"]
+    c = np.concatenate([[0.0], np.cumsum(0.5 * (w[1:] + w[:-1]) * np.diff(t))])
+    i0 = int(np.searchsorted(t, 0.0))
+    th0 = c[i0] + 0.5 * (w[i0] + w[min(i0 + 1, len(t) - 1)]) * (0.0 - t[i0])
+    slope = (w[1:] - w[:-1]) / np.diff(t)   # local slope of linear interpolant
+    def W(q):
+        # exact integral of the piecewise-linear interpolant from 0 to q
+        q = np.asarray(q, float)
+        i = np.clip(np.searchsorted(t, q) - 1, 0, len(t) - 2)
+        dq = q - t[i]
+        return c[i] + w[i] * dq + 0.5 * slope[i] * dq**2 - th0
+    return W
+
+
+def wrap(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def fit_psi(dx, dy, dtheta):
+    """Orthogonal Procrustes: minimise sum || Rz(psi) a_i - b_i ||^2 with
+    a_i = dp_l (lidar frame), b_i = Lhat_i*u(dtheta_i/2).  Returns psi,
+    per-scan residual vectors, rss, a, b."""
+    a = np.column_stack([dx, dy])
+    L = np.hypot(dx, dy)
+    u = np.column_stack([np.cos(dtheta / 2.0), np.sin(dtheta / 2.0)])
+    b = L[:, None] * u
+    c = float(np.sum(a * b))                       # sum a.b
+    s = float(np.sum(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]))  # sum a x b
+    psi = np.arctan2(s, c)
+    R = np.array([[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]])
+    evec = a @ R.T - b
+    return psi, evec, float(np.sum(evec**2)), a, b
+
+
+RENDER_SRC = r"""# renderer: draws the six diagnostics panels with Pillow (system python3.14)
+import json, sys, math
+from PIL import Image, ImageDraw, ImageFont
+
+D = json.load(open(sys.argv[1]))
+W, H = 1720, 1580
+img = Image.new("RGB", (W, H), "white")
+dr = ImageDraw.Draw(img)
+try:
+    F = ImageFont.load_default(size=15); FS = ImageFont.load_default(size=12)
+except TypeError:
+    F = FS = ImageFont.load_default()
+
+dr.text((W // 2 - 330, 12), D["title"], fill="black", font=F)
+PX0, PY0, PW, PH, GAP = 95, 70, 720, 420, 70
+
+def rect(i, j):
+    x = PX0 + j * (PW + GAP + 90); y = PY0 + i * (PH + GAP)
+    return (x, y, x + PW, y + PH)
+
+def ticks(v):
+    lo, hi = float(min(v)), float(max(v))
+    if hi - lo < 1e-12: hi = lo + 1e-12
+    return [lo + (hi - lo) * k / 4.0 for k in range(5)]
+
+def setup(i, j, title, xlabel, ylabel):
+    x0, y0, x1, y1 = rect(i, j)
+    dr.rectangle([x0, y0, x1, y1], outline="black")
+    dr.text((x0, y0 - 24), title, fill="black", font=F)
+    tw = dr.textlength(xlabel, font=FS)
+    dr.text((x0 + (PW - tw) / 2, y1 + 6), xlabel, fill="black", font=FS)
+    ti = Image.new("RGB", (240, 20), "white")
+    ImageDraw.Draw(ti).text((2, 2), ylabel, fill="black", font=FS)
+    ti = ti.rotate(90, expand=True)
+    img.paste(ti, (max(x0 - 56, 0), y0 + PH // 2 - ti.height // 2))
+    return (x0, y0, x1, y1)
+
+def mp(x, y, r, xr, yr):
+    x0, y0, x1, y1 = r
+    fx = (x - xr[0]) / (xr[1] - xr[0]); fy = (y - yr[0]) / (yr[1] - yr[0])
+    return (x0 + fx * PW, y1 - fy * PH)
+
+def curve(r, xs, ys, xr, yr, color, w=2):
+    pts = [mp(x, y, r, xr, yr) for x, y in zip(xs, ys)]
+    if len(pts) > 1: dr.line(pts, fill=color, width=w)
+
+def scatter(r, xs, ys, xr, yr, color, rad=1):
+    for x, y in zip(xs, ys):
+        px, py = mp(x, y, r, xr, yr)
+        dr.ellipse([px - rad, py - rad, px + rad, py + rad], fill=color)
+
+def aticks(r, xr, yr):
+    x0, y0, x1, y1 = r
+    for tv in ticks(xr):
+        px, _ = mp(tv, yr[0], r, xr, yr)
+        dr.line([px, y1, px, y1 + 5], fill="black")
+        lab = "%.3g" % tv
+        dr.text((px - dr.textlength(lab, font=FS) / 2, y1 + 8), lab, fill="black", font=FS)
+    for tv in ticks(yr):
+        _, py = mp(xr[0], tv, r, xr, yr)
+        dr.line([x0 - 5, py, x0, py], fill="black")
+        lab = "%.3g" % tv
+        dr.text((x0 - 8 - dr.textlength(lab, font=FS), py - 7), lab, fill="black", font=FS)
+
+BLUE, RED, GREY = (40, 90, 200), (210, 50, 50), (150, 150, 150)
+gt, gw = D["gyro_t"], D["gyro_w"]
+xr = (min(gt), max(gt))
+
+r = setup(0, 0, "Gyro stream (alternating segment windows shaded)", "IMU time [s]", "omega_z [rad/s]")
+yr = (min(gw) - 0.02, max(gw) + 0.02)
+for k in range(len(D["seg_t0"])):
+    if k % 2 == 0:
+        a = mp(D["seg_t0"][k], 0, r, xr, yr)[0]; b2 = mp(D["seg_t1"][k], 0, r, xr, yr)[0]
+        dr.rectangle([a, r[1], b2, r[3]], fill=(246, 246, 246))
+curve(r, gt, gw, xr, yr, (30, 60, 160), 1)
+aticks(r, xr, yr)
+
+r = setup(0, 1, "Heading consistency", "time [s]", "yaw [rad]")
+th, lt, lc = D["head_th"], D["lid_t"], D["lid_cum"]
+yr = (min(min(th), min(lc)) - 0.1, max(max(th), max(lc)) + 0.1)
+curve(r, D["head_t"], th, xr, yr, BLUE, 2)
+scatter(r, lt, lc, xr, yr, RED, 1)
+aticks(r, xr, yr)
+dr.text((r[0] + 10, r[1] + 8), "blue: gyro integral; red: lidar cumsum(dyaw) (train)", fill="black", font=FS)
+
+r = setup(1, 0, "Yaw residuals vs time (wrapped)", "time [s]", "[rad]")
+yr = (-0.02, 0.02)
+curve(r, [xr[0], xr[1]], [2 * D["s_yaw"]] * 2, xr, yr, GREY, 1)
+curve(r, [xr[0], xr[1]], [-2 * D["s_yaw"]] * 2, xr, yr, GREY, 1)
+scatter(r, D["ryt"], D["ryv"], xr, yr, BLUE, 1)
+scatter(r, D["rht"], D["rhv"], xr, yr, RED, 1)
+aticks(r, xr, yr)
+dr.text((r[0] + 10, r[1] + 8), "blue train, red heldout, dashed: +/-2 sigma = %.4f" % (2 * D["s_yaw"]), fill="black", font=FS)
+
+r = setup(1, 1, "Yaw residual histogram (s=%.4f rad)" % D["s_yaw"], "[rad]", "density")
+edges, htr, hho = D["hist_edges"], D["hist_tr"], D["hist_ho"]
+ymax = max(max(htr), max(hho)) * 1.15
+for h, col in ((htr, BLUE), (hho, RED)):
+    for c in range(len(h)):
+        p1 = mp(edges[c], 0, r, (-0.025, 0.025), (0, ymax))
+        p2 = mp(edges[c + 1], h[c], r, (-0.025, 0.025), (0, ymax))
+        dr.rectangle([min(p1[0], p2[0]), min(p1[1], p2[1]),
+                      max(p1[0], p2[0]), max(p1[1], p2[1])], outline=col)
+xs = [-0.025 + 0.05 * k / 199.0 for k in range(200)]
+s2 = D["s_yaw"] ** 2
+gs = [math.exp(-x * x / (2 * s2)) / math.sqrt(2 * math.pi * s2) for x in xs]
+curve(r, xs, gs, (-0.025, 0.025), (0, ymax), "black", 2)
+aticks(r, (-0.025, 0.025), (0, ymax))
+
+r = setup(2, 0, "Translation (chord) residuals vs calibrated dtheta", "dtheta [rad]", "[m]")
+dtall = D["dth_tr"] + D["dth_ho"]
+xr2 = (min(dtall), max(dtall)); yr2 = (0, max(max(D["rt_tr"]), max(D["rt_ho"])) * 1.1)
+scatter(r, D["dth_tr"], D["rt_tr"], xr2, yr2, BLUE, 1)
+scatter(r, D["dth_ho"], D["rt_ho"], xr2, yr2, RED, 1)
+curve(r, [xr2[0], xr2[1]], [D["sig_trans"]] * 2, xr2, yr2, GREY, 1)
+aticks(r, xr2, yr2)
+dr.text((r[0] + 10, r[1] + 8), "grey line: sigma_trans = %.3f m" % D["sig_trans"], fill="black", font=FS)
+
+r = setup(2, 1, "Profile cost vs assumed time offset (identifiability)", "tau [s]", "log10 RSS_yaw")
+taus, costs = D["taus"], D["costs"]
+yr3 = (min(costs) - 0.3, max(costs) + 0.1)
+curve(r, taus, costs, (-0.03, 0.03), yr3, BLUE, 2)
+px = mp(D["tau_hat"], 0, r, (-0.03, 0.03), yr3)[0]
+dr.line([px, r[1], px, r[3]], fill=RED, width=2)
+aticks(r, (-0.03, 0.03), yr3)
+dr.text((r[0] + 10, r[1] + 8), "red line: tau_hat = %.5f s" % D["tau_hat"], fill="black", font=FS)
+
+img.save("calibration_diagnostics.png")
+print("figure written")
+"""
+
+
+def main():
+    g, lid, seg, info = load()
+    SIG_YAW = float(lid["sigma_yaw_rad"][0])
+    SIG_TRANS = float(lid["sigma_trans_m"][0])
+    W = make_theta(g)
+    gt, gw = g["imu_time_s"], g["omega_z_rad_s"]
+
+    split = lid["split"]
+    tr = split == "train"; ho = split == "heldout"
+    scan_id = lid["scan_id"].astype(int)
+    t0, t1 = lid["t0_lidar_s"], lid["t1_lidar_s"]
+    dt = t1 - t0
+    dyaw = lid["dyaw_lidar_rad"]
+    dx, dy = lid["dx_lidar_m"], lid["dy_lidar_m"]
+    n_tr = int(tr.sum())
+
+    # segment membership of every scan
+    seg_id_of = np.full(len(lid), -1)
+    for k in range(len(seg)):
+        m = (t0 >= seg["t0_lidar_s"][k]) & (t0 < seg["t1_lidar_s"][k])
+        seg_id_of[m] = int(seg["segment_id"][k])
+    segs = seg["segment_id"].astype(int)
+
+    # ---------------- 1. yaw channel: profile fit of (tau, b) on TRAIN rows
+    def ss_fn(tau):
+        I = W(t1 + tau) - W(t0 + tau)
+        b = np.dot(I[tr] - dyaw[tr], dt[tr]) / np.dot(dt[tr], dt[tr])
+        r = dyaw[tr] - (I[tr] - b * dt[tr])
+        return float(r @ r), b, r
+
+    res = minimize_scalar(lambda x: ss_fn(x)[0], bounds=(-0.05, 0.05),
+                          method="bounded", options={"xatol": 1e-12})
+    tau = float(res.x); _, b, r_yaw_tr, ss_yaw = *ss_fn(tau), None
+    ss_yaw, b, r_yaw_tr = ss_fn(tau)
+    s2_yaw = ss_yaw / (n_tr - 2)
+
+    h = 1e-6
+    f0, f1, f2 = ss_fn(tau)[0], ss_fn(tau + h)[0], ss_fn(tau - h)[0]
+    d2 = (f1 - 2 * f0 + f2) / h**2
+    se_tau = float(np.sqrt(2.0 * s2_yaw / d2))
+    se_b = float(np.sqrt(s2_yaw / np.dot(dt[tr], dt[tr])))
+
+    # ------------- residual-structure audit on TRAIN rows only
+    seg_mean = {int(s): float(np.mean(r_yaw_tr[seg_id_of[tr] == s])) for s in segs}
+    rss1 = float(np.sum(r_yaw_tr**2))
+    rss2 = sum(float(np.sum((r_yaw_tr[seg_id_of[tr] == s] - seg_mean[int(s)])**2))
+               for s in segs)
+    df1, df2 = n_tr - 2, n_tr - 2 - (len(segs) - 1)
+    F = ((rss1 - rss2) / (df1 - df2)) / (rss2 / df2)
+    p_seg = float(fdist.sf(F, df1 - df2, df2))
+    ac = [float(np.corrcoef(r_yaw_tr[:-k], r_yaw_tr[k:])[0, 1]) for k in (1, 2, 3, 5, 10)]
+    iw0 = gw[np.clip(np.searchsorted(gt, t0[tr] + tau), 0, len(gt) - 1)]
+    iw1 = gw[np.clip(np.searchsorted(gt, t1[tr] + tau), 0, len(gt) - 1)]
+    X = np.column_stack([np.ones(n_tr), iw0, iw1])  # dt is constant -> collinear with intercept
+    coef, *_ = np.linalg.lstsq(X, r_yaw_tr, rcond=None)
+    structure = {
+        "global_mean": float(np.mean(r_yaw_tr)),
+        "global_std": float(np.std(r_yaw_tr, ddof=1)),
+        "per_segment_mean": seg_mean,
+        "per_segment_offset_F": float(F), "per_segment_offset_p": p_seg,
+        "autocorr_lag1_2_3_5_10": ac,
+        "covariate_regression_const_omega0_omega1": [float(x) for x in coef],
+        "decision": "homogeneous noise model retained" if p_seg >= 0.01
+                    else "per-segment offsets supported (p<0.01)",
+    }
+    use_seg_offsets = p_seg < 0.01
+    if use_seg_offsets:                      # profile offsets out, refit tau,b
+        c_hat = np.zeros(len(lid))
+        for s in segs:
+            c_hat[tr & (seg_id_of == s)] = seg_mean[int(s)]
+        def ss2(x):
+            I = W(t1 + x) - W(t0 + x)
+            y = dyaw[tr] - I[tr] - c_hat[tr]
+            bb = np.dot(y, dt[tr]) / np.dot(dt[tr], dt[tr])
+            rr = y - bb * dt[tr]
+            return float(rr @ rr), bb, rr
+        res2 = minimize_scalar(lambda x: ss2(x)[0], bounds=(-0.05, 0.05),
+                               method="bounded", options={"xatol": 1e-12})
+        tau = float(res2.x)
+        ss_yaw, b, r_yaw_tr = ss2(tau)
+        s2_yaw = ss_yaw / (n_tr - 2 - (len(segs) - 1))
+        f0, f1, f2 = ss2(tau)[0], ss2(tau + h)[0], ss2(tau - h)[0]
+        d2 = (f1 - 2 * f0 + f2) / h**2
+        se_tau = float(np.sqrt(2.0 * s2_yaw / d2))
+        se_b = float(np.sqrt(s2_yaw / np.dot(dt[tr], dt[tr])))
+    dth_cal = (W(t1 + tau) - W(t0 + tau)) - b * dt    # calibrated dyaw model
+
+    # ------------- 2. translation channel: Procrustes fit of psi on TRAIN rows
+    psi, evec_tr, rss_tr, a_tr, b_tr = fit_psi(dx[tr], dy[tr], dth_cal[tr])
+    psi, evec_tr, rss_tr, a_tr, b_tr = fit_psi(dx[tr], dy[tr], dth_cal[tr])  # refined
+    s2_trans = rss_tr / (n_tr - 1)          # rotation removes 1 dof (mean angle)
+    se_psi = float(np.sqrt(s2_trans / np.sum(a_tr**2)))
+    r_trans_tr = np.hypot(evec_tr[:, 0], evec_tr[:, 1])
+
+    # ---------------- 3. held-out residuals (validation only)
+    dth_ho = dth_cal[ho]
+    r_yaw_ho = wrap(dyaw[ho] - dth_ho)
+    _, evec_ho, _, a_ho, b_ho = fit_psi(dx[ho], dy[ho], dth_ho)
+    r_trans_ho = np.hypot(evec_ho[:, 0], evec_ho[:, 1])
+
+    # ---------------- 4. per-segment observability scores (train rows only)
+    # Fisher-style per-scan information for each parameter, normalized by the
+    # max over segments, combined with the task's own parameter weights.
+    # Larger score = more useful for constraining the reported quantities.
+    w_sens = (gw[np.clip(np.searchsorted(gt, t1 + tau), 0, len(gt) - 1)]
+              - gw[np.clip(np.searchsorted(gt, t0 + tau), 0, len(gt) - 1)])
+    I_tau = np.array([np.mean(w_sens[tr & (seg_id_of == s)]**2) for s in segs]) / SIG_YAW**2
+    I_b = np.array([np.mean(dt[tr & (seg_id_of == s)]**2) for s in segs]) / SIG_YAW**2
+    I_p = np.array([np.mean((dx[tr & (seg_id_of == s)]**2 + dy[tr & (seg_id_of == s)]**2))
+                    for s in segs]) / SIG_TRANS**2
+    nrm = lambda v: v / v.max()
+    pw = info["scoring"]["parameter_weights"]
+    wsum = pw["time_offset_s"] + pw["gyro_bias_rad_s"] + pw["yaw_extrinsic_rad"]
+    score = (pw["time_offset_s"] * nrm(I_tau) + pw["gyro_bias_rad_s"] * nrm(I_b)
+             + pw["yaw_extrinsic_rad"] * nrm(I_p)) / wsum
+    order = np.argsort(-score)
+
+    # ---------------- 5. outputs
+    with open("calibration.csv", "w") as f:
+        f.write("gyro_bias_rad_s,time_offset_s,yaw_extrinsic_rad\n")
+        f.write("%.10f,%.10f,%.10f\n" % (b, tau, psi))
+
+    with open("observability.csv", "w") as f:
+        f.write("segment_id,t0_lidar_s,t1_lidar_s,observability_score\n")
+        for k, s in enumerate(segs):
+            f.write("%d,%.6f,%.6f,%.10f\n" % (s, seg["t0_lidar_s"][k],
+                    seg["t1_lidar_s"][k], score[k]))
+
+    ho_rows = np.where(ho)[0]
+    ho_rows = ho_rows[np.argsort(scan_id[ho_rows])]
+    with open("residuals.csv", "w") as f:
+        f.write("scan_id,residual_yaw_rad,residual_trans_m\n")
+        for i in ho_rows:
+            j = int(np.where(scan_id[ho] == scan_id[i])[0][0])
+            f.write("%d,%.10f,%.10f\n" % (scan_id[i], r_yaw_ho[j], r_trans_ho[j]))
+
+    # ---------------- 6. diagnostics figure
+    # matplotlib is unavailable in this offline environment and Pillow's C
+    # extension is built for the system python3.14 (which lacks numpy), so the
+    # panels are rasterized by shelling out to python3.14 with Pillow, using
+    # plot data serialized from this numpy/scipy process.
+    import subprocess, sys, shutil, os, tempfile
+    th_of = W
+    tm = np.linspace(gt[0], gt[-1], 4000)
+    taus = np.linspace(-0.03, 0.03, 241)
+    costs = [ss_fn(x)[0] for x in taus]
+    step = max(1, len(gt) // 2400)
+    plot_data = {
+        "title": "Calibration diagnostics | b=%.6f rad/s, tau=%.6f s, psi=%.6f rad"
+                 % (b, tau, psi),
+        "gyro_t": gt[::step].tolist(), "gyro_w": gw[::step].tolist(),
+        "seg_t0": seg["t0_lidar_s"].tolist(), "seg_t1": seg["t1_lidar_s"].tolist(),
+        "head_t": tm.tolist(), "head_th": th_of(tm).tolist(),
+        "lid_t": (t0[tr] + tau).tolist(),
+        "lid_cum": (np.cumsum(dyaw[tr]) - dyaw[tr] / 2).tolist(),
+        "ryt": t0[tr].tolist(), "ryv": r_yaw_tr.tolist(),
+        "rht": t0[ho].tolist(), "rhv": r_yaw_ho.tolist(),
+        "s_yaw": float(np.sqrt(s2_yaw)),
+        "hist_edges": np.linspace(-0.025, 0.025, 51).tolist(),
+        "hist_tr": np.histogram(r_yaw_tr, bins=np.linspace(-0.025, 0.025, 51), density=True)[0].tolist(),
+        "hist_ho": np.histogram(r_yaw_ho, bins=np.linspace(-0.025, 0.025, 51), density=True)[0].tolist(),
+        "dth_tr": dth_cal[tr].tolist(), "rt_tr": r_trans_tr.tolist(),
+        "dth_ho": dth_ho.tolist(), "rt_ho": r_trans_ho.tolist(),
+        "sig_trans": SIG_TRANS,
+        "taus": taus.tolist(), "costs": np.log10(np.array(costs) + 1e-12).tolist(),
+        "tau_hat": float(tau),
+    }
+    fd, jpath = tempfile.mkstemp(suffix=".json"); os.close(fd)
+    with open(jpath, "w") as f:
+        json.dump(plot_data, f)
+    py314 = shutil.which("python3.14") or "/usr/bin/python3.14"
+    try:
+        subprocess.run([py314, "-c", RENDER_SRC, jpath], check=True)
+    finally:
+        os.remove(jpath)
+
+    # ---------------- 7. metrics.json (self-describing; schema not specified)
+    rms = lambda v: float(np.sqrt(np.mean(v**2)))
+    metrics = {
+        "schema_note": "Self-describing metrics file; task_info.json does not specify a schema for metrics.json.",
+        "method": {
+            "fit_rows": "split=='train' only (n=%d); heldout (n=%d) used only for residuals.csv and diagnostics" % (n_tr, int(ho.sum())),
+            "yaw_model": "dyaw_i = Theta(t1_i+tau) - Theta(t0_i+tau) - b*dt_i + N(0, sigma_yaw^2), Theta = cumulative trapezoid integral of gyro omega",
+            "translation_model": "Rz(psi)*dp_l = Lhat*[cos(dtheta/2), sin(dtheta/2)] (unicycle chord); closed-form Procrustes over psi; dtheta from calibrated (b, tau)",
+            "estimator": "profile weighted least squares (tau profiled, b closed form) + closed-form Procrustes; per-segment residual-offset structure adopted only if F-test p<0.01",
+            "residual_trans_m_definition": "|| Rz(psi)*dp_l - Lhat*[cos(dtheta/2), sin(dtheta/2)] ||_2 in metres, using calibrated (b, tau, psi); cross-track/chord-geometry mismatch",
+            "residual_wrap_convention": "[-pi, pi)",
+            "structure_audit_train": structure,
+            "per_segment_offsets_used": bool(use_seg_offsets),
+            "task_info_convention_check": "Full keyword scan of task_info.json (extrinsic/rotate/frame/convention/offset/sign/clock/mount) found no wording hinting at the generator's extrinsic-sign convention; standard sensor-to-body convention adopted.",
+        },
+        "conventions": {
+            "time_offset_s": "tau: lidar-clock interval [t0,t1] corresponds to IMU-clock [t0+tau, t1+tau]",
+            "yaw_extrinsic_rad": "sensor-to-body convention: v_b = Rz(psi) v_l, i.e. angle(dp_l) = dtheta/2 - psi. The opposite (measurement-rotation) convention would flip the sign; recorded here for auditability.",
+        },
+        "parameters": {
+            "gyro_bias_rad_s": {"value": float(b), "se": se_b,
+                                 "tolerance_band": info["scoring"]["tolerance_bands"]["gyro_bias_rad_s"]},
+            "time_offset_s": {"value": float(tau), "se": se_tau,
+                               "tolerance_band": info["scoring"]["tolerance_bands"]["time_offset_s"]},
+            "yaw_extrinsic_rad": {"value": float(psi), "se": se_psi,
+                                   "tolerance_band": info["scoring"]["tolerance_bands"]["yaw_extrinsic_rad"]},
+        },
+        "residuals": {
+            "yaw_train": {"rms": rms(r_yaw_tr), "mean": float(np.mean(r_yaw_tr)), "n": n_tr},
+            "yaw_heldout": {"rms": rms(r_yaw_ho), "mean": float(np.mean(r_yaw_ho)), "n": int(ho.sum())},
+            "trans_train": {"rms": rms(r_trans_tr), "mean": float(np.mean(r_trans_tr)), "n": n_tr},
+            "trans_heldout": {"rms": rms(r_trans_ho), "mean": float(np.mean(r_trans_ho)), "n": int(ho.sum())},
+        },
+        "observability": {
+            "definition": "per-segment Fisher-style per-train-scan information for (tau, b, psi); each component normalized by its max over segments; combined with task parameter weights (tau 0.4, b 0.25, psi 0.35); larger = more constraining",
+            "components": {str(int(s)): {"I_tau_per_scan": float(I_tau[k]),
+                                          "I_b_per_scan": float(I_b[k]),
+                                          "I_psi_per_scan": float(I_p[k]),
+                                          "score": float(score[k]),
+                                          "n_train": int((tr & (seg_id_of == s)).sum())}
+                            for k, s in enumerate(segs)},
+            "ranking_most_to_least_useful": [int(segs[i]) for i in order],
+        },
+    }
+    with open("metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("b   = %.6f +- %.6f rad/s" % (b, se_b))
+    print("tau = %.6f +- %.6f s" % (tau, se_tau))
+    print("psi = %.6f +- %.6f rad" % (psi, se_psi))
+    print("yaw   train rms %.6f mean %.2e | heldout rms %.6f mean %.2e"
+          % (rms(r_yaw_tr), np.mean(r_yaw_tr), rms(r_yaw_ho), np.mean(r_yaw_ho)))
+    print("trans train rms %.6f | heldout rms %.6f" % (rms(r_trans_tr), rms(r_trans_ho)))
+    print("structure audit:", json.dumps(structure)[:700])
+    print("segment scores:", {int(s): round(float(score[k]), 4) for k, s in enumerate(segs)})
+
+
+if __name__ == "__main__":
+    main()

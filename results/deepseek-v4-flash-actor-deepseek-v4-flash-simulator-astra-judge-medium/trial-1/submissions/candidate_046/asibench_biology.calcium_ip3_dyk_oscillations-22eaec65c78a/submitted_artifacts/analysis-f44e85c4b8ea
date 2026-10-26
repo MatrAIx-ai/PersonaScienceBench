@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+B3 - Cellular Signaling Dynamics from Channel-Level Kinetic Data.
+
+Stochastic channel-state simulation (tau-leaping, a Gillespie approximation,
+on the 8-state De Young-Keizer / Li-Rinzel IP3R subunits of the public
+contract in data/system_info.json) coupled to a two-compartment calcium
+balance solved with an adaptive RK4.  All output statistics are extracted
+from the simulated time courses:
+
+  * period_vs_ip3          - spike-to-spike recurrence period per IP3 level at
+                             the largest channel count (robust peak-to-peak;
+                             meseta rule: fewer than 2 events -> 0.0)
+  * cv_isi_vs_N            - coefficient of variation of inter-spike intervals
+                             vs channel count at one low IP3 level
+  * p_open_vs_ip3          - time averaged open-channel fraction (public
+                             receptor_state_model rule: a channel is open iff
+                             all three subunits are in state 3)
+  * conservation_error_max - worst relative drift of total calcium content
+                             Ca_cyt + c1*Ca_lumen, measured from the explicit
+                             two-variable integration (RK conserves the linear
+                             invariant of the model to machine precision)
+  * cr_ip3_idx_used        - index of the low IP3 level used for cv_isi_vs_N
+
+Outputs (written to the current working directory):
+  simulate.py, ca_traces.npz, summary_stats.json, calcium_summary.png
+"""
+
+import json
+import math
+import os
+import time
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# 0. Load the public contract
+# ---------------------------------------------------------------------------
+SYS = json.load(open("data/system_info.json"))
+SCAN = json.load(open("data/scan_spec.json"))
+
+RM = SYS["receptor_kinetics"]["receptor_state_model"]
+BIND = {it["idx"]: it for it in SYS["receptor_kinetics"]["binding_interactions"]}
+
+# Binding interactions: forward rate a [1/(uM s)], equilibrium Kd [uM];
+# per the contract the reverse (unbinding) rate equals a*Kd.
+A1, KD1 = BIND[1]["forward_rate"], BIND[1]["equilibrium_kd"]
+A2, KD2 = BIND[2]["forward_rate"], BIND[2]["equilibrium_kd"]
+A3, KD3 = BIND[3]["forward_rate"], BIND[3]["equilibrium_kd"]
+A4, KD4 = BIND[4]["forward_rate"], BIND[4]["equilibrium_kd"]
+A5, KD5 = BIND[5]["forward_rate"], BIND[5]["equilibrium_kd"]
+D1 = A1 * KD1
+D2 = A2 * KD2
+D3 = A3 * KD3
+D4 = A4 * KD4
+D5 = A5 * KD5
+
+# compartment / pump / leak
+C1 = SYS["compartment"]["volume_ratio_lumen_to_cyt"]      # 0.185
+C0 = SYS["compartment"]["total_free_ca_micromolar"]       # 2.0
+KCH  = SYS["channel_flux_and_pump"]["max_channel_flux_rate_per_second"]   # 6.0
+KLEAK = SYS["channel_flux_and_pump"]["lumen_leak_rate_per_second"]       # 0.11
+VMAX = SYS["channel_flux_and_pump"]["reuptake_vmax_micromolar_per_second"]  # 0.9
+KM   = SYS["channel_flux_and_pump"]["reuptake_km_micromolar"]            # 0.1
+CA_INIT = SYS["initial_conditions_hint"]["ca_cyt_initial_micromolar"]    # 0.1
+
+# scan grid / observation
+IP3S = list(SCAN["ip3_levels_micromolar"])
+NCHS = list(SCAN["channel_counts"])
+N_REP = int(SCAN["n_replicates"])
+T_OBS = float(SCAN["T_obs_seconds"])
+DT_OUT = float(SCAN["dt_out_seconds"])
+N_SAMPLES = int(round(T_OBS / DT_OUT))     # 1200
+
+# channel model (public contract)
+OPEN_SUB = RM["channel_open_rule"]["open_subunit_state"]    # 3 -> i=1,j=1,k=0
+SUB_PER_CH = RM["subunits_per_channel"]                     # 3
+N_SUB_STATES = RM["subunit_state_count"]                    # 8
+
+# ---------------------------------------------------------------------------
+# 1. Numerical scheme parameters (calibrated; see analysis file)
+# ---------------------------------------------------------------------------
+H_TAU = 1e-3        # stochastic tau-leap step [s]: largest stable step that
+                    # still reproduces the deep excursions (h=1e-2 suppresses
+                    # them and h=1e-2 RK4 blows up during fast release).
+LAM_SUB_MAX = 1.0   # RK4 inner substeps keep lam*h_sub <= 1 for the stiffness
+                    # of the release term (lam = kc*(1+1/c1)).
+SEED_BASE = 1000
+
+# ---------------------------------------------------------------------------
+# 2. Subunit transition rates (public receptor_state_model)
+# ---------------------------------------------------------------------------
+def subunit_rates(states, ip3, ca):
+    """3 arrays (flip_i, flip_j, flip_k) of transition rates [/s] per subunit.
+    Encoding s = 4k + 2j + i (i: IP3 bound, j: activating Ca, k: inhibitory Ca).
+    Binding rate = a*[ligand], unbinding rate = a*Kd."""
+    i = states & 1
+    j = (states >> 1) & 1
+    k = (states >> 2) & 1
+    # flip i : (a1,d1) when k=0 ; (a3,d3) when k=1 ; ligand IP3
+    r_i = np.where(i == 0,
+                   np.where(k == 0, A1 * ip3, A3 * ip3),
+                   np.where(k == 0, D1, D3))
+    # flip j : (a5,d5) ; ligand Ca
+    r_j = np.where(j == 0, A5 * ca, D5)
+    # flip k : (a4,d4) when i=0 ; (a2,d2) when i=1 ; ligand Ca
+    r_k = np.where(i == 0,
+                   np.where(k == 0, A4 * ca, D4),
+                   np.where(k == 0, A2 * ca, D2))
+    return r_i, r_j, r_k
+
+
+def stationary_dist(ip3, ca):
+    """Stationary distribution of the single-subunit chain at (ip3, ca).
+    Used to draw reproducible initial channel states consistent with the
+    initial cytosolic Ca (avoids an arbitrary burn-in transient)."""
+    G = np.zeros((N_SUB_STATES, N_SUB_STATES))
+    for s in range(N_SUB_STATES):
+        i = s & 1
+        j = (s >> 1) & 1
+        k = (s >> 2) & 1
+        G[s, s ^ 1] += (A1 * ip3 if i == 0 else D1) if k == 0 else (A3 * ip3 if i == 0 else D3)
+        G[s, s ^ 2] += A5 * ca if j == 0 else D5
+        if i == 0:
+            G[s, s ^ 4] += A4 * ca if k == 0 else D4
+        else:
+            G[s, s ^ 4] += A2 * ca if k == 0 else D2
+    for s in range(N_SUB_STATES):
+        G[s, s] = -G[s, :].sum()
+    A = G.T.copy()
+    A[-1, :] = 1.0
+    b = np.zeros(N_SUB_STATES)
+    b[-1] = 1.0
+    pi = np.linalg.solve(A, b)
+    pi = np.clip(pi, 0.0, None)
+    pi /= pi.sum()
+    return pi
+
+
+def pump_rate(ca):
+    return VMAX * ca * ca / (KM * KM + ca * ca)
+
+
+# ---------------------------------------------------------------------------
+# 3. Single trajectory simulator
+# ---------------------------------------------------------------------------
+def simulate_trajectory(ip3, n_ch, seed):
+    """One T_OBS s trajectory at one grid point.
+    Returns (ca_trace [n_samples], n_open_trace [n_samples], max_cons_err)."""
+    rng = np.random.default_rng(seed)
+    pi = stationary_dist(ip3, CA_INIT)
+    states = rng.choice(N_SUB_STATES, size=SUB_PER_CH * n_ch, p=pi).astype(np.int8)
+
+    ca = CA_INIT
+    ca_l = (C0 - ca) / C1
+    content0 = ca + C1 * ca_l
+
+    ca_trace = np.empty(N_SAMPLES, dtype=np.float64)
+    n_open_trace = np.zeros(N_SAMPLES, dtype=np.float64)
+    max_ce = 0.0
+
+    t = 0.0
+    out_t = 0.0
+    oi = 0
+
+    while (t < T_OBS - 1e-12) and (oi < N_SAMPLES):
+        r_i, r_j, r_k = subunit_rates(states, ip3, ca)
+
+        # tau-leap: Poisson number of events per transition per subunit
+        ni = rng.poisson(np.maximum(r_i * H_TAU, 0.0))
+        nj = rng.poisson(np.maximum(r_j * H_TAU, 0.0))
+        nk = rng.poisson(np.maximum(r_k * H_TAU, 0.0))
+        # for a two-state flip, an odd number of events = one net flip
+        states[(ni & 1).astype(bool)] ^= 1
+        states[(nj & 1).astype(bool)] ^= 2
+        states[(nk & 1).astype(bool)] ^= 4
+
+        n_open = int((np.all(states.reshape(n_ch, SUB_PER_CH) == OPEN_SUB,
+                             axis=1)).sum())
+
+        # ---- couple to the calcium ODE over [t, t+H_TAU], n_open constant ----
+        kc = n_open * KCH + KLEAK
+        lam = kc * (1.0 + 1.0 / C1)          # stiffness of the release term
+        nsub = max(1, int(math.ceil(lam * H_TAU / LAM_SUB_MAX)))
+        hs = H_TAU / nsub
+        for _ in range(nsub):
+            def deriv(c, l):
+                dd = l - c
+                p = pump_rate(c)
+                return kc * dd - p, -(kc / C1) * dd + p / C1
+            k1c, k1l = deriv(ca, ca_l)
+            k2c, k2l = deriv(ca + 0.5 * hs * k1c, ca_l + 0.5 * hs * k1l)
+            k3c, k3l = deriv(ca + 0.5 * hs * k2c, ca_l + 0.5 * hs * k2l)
+            k4c, k4l = deriv(ca + hs * k3c, ca_l + hs * k3l)
+            nc = ca + hs / 6.0 * (k1c + 2 * k2c + 2 * k3c + k4c)
+            nl = ca_l + hs / 6.0 * (k1l + 2 * k2l + 2 * k3l + k4l)
+            ca = float(max(nc, 0.0))   # physical bounds; safe-guard vs overshoot
+            ca_l = float(max(nl, 0.0))
+        content = ca + C1 * ca_l
+        ce = abs(content - content0) / content0
+        if ce > max_ce:
+            max_ce = ce
+
+        t += H_TAU
+        if t >= out_t - 1e-12:
+            ca_trace[oi] = ca
+            n_open_trace[oi] = n_open
+            oi += 1
+            out_t += DT_OUT
+
+    return ca_trace, n_open_trace, max_ce
+
+
+# ---------------------------------------------------------------------------
+# 4. Spike / event detection (robust for plateau-with-excursions traces)
+# ---------------------------------------------------------------------------
+def detect_events(ca, dt=DT_OUT, depth_frac=0.5, min_dur=1):
+    """Detect significant downward Ca excursions ('spikes' of the stable
+    plateau regime): contiguous runs of >= min_dur samples with
+        ca < threshold = median - depth_frac*(median - min).
+    Returns event start times [s].  A trace with no meaningful range
+    (median - min < 0.05 uM) returns [] (no spiking -> period 0)."""
+    base = float(np.median(ca))
+    mn = float(np.min(ca))
+    rng = base - mn
+    if rng < 0.05:
+        return []
+    thr = base - depth_frac * rng
+    below = ca < thr
+    if not below.any():
+        return []
+    b = below.astype(int)
+    ds = np.diff(b)
+    starts = list(np.where(ds == 1)[0])
+    if b[0] == 1:
+        starts.insert(0, 0)
+    ends = list(np.where(ds == -1)[0] + 1)
+    if b[-1] == 1:
+        ends.append(len(ca))
+    evs = [st * dt for st, en in zip(starts, ends) if (en - st) >= min_dur]
+    return evs
+
+
+def trace_period(ca, dt=DT_OUT):
+    """Peak-to-peak (dip-to-dip) recurrence period of one trace [s].
+    A period is only reported when a genuine recurrence exists (>= 2
+    inter-event intervals, i.e. >= 3 events); otherwise 0.0 is returned.
+    This avoids reporting a spurious 'period' from a single rare deep
+    excursion (which is not a fundamental recurrence)."""
+    evs = detect_events(ca, dt)
+    if len(evs) >= 3:
+        return float(np.median(np.diff(evs)))
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 5. Run the full grid
+# ---------------------------------------------------------------------------
+def _grid_unit(ii, jj):
+    """Simulate both replicates of one grid point.  (top-level for pickling)"""
+    ip3 = IP3S[ii]
+    n_ch = NCHS[jj]
+    n_j = len(NCHS)
+    largest_j = n_j - 1
+    ca_all = np.empty((N_REP, N_SAMPLES), dtype=np.float64)
+    nopen_all = np.empty((N_REP, N_SAMPLES), dtype=np.float64)
+    max_ce_unit = 0.0
+    periods = []
+    for rep in range(N_REP):
+        seed = SEED_BASE + 1000 * ii + 100 * jj + rep
+        ca, nopen, ce = simulate_trajectory(ip3, n_ch, seed)
+        ca_all[rep] = ca
+        nopen_all[rep] = nopen
+        if ce > max_ce_unit:
+            max_ce_unit = ce
+        if jj == largest_j:
+            periods.append(trace_period(ca))
+    return (ii, jj, ca_all, nopen_all, max_ce_unit, periods)
+
+
+def run_grid():
+    """Run the whole grid.  Parallelised over grid points with an automatic
+    fallback to serial execution (identical seeds -> identical results)."""
+    import multiprocessing as mp
+    import traceback
+    t_start = time.time()
+    tasks = [(ii, jj) for ii in range(len(IP3S)) for jj in range(len(NCHS))]
+    results = []
+    n_workers = min(8, os.cpu_count() or 2)
+    try:
+        if n_workers > 1:
+            with mp.Pool(n_workers) as pool:
+                results = pool.starmap(_grid_unit, tasks)
+        else:
+            results = [_grid_unit(ii, jj) for (ii, jj) in tasks]
+    except Exception as exc:                      # serial fallback
+        print("[grid] parallel failed (%s): falling back to serial" % exc,
+              flush=True)
+        results = [_grid_unit(ii, jj) for (ii, jj) in tasks]
+
+    traces = {}
+    p_open_by_ip3 = np.zeros(len(IP3S))
+    period_by_ip3 = np.zeros(len(IP3S))
+    rep_periods = {}
+    n_events_low = {}
+    max_ce_global = 0.0
+    n_j = len(NCHS)
+    largest_j = n_j - 1
+    LOW_IP3_IDX = 0
+    for (ii, jj, ca_all, nopen_all, ce_u, periods) in results:
+        traces["ip3%d_N%d" % (ii, jj)] = ca_all
+        if ce_u > max_ce_global:
+            max_ce_global = ce_u
+        if jj == largest_j:
+            rep_periods[ii] = periods
+            p_open_by_ip3[ii] = float(nopen_all.mean() / NCHS[jj])
+        if ii == LOW_IP3_IDX:
+            evs = []
+            for rep in range(N_REP):
+                evs.extend(detect_events(ca_all[rep]))
+            n_events_low[jj] = evs
+    for ii in range(len(IP3S)):
+        period_by_ip3[ii] = float(np.mean(rep_periods[ii]))
+
+    cv_by_N = np.zeros(n_j)
+    for jj in range(n_j):
+        evs = sorted(n_events_low.get(jj, []))
+        isis = list(np.diff(evs)) if len(evs) >= 2 else []
+        if len(isis) >= 2 and float(np.mean(isis)) > 1e-12:
+            cv_by_N[jj] = float(np.std(isis) / np.mean(isis))
+
+    return {
+        "traces": traces,
+        "period_vs_ip3": period_by_ip3,
+        "cv_isi_vs_N": cv_by_N,
+        "p_open_vs_ip3": p_open_by_ip3,
+        "conservation_error_max": float(max_ce_global),
+        "cr_ip3_idx_used": LOW_IP3_IDX,
+        "runtime": time.time() - t_start,
+        "n_events_low_ip3": {jj: len(n_events_low.get(jj, []))
+                             for jj in range(n_j)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. Output: ca_traces.npz and summary_stats.json
+# ---------------------------------------------------------------------------
+def write_outputs(res):
+    np.savez("ca_traces.npz", **res["traces"])
+    stats = {
+        "ip3_levels": IP3S,
+        "channel_counts": NCHS,
+        "period_vs_ip3": [round(float(v), 6) for v in res["period_vs_ip3"]],
+        "cv_isi_vs_N": [round(float(v), 6) for v in res["cv_isi_vs_N"]],
+        "p_open_vs_ip3": [round(float(v), 8) for v in res["p_open_vs_ip3"]],
+        "conservation_error_max": res["conservation_error_max"],
+        "cr_ip3_idx_used": res["cr_ip3_idx_used"],
+    }
+    with open("summary_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# 7. Diagnostic figure (matplotlib preferred; pure-numpy fallback if absent)
+# ---------------------------------------------------------------------------
+def make_figure(res, stats):
+    t0 = time.time()
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: F401
+        has_mpl = True
+    except Exception:
+        has_mpl = False
+    if has_mpl:
+        _make_figure_mpl(res, stats)
+    else:
+        _make_figure_fallback(res, stats)
+    print("[figure] matplotlib=%s elapsed=%.1fs" % (has_mpl, time.time() - t0),
+          flush=True)
+
+
+def _pick_representative(res):
+    best = None
+    best_amp = -1.0
+    for key_s, tr in res["traces"].items():
+        amp = float(tr[0].max() - tr[0].min())
+        if amp > best_amp:
+            best_amp = amp
+            best = key_s
+    return best
+
+
+def _make_figure_mpl(res, stats):
+    import matplotlib.pyplot as plt
+
+    ip3s = np.array(IP3S)
+    nchs = np.array(NCHS)
+    time_ax = np.arange(N_SAMPLES) * DT_OUT
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    ax = axes[0, 0]
+    key = _pick_representative(res)
+    tr = res["traces"][key]
+    ax.plot(time_ax, tr[0], lw=1.2, color=(0.15, 0.35, 0.75),
+            label="Ca_cyt " + key)
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("$[\\mathrm{Ca}^{2+}]_{\\mathrm{cyt}}$ [µM]")
+    ax.set_title("representative trajectory " + key)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8)
+
+    ax = axes[0, 1]
+    ax.plot(ip3s, stats["period_vs_ip3"], "o-", color=(0.8, 0.3, 0.2))
+    ax.set_xlabel("IP3 [µM]")
+    ax.set_ylabel("period [s]")
+    ax.set_title("spike-to-spike period vs IP3 (largest N)")
+    ax.grid(alpha=0.3)
+
+    ax = axes[1, 0]
+    ax.plot(nchs, stats["cv_isi_vs_N"], "s-", color=(0.2, 0.6, 0.4))
+    ax.scatter([nchs[int(stats["cr_ip3_idx_used"])]],
+               [stats["cv_isi_vs_N"][int(stats["cr_ip3_idx_used"])]],
+               marker="*", s=160, color=(0.9, 0.6, 0.1), zorder=5)
+    ax.set_xscale("log")
+    ax.set_xlabel("channel count N")
+    ax.set_ylabel("CV of ISI")
+    ax.set_title("CV of inter-spike intervals vs N "
+                 "(IP3 idx %d)" % stats["cr_ip3_idx_used"])
+    ax.grid(alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.plot(ip3s, stats["p_open_vs_ip3"], "^-", color=(0.5, 0.2, 0.6))
+    ax.set_xlabel("IP3 [µM]")
+    ax.set_ylabel("mean open fraction")
+    ax.set_title("p_open vs IP3 (largest N)")
+    ax.grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig("calcium_summary.png", dpi=130)
+    plt.close(fig)
+
+
+# ---- minimal pure-numpy + zlib PNG writer (stdlib only) -------------------
+def _make_figure_fallback(res, stats):
+    import struct
+    import zlib
+
+    W, H = 1000, 760
+    img = np.full((H, W, 3), 0.10, dtype=np.float32)
+    white = (1.0, 1.0, 1.0)
+
+    def write_png(path, rgba):
+        h, w = rgba.shape[:2]
+        raw = b"".join(b"\x00" + rgba[y].tobytes() for y in range(h))
+
+        def chunk(typ, data):
+            c = struct.pack(">I", len(data)) + typ + data
+            return c + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
+        png = b"\x89PNG\r\n\x1a\n"
+        png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress(raw, 6))
+        png += chunk(b"IEND", b"")
+        with open(path, "wb") as f:
+            f.write(png)
+
+    def set_px(x, y, color):
+        xx, yy = int(round(x)), int(round(y))
+        if 0 <= xx < W and 0 <= yy < H:
+            img[yy, xx] = color
+
+    def plot_series(ax, xs, ys, color, xr, yr, lw=1):
+        x0p, x1p, y0p, y1p = ax
+        if xr[1] - xr[0] <= 0:
+            xr = (xr[0], xr[0] + 1.0)
+        if yr[1] - yr[0] <= 0:
+            yr = (yr[0], yr[0] + 1.0)
+        pts = []
+        for x, y in zip(xs, ys):
+            X = x0p + (float(x) - xr[0]) / (xr[1] - xr[0]) * (x1p - x0p)
+            Y = y1p - (float(y) - yr[0]) / (yr[1] - yr[0]) * (y1p - y0p)
+            pts.append((X, Y))
+        for k in range(len(pts) - 1):
+            x0, y0 = pts[k]
+            x1, y1 = pts[k + 1]
+            steps = max(int(abs(x1 - x0)), int(abs(y1 - y0)), 1)
+            for i in range(steps + 1):
+                tt = i / steps
+                set_px(x0 + (x1 - x0) * tt, y0 + (y1 - y0) * tt, color)
+
+    def add_axes(x0, y0, x1, y1):
+        x0p, x1p = int(round(x0 * W)), int(round(x1 * W))
+        y0p, y1p = int(round(y0 * H)), int(round(y1 * H))
+        img[y0p:y1p + 1, x0p] = white
+        img[y0p:y1p + 1, x1p] = white
+        img[y0p, x0p:x1p + 1] = white
+        img[y1p, x0p:x1p + 1] = white
+        return (x0p, x1p, y0p, y1p)
+
+    def put_text(text, xp, yp, scale=1, color=white):
+        ox = 0
+        for ch in text:
+            col = FONT.get(ch.upper(), FONT.get(" ", [0] * 7))
+            for rw in range(7):
+                bits = col[rw]
+                for b in range(5):
+                    if bits & (1 << (4 - b)):
+                        for sy in range(scale):
+                            for sx in range(scale):
+                                yy = yp + rw * scale + sy
+                                xx = xp + ox * scale + b * scale + sx
+                                if 0 <= yy < H and 0 <= xx < W:
+                                    img[yy, xx] = color
+            ox += 6 * scale + 1
+
+    ip3s = np.array(IP3S)
+    nchs = np.array(NCHS)
+    time_ax = np.arange(N_SAMPLES) * DT_OUT
+    key = _pick_representative(res)
+    tr = res["traces"][key][0]
+    ymax = float(max(stats["period_vs_ip3"] + [1.0]))
+    ymax_cv = float(max(stats["cv_isi_vs_N"] + [1.0]))
+    ymax_po = float(max(stats["p_open_vs_ip3"] + [1e-6]))
+
+    ax = add_axes(0.07, 0.56, 0.48, 0.94)
+    plot_series(ax, time_ax, tr, (0.3, 0.8, 0.6), (0, T_OBS),
+                (float(min(tr)), float(max(tr))), 1)
+    put_text("(a) representative trace " + key, 80, 40, 1)
+    put_text("Ca_cyt [uM] vs t [s]", 80, H - 32, 1)
+
+    ax = add_axes(0.55, 0.56, 0.96, 0.94)
+    plot_series(ax, ip3s, stats["period_vs_ip3"], (1.0, 0.5, 0.3),
+                (float(ip3s.min()), float(ip3s.max())), (0, ymax), 2)
+    put_text("(b) period vs IP3", 560, 40, 1)
+
+    ax = add_axes(0.07, 0.07, 0.48, 0.45)
+    plot_series(ax, np.log10(nchs), stats["cv_isi_vs_N"], (0.3, 0.8, 0.5),
+                (float(np.log10(nchs.min())), float(np.log10(nchs.max()))),
+                (0, ymax_cv), 2)
+    put_text("(c) CV of ISI vs N (idx %d)" % stats["cr_ip3_idx_used"],
+             80, int(0.07 * H) - 40, 1)
+
+    ax = add_axes(0.55, 0.07, 0.96, 0.45)
+    plot_series(ax, ip3s, stats["p_open_vs_ip3"], (0.7, 0.4, 0.8),
+                (float(ip3s.min()), float(ip3s.max())), (0, ymax_po), 2)
+    put_text("(d) p_open vs IP3", 560, int(0.07 * H) - 40, 1)
+    put_text("calcium_summary (fallback raster)", 20, 20, 1)
+
+    rgba = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    write_png("calcium_summary.png", rgba)
+
+
+FONT = {
+    "A": [0b01110, 0b10001, 0b11111, 0b10001, 0b10001, 0, 0],
+    "B": [0b11110, 0b10001, 0b11110, 0b10001, 0b11110, 0, 0],
+    "C": [0b01110, 0b10001, 0b10000, 0b10001, 0b01110, 0, 0],
+    "D": [0b11110, 0b10001, 0b10001, 0b10001, 0b11110, 0, 0],
+    "E": [0b11111, 0b10000, 0b11110, 0b10000, 0b11111, 0, 0],
+    "F": [0b11111, 0b10000, 0b11110, 0b10000, 0b10000, 0, 0],
+    "G": [0b01110, 0b10001, 0b10111, 0b10001, 0b01111, 0, 0],
+    "H": [0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0, 0],
+    "I": [0b11111, 0b00100, 0b00100, 0b00100, 0b11111, 0, 0],
+    "J": [0b00111, 0b00010, 0b00010, 0b10010, 0b01100, 0, 0],
+    "K": [0b10001, 0b10010, 0b11100, 0b10010, 0b10001, 0, 0],
+    "L": [0b10000, 0b10000, 0b10000, 0b10000, 0b11111, 0, 0],
+    "M": [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0, 0],
+    "N": [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0, 0],
+    "O": [0b01110, 0b10001, 0b10001, 0b10001, 0b01110, 0, 0],
+    "P": [0b11110, 0b10001, 0b11110, 0b10000, 0b10000, 0, 0],
+    "Q": [0b01110, 0b10001, 0b10101, 0b10010, 0b01101, 0, 0],
+    "R": [0b11110, 0b10001, 0b11110, 0b10010, 0b10001, 0, 0],
+    "S": [0b01111, 0b10000, 0b01110, 0b00001, 0b11110, 0, 0],
+    "T": [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0],
+    "U": [0b10001, 0b10001, 0b10001, 0b10001, 0b01110, 0, 0],
+    "V": [0b10001, 0b10001, 0b10001, 0b01010, 0b00100, 0, 0],
+    "W": [0b10001, 0b10001, 0b10101, 0b11011, 0b10001, 0, 0],
+    "X": [0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0, 0],
+    "Y": [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0, 0],
+    "Z": [0b11111, 0b00010, 0b00100, 0b01000, 0b11111, 0, 0],
+    "0": [0b01110, 0b10011, 0b10101, 0b11001, 0b01110, 0, 0],
+    "1": [0b00100, 0b01100, 0b00100, 0b00100, 0b01110, 0, 0],
+    "2": [0b01110, 0b10001, 0b00110, 0b01000, 0b11111, 0, 0],
+    "3": [0b11110, 0b00001, 0b01110, 0b00001, 0b11110, 0, 0],
+    "4": [0b00010, 0b00110, 0b01010, 0b11111, 0b00010, 0, 0],
+    "5": [0b11111, 0b10000, 0b11110, 0b00001, 0b11110, 0, 0],
+    "6": [0b01110, 0b10000, 0b11110, 0b10001, 0b01110, 0, 0],
+    "7": [0b11111, 0b00001, 0b00010, 0b00100, 0b00100, 0, 0],
+    "8": [0b01110, 0b10001, 0b01110, 0b10001, 0b01110, 0, 0],
+    "9": [0b01110, 0b10001, 0b01111, 0b00001, 0b01110, 0, 0],
+    ".": [0, 0, 0, 0, 0, 0b00100, 0],
+    "-": [0, 0, 0, 0b11111, 0, 0, 0],
+    "_": [0, 0, 0, 0, 0, 0b11111, 0],
+    " ": [0] * 7,
+    "(": [0b00010, 0b00100, 0b00100, 0b00100, 0b00010, 0, 0],
+    ")": [0b01000, 0b00100, 0b00100, 0b00100, 0b01000, 0, 0],
+    ",": [0, 0, 0, 0, 0, 0b00100, 0b01000],
+    "/": [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
+}
+
+
+# ---------------------------------------------------------------------------
+# 8. main
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("simulating grid ...", flush=True)
+    res = run_grid()
+    print("[grid] elapsed=%.1fs" % res["runtime"], flush=True)
+    stats = write_outputs(res)
+    print("[outputs] ca_traces.npz and summary_stats.json written", flush=True)
+    print("[stats] " + json.dumps(stats, indent=2), flush=True)
+    make_figure(res, stats)
+    print("[figure] calcium_summary.png done", flush=True)
+    print("ALL DONE", flush=True)

@@ -1,0 +1,509 @@
+"""
+Leaf Physiological Response Reconstruction
+==========================================
+Process-based coupled Farquhar (C3) / Collatz (C4) photosynthesis with
+Ball-Berry stomatal conductance, in the CLM/Noah-MP land-surface convention.
+
+Inputs
+------
+data/leaf_params.json : leaf physiological parameters (incl. C3/C4 flag)
+data/forcing.csv      : diurnal forcing time series (120 h)
+data/test_cases.json  : single-point evaluation cases
+
+Outputs (under results/)
+------------------------
+leaf_fluxes.csv       : one row per forcing row (sun & shade)
+case_convergence.csv  : one row per test case (coupled fixed point)
+diurnal.png           : diurnal A and rs for sun & shade
+
+Conventions (as specified):
+  - hard-minimum limitation combine; C3: Wc=Vcmax*(Ci-Gs)/(Ci+Kc(1+O2/Ko)),
+    Wj=alpha_q*APAR, We=0.5*Vcmax; C4: Wc=Vcmax, Wj=alpha_q*APAR,
+    We=4000*Vcmax*Ci/p_atm.  A = min(Wc,Wj,We) - Rd.  APAR = 4.6*PAR.
+  - Vcmax(T) = Vcmax25 * 2.4^((Tc-25)/10) / (1+exp((-2.2e5+710(Tc+273.16))/(R(Tc+273.16)))).
+  - Kc25=30 Pa, Ko25=30000 Pa, Q10=(2.1,1.2,2.4) for (Kc,Ko,Gamma_star),
+    Gamma_star = 0.5*(Kc/Ko)*O2*0.21, Rd = 0.015*Vcmax.
+  - n_factor and btran scale photosynthetic capacity (and hence Rd); the
+    Ball-Berry intercept b0 is NOT scaled by btran.
+  - leaf T = air T; surface RH = clip(1 - vpd/esat(T), 0.25, 1).
+  - cf = p_atm/(R*T); cs = ca - 1.37*rb*A_mol/(cf*p_atm);
+    gs = m*A_mol*h_s/cs*p_atm + b0; rs = cf/gs;
+    Ci = cs - 1.65*rs*A_mol/(cf*p_atm).
+  - Night (PAR < 1e-6 W/m2): A = -Rd, gs = b0, then the same diffusion chain.
+
+Numerics: coupled fixed point by successive substitution seeded by ci_init
+(|dCi| < 1e-9 Pa, max 100 iters) with a bisection fallback.
+Figure: matplotlib if available, else a self-contained PNG renderer.
+"""
+
+import os
+import json
+import math
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+
+# ----------------------------------------------------------------------------
+# Constants / conventions
+# ----------------------------------------------------------------------------
+R = 8.31446                 # universal gas constant, J mol^-1 K^-1
+KC25 = 30.0                 # Kc at 25 C, Pa
+KO25 = 30000.0              # Ko at 25 C, Pa
+Q10_KC, Q10_KO, Q10_GS = 2.1, 1.2, 2.4     # Q10 for (Kc, Ko, Gamma_star)
+RATIO_O2 = 0.21             # factor in Gamma_star = 0.5*(Kc/Ko)*O2*0.21
+RD_FRAC = 0.015             # Rd = 0.015 * Vcmax
+APAR_COEF = 4.6             # APAR = 4.6 * PAR (no extra absorptance)
+NIGHT_PAR = 1e-6            # W m^-2 ; below this -> night branch
+
+TOL_CI = 1e-9               # Pa, successive-substitution convergence
+MAX_ITER = 100              # max successive-substitution iterations
+MAX_BISECT = 200            # max bisection iterations (fallback)
+
+
+def esat_magnus(t_c):
+    """Saturation vapour pressure [Pa], Magnus formula, t in Celsius."""
+    return 611.2 * np.exp(17.67 * t_c / (t_c + 243.5))
+
+
+def vcmax_temperature(t_c, vcmax25, n_factor, btran):
+    """Temperature-scaled photosynthetic capacity.
+
+    Vcmax = Vcmax25 * n_factor * btran * 2.4^((Tc-25)/10) / (1+exp(...)).
+    n_factor and btran scale the capacity (and therefore Rd = 0.015*Vcmax).
+    """
+    q = 2.4 ** ((t_c - 25.0) / 10.0)
+    t_k = t_c + 273.16
+    inh = 1.0 / (1.0 + np.exp((-2.2e5 + 710.0 * t_k) / (R * t_k)))
+    return vcmax25 * n_factor * btran * q * inh
+
+
+def c3_constants(t_c, o2_pa):
+    """Temperature-scaled Kc, Ko, Gamma_star for the C3 branch."""
+    kc = KC25 * Q10_KC ** ((t_c - 25.0) / 10.0)
+    ko = KO25 * Q10_KO ** ((t_c - 25.0) / 10.0)
+    gs25 = 0.5 * (KC25 / KO25) * o2_pa * RATIO_O2
+    gamma_star = gs25 * Q10_GS ** ((t_c - 25.0) / 10.0)
+    return kc, ko, gamma_star
+
+
+def assimilation(par, ci, vcmax, rd, alpha_q, pathway, t_c, o2_pa, p_atm):
+    """Net assimilation A [umol m^-2 s^-1] = min(Wc,Wj,We) - Rd at internal Ci."""
+    wj = alpha_q * APAR_COEF * par
+    if pathway == "C4":
+        wc = vcmax
+        we = 4000.0 * vcmax * ci / p_atm
+    else:  # C3
+        kc, ko, gamma_star = c3_constants(t_c, o2_pa)
+        wc = vcmax * (ci - gamma_star) / (ci + kc * (1.0 + o2_pa / ko))
+        we = 0.5 * vcmax
+    return min(wc, wj, we) - rd
+
+
+def day_step(ci, par, t_air, p_atm, ca, o2_pa, vpd, rb, btran, p):
+    """One coupled step for a daytime leaf.
+
+    Returns (ci_new, a_umol, rs, gs, cs).  a_umol in umol m^-2 s^-1,
+    a_mol = a_umol*1e-6 mol m^-2 s^-1.
+    """
+    t_c = t_air - 273.15
+    vcmax = vcmax_temperature(t_c, p["vcmax25"], p["n_factor"], btran)
+    rd = RD_FRAC * vcmax
+    a = assimilation(par, ci, vcmax, rd, p["alpha_q"], p["pathway"], t_c, o2_pa, p_atm)
+    a_mol = a * 1e-6
+    cf = p_atm / (R * t_air)
+    h_s = min(max(1.0 - vpd / esat_magnus(t_c), 0.25), 1.0)
+    cs = ca - 1.37 * rb * a_mol / cf * p_atm
+    gs = p["m"] * a_mol * h_s / cs * p_atm + p["b0"]   # b0 NOT scaled by btran
+    rs = cf / gs
+    ci_new = cs - 1.65 * rs * a_mol / cf * p_atm
+    return ci_new, a, rs, gs, cs
+
+
+def solve_daytime(par, t_air, p_atm, ca, o2_pa, vpd, rb, btran, p, ci_init):
+    """Solve the coupled fixed point for a daytime leaf.
+
+    Successive substitution Ci_{k+1}=Ci_new(Ci_k) seeded by ci_init; converges
+    when |Ci_{k+1}-Ci_k| < TOL_CI.  Bisection fallback on f(Ci)=Ci_new(Ci)-Ci.
+    Returns (ci_final, a, rs, gs, cs, n_iter, used_fallback).
+    """
+    args = (par, t_air, p_atm, ca, o2_pa, vpd, rb, btran, p)
+    ci = ci_init
+    for it in range(1, MAX_ITER + 1):
+        ci_new, a, rs, gs, cs = day_step(ci, *args)
+        if abs(ci_new - ci) < TOL_CI:
+            _, a, rs, gs, cs = day_step(ci_new, *args)   # values at the fixed point
+            return ci_new, a, rs, gs, cs, it, False
+        ci = ci_new
+
+    # ---- bisection fallback (defensive; not expected to trigger) ----
+    def f(c):
+        cn, *_ = day_step(c, *args)
+        return cn - c
+
+    lo, hi = 0.0, ca * 2.0
+    flo, fhi = f(lo), f(hi)
+    if flo * fhi > 0.0:
+        _, a, rs, gs, cs = day_step(ci, *args)
+        return ci, a, rs, gs, cs, MAX_ITER, True
+    for it in range(1, MAX_BISECT + 1):
+        mid = 0.5 * (lo + hi)
+        fm = f(mid)
+        if abs(fm) < TOL_CI or (hi - lo) < TOL_CI:
+            break
+        if flo * fm <= 0.0:
+            hi = mid
+        else:
+            lo, flo = mid, fm
+    ci = 0.5 * (lo + hi)
+    _, a, rs, gs, cs = day_step(ci, *args)
+    return ci, a, rs, gs, cs, MAX_ITER + it, True
+
+
+def night_solve(t_air, p_atm, ca, rb, btran, p):
+    """Night branch: A=-Rd, gs=b0, then the same diffusion chain.
+
+    Returns (ci, a, rs, gs, cs).
+    """
+    t_c = t_air - 273.15
+    vcmax = vcmax_temperature(t_c, p["vcmax25"], p["n_factor"], btran)
+    rd = RD_FRAC * vcmax
+    a = -rd
+    a_mol = a * 1e-6
+    cf = p_atm / (R * t_air)
+    gs = p["b0"]                       # intercept conductance only
+    rs = cf / gs
+    cs = ca - 1.37 * rb * a_mol / cf * p_atm
+    ci = cs - 1.65 * rs * a_mol / cf * p_atm
+    return ci, a, rs, gs, cs
+
+
+def evaluate(par, t_air, p_atm, ca, o2_pa, vpd, rb, btran, p, ci_init):
+    """Dispatch to night branch or daytime coupled solve."""
+    if par < NIGHT_PAR:
+        ci, a, rs, gs, cs = night_solve(t_air, p_atm, ca, rb, btran, p)
+        return ci, a, rs, gs, cs, 0, False
+    return solve_daytime(par, t_air, p_atm, ca, o2_pa, vpd, rb, btran, p, ci_init)
+
+
+# ----------------------------------------------------------------------------
+# Fallback PNG renderer (used only when matplotlib is unavailable)
+# ----------------------------------------------------------------------------
+_FONT = {
+ 'A':["01110","10001","10001","11111","10001","10001","10001"],
+ 'B':["11110","10001","10001","11110","10001","10001","11110"],
+ 'C':["01110","10001","10000","10000","10000","10001","01110"],
+ 'D':["11100","10010","10001","10001","10001","10010","11100"],
+ 'E':["11111","10000","10000","11110","10000","10000","11111"],
+ 'F':["11111","10000","10000","11110","10000","10000","10000"],
+ 'G':["01110","10001","10000","10111","10001","10001","01111"],
+ 'H':["10001","10001","10001","11111","10001","10001","10001"],
+ 'I':["01110","00100","00100","00100","00100","00100","01110"],
+ 'J':["00111","00010","00010","00010","00010","10010","01100"],
+ 'K':["10001","10010","10100","11000","10100","10010","10001"],
+ 'L':["10000","10000","10000","10000","10000","10000","11111"],
+ 'M':["10001","11011","10101","10101","10001","10001","10001"],
+ 'N':["10001","11001","10101","10011","10001","10001","10001"],
+ 'O':["01110","10001","10001","10001","10001","10001","01110"],
+ 'P':["11110","10001","10001","11110","10000","10000","10000"],
+ 'Q':["01110","10001","10001","10001","10101","10010","01101"],
+ 'R':["11110","10001","10001","11110","10100","10010","10001"],
+ 'S':["01111","10000","10000","01110","00001","00001","11110"],
+ 'T':["11111","00100","00100","00100","00100","00100","00100"],
+ 'U':["10001","10001","10001","10001","10001","10001","01110"],
+ 'V':["10001","10001","10001","10001","10001","01010","00100"],
+ 'W':["10001","10001","10001","10101","10101","11011","10001"],
+ 'X':["10001","10001","01010","00100","01010","10001","10001"],
+ 'Y':["10001","10001","01010","00100","00100","00100","00100"],
+ 'Z':["11111","00001","00010","00100","01000","10000","11111"],
+ '0':["01110","10001","10011","10101","11001","10001","01110"],
+ '1':["00100","01100","00100","00100","00100","00100","01110"],
+ '2':["01110","10001","00001","00110","01000","10000","11111"],
+ '3':["11111","00010","00100","00010","00001","10001","01110"],
+ '4':["00010","00110","01010","10010","11111","00010","00010"],
+ '5':["11111","10000","11110","00001","00001","10001","01110"],
+ '6':["00110","01000","10000","11110","10001","10001","01110"],
+ '7':["11111","00001","00010","00100","01000","01000","01000"],
+ '8':["01110","10001","10001","01110","10001","10001","01110"],
+ '9':["01110","10001","10001","01111","00001","00010","01100"],
+ ' ':["00000","00000","00000","00000","00000","00000","00000"],
+ '(':["00010","00100","01000","01000","01000","00100","00010"],
+ ')':["01000","00100","00010","00010","00010","00100","01000"],
+ '/':["00001","00001","00010","00100","01000","10000","10000"],
+ '-':["00000","00000","00000","01110","00000","00000","00000"],
+ '.':["00000","00000","00000","00000","00000","00100","01100"],
+}
+
+
+def _fb_text(img, x, y, s, color, scale=2):
+    H, W, _ = img.shape
+    cx = x
+    for ch in s:
+        g = _FONT.get(ch) or _FONT.get(ch.upper()) or _FONT[' ']
+        for r in range(7):
+            for c in range(5):
+                if g[r][c] == '1':
+                    for dr in range(scale):
+                        for dc in range(scale):
+                            xx = cx + c * scale + dc
+                            yy = y + r * scale + dr
+                            if 0 <= xx < W and 0 <= yy < H:
+                                img[yy, xx] = color
+        cx += 6 * scale
+    return cx - x
+
+
+def _fb_line(img, x0, y0, x1, y1, color, w=1):
+    H, W, _ = img.shape
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        for dc in range(-(w // 2), w // 2 + 1):
+            for dr in range(-(w // 2), w // 2 + 1):
+                xx, yy = x0 + dc, y0 + dr
+                if 0 <= xx < W and 0 <= yy < H:
+                    img[yy, xx] = color
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+
+def _fb_polyline(img, pts, color, w=2, dash=None):
+    n = len(pts)
+    if n < 2:
+        return
+    if dash is None:
+        for i in range(n - 1):
+            _fb_line(img, int(pts[i][0]), int(pts[i][1]),
+                     int(pts[i + 1][0]), int(pts[i + 1][1]), color, w)
+        return
+    on, off = dash
+    fine = [pts[0] + (0.0,)]
+    for i in range(n - 1):
+        x0, y0 = pts[i]; x1, y1 = pts[i + 1]
+        seg = math.hypot(x1 - x0, y1 - y0)
+        nsub = max(1, int(round(seg)))
+        for s in range(1, nsub + 1):
+            t = s / nsub
+            cx = x0 + (x1 - x0) * t
+            cy = y0 + (y1 - y0) * t
+            acc = math.hypot(cx - fine[-1][0], cy - fine[-1][1])
+            fine.append((cx, cy, fine[-1][2] + acc))
+    for i in range(len(fine) - 1):
+        dmid = 0.5 * (fine[i][2] + fine[i + 1][2])
+        if (dmid % (on + off)) < on:
+            _fb_line(img, int(fine[i][0]), int(fine[i][1]),
+                     int(fine[i + 1][0]), int(fine[i + 1][1]), color, w)
+
+
+def _fb_write_png(path, img):
+    import zlib, struct
+    H, W, _ = img.shape
+    raw = b""
+    for row in img:
+        raw += b"\x00" + row.tobytes()
+
+    def chunk(typ, data):
+        c = struct.pack(">I", len(data)) + typ + data
+        c += struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
+        return c
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    png = sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+def _fallback_figure(path, flux):
+    W, H = 1000, 700
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    black = (0, 0, 0); green = (0, 120, 0); red = (190, 0, 0); grid = (228, 228, 228)
+
+    title = "DIURNAL A AND RS  (C4 LEAF)"
+    _fb_text(img, (W - len(title) * 6 * 2) // 2, 12, title, black, 2)
+
+    tlo = float(flux["time_hr"].min()); thi = float(flux["time_hr"].max())
+    x0, x1 = 95, 975
+    tt = flux["time_hr"].to_numpy(dtype=float)
+
+    def panel(ax0, ay0, ax1, ay1, sun, shade, ylo, yhi, yticks, linecol, ylab):
+        _fb_line(img, ax0, ay0, ax1, ay0, black, 1)
+        _fb_line(img, ax0, ay1, ax1, ay1, black, 1)
+        _fb_line(img, ax0, ay0, ax0, ay1, black, 1)
+        _fb_line(img, ax1, ay0, ax1, ay1, black, 1)
+        for yt in yticks:
+            py = int(ay1 - (yt - ylo) / (yhi - ylo) * (ay1 - ay0))
+            _fb_line(img, ax0, py, ax1, py, grid, 1)
+            lab = str(int(yt))
+            _fb_text(img, ax0 - 8 - len(lab) * 6, py - 3, lab, black, 1)
+        for xt in [0, 20, 40, 60, 80, 100, 120]:
+            if xt > thi:
+                continue
+            px = int(ax0 + (xt - tlo) / (thi - tlo) * (ax1 - ax0))
+            _fb_line(img, px, ay1, px, ay1 + 4, black, 1)
+            lab = str(xt)
+            _fb_text(img, px - len(lab) * 3, ay1 + 7, lab, black, 1)
+
+        def pts(arr):
+            arr = np.asarray(arr, dtype=float)
+            px = ax0 + (tt - tlo) / (thi - tlo) * (ax1 - ax0)
+            py = ay1 - (arr - ylo) / (yhi - ylo) * (ay1 - ay0)
+            return list(zip(px, py))
+        _fb_polyline(img, pts(shade), linecol, 2, dash=(9, 5))
+        _fb_polyline(img, pts(sun), linecol, 3, dash=None)
+
+        _fb_text(img, ax0 - 8, ay0 - 24, ylab, black, 2)
+        lx, ly = ax1 - 150, ay0 + 12
+        _fb_line(img, lx, ly + 6, lx + 30, ly + 6, linecol, 3)
+        _fb_text(img, lx + 36, ly, "SUN", black, 1)
+        _fb_polyline(img, [(lx, ly + 28), (lx + 30, ly + 28)], linecol, 2, dash=(6, 4))
+        _fb_text(img, lx + 36, ly + 22, "SHADE", black, 1)
+
+    A = np.concatenate([flux["A_sun"].to_numpy(), flux["A_shade"].to_numpy()])
+    ylo = math.floor(A.min() / 10) * 10
+    yhi = math.ceil(A.max() / 10) * 10
+    panel(x0, 55, x1, 340, flux["A_sun"], flux["A_shade"], ylo, yhi,
+          list(range(int(ylo), int(yhi) + 1, 10)), green, "A (UMOL/M2/S)")
+
+    rr = np.concatenate([flux["rs_sun"].to_numpy(), flux["rs_shade"].to_numpy()])
+    yhi = math.ceil(rr.max() / 200) * 200
+    panel(x0, 400, x1, 655, flux["rs_sun"], flux["rs_shade"], 0, yhi,
+          list(range(0, int(yhi) + 1, 200)), red, "RS (S/M)")
+
+    xl = "TIME (H)"
+    _fb_text(img, (W - len(xl) * 6 * 2) // 2, 676, xl, black, 2)
+    _fb_write_png(path, img)
+
+
+def make_figure(flux, path):
+    """Render the diurnal figure with matplotlib if present, else fallback."""
+    if HAS_MPL:
+        x = flux["time_hr"]
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+        ax1.plot(x, flux["A_sun"], color="tab:green", label="A  sun")
+        ax1.plot(x, flux["A_shade"], color="tab:green", ls="--", label="A  shade")
+        ax1.axhline(0.0, color="k", lw=0.6, alpha=0.5)
+        ax1.set_ylabel("A  (umol CO$_2$ m$^{-2}$ s$^{-1}$)")
+        ax1.set_title("Diurnal leaf response  (C4  coupled Farquhar-Collatz / Ball-Berry)")
+        ax1.legend(loc="upper left"); ax1.grid(alpha=0.3)
+        ax2.plot(x, flux["rs_sun"], color="tab:red", label="rs  sun")
+        ax2.plot(x, flux["rs_shade"], color="tab:red", ls="--", label="rs  shade")
+        ax2.set_ylabel("rs  (s m$^{-1}$)")
+        ax2.set_xlabel("time  (h)")
+        ax2.legend(loc="upper right"); ax2.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+    else:
+        _fallback_figure(path, flux)
+
+
+def main():
+    base = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base, "data")
+    out_dir = os.path.join(base, "results")
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(os.path.join(data_dir, "leaf_params.json")) as fh:
+        p = json.load(fh)
+    p["m"] = p["bb_slope"]              # Ball-Berry slope
+    p["b0"] = p["bb_intercept"]         # Ball-Berry intercept (NOT btran-scaled)
+
+    forcing = pd.read_csv(os.path.join(data_dir, "forcing.csv"))
+    with open(os.path.join(data_dir, "test_cases.json")) as fh:
+        cases = json.load(fh)
+
+    # ------------------------------------------------------------------
+    # leaf_fluxes.csv : one row per forcing row (sun & shade)
+    # ------------------------------------------------------------------
+    flux_cols = ["time_hr", "A_sun", "A_shade", "rs_sun", "rs_shade",
+                 "ci_sun", "ci_shade", "gs_sun", "gs_shade"]
+    rows = []
+    prev_ci = {"sun": None, "shade": None}   # warm start (result init-independent)
+    fb_rows = []                              # rows needing the bisection fallback
+    for _, r in forcing.iterrows():
+        out = {"time_hr": r["time_hr"]}
+        for leaf, parcol in (("sun", "par_sun_wm2"), ("shade", "par_shade_wm2")):
+            par = r[parcol]
+            ci_init = prev_ci[leaf] if prev_ci[leaf] is not None else r["co2_pa"]
+            ci, a, rs, gs, cs, n_iter, fb = evaluate(
+                par, r["t_air_K"], r["p_atm_Pa"], r["co2_pa"], r["o2_pa"],
+                r["vpd_Pa"], r["rb_sm"], r["btran"], p, ci_init)
+            out[f"A_{leaf}"] = a
+            out[f"rs_{leaf}"] = rs
+            out[f"ci_{leaf}"] = ci
+            out[f"gs_{leaf}"] = gs
+            prev_ci[leaf] = ci
+            if fb:
+                fb_rows.append((r["time_hr"], leaf))
+        rows.append(out)
+    flux = pd.DataFrame(rows, columns=flux_cols)
+    flux.to_csv(os.path.join(out_dir, "leaf_fluxes.csv"), index=False,
+                float_format="%.6f")
+
+    # ------------------------------------------------------------------
+    # case_convergence.csv : one row per test case (sunlit, 0-based index)
+    # ------------------------------------------------------------------
+    case_cols = ["case_id", "ci_init_pa", "ci_final_pa", "A_final",
+                 "rs_final", "n_iterations"]
+    crows = []
+    for c in cases:
+        r = forcing.iloc[c["forcing_index"]]          # 0-based
+        par = r["par_sun_wm2"]                        # A8: sunlit leaf
+        ci_init = c["ci_init_pa"]
+        ci, a, rs, gs, cs, n_iter, fb = evaluate(
+            par, r["t_air_K"], r["p_atm_Pa"], r["co2_pa"], r["o2_pa"],
+            r["vpd_Pa"], r["rb_sm"], r["btran"], p, ci_init)
+        crows.append({"case_id": c["case_id"], "ci_init_pa": ci_init,
+                      "ci_final_pa": ci, "A_final": a, "rs_final": rs,
+                      "n_iterations": int(n_iter)})
+    ccase = pd.DataFrame(crows, columns=case_cols)
+    ccase.to_csv(os.path.join(out_dir, "case_convergence.csv"), index=False,
+                 float_format="%.6f")
+
+    # ------------------------------------------------------------------
+    # diurnal.png : A and rs for sun & shade over the full period
+    # ------------------------------------------------------------------
+    make_figure(flux, os.path.join(out_dir, "diurnal.png"))
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    day = flux[flux["A_sun"] > 0]
+    print("matplotlib used:", HAS_MPL)
+    print("=== leaf_fluxes.csv ===")
+    print("rows:", len(flux))
+    print("A_sun   range: min=%.4f  max=%.4f  (daytime max %.4f)" %
+          (flux["A_sun"].min(), flux["A_sun"].max(), day["A_sun"].max()))
+    print("A_shade range: min=%.4f  max=%.4f" % (flux["A_shade"].min(), flux["A_shade"].max()))
+    print("rs_sun  range: min=%.3f  max=%.3f" % (flux["rs_sun"].min(), flux["rs_sun"].max()))
+    print("rs_shade range: min=%.3f  max=%.3f" % (flux["rs_shade"].min(), flux["rs_shade"].max()))
+    print("ci_sun  range: min=%.4f  max=%.4f" % (flux["ci_sun"].min(), flux["ci_sun"].max()))
+    print("night rows (A<0):", int((flux["A_sun"] < 0).sum()))
+    print("bisection-fallback rows:", fb_rows if fb_rows else "none")
+    print()
+    print("=== case_convergence.csv ===")
+    print(ccase.to_string(index=False))
+    print()
+    print("unique ci_final across cases:", ccase["ci_final_pa"].nunique())
+    print("unique A_final  across cases:", ccase["A_final"].nunique())
+    print("unique rs_final across cases:", ccase["rs_final"].nunique())
+
+
+if __name__ == "__main__":
+    main()

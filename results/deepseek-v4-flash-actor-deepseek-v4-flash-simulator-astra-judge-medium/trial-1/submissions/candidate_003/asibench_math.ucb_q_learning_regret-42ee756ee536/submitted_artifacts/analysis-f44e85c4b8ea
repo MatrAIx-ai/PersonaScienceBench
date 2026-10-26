@@ -1,0 +1,347 @@
+"""Diagnostics for the optimistic double-Q + bounded-trace agent.
+
+Runs the OFFICIAL public calibration protocol (public_calibration_runner.py)
+on the 3 transparent MDPs x 3 evaluation seeds and reports:
+  1) per-case and total mean regret vs plain UCB-B and strong reference
+  2) cumulative-regret curves (burn-in view)
+  3) mechanism diagnostics (trace vs one-step target variance, injected bonus
+     size, suboptimal-action fraction during burn-in, blend weight zeta)
+  4) ablations and a small one-at-a-time shared-config sensitivity grid
+"""
+from __future__ import annotations
+import sys, os, json
+import numpy as np
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+import analysis
+from data import public_calibration_runner as runner
+
+SUITE = json.load(open(os.path.join(ROOT, "data", "public_calibration_suite.json")))
+CASES = SUITE["cases"]
+SEEDS = SUITE["eval_seeds"]
+
+# ---------------------------------------------------------------------------
+# Plain UCB-B reference (self-contained re-implementation used for comparison)
+# ---------------------------------------------------------------------------
+class UcbB:
+    """Plain Bernstein UCB-Q baseline (mean of one-step bootstrap targets
+    + Bernstein bonus computed from the sampled-variance of those targets)."""
+    def __init__(self, spec, seed):
+        self.H, self.S, self.A = int(spec["H"]), int(spec["S"]), int(spec["A"])
+        self.n = np.zeros((self.H, self.S, self.A))
+        self.q = np.zeros((self.H, self.S, self.A))
+        self.m2 = np.zeros((self.H, self.S, self.A))
+        self.maxval = (self.H - np.arange(1, self.H + 1) + 1).astype(float)
+        self.glob = 1.0
+
+    def act(self, h, state):
+        hh = h - 1
+        best_a, best_s = 0, -1.0
+        for a in range(self.A):
+            mx = self.maxval[hh]
+            if self.n[hh, state, a] < 1:
+                sc = mx * 2.0
+            else:
+                n = self.n[hh, state, a]
+                var = self.m2[hh, state, a] / n
+                T = self.glob
+                bonus = np.sqrt(2.0 * var * np.log(T) / n) + (mx * np.log(T)) / (3.0 * n)
+                sc = min(self.q[hh, state, a] + bonus, mx)
+            if sc > best_s:
+                best_s, best_a = sc, a
+        return best_a
+
+    def observe(self, h, state, action, reward, next_state, done):
+        hh = h - 1
+        if hh >= self.H - 1:
+            y = float(reward)
+        else:
+            y = float(reward) + float(self.q[hh + 1, next_state, :].max())
+        y = min(y, self.maxval[hh])
+        n = self.n[hh, state, action]
+        if n == 0:
+            self.q[hh, state, action] = y
+            self.m2[hh, state, action] = 0.0
+        else:
+            old = self.q[hh, state, action]
+            new = old + (y - old) / (n + 1.0)
+            self.q[hh, state, action] = new
+            self.m2[hh, state, action] += (y - old) * (y - new)
+        self.n[hh, state, action] = n + 1.0
+        self.glob += 1.0
+
+# ---------------------------------------------------------------------------
+# Optimal policy for a fully-known public MDP (backward induction) -- used only
+# for diagnostics metrics (suboptimal-action fraction), never by the agent.
+# ---------------------------------------------------------------------------
+def optimal_values(case):
+    spec = case["spec"]
+    H, S, A = int(spec["H"]), int(spec["S"]), int(spec["A"])
+    R = np.asarray(spec["R"])
+    P = np.asarray(spec["P"])
+    V = np.zeros((H + 1, S))  # V[H] = 0
+    Q = np.zeros((H, S, A))
+    for hh in range(H - 1, -1, -1):
+        for s in range(S):
+            for a in range(A):
+                Q[hh, s, a] = R[hh, s, a] + (P[hh, s, a] * V[hh + 1]).sum()
+        V[hh] = Q[hh].max(axis=1)
+    return Q, V
+
+
+# ---------------------------------------------------------------------------
+# Probe wrapper: records per-episode reward, suboptimal actions and mechanism
+# stats (zeta, bonuses, variances) along the official runner protocol.
+# ---------------------------------------------------------------------------
+class Probe:
+    def __init__(self, base, MDP_Q):
+        self.base = base
+        self.Q = MDP_Q
+        self.ep_rewards = []
+        self.per_ep = []
+        self.eps_open = False
+        self._ep = {"subopt": 0, "steps": 0, "zeta": [], "bonus1": [], "bonusm": [],
+                    "var1": [], "varm": []}
+
+    def _diag_step(self, hh, s, a):
+        A_ = self.base
+        n = A_.n[hh, s, a]
+        qstar = self.Q[hh, s]
+        best_opt = qstar.max()
+        if n >= 1:
+            self._ep["steps"] += 1
+            if hh == 0 and qstar[a] < best_opt - 1e-9:
+                self._ep["subopt"] += 1
+            var_m = A_.m2_m[hh, s, a] / n
+            var_1 = A_.m2_1[hh, s, a] / n
+            self._ep["var1"].append(var_1); self._ep["varm"].append(var_m)
+            zeta = np.clip(analysis.N0 / (analysis.N0 + n), analysis.ZMIX, 1.0)
+            self._ep["zeta"].append(zeta)
+            lfac = float(np.log(max(1.0, analysis.CDISC_LOG * n)))
+            se_t = np.sqrt(var_m / n) if var_m > 0.0 else 0.0
+            mx = A_.maxval[hh]
+            bonus_1 = analysis.C1 * se_t * np.sqrt(lfac) + analysis.C2 * mx / n
+            if var_1 > 0.0 and n > 1.0:
+                bonus_1 = min(bonus_1, analysis.KHI * np.sqrt(var_1 / n)) + analysis.C2 * mx / n
+            bonus_m = analysis.C1 * se_t * np.sqrt(lfac) + analysis.C2 * min(analysis.C_TRACE, mx) / n
+            self._ep["bonus1"].append(bonus_1); self._ep["bonusm"].append(bonus_m)
+
+    def act(self, h, state):
+        actn = self.base.act(h, state)
+        self._diag_step(int(h) - 1, int(state), actn)
+        return actn
+
+    def observe(self, h, state, action, reward, next_state, done):
+        self.base.observe(h, state, action, reward, next_state, done)
+
+    def reset_episode(self, episode, state):
+        self.eps_open = True
+        self._ep = {"subopt": 0, "steps": 0, "zeta": [], "bonus1": [], "bonusm": [],
+                    "var1": [], "varm": []}
+        self.base.reset_episode(episode, state)
+
+    def end_episode(self, episode, episode_reward):
+        self.ep_rewards.append(float(episode_reward))
+        self.per_ep.append(self._ep)
+        self.eps_open = False
+        self.base.end_episode(episode, episode_reward)
+
+# ---------------------------------------------------------------------------
+# Suite runners
+# ---------------------------------------------------------------------------
+def run_suite(factory):
+    per_case = {}
+    total_reg = 0.0
+    for case in CASES:
+        cid = case["spec"]["case_id"]
+        regs = [runner.run_case(case, factory, seed)["regret"] for seed in SEEDS]
+        per_case[cid] = float(np.mean(regs))
+        total_reg += float(np.mean(regs))
+    return total_reg, per_case
+
+
+def emulate(case, agent_factory, seed, record_probe=True):
+    """Replicate the official runner loop, returning (mean_cumsum_regret,
+    probe) where probe records per-episode diagnostics."""
+    spec = case["spec"]
+    qstar, _ = optimal_values(case)
+    base = agent_factory(spec, seed)
+    ag = Probe(base, qstar)
+    rng = np.random.default_rng(seed + 9176)
+    K, H = int(spec["K"]), int(spec["H"])
+    S, A = int(spec["S"]), int(spec["A"])
+    P = np.asarray(spec["P"]); R = np.asarray(spec["R"])
+    cum = []
+    for e in range(K):
+        st = 0; er = 0.0
+        ag.reset_episode(e, st)
+        for hh in range(H):
+            actn = ag.act(hh + 1, st)
+            rw = float(R[hh, st, actn])
+            ns = int(rng.choice(S, p=P[hh, st, actn]))
+            ag.observe(hh + 1, st, actn, rw, ns, hh == H - 1)
+            er += rw; st = ns
+        ag.end_episode(e, er)
+        cum.append(float(case["optimal_start_value"]) - er)
+    return np.cumsum(np.array(cum)), ag
+
+
+def configure(**kw):
+    for k, v in kw.items():
+        setattr(analysis, k, v)
+
+
+DEFAULT = {}
+
+def snapshot():
+    global DEFAULT
+    DEFAULT = {k: getattr(analysis, k) for k in
+               ("C_TRACE", "BETA_C", "C1", "C2", "KHI", "N0", "ZMIX", "CDISC_LOG", "C3")}
+
+def restore():
+    for k, v in DEFAULT.items():
+        setattr(analysis, k, v)
+
+def main():
+    snapshot()
+    results = {}
+
+    # ------------------- 1) headline vs UCB-B & strong reference -------------
+    restore()
+    tot_ours, per_ours = run_suite(lambda s, sd: analysis.make_agent(s, sd))
+    tot_ucb, per_ucb = run_suite(lambda s, sd: UcbB(s, sd))
+    strong = SUITE["baselines"]["strong_reference"]["per_case"]
+    ucb_json = SUITE["baselines"]["plain_ucb_b"]["per_case"]
+
+    print("=" * 100)
+    print("HEADLINE: total mean regret over public suite (3 cases x 3 seeds)")
+    print("=" * 100)
+    print(f"{'case':<26}{'ours':>9}{'UCB-B(reimpl)':>15}{'UCB-B(json)':>13}{'strong_ref':>12}")
+    for cid in per_ours:
+        print(f"{cid:<26}{per_ours[cid]:>9.2f}{per_ucb[cid]:>15.2f}"
+              f"{ucb_json[cid]['mean_regret']:>13.2f}{strong[cid]['mean_regret']:>12.2f}")
+    print(f"{'TOTAL':<26}{tot_ours:>9.2f}{tot_ucb:>15.2f}"
+          f"{SUITE['baselines']['plain_ucb_b']['total_regret']:>13.2f}"
+          f"{SUITE['baselines']['strong_reference']['total_regret']:>12.2f}")
+    results["headline"] = {"ours_total": tot_ours, "ucb_reimpl_total": tot_ucb,
+                           "ucb_json_total": SUITE["baselines"]["plain_ucb_b"]["total_regret"],
+                           "strong_total": SUITE["baselines"]["strong_reference"]["total_regret"],
+                           "per_case_ours": per_ours, "per_case_ucb_reimpl": per_ucb,
+                           "per_case_ucb_json": ucb_json, "per_case_strong": strong}
+
+    # ------------------- 2) curves + mechanism diagnostics -------------------
+    restore()
+    curves, probes = {}, {}
+    for case in CASES:
+        cid = case["spec"]["case_id"]
+        cums, ags = [], []
+        for seed in SEEDS:
+            cum, ag = emulate(case, analysis.make_agent, seed)
+            cums.append(cum); ags.append(ag)
+        curves[cid] = {"mean_cumsum": np.mean(np.vstack(cums), axis=0).tolist()}
+        agg = {"zeta": [], "b1": [], "bm": [], "v1": [], "vm": []}
+        sub, stp = 0, 0
+        first30 = 0
+        for ag in ags:
+            for ep in ag.per_ep:
+                if ep["steps"] > 0:
+                    agg["zeta"].append(np.mean(ep["zeta"]))
+                    agg["b1"].append(np.mean(ep["bonus1"]))
+                    agg["bm"].append(np.mean(ep["bonusm"]))
+                    agg["v1"].append(np.mean(ep["var1"]))
+                    agg["vm"].append(np.mean(ep["varm"]))
+            K = int(case["spec"]["K"])
+            first30 = int(0.3 * K)
+            sub += sum(ep["subopt"] for ep in ag.per_ep[:first30])
+            stp += sum(ep["steps"] for ep in ag.per_ep[:first30])
+        probes[cid] = {
+            "zeta_first10": float(np.mean(agg["zeta"][:30])),
+            "zeta_last10": float(np.mean(agg["zeta"][-30:])),
+            "bonus1_first10": float(np.mean(agg["b1"][:30])),
+            "bonusm_first10": float(np.mean(agg["bm"][:30])),
+            "var1_first10": float(np.mean(agg["v1"][:30])),
+            "varm_first10": float(np.mean(agg["vm"][:30])),
+            "subopt_frac_first30": float(sub / max(1, stp)),
+        }
+    results["curves_ours"] = curves
+    results["probes_ours"] = probes
+
+    print()
+    print("CUMULATIVE REGRET (ours), episode 1..20 and 21..40")
+    for cid, c in curves.items():
+        v = np.asarray(c["mean_cumsum"])
+        print(f"{cid:<28}" + " ".join(f"{x:6.1f}" for x in np.round(v[:20], 1)))
+        print(f"{'':28}" + " ".join(f"{x:6.1f}" for x in np.round(v[20:40], 1)))
+
+    print()
+    print("MECHANISM DIAGNOSTICS (ours, mean over 3 seeds)")
+    print(f"{'case':<26}{'zeta@first':>10}{'zeta@last':>10}{'b1@first':>9}{'bm@first':>9}"
+          f"{'var1@first':>11}{'varm@first':>11}{'subopt%30':>10}")
+    for cid, p in probes.items():
+        print(f"{cid:<26}{p['zeta_first10']:>10.3f}{p['zeta_last10']:>10.3f}"
+              f"{p['bonus1_first10']:>9.3f}{p['bonusm_first10']:>9.3f}"
+              f"{p['var1_first10']:>11.4f}{p['varm_first10']:>11.4f}"
+              f"{100*p['subopt_frac_first30']:>9.1f}%")
+
+
+    # ------------------- 3) ablations + small sensitivity grid --------------
+    print()
+    print("=" * 100)
+    print("ABLATIONS & SENSITIVITY (one shared config per row, all 3 cases)")
+    print("=" * 100)
+    rows = []
+
+    def add(name, factory):
+        tot, per = run_suite(factory)
+        rows.append((name, tot))
+        return tot, per
+
+    restore()
+    add("BASELINE (default)", lambda s, sd: analysis.make_agent(s, sd))
+    restore()
+    configure(N0=1e9, ZMIX=1.0)
+    add("one-step only (zeta=1)", lambda s, sd: analysis.make_agent(s, sd))
+    restore()
+    configure(N0=0.0, ZMIX=0.0)
+    add("trace only (zeta=0)", lambda s, sd: analysis.make_agent(s, sd))
+    restore()
+    add("UCB-B (reimpl)", lambda s, sd: UcbB(s, sd))
+
+    grid = [
+        ("C_TRACE=4 ", {"C_TRACE": 4}),
+        ("C_TRACE=16", {"C_TRACE": 16}),
+        ("N0=3      ", {"N0": 3.0}),
+        ("N0=12     ", {"N0": 12.0}),
+        ("C1=0.8    ", {"C1": 0.8}),
+        ("C1=1.5    ", {"C1": 1.5}),
+        ("C2=0.9    ", {"C2": 0.9}),
+        ("C2=2.0    ", {"C2": 2.0}),
+        ("KHI=0.6   ", {"KHI": 0.6}),
+        ("KHI=1.3   ", {"KHI": 1.3}),
+        ("ZMIX=0.05 ", {"ZMIX": 0.05}),
+        ("ZMIX=0.4  ", {"ZMIX": 0.4}),
+        ("BETA=0.3  ", {"BETA_C": 0.3}),
+        ("C3=0.4    ", {"C3": 0.4}),
+    ]
+    for name, kw in grid:
+        restore()
+        configure(**kw)
+        add(name, lambda s, sd: analysis.make_agent(s, sd))
+    restore()
+
+    print(f"{'config':<27}{'total mean regret':>18}   (strong_ref=77.57, UCB-B=207.99)")
+    for name, tot in rows:
+        print(f"{name:<27}{tot:>18.3f}")
+    results["ablations"] = [{"config": n, "total": t} for n, t in rows]
+
+    # ---------------- save -----------------
+    out = os.path.join(ROOT, "diagnostics_results.json")
+    json.dump(results, open(out, "w"), indent=1, sort_keys=True)
+    print()
+    print("saved:", out)
+
+
+if __name__ == "__main__":
+    main()

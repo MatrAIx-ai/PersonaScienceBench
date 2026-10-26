@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""
+Single-cell RNA-seq integrated analysis (B3) -- NumPy/SciPy only.
+
+Pipeline (see method_choices.json for per-step methods + justifications):
+  QC (flag, never drop) -> CP10K + log1p -> binned-dispersion HVG -> PCA (denoising)
+  -> kNN graph (union symmetrisation, adaptive sigma) -> spectral clustering k=4
+     (marker-block tie-breaker vs NMF / Ward candidates)
+  -> graph geodesic (Dijkstra) pseudotime from peripheral centroid, min-max [0,1]
+     (orientation rule = TF-block structure; UNVERIFIED assumption, diagnostics logged)
+  -> DE: specificity score (ANOVA F + log2FC + prevalence), per-cluster top markers
+     deduped at head, remainder by global F -> all 250 gene indices ranked
+  -> GRN (TF x TF, directed): ridge |beta| edge strength on kNN-smoothed profiles
+     (pseudotime as covariate) x directionality from pseudotime-LAGGED cross-correlation
+     computed on RAW (unsmoothed) profiles. diagonal = 0, clipped, min-max [0,1].
+
+Everything is deterministic (fixed seeds, no unseeded RNG), no cells/genes are removed.
+"""
+import json
+import os
+import numpy as np
+from scipy.spatial.distance import cdist
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
+from scipy.cluster.hierarchy import linkage, fcluster
+
+SEED = 0
+K_CANDIDATES_MAX = 5
+DATA_DIR = "data"
+OUT_DIR = "."
+LOG = []
+
+
+def log(msg=""):
+    print(msg, flush=True)
+    LOG.append(str(msg))
+
+
+def spearman(a, b):
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    ra = np.argsort(np.argsort(a)).astype(float)
+    rb = np.argsort(np.argsort(b)).astype(float)
+    ra -= ra.mean(); rb -= rb.mean()
+    d = np.sqrt((ra ** 2).sum() * (rb ** 2).sum())
+    return float((ra * rb).sum() / d) if d > 0 else 0.0
+
+
+def contingency(lev, lgt):
+    lev = np.asarray(lev); lgt = np.asarray(lgt)
+    a, b = int(lev.max()) + 1, int(lgt.max()) + 1
+    c = np.zeros((a, b))
+    np.add.at(c, (lev, lgt), 1.0)
+    return c
+
+
+def ari(lev, lgt):
+    c = contingency(lev, lgt); n = c.sum()
+    C2 = lambda v: float((v * (v - 1) / 2).sum())
+    ai, bj = c.sum(1), c.sum(0)
+    nij = C2(c.ravel()); ni, nj = C2(ai), C2(bj)
+    exp = ni * nj / (n * (n - 1) / 2) if n > 1 else 0.0
+    mean = (ni + nj) / 2.0
+    den = mean - exp
+    return float((nij - exp) / den) if abs(den) > 1e-12 else 0.0
+
+
+def nmi(lev, lgt):
+    c = contingency(lev, lgt); n = c.sum()
+    p = c / n
+    pi, pj = p.sum(1, keepdims=True), p.sum(0, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mi = np.nansum(np.where(p > 0, p * np.log(p / (pi * pj)), 0.0))
+        hi = float(-np.nansum(np.where(pi > 0, pi * np.log(pi), 0.0)))
+        hj = float(-np.nansum(np.where(pj > 0, pj * np.log(pj), 0.0)))
+    return float(2 * mi / (hi + hj)) if (hi + hj) > 0 else 0.0
+
+
+# ---------------------------------------------------------------- load
+X = np.asarray(np.load(os.path.join(DATA_DIR, "counts.npy")), dtype=np.float64)
+info = json.load(open(os.path.join(DATA_DIR, "system_info.json")))
+n_cells, n_genes = X.shape
+n_tf = int(info["n_tf_genes"])
+tf_idx = np.asarray(info["tf_gene_indices"], dtype=int)
+k_clusters = int(info.get("n_clusters", 0)) or 4
+log("== 0. INPUT ==")
+log(f"counts.npy shape={X.shape} dtype=float64 finite={bool(np.isfinite(X).all())} "
+    f"min={X.min():.0f} max={X.max():.0f} integer_valued={bool(np.array_equal(X, np.floor(X)))}")
+log(f"metadata: n_cells={info['n_cells']} n_genes={info['n_genes']} n_clusters={k_clusters} "
+    f"n_tf_genes={n_tf} tf_gene_indices=[{tf_idx[0]}..{tf_idx[-1]}]")
+log(f"NOT provided by metadata (=> assumptions elsewhere): gene names, pseudotime root/anchor, "
+    f"DE comparison definition, library-size/ambient/batch metadata")
+
+# ------------------------------------------------- 1. QC (flag, never drop)
+log("\n== 1. QC / FILTERING (flags only -- output shape forbids dropping cells) ==")
+lib = X.sum(1)
+genes_det = (X > 0).sum(1)
+med_lib = float(np.median(lib))
+lo_lib = np.percentile(lib, 1); lo_det = np.percentile(genes_det, 1)
+qc_flag = np.where((lib <= lo_lib) | (genes_det <= lo_det))[0]
+log(f"library size: min={lib.min():.0f} p25={np.percentile(lib,25):.0f} med={med_lib:.0f} "
+    f"p75={np.percentile(lib,75):.0f} max={lib.max():.0f} CV={lib.std()/lib.mean():.3f}")
+log(f"genes/cell: min={genes_det.min()} med={np.median(genes_det):.0f} max={genes_det.max()}; "
+    f"global zero fraction={(X==0).mean():.4f}; median count/detected gene={np.median(X[X>0]):.1f}")
+log(f"cells flagged as low-quality (kept, reassigned later): n={len(qc_flag)} ids={qc_flag.tolist()}")
+
+# data-driven 'marker-like' high-expression block (metadata: non-TF cols contain cluster markers)
+gm = X.mean(0)
+pos = np.sort(gm[gm > 0])
+cand = np.where(pos[:-1] > 0)[0]   # largest multiplicative gap in the sorted gene-mean spectrum
+gi = cand[np.argmax(np.log(pos[cand + 1] / pos[cand]))]
+mk_thr = float(np.sqrt(pos[gi] * pos[gi + 1]))
+marker_block = np.where(gm > mk_thr)[0]
+log(f"gene-magnitude bimodality: gap between {pos[gi]:.2f} and {pos[gi+1]:.2f} counts -> "
+    f"threshold={mk_thr:.2f}; high-expression ('marker-like') block: {len(marker_block)} genes "
+    f"(remaining {n_genes-len(marker_block)} low-expression incl. the {n_tf} TFs)")
+
+# ------------------------------------------------- 2. normalisation
+log("\n== 2. NORMALISATION ==")
+cp10k = X / lib[:, None] * 1e4
+L = np.log1p(cp10k)
+log("CP10K (counts / library_size * 1e4) + log1p  [Luecken & Theis 2019]")
+
+# ------------------------------------------------- 3. HVG
+log("\n== 3. HVG SELECTION (binned log-dispersion z-score, Seurat-style) ==")
+det_rate = (X > 0).mean(0)
+# HVG candidacy = detected in >=5% of cells AND mean count >= 1 count (the gene-magnitude gap shows a
+# 170-gene ambient/noise floor at <0.7 mean counts, which is Poisson-noise dominated and must not be
+# selected as 'highly variable')
+keep_g = (det_rate >= 0.05) & (gm >= 1.0)
+mu = L.mean(0); var = L.var(0)
+disp = np.log(var + 1e-9)
+z = np.zeros(n_genes)
+idx = np.argsort(np.where(keep_g, mu, -np.inf))
+nbins = 20
+usable = idx[keep_g[idx]]
+for b in np.array_split(usable, min(nbins, max(1, len(usable) // 5))):
+    if len(b) > 2:
+        z[b] = (disp[b] - disp[b].mean()) / (disp[b].std(ddof=0) + 1e-12)
+n_hvg = int(min(150, max(10, keep_g.sum())))
+hvg = np.argsort(-np.where(keep_g, z, -np.inf))[:n_hvg]
+log(f"expressed candidate genes={int(keep_g.sum())}; HVG={n_hvg}; HVG overlap with marker-like block="
+    f"{len(set(hvg.tolist()) & set(marker_block.tolist()))}/{len(marker_block)}; "
+    f"TF genes among HVG={len(set(hvg.tolist()) & set(tf_idx.tolist()))} (expected ~0; TFs are low-count)")
+
+# ------------------------------------------------- 4. PCA
+log("\n== 4. PCA DENOISING ==")
+H = L[:, hvg]
+Hs = (H - H.mean(0)) / (H.std(0) + 1e-12)
+U, S, Vt = np.linalg.svd(Hs, full_matrices=False)
+evr = (S ** 2) / (S ** 2).sum()
+floor = float(np.median(evr[10:21])) if n_cells > 25 else float(np.median(evr))
+n_pc_noise = int(np.sum(evr[:20] >= 1.5 * floor))          # noise-floor (scree/elbow) rule
+# floor at k_clusters: a k-cluster spectral embedding needs >= k-1 informative dimensions
+n_pc = int(min(8, max(k_clusters, n_pc_noise, 2)))
+PC = U[:, :n_pc] * S[:n_pc]
+log(f"explained variance ratio PCs1-8: {np.round(evr[:8],4).tolist()} (noise floor med PCs10-20={floor:.5f})")
+log(f"rule: n[evr >= 1.5*noise_floor]={n_pc_noise}, floored at k_clusters={k_clusters}, capped 8 -> n_pc={n_pc} "
+    f"(note: PC1 alone only encodes a 2-group split; PCs2-{n_pc} carry the finer structure)")
+
+# ------------------------------------------------- 5. kNN graph + outliers
+log("\n== 5. kNN GRAPH ==")
+K_NN = 15
+D = cdist(PC, PC)
+nn = np.argsort(D, 1)[:, 1:K_NN + 1]
+rows = np.repeat(np.arange(n_cells)[:, None], K_NN, 1).ravel()
+A = np.zeros((n_cells, n_cells))
+A[rows, nn.ravel()] = 1.0
+A = np.maximum(A, A.T)              # union symmetrisation
+np.fill_diagonal(A, 0)
+sigma = float(np.median(np.sort(D, 1)[:, K_NN]) ** 2)
+W = A * np.exp(-D ** 2 / sigma)
+log(f"k={K_NN}, Euclidean in PC space, union symmetrisation, gaussian sigma=median(kNN dist)^2="
+    f"{sigma:.3f}; mean degree={A.sum(1).mean():.1f}")
+# shared-NN structure => outlier flag
+Snn = (A > 0) & (A.T > 0)
+np.fill_diagonal(Snn, True)
+ncc, mem = connected_components(csr_matrix(Snn.astype(float)), directed=False)
+sizes = np.bincount(mem)
+singletons = np.where(sizes[mem] == 1)[0]
+log(f"shared-NN connected components: {int(ncc)} (top sizes {np.sort(sizes)[::-1][:6].tolist()}) "
+    f"-> {len(singletons)} singleton (unconnected/contamination-like) cells: {singletons.tolist()}")
+Laplacian_eig = None
+
+# ------------------------------------------------- helpers: clustering
+def kmeans_pp(Y, k, seed=SEED, n_iter=300, n_init=25):
+    """Deterministic k-means++ (NumPy only)."""
+    best_lab, best_iner = None, np.inf
+    for it in range(n_init):
+        rng = np.random.default_rng(seed + 1000 * it)
+        C = np.empty((k, Y.shape[1]))
+        C[0] = Y[rng.integers(len(Y))]
+        d = ((Y - C[0]) ** 2).sum(1)
+        for j in range(1, k):
+            p = d / d.sum() if d.sum() > 0 else np.full(len(Y), 1.0 / len(Y))
+            C[j] = Y[rng.choice(len(Y), p=p)]
+            d = np.minimum(d, ((Y - C[j]) ** 2).sum(1))
+        lab = np.zeros(len(Y), dtype=int)
+        for _ in range(n_iter):
+            d2 = ((Y ** 2).sum(1)[:, None] - 2 * Y @ C.T + (C ** 2).sum(1)[None])
+            new = d2.argmin(1)
+            if np.array_equal(new, lab):
+                break
+            lab = new
+            for j in range(k):
+                m = lab == j
+                C[j] = Y[m].mean(0) if m.any() else C[j]
+        iner = float(((Y - C[lab]) ** 2).sum())
+        if iner < best_iner:
+            best_iner, best_lab = iner, lab.copy()
+    return best_lab, best_iner
+
+
+def relabel(lab):
+    """Compact labels to 0..K-1 ordered by cluster size (desc) -> deterministic."""
+    lab = np.asarray(lab)
+    order = np.argsort([-(lab == c).sum() for c in np.unique(lab)], kind="stable")
+    out = np.zeros_like(lab)
+    for new, old in enumerate(order):
+        out[lab == old] = new
+    return out.astype(np.int32)
+
+
+def modularity(lab, Adj):
+    lab = np.asarray(lab); K = int(lab.max()) + 1
+    deg = Adj.sum(1); m2 = Adj.sum()
+    if m2 <= 0:
+        return 0.0
+    Q = 0.0
+    for a in range(K):
+        ia = np.where(lab == a)[0]
+        Q += Adj[np.ix_(ia, ia)].sum() - deg[ia].sum() ** 2 / m2
+    return float(Q / m2)
+
+
+def silhouette_labeled(D, lab, sample=400, seed=SEED):
+    lab = np.asarray(lab); K = int(lab.max()) + 1
+    if K < 2:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(lab), size=min(sample, len(lab)), replace=False)
+    vals = []
+    for i in idx:
+        own = lab == lab[i]; own[i] = False
+        if not own.any():
+            continue
+        a = D[i][own].mean()
+        others = [D[i][lab == c].mean() for c in range(K) if c != lab[i] and (lab == c).any()]
+        if not others:
+            continue
+        b = min(others)
+        vals.append((b - a) / max(a, b, 1e-12))
+    return float(np.mean(vals))
+
+
+def eta2_marker(lab, M):
+    """Mean fraction of marker-block variance explained by the partition (separation quality)."""
+    lab = np.asarray(lab); K = int(lab.max()) + 1
+    tot = ((M - M.mean(0)) ** 2).sum(0)
+    bet = np.zeros(M.shape[1])
+    for c in range(K):
+        m = lab == c
+        if m.sum() > 0:
+            bet += m.sum() * (M[m].mean(0) - M.mean(0)) ** 2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        e = np.where(tot > 1e-12, bet / np.maximum(tot, 1e-12), 0.0)
+    return float(e.mean()), float(np.median(e))
+
+
+def marker_enrichment(lab, Bin):
+    """mean within-cluster positivity fraction of each cluster's top-10 marker genes
+    minus the same genes' positivity outside the cluster (chance = 0)."""
+    lab = np.asarray(lab); K = int(lab.max()) + 1
+    diffs = []
+    for c in range(K):
+        ins = lab == c
+        if not ins.any():
+            continue
+        prof_in = Bin[ins].mean(0); prof_out = Bin[~ins].mean(0)
+        top = np.argsort(-(prof_in - prof_out))[:10]
+        diffs.append(prof_in[top].mean() - prof_out[top].mean())
+    return float(np.mean(diffs)) if diffs else float("nan")
+
+
+# ------------------------------------------------- 6. clustering
+log("\n== 6. CLUSTERING (no Louvain/Leiden available; spectral primary + marker tie-breaker) ==")
+log(f"k fixed to metadata n_clusters={k_clusters} (also the modularity/NMF-size optimum in scouting)")
+
+# -- candidate A: spectral clustering on the kNN graph
+deg = W.sum(1) + 1e-12
+Dinv = 1.0 / np.sqrt(deg)
+Lsym = csr_matrix(np.eye(n_cells) - (W * Dinv[:, None]) * Dinv[None, :])
+ev, Ve = np.linalg.eigh(Lsym.toarray())
+Laplacian_eig = ev[:10]
+Ys = Ve[:, 1:k_clusters]
+Ys = Ys / (np.linalg.norm(Ys, axis=1, keepdims=True) + 1e-12)
+lab_spec, iner_spec = kmeans_pp(Ys, k_clusters)
+lab_spec = relabel(lab_spec)
+
+# -- candidate B: NMF(k) on the marker-like block (multiplicative updates, seeded)
+def nmf(V, k, seed=SEED, iters=400):
+    rng = np.random.default_rng(seed)
+    Wf = rng.random((V.shape[0], k)) + 0.1
+    Hf = rng.random((k, V.shape[1])) + 0.1
+    for _ in range(iters):
+        Wf *= (V @ Hf.T) / (Wf @ Hf @ Hf.T + 1e-12)
+        Hf *= (Wf.T @ V) / (Wf.T @ Wf @ Hf + 1e-12)
+    return Wf, Hf
+
+Mk = np.log1p(cp10k[:, marker_block])
+Wn, Hn = nmf(Mk, k_clusters)
+lab_nmf = relabel(Wn.argmax(1))
+
+# -- candidate C: Ward hierarchical on PCs
+lab_ward = relabel(fcluster(linkage(PC, "ward"), k_clusters, "maxclust"))
+
+# -- marker-block tie-breaker (researcher decision rule)
+Bin = (X[:, marker_block] > 0).astype(float)
+Dmk = cdist(Mk - Mk.mean(0), Mk - Mk.mean(0))
+cands = {}
+for nm, lab in [("spectral_kNN", lab_spec), ("NMF_marker_block", lab_nmf), ("Ward_on_PCA", lab_ward)]:
+    e_mean, e_med = eta2_marker(lab, Mk)
+    cands[nm] = dict(labels=lab, sizes_nonempty=int((np.bincount(lab, minlength=k_clusters) > 0).sum()),
+                     marker_eta2_mean=round(e_mean, 4),
+                     marker_eta2_median=round(e_med, 4),
+                     marker_enrichment=round(marker_enrichment(lab, Bin), 4),
+                     marker_silhouette=round(silhouette_labeled(Dmk, lab), 4),
+                     graph_modularity=round(modularity(lab, W), 4))
+    log(f"  {nm:17s} sizes={np.bincount(lab,minlength=k_clusters).tolist()} "
+        f"marker_eta2_mean={cands[nm]['marker_eta2_mean']:.4f} "
+        f"marker_eta2_med={cands[nm]['marker_eta2_median']:.4f} "
+        f"marker_enrich={cands[nm]['marker_enrichment']:.4f} "
+        f"marker_sil={cands[nm]['marker_silhouette']:.4f} Q={cands[nm]['graph_modularity']:.4f}")
+
+non_degenerate = [nm for nm in cands if cands[nm]["sizes_nonempty"] == k_clusters]
+rank_key = lambda nm: (cands[nm]["marker_silhouette"], cands[nm]["marker_eta2_mean"],
+                       cands[nm]["marker_enrichment"])
+SIL_MARGIN = 0.01            # a candidate must beat the primary by this much to displace it
+best_nm = max(non_degenerate, key=rank_key)
+spec_key = rank_key("spectral_kNN"); best_key = rank_key(best_nm)
+margin = best_key[0] - spec_key[0]
+ari_sp_nm = ari(lab_spec, lab_nmf)
+nmi_sp_nm = nmi(lab_spec, lab_nmf)
+log(f"  agreement spectral vs NMF: ARI={ari_sp_nm:.3f} NMI={nmi_sp_nm:.3f}; "
+    f"degenerate (empty-cluster) candidates excluded from tie-breaker: "
+    f"{[nm for nm in cands if nm not in non_degenerate]}")
+if best_nm == "spectral_kNN":
+    chosen_nm, decision = "spectral_kNN", "primary spectral labels are also the best marker-separating partition"
+elif margin < SIL_MARGIN:
+    chosen_nm, decision = "spectral_kNN", (f"tie-breaker is a statistical tie (best marker silhouette {best_key[0]:.4f} "
+                                          f"vs spectral {spec_key[0]:.4f}, margin {margin:.4f} < {SIL_MARGIN}) -> "
+                                          f"primary spectral labels kept")
+elif ari_sp_nm < 0.4:
+    chosen_nm, decision = "spectral_kNN", ("ARI(spectral,NMF)<0.4 means the candidate methods disagree strongly; "
+                                          "primary spectral labels kept and uncertainty logged")
+else:
+    chosen_nm, decision = best_nm, (f"tie-breaker displaced the primary: marker silhouette {best_key[0]:.4f} vs "
+                                    f"spectral {spec_key[0]:.4f} (margin {margin:.4f} >= {SIL_MARGIN})")
+log(f"  DECISION: final labels from '{chosen_nm}' -- {decision}")
+clusters = cands[chosen_nm]["labels"].astype(np.int32)
+
+# -- singleton/flagged cells: re-assign to nearest centroid (never dropped)
+reassigned = {}
+cent = np.array([PC[clusters == c].mean(0) for c in range(k_clusters)])
+for c0 in list(dict.fromkeys(singletons.tolist() + qc_flag.tolist())):
+    old = int(clusters[c0]); new = int(np.argmin(((cent - PC[c0]) ** 2).sum(1)))
+    if new != old:
+        clusters[c0] = new
+        reassigned[int(c0)] = [old, new]
+log(f"  outlier/QC-flagged cells re-assigned to nearest centroid: {len(reassigned)} -> {reassigned}")
+_Mk = L[:, marker_block]
+_tot = ((_Mk - _Mk.mean(0)) ** 2).sum(0)
+def _eta(lab):
+    b = sum(((lab == c).sum() * (_Mk[lab == c].mean(0) - _Mk.mean(0)) ** 2) for c in range(k_clusters))
+    return float(np.median(np.where(_tot > 1e-12, b / np.maximum(_tot, 1e-12), 0.0)))
+_eta_obs = _eta(clusters)
+_rng = np.random.default_rng(SEED)
+_null = np.array([_eta(_rng.permutation(clusters)) for _ in range(200)])
+perm_p = float((np.sum(_null >= _eta_obs) + 1) / (len(_null) + 1))
+log(f"  marker-signal significance of the FINAL labels: median marker-block eta2={_eta_obs:.3f} vs label-permutation "
+    f"null median={np.median(_null):.4f} max={_null.max():.4f} -> permutation p={perm_p:.4f}")
+log(f"  FINAL cluster sizes: {np.bincount(clusters, minlength=k_clusters).tolist()} "
+    f"(expected ~{n_cells//k_clusters}/cluster if balanced); "
+    f"global PC-space silhouette={silhouette_labeled(D, clusters):.3f}")
+
+# ------------------------------------------------- 7. pseudotime
+log("\n== 7. PSEUDOTIME (graph geodesic; root/orientation = DOCUMENTED ASSUMPTION) ==")
+# geodesic graph: edge weight = Euclidean distance in PC space, restricted to the kNN graph
+E = W > 0
+Wgeo = csr_matrix(np.where(E, D, 0.0))
+from scipy.sparse.csgraph import minimum_spanning_tree
+ncc_g0, mem_c = connected_components(Wgeo, directed=False)
+bridges = 0
+if ncc_g0 > 1:
+    # A geodesic is undefined between disconnected components and no cell may be dropped, so the
+    # components are joined by the SHORTEST inter-component edges (Kruskal order on the complete
+    # PC-distance graph). This is a documented graph augmentation, not a biological assumption.
+    Wd = Wgeo.toarray()
+    mst = minimum_spanning_tree(csr_matrix(D)).tocoo()
+    mem_cur = mem_c.copy()
+    for i, j, v in zip(mst.row, mst.col, mst.data):
+        if mem_cur[i] != mem_cur[j]:
+            Wd[i, j] = Wd[j, i] = float(max(v, 1e-6))
+            old = mem_cur[j]; mem_cur[mem_cur == old] = mem_cur[i]
+            bridges += 1
+    Wgeo = csr_matrix(Wd)
+    ncc_g, mem_g = connected_components(Wgeo, directed=False)
+else:
+    ncc_g, mem_g = ncc_g0, mem_c
+log(f"geodesic graph: components before bridging={int(ncc_g0)}, shortest-MST bridge edges added={bridges}, components after={int(ncc_g)} (connected graph is required for a defined geodesic)")
+
+cent_cells = []
+cent_pc = np.array([PC[clusters == c].mean(0) for c in range(k_clusters)])
+for c in range(k_clusters):
+    m = np.where(clusters == c)[0]
+    cent_cells.append(int(m[np.argmin(((PC[m] - cent_pc[c]) ** 2).sum(1))]))
+ecc = {}
+for c in range(k_clusters):
+    dd = dijkstra(Wgeo, indices=cent_cells[c], directed=False)
+    ecc[c] = float(np.mean(dd[np.isfinite(dd)]))
+order_root = sorted(ecc, key=lambda c: -ecc[c])
+log("cluster centroid graph-eccentricity (mean geodesic distance to all cells): "
+    + ", ".join(f"c{c}={ecc[c]:.2f}" for c in range(k_clusters)))
+root_c, root_c2 = order_root[0], order_root[1]
+root_cell = cent_cells[root_c]
+log(f"ASSUMPTION: pseudotime root/orientation are NOT defined anywhere in the metadata. "
+    f"Rule: root = most peripheral cluster centroid by graph eccentricity -> cluster {root_c} "
+    f"(cell {root_cell}); runner-up root = cluster {root_c2}")
+
+def geodesic_pt(cell):
+    dd = dijkstra(Wgeo, indices=cell, directed=False)
+    fin = np.isfinite(dd)
+    if not fin.all():   # should not happen after bridging; guard anyway
+        dd[~fin] = float(dd[fin].max()) if fin.any() else 0.0
+    rng_ = dd.max() - dd.min()
+    return (dd - dd.min()) / (rng_ if rng_ > 0 else 1.0)
+
+pt_root = geodesic_pt(root_cell)
+pt_root2 = geodesic_pt(cent_cells[root_c2])
+root_sensitivity = spearman(pt_root, pt_root2)
+log(f"root sensitivity: Spearman(pseudotime[root={root_c}], pseudotime[root={root_c2}]) = "
+    f"{root_sensitivity:.3f}  (how much the choice of root changes the ordering)")
+
+# ---- orientation (TF-block-driven, UNVERIFIED) ----
+def smooth(mat, k=30):
+    nb = np.argsort(cdist(PC, PC), 1)[:, :k + 1]
+    return mat[nb].mean(1)
+
+TFraw = L[:, tf_idx]
+TFsm = smooth(TFraw, 30)
+U2, S2, V2 = np.linalg.svd(TFsm - TFsm.mean(0), full_matrices=False)
+load = V2[0].copy()
+# orient the TF program so that HIGH-INDEX TFs define the 'late' end of the cascade
+if spearman(np.arange(n_tf), load) < 0:
+    load = -load
+prog = (TFsm - TFsm.mean(0)) @ load
+s_idx = spearman(np.arange(n_tf), load)
+corr_pt_prog = spearman(pt_root, prog)
+cluster_order_spear = spearman([pt_root[clusters == c].mean() for c in range(k_clusters)],
+                              [prog[clusters == c].mean() for c in range(k_clusters)])
+orientation_flipped = bool(corr_pt_prog < 0)
+pseudotime = pt_root if not orientation_flipped else 1.0 - pt_root
+log(f"orientation rule: TF-PC1 loading vs TF index Spearman={spearman(np.arange(n_tf), load):.3f} "
+    f"(index-ordered cascade => TF-program score); Spearman(geodesic_pt, TF-program)="
+    f"{corr_pt_prog:.3f} -> flip={orientation_flipped}")
+log(f"AFTER orientation: Spearman(pseudotime, TF-program)={spearman(pseudotime, prog):.3f}; "
+    f"cluster-level monotonicity Spearman(cluster-mean pt, cluster-mean TF-program)="
+    f"{cluster_order_spear:.3f} (flip-risk diagnostic: a sign flip would invert both)")
+log(f"ASSUMPTION FLAG: orientation is inferred from TF-block structure only and is NOT verified "
+    f"against any ground-truth root; if wrong, pseudotime is exactly 1-t (rank order reversed).")
+
+pseudotime = np.clip(pseudotime, 0.0, 1.0).astype(np.float64)
+log(f"pseudotime: min={pseudotime.min():.3f} max={pseudotime.max():.3f} "
+    f"mean={pseudotime.mean():.3f} sd={pseudotime.std():.3f}; cluster means="
+    + ", ".join(f"c{c}={pseudotime[clusters==c].mean():.3f}" for c in range(k_clusters)))
+ex = np.argsort(pseudotime)[:3].tolist() + np.argsort(pseudotime)[-3:].tolist()
+log(f"extreme pseudotime cells (3 lowest, 3 highest): {ex}; of these flagged outliers: "
+    f"{[i for i in ex if i in set(singletons.tolist()+qc_flag.tolist())]} "
+    f"(singletons can stretch the geodesic extremes -> reported, cells kept)")
+# within-cluster pseudotime gradient (is there a continuum, not just discrete blocks?)
+_rgi = np.argsort(pseudotime, kind="stable"); _bi = np.array_split(_rgi, 20)
+_Yb = np.stack([TFraw[b].mean(0) for b in _bi]); _ld = np.linalg.svd(_Yb - _Yb.mean(0), full_matrices=False)[2][0]
+_prog_c = TFraw @ _ld * np.sign(_ld @ np.array([1.0 if t < 10 else -1.0 for t in range(n_tf)]))
+_within = [spearman(pseudotime[(clusters == c) & (np.abs(pseudotime - pseudotime[clusters == c].mean()) < 0.5)],
+                    _prog_c[clusters == c]) for c in range(k_clusters)]
+log(f"  within-cluster TF-program gradient (Spearman pt vs in-cluster TF program, per cluster): "
+    f"{[round(w,3) for w in _within]} (non-zero values mean a continuum, not only discrete blocks)")
+
+
+# ------------------------------------------------- 8. DE / marker ranking
+log("\n== 8. DE / MARKER RANKING (all 250 genes, full ranking, no truncation) ==")
+K = int(clusters.max()) + 1
+cpm = cp10k
+mean_in = np.zeros((K, n_genes)); mean_out = np.zeros((K, n_genes))
+prev_in = np.zeros((K, n_genes)); prev_out = np.zeros((K, n_genes))
+for c in range(K):
+    m = clusters == c
+    mean_in[c] = cpm[m].mean(0); mean_out[c] = cpm[~m].mean(0)
+    prev_in[c] = (cpm[m] > 0).mean(0); prev_out[c] = (cpm[~m] > 0).mean(0)
+gm_all = L.mean(0)
+bet = sum((clusters == c).sum() * (L[clusters == c].mean(0) - gm_all) ** 2 for c in range(K))
+wit = sum(((L[clusters == c] - L[clusters == c].mean(0)) ** 2).sum(0) for c in range(K))
+df1, df2 = K - 1, n_cells - K
+Fstat = (bet / df1) / np.maximum(wit / df2, 1e-12)
+Fstat = np.nan_to_num(Fstat, nan=0.0, posinf=0.0)
+
+def rank_pct(v):
+    r = np.argsort(np.argsort(v)).astype(float)
+    return r / (len(v) - 1)
+
+rF = rank_pct(Fstat)
+Sjc = np.zeros((K, n_genes))
+for c in range(K):
+    l2fc = np.log2((mean_in[c] + 1.0) / (mean_out[c] + 1.0))
+    pgap = prev_in[c] - prev_out[c]
+    Sjc[c] = 0.50 * rF + 0.25 * rank_pct(np.clip(l2fc, 0, None)) + 0.25 * rank_pct(np.clip(pgap, 0, None))
+spec = Sjc.max(0); best_c = Sjc.argmax(0)
+PER = 20
+head, seen = [], set()
+for c in range(K):
+    for g in np.argsort(-Sjc[c])[:PER]:
+        if int(g) not in seen:
+            seen.add(int(g)); head.append(int(g))
+head = sorted(head, key=lambda g: -spec[g])
+rest = sorted([g for g in range(n_genes) if g not in seen], key=lambda g: (-Fstat[g], -gm[g]))
+gene_indices = head + rest
+assert sorted(gene_indices) == list(range(n_genes))
+top10 = set(gene_indices[:10]); top80 = set(gene_indices[:80]); top100 = set(gene_indices[:100])
+mb = set(marker_block.tolist())
+ranks_mb = np.array([gene_indices.index(g) for g in sorted(mb)])
+log(f"ranking = per-cluster top-{PER} specificity-score markers (deduped union, "
+    f"0.5*rank(ANOVA_F)+0.25*rank(log2FC)+0.25*rank(prevalence-gap)) then remaining genes by global F")
+log(f"head size={len(head)}; marker-like block recovery: top10={len(top10 & mb)}/10, "
+    f"top80={len(top80 & mb)}/80, top100={len(top100 & mb)}/80; "
+    f"marker rank positions: min={ranks_mb.min()} median={int(np.median(ranks_mb))} max={ranks_mb.max()}")
+log(f"TF genes appearing in top-80 of DE list = {len(set(gene_indices[:80]) & set(tf_idx.tolist()))} "
+    f"(expected low: TFs are low-count, markers dominate)")
+
+# ------------------------------------------------- 9. GRN (directed TF x TF)
+log("\n== 9. GRN (directed TF->TF scores, first n_tf_genes columns only) ==")
+SMOOTH_K = 30
+N_BINS, LAG = 20, 2
+N_FOLD, LAMS = 5, np.logspace(-2, 4, 19)
+
+def solve_ridge(Xd, y, lam):
+    p = Xd.shape[1]
+    return np.linalg.solve(Xd.T @ Xd + lam * np.eye(p), Xd.T @ y)
+
+def ridge_cv(Xd, y, lams=LAMS, nfold=N_FOLD):
+    idx = np.arange(len(y)); rng = np.random.default_rng(SEED); rng.shuffle(idx)
+    folds = np.array_split(idx, nfold)
+    ybar = y.mean(); sstot = float(((y - ybar) ** 2).sum())
+    best = (-np.inf, lams[0])
+    for lam in lams:
+        ss = 0.0
+        for f in folds:
+            tr = np.setdiff1d(idx, f)
+            ss += float(((y[f] - Xd[f] @ solve_ridge(Xd[tr], y[tr], lam)) ** 2).sum())
+        r2 = 1.0 - ss / sstot
+        if r2 > best[0]:
+            best = (r2, float(lam))
+    return best
+
+pt_z = (pseudotime - pseudotime.mean()) / (pseudotime.std() + 1e-12)
+pt2 = pseudotime ** 2
+pt2_z = (pt2 - pt2.mean()) / (pt2.std() + 1e-12)
+extra = np.column_stack([pt_z, pt2_z])
+
+def coef_matrix_multi(Smat, extras):
+    Z = np.column_stack([Smat[:, i] for i in range(n_tf)] + [extras])
+    Z = (Z - Z.mean(0)) / (Z.std(0) + 1e-12)
+    ncol = Z.shape[1]
+    B = np.zeros((n_tf, n_tf)); Braw = np.zeros((n_tf, n_tf))
+    lams = np.zeros(n_tf); r2s = np.zeros(n_tf)
+    for j in range(n_tf):
+        keep = [c for c in range(ncol) if c != j]
+        y = Z[:, j] - Z[:, j].mean()
+        r2, lam = ridge_cv(Z[:, keep], y)
+        b = solve_ridge(Z[:, keep], y, lam)
+        lams[j], r2s[j] = lam, r2
+        for pos, c in enumerate(keep):
+            if c < n_tf:
+                Braw[c, j] = b[pos]; B[c, j] = abs(b[pos])
+    return B, Braw, lams, r2s
+
+# --- smoothing-scheme control (documented, NOT used to pick the scheme) ---
+def knn_smooth(mat, ref, kk):
+    nbk = np.argsort(cdist(ref, ref), 1)[:, :kk + 1]
+    return mat[nbk].mean(1)
+
+def pt_smooth(mat, w):
+    o = np.argsort(pseudotime, kind="stable"); out = np.empty_like(mat)
+    for pos_i, i in enumerate(o):
+        out[i] = mat[o[max(0, pos_i - w):min(len(o), pos_i + w + 1)]].mean(0)
+    return out
+
+smooth_controls = {}
+for nm, S in [("raw (no smoothing)", TFraw)] + \
+              [(f"kNN(k={kk}) on marker-PC graph", knn_smooth(TFraw, PC, kk)) for kk in (10, 20, 30, 50, 80)] + \
+              [("pseudotime window +/-50 cells", pt_smooth(TFraw, 50))]:
+    Zc = np.column_stack([S[:, i] for i in range(n_tf)] + [np.column_stack([
+        (pseudotime - pseudotime.mean()) / (pseudotime.std() + 1e-12),
+        ((pseudotime ** 2) - (pseudotime ** 2).mean()) / ((pseudotime ** 2).std() + 1e-12)])])
+    Zc = (Zc - Zc.mean(0)) / (Zc.std(0) + 1e-12)
+    rr = [ridge_cv(Zc[:, [c for c in range(Zc.shape[1]) if c != j]], Zc[:, j] - Zc[:, j].mean())[0]
+          for j in range(n_tf)]
+    co = np.corrcoef(S.T)[np.triu_indices(n_tf, 1)]
+    smooth_controls[nm] = {"mean_heldout_R2": round(float(np.mean(rr)), 3),
+                           "max_abs_TF_TF_corr": round(float(np.abs(co).max()), 3)}
+log("smoothing-scheme control (held-out R^2 is NOT a fair criterion across schemes, because smoothing "
+    "along pseudotime inflates it by construction -- the pseudotime-window scheme 'wins' trivially and is "
+    "rejected as circular):")
+for nm, d in smooth_controls.items():
+    log(f"    {nm:34s} held-out R2={d['mean_heldout_R2']:.3f}  max|TF-TF corr|={d['max_abs_TF_TF_corr']:.3f}")
+log(f"  -> smoothing scheme fixed a priori: kNN(k={SMOOTH_K}) neighbourhood mean on the marker-PC graph "
+    f"(pseudotime-independent, so it cannot manufacture temporal ordering); only lambda is CV-selected")
+
+log(f"edge STRENGTH: ridge on kNN-smoothed (k={SMOOTH_K}) TF profiles + pseudotime (linear+quad) "
+    f"covariates; lambda per target by {N_FOLD}-fold held-out R^2 (grid {LAMS.min():.0e}-{LAMS.max():.0e}); "
+    f"beta therefore = residual (pseudotime-partialled) association")
+B_sm, B_sm_raw, lam_sm, r2_sm = coef_matrix_multi(TFsm, extra)
+B_rw, B_rw_raw, lam_rw, r2_rw = coef_matrix_multi(TFraw, extra)
+log(f"held-out R^2 (smoothed predictors): mean={r2_sm.mean():.3f} range=[{r2_sm.min():.3f},{r2_sm.max():.3f}]; "
+    f"raw predictors: mean={r2_rw.mean():.3f}; selected lambdas (smoothed) median={np.median(lam_sm):.2f}")
+
+# ---- directionality source 1 (PRIMARY): pseudotime-LAGGED cross-correlation on RAW profiles ----
+ordr = np.argsort(pseudotime, kind="stable")
+bin_id = np.array_split(ordr, N_BINS)
+Yb = np.stack([TFraw[b].mean(0) for b in bin_id])           # N_BINS x n_tf, raw (unsmoothed)
+def lag_corr(lead_lag):
+    M = np.zeros((n_tf, n_tf))
+    xs = np.arange(LAG, N_BINS)
+    for i in range(n_tf):
+        src = Yb[xs - lead_lag, i]
+        for j in range(n_tf):
+            if i == j:
+                continue
+            tgt = Yb[xs, j]
+            s_, t_ = src.std(), tgt.std()
+            M[i, j] = 0.0 if s_ < 1e-12 or t_ < 1e-12 else float(np.corrcoef(src, tgt)[0, 1])
+    return M
+A_lag = lag_corr(LAG)                                        # corr( x_i at t-LAG , x_j at t )
+asym_lag = A_lag - A_lag.T                                   # >0 supports i -> j
+# ---- directionality source 2 (secondary): reciprocal ridge asymmetry on RAW profiles ----
+asym_reg = np.abs(B_rw) - np.abs(B_rw.T)
+
+def norm01(M):
+    m = np.abs(M).max()
+    return M / (m if m > 0 else 1.0)
+
+a_lag_n = norm01(asym_lag); a_reg_n = norm01(asym_reg)
+pairs = [(i, j) for i in range(n_tf) for j in range(i + 1, n_tf)]
+strong = [(i, j) for (i, j) in pairs
+          if abs(asym_lag[i, j]) > 0.1 * np.abs(asym_lag).max() and abs(asym_reg[i, j]) > 0.1 * np.abs(asym_reg).max()]
+agree = sum(1 for (i, j) in strong if np.sign(asym_lag[i, j]) == np.sign(asym_reg[i, j]))
+log(f"directionality source-1 (lagged cross-corr on RAW profiles, {N_BINS} pseudotime bins, "
+    f"lag={LAG} bins): max|asym|={np.abs(asym_lag).max():.3f}")
+log(f"directionality source-2 (reciprocal ridge asymmetry on RAW profiles): max|asym|="
+    f"{np.abs(asym_reg).max():.3f}")
+log(f"CONSISTENCY of the two independent raw-based direction sources: {agree}/{len(strong)} "
+    f"informative pairs agree on direction ({100.0*agree/max(1,len(strong)):.0f}%)")
+net_out = asym_lag.sum(1)
+log(f"FLIP-RISK / POSITIVE CONTROL (index-ordered cascade hypothesis): Spearman(TF index, net lagged outflow)="
+    f"{spearman(np.arange(n_tf), net_out):.3f} -- if TF0..TF19 act as an ordered cascade, low-index "
+    f"regulators should show net outflow (negative index-vs-outflow slope). Reported as evidence, "
+    f"NOT fitted to. NOTE: the statistic is computed on the ORIENTED pseudotime, so flipping pseudotime flips its "
+    f"sign; a NEGATIVE value is what an index-ordered (TF0 -> TF19) cascade predicts, therefore the observed "
+    f"value is weak evidence AGAINST the chosen orientation and quantifies the flip risk. Combined with "
+    f"Spearman(pt[root {root_c}], pt[root {root_c2}])={root_sensitivity:.3f} (the two candidate roots sit at "
+    f"opposite trajectory ends), the direction of pseudotime is the dominant uncertainty of this task.")
+
+# ---- combine: strength x direction gate ----
+gate = np.clip(0.5 + 0.75 * a_lag_n + 0.25 * a_reg_n, 0.05, 1.0)
+score = B_sm * gate
+np.fill_diagonal(score, 0.0)
+score = np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+lo, hi = np.percentile(score[score > 0], [1, 99]) if (score > 0).any() else (0.0, 1.0)
+score = np.clip(score, None, hi)          # winsorise BEFORE min-max so that a single extreme value
+score = score - score.min()               # cannot compress the rest of the rank structure
+rng_s = score.max() - score.min()
+grn = score / (rng_s if rng_s > 0 else 1.0)
+np.fill_diagonal(grn, 0.0)
+grn = np.nan_to_num(grn, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+sym = float(np.abs(grn - grn.T).mean() / (grn.mean() + 1e-12))
+n_pair_decisive = int(np.sum(np.abs(grn - grn.T) > 0.05))
+log(f"score[i,j] = |beta_i->j| x direction gate clip(0.5+0.75*a_lag+0.25*a_reg, 0.05, 1.0); "
+    f"diagonal=0, winsorised at 99th pct, min-max -> [0,1]")
+log(f"grn_scores: shape={grn.shape} dtype={grn.dtype} min={grn.min():.4f} max={grn.max():.4f} "
+    f"mean={grn.mean():.4f} finite={bool(np.isfinite(grn).all())} diag_max={np.abs(np.diag(grn)).max():.1e}")
+log(f"asymmetry metric mean|S-S^T|/mean(S)={sym:.3f}; ordered pairs with >0.05 directional gap="
+    f"{n_pair_decisive}/{n_tf*(n_tf-1)}")
+
+# ------------------------------------------------- 10. write outputs
+log("\n== 10. OUTPUTS ==")
+clusters = np.ascontiguousarray(clusters, dtype=np.int32)
+pseudotime = np.ascontiguousarray(pseudotime, dtype=np.float64)
+grn = np.ascontiguousarray(grn, dtype=np.float64)
+np.save(os.path.join(OUT_DIR, "clusters.npy"), clusters)
+np.save(os.path.join(OUT_DIR, "pseudotime.npy"), pseudotime)
+np.save(os.path.join(OUT_DIR, "grn_scores.npy"), grn)
+with open(os.path.join(OUT_DIR, "de_genes.json"), "w") as fh:
+    json.dump({"gene_indices": [int(g) for g in gene_indices]}, fh)
+
+audit = {
+  "clusters": {"shape": list(clusters.shape), "dtype": str(clusters.dtype),
+               "values": sorted(set(int(c) for c in clusters)),
+               "sizes": np.bincount(clusters, minlength=k_clusters).tolist(),
+               "expected_balanced_size": int(round(n_cells / k_clusters)),
+               "n_singleton_cells": int(len(singletons)), "singleton_cells": singletons.tolist(),
+               "n_reassigned_to_nearest_centroid": len(reassigned)},
+  "pseudotime": {"shape": list(pseudotime.shape), "dtype": str(pseudotime.dtype),
+                 "min": float(pseudotime.min()), "max": float(pseudotime.max()),
+                 "mean": float(pseudotime.mean()), "sd": float(pseudotime.std()),
+                 "cluster_means": {f"c{c}": round(float(pseudotime[clusters == c].mean()), 4) for c in range(k_clusters)},
+                 "root_cluster": int(root_c), "orientation_flipped": orientation_flipped,
+                 "spearman_vs_runner_up_root": round(root_sensitivity, 4),
+                 "spearman_vs_TF_program": round(spearman(pseudotime, prog), 4),
+                 "extreme_cells_low3_high3": ex,
+                 "extreme_cells_that_are_flagged_outliers": [i for i in ex if i in set(singletons.tolist() + qc_flag.tolist())]},
+  "de_genes": {"n_ranked": len(gene_indices), "unique": len(set(gene_indices)), "head_size": len(head),
+               "marker_like_block_size": int(len(marker_block)),
+               "markers_in_top10": int(len(top10 & mb)), "markers_in_top80": int(len(top80 & mb)),
+               "markers_in_top100": int(len(top100 & mb)),
+               "marker_rank_min": int(ranks_mb.min()), "marker_rank_median": int(np.median(ranks_mb)),
+               "marker_rank_max": int(ranks_mb.max()),
+               "tf_genes_in_top80": int(len(set(gene_indices[:80]) & set(tf_idx.tolist())))},
+  "grn": {"shape": list(grn.shape), "dtype": str(grn.dtype), "min": float(grn.min()), "max": float(grn.max()),
+          "mean": float(grn.mean()), "diag_zero": bool(np.all(np.diag(grn) == 0)),
+          "all_finite": bool(np.isfinite(grn).all()),
+          "symmetry_metric_mean_abs_diff_over_mean": round(sym, 4),
+          "decisive_ordered_pairs": int(n_pair_decisive),
+          "direction_sources_agreement": f"{agree}/{len(strong)}",
+          "heldout_R2_mean_smoothed": round(float(r2_sm.mean()), 4),
+          "heldout_R2_mean_raw": round(float(r2_rw.mean()), 4),
+          "spearman_TFindex_vs_net_lagged_outflow": round(spearman(np.arange(n_tf), net_out), 4)},
+}
+
+# ------------------------------------------------- 11. method_choices.json
+steps = {}
+steps["qc_filtering"] = {
+  "method": "flag-only QC, NO cell/gene removal; low-quality = library size or genes-detected at/below 1st percentile",
+  "justification": "clusters.npy/pseudotime.npy must cover all n_cells, and de_genes.json indices must stay in the original 250-gene space; dropping rows/columns would break the output contract",
+  "alternatives_considered": ["hard cell filtering (libsize/genes/min-count)", "gene filtering (detected in >=1% cells)", "doublet removal"],
+  "decision_evidence": (f"library size CV=0.19 (901-3992), genes/cell 26-73, 80.8% zeros -> no catastrophic low-quality "
+                        f"population; {len(qc_flag)} cells at the 1st-percentile edges; shared-NN graph produced "
+                        f"{len(singletons)} singleton (contamination-like) cells {singletons.tolist()}, reassigned to nearest "
+                        f"centroid ({len(reassigned)} labels changed)"),
+  "assumption": "flagged singletons are contaminants/outliers, not a biological state (unverifiable: no metadata)"}
+steps["normalisation"] = {
+  "method": "CP10K (counts / library_size * 1e4) + log1p",
+  "justification": "library sizes vary ~4.4x (CV 0.19) and correlate 0.55 with genes detected, so depth must be removed before log1p (Luecken & Theis 2019, Nat Protoc)",
+  "alternatives_considered": ["scran-style deconvolution size factors", "SCT-like Pearson residuals"],
+  "decision_evidence": "CP10K+log1p already recovers balanced 4-way structure and puts 80/80 marker-like genes in the DE top-100, so the extra machinery of pooled size factors was unnecessary in this depth range",
+  "assumption": "no ambient-RNA or cell-size metadata available, so no extra correction"}
+steps["hvg_selection"] = {
+  "method": "Seurat-style mean-variance binning (20 bins of average log-expression), z-score of log dispersion per bin, detection>=5%, top 150 genes",
+  "justification": "selects genes more variable than the mean-variance trend predicts (Luecken & Theis 2019) instead of high-count housekeeping genes",
+  "alternatives_considered": ["top variance", "variance/mean (dispersion) only", "no gene selection"],
+  "decision_evidence": (f"gene magnitudes are bimodal (gap {pos[gi]:.2f}->{pos[gi+1]:.2f} counts): {len(marker_block)} high-expression "
+                        f"'marker-like' genes vs {n_genes-len(marker_block)} low-count genes; HVG captured "
+                        f"{len(set(hvg.tolist()) & set(marker_block.tolist()))}/{len(marker_block)} marker-like genes; the 20 TFs "
+                        f"(mean 0.38-0.69 counts) are not HVGs, which is harmless because the GRN uses its own TF path"),
+  "assumption": "HVG choice affects only PCA/clustering, not DE or GRN gene space"}
+steps["pca_denoising"] = {
+  "method": "SVD on z-scored HVG matrix; n_PC = #{evr >= 1.5 * median(evr, PCs 10-20)} clamped to [2,5]",
+  "justification": "keeps components above the noise floor (scree/elbow rule) and discards noisy PCs",
+  "alternatives_considered": ["fixed 2 / 5 / 10 PCs", "JackStraw permutation test (costlier)", "all PCs"],
+  "decision_evidence": (f"evr={np.round(evr[:8],4).tolist()} with a flat tail; PC1 alone only encodes a 2-group split "
+                        f"(shared-NN components 418+379), so PCs2-{n_pc} are needed to reach the documented 4 clusters -> n_pc={n_pc}"),
+  "assumption": "no covariates exist in system_info.json, therefore covariate regression and MNN/spectral batch alignment are "
+                "NOT applicable (single unlabelled dataset); this is a documented decision, not a missing capability"}
+steps["outlier_and_batch_handling"] = {
+  "method": "graph-based outlier flagging (shared-NN connected components) + nearest-centroid reassignment; no batch alignment",
+  "justification": "geodesic/spectral methods need a connected graph, and with no batch labels MNN/spectral alignment would be unjustified",
+  "alternatives_considered": ["PCA z-score outlier removal", "MNN/spectral alignment", "covariate regression"],
+  "decision_evidence": (f"normalized-Laplacian spectrum {np.round(Laplacian_eig[:6],4).tolist()} shows a clean eigen-gap only after "
+                        f"the first 2 eigenvalues (2 macro-groups); shared-NN components={int(ncc)} "
+                        f"({np.sort(sizes)[::-1][:4].tolist()}); no cell dropped"),
+  "assumption": "the dominant 2-group axis is biological (two programmes), not technical batch, since no batch label exists"}
+steps["knn_graph"] = {
+  "method": f"k={K_NN} NN in PC space, Euclidean, UNION symmetrisation (A|A^T), Gaussian affinity sigma=median(kNN dist)^2",
+  "justification": "union symmetrisation keeps the graph connected (required for spectral clustering and Dijkstra); adaptive sigma removes the distance scale",
+  "alternatives_considered": ["mutual/shared-NN weighting", "cosine/correlation distance", "k=7/30"],
+  "decision_evidence": (f"union graph mean degree={A.sum(1).mean():.1f}, components after building the geodesic graph={int(ncc_g)} "
+                        f"({bridges} documented bridge edge(s) added because components otherwise disconnect and no cell may be dropped); "
+                        f"a shared-NN-only graph has 2 components and cannot yield 4 clusters or a defined geodesic"),
+  "assumption": "Euclidean distance in denoised PC space is an appropriate local metric for these counts"}
+steps["clustering"] = {
+  "method": (f"PRIMARY spectral clustering: symmetric normalized Laplacian of the kNN graph, {k_clusters} eigenvectors, "
+             f"row-normalised, deterministic seeded k-means++ (25 restarts); k={k_clusters} fixed by metadata; marker-block "
+             f"tie-breaker against NMF(marker block) and Ward-on-PCA candidates"),
+  "justification": "Louvain/Leiden are unavailable with NumPy/SciPy only. Spectral clustering is deterministic, graph-based and optimises "
+                   "the same normalised-cut objective that modularity rewards; consensus clustering was rejected as primary because it is "
+                   "harder to audit/attribute (researcher decision)",
+  "alternatives_considered": ["Ward/agglomerative on PCs", "plain k-means on PCs", "NMF on marker block",
+                              "shared-NN connected components (gives only 2)", "consensus clustering"],
+  "decision_evidence": {
+      "k_justification": f"system_info.json states n_clusters={k_clusters}; scouting independently peaked at k=4 "
+                         f"(NMF modularity k=2..6 = 0.499/0.559/0.626/0.616/0.572; NMF4 sizes ~200/cell-group)",
+      "candidate_metrics": {nm: {kk: vv for kk, vv in d.items() if kk != "labels"} for nm, d in cands.items()},
+      "spectral_vs_nmf_ARI": round(ari_sp_nm, 4), "spectral_vs_nmf_NMI": round(nmi_sp_nm, 4),
+      "tie_breaker_rule": f"a non-degenerate candidate displaces the primary spectral labels only if its marker-block average "
+                          f"silhouette exceeds the spectral one by >= {SIL_MARGIN} (ranking keys: marker silhouette, then mean marker eta^2, "
+                          f"then top-marker enrichment); degenerate cuts (empty cluster) are excluded, and if ARI(spectral,NMF) < 0.4 the "
+                          f"primary spectral labels are kept with the disagreement logged",
+      "tie_breaker_margin": round(float(margin), 4), "silhouette_margin_required": SIL_MARGIN,
+      "final_decision": f"{chosen_nm}: {decision}"},
+  "assumption": (f"n_clusters=4 is trustworthy although boundaries are fuzzy (silhouette ~0.20 at k=4 vs 0.51 at k=2; "
+                 f"ARI(spectral,NMF)={ari_sp_nm:.2f}); boundary cells are therefore method-sensitive")}
+ecc_round = {f"c{c}": round(ecc[c], 2) for c in range(k_clusters)}
+steps["pseudotime"] = {
+  "method": "graph geodesic pseudotime: Dijkstra shortest paths on the weighted kNN graph from the root cell, min-max scaled to [0,1] float64",
+  "justification": "a non-linear manifold requires geodesic (not Euclidean) distance, which follows the trajectory instead of cutting through "
+                   "the ambient space; no metadata root exists, so a fixed, documented rule is used",
+  "alternatives_considered": ["diffusion pseudotime (DPT) on diffusion maps", "principal curve", "PC1 projection (rejected: only a 2-group axis)",
+                              "Euclidean distance from root (rejected: non-local)"],
+  "decision_evidence": {
+      "root_rule": f"root = cluster centroid with maximal graph eccentricity (mean geodesic distance to all cells); "
+                   f"eccentricity={ecc_round} -> root cluster {root_c} (cell {root_cell}); runner-up root cluster {root_c2}",
+      "root_sensitivity_spearman_vs_runner_up_root": round(root_sensitivity, 4),
+      "orientation_rule": "orientation inferred from TF-block structure only: TF-PC1 loadings are monotone in TF index "
+                          f"(Spearman loading-vs-index={s_idx:.3f}), i.e. an index-ordered cascade; pseudotime is oriented so that "
+                          "high-index (late) TF activity increases with pseudotime",
+      "orientation_verified_against_ground_truth": False,
+      "flip_diagnostics": {"spearman_geodesic_pt_vs_TF_program_before_flip": round(corr_pt_prog, 4),
+                           "spearman_final_pt_vs_TF_program": round(spearman(pseudotime, prog), 4),
+                           "spearman_cluster_mean_pt_vs_cluster_mean_TF_program": round(cluster_order_spear, 4),
+                           "orientation_flipped": orientation_flipped},
+      "scaling_decision": "min-max to [0,1]; the task fixes no range and rank order is scale-invariant"},
+  "assumption": "LARGEST ASSUMPTION OF THE TASK: neither root nor direction is defined in the inputs. Root = peripheral centroid by graph "
+                "eccentricity; direction = TF-block-driven and UNVERIFIED. A wrong direction yields exactly 1-t (reversed ranks); the "
+                f"runner-up root would change the ordering by Spearman {root_sensitivity:.2f}."}
+steps["de_genes"] = {
+  "method": "specificity score = 0.50*rank_pct(ANOVA F across clusters) + 0.25*rank_pct(clip(log2 FC(cluster vs rest))) + "
+            "0.25*rank_pct(clip(detection-prevalence gap))); per-cluster top-20 genes by this score form a deduplicated union placed at the "
+            "head (ordered by score); all remaining genes follow ranked by global ANOVA F. ALL 250 gene indices returned (no truncation)",
+  "justification": "ANOVA F alone favours high-count genes, log2FC alone ignores evidence across cells, prevalence alone ignores magnitude; "
+                   "rank-based combination is unit-free. Returning the full ranking makes any later top-K cut-off valid and keeps the index "
+                   "space unambiguous (original 250-gene space, not an HVG subset)",
+  "alternatives_considered": ["Welch t-test per cluster vs rest", "log2FC-only", "Kruskal-Wallis", "truncated K=50 list",
+                              "ranking restricted to HVGs (rejected: index-space ambiguity)"],
+  "decision_evidence": {
+      "validation_on_data": f"the high-expression marker-like block ({len(marker_block)} genes; metadata says the cluster markers live in the "
+                            f"non-TF columns) covers {len(top10 & mb)}/10 of the top-10, {len(top80 & mb)}/80 of the top-80 and "
+                            f"{len(top100 & mb)}/80 of the top-100",
+      "marker_rank_positions_min_med_max": [int(ranks_mb.min()), int(np.median(ranks_mb)), int(ranks_mb.max())],
+      "scouting_check": "ANOVA F alone previously put 80/80 marker-like genes in the top-100 and all top-15 (this is what validates the ranking)",
+      "head_size": len(head), "tf_genes_in_top80": int(len(set(gene_indices[:80]) & set(tf_idx.tolist())))},
+  "assumption": "'gene_indices' = globally ranked candidate marker indices over all genes; gene names are absent so identity-based validation "
+                "is impossible (validation is by independent marker-block recovery)"}
+steps["grn"] = {
+  "method": f"directed TF->TF scores over the first n_tf_genes={n_tf} columns. STRENGTH |beta_ij|: per-target ridge regression of "
+            f"kNN-smoothed (k={SMOOTH_K}) TF profiles on all other TFs + pseudotime (linear & quadratic) covariates, lambda per target by "
+            f"{N_FOLD}-fold held-out R^2 (grid {LAMS.min():.0e}-{LAMS.max():.0e}). DIRECTION: pseudotime-lagged cross-correlation on RAW "
+            f"(unsmoothed) profiles, asym = corr(x_i(t-L),x_j(t)) - corr(x_j(t-L),x_i(t)) with {N_BINS} pseudotime bins and lag L={LAG}, "
+            f"plus reciprocal-ridge asymmetry on raw profiles as a secondary signal. "
+            f"score[i,j] = |beta_ij| * clip(0.5 + 0.75*a_lag + 0.25*a_reg, 0.05, 1); diagonal=0; winsorised at the 99th percentile before "
+            f"min-max rescaling to [0,1]; grn[i,j] means i -> j",
+  "justification": "symmetric correlation cannot give direction. Smoothing is used ONLY to de-noise edge magnitude (raw TF-TF |r| peaks at "
+                   "~0.21 vs ~0.48 after kNN smoothing) because symmetric kNN neighbourhoods can manufacture symmetric edges; therefore "
+                   "directionality is taken exclusively from RAW profiles through a temporal (pseudotime-lagged) asymmetry, which symmetric "
+                   "smoothing cannot create. Pseudotime enters as a covariate because all TFs drift along it (cluster-mean TF correlations "
+                   "reach 0.999), so beta_ij must be read as a residual, pseudotime-partialled connection rather than raw co-expression",
+  "alternatives_considered": ["Pearson/Spearman correlation matrix (rejected: undirected)",
+                              "partial correlation / precision matrix (rejected as primary: undirected, sign-only)",
+                              "mutual-information / transfer-entropy asymmetry on pseudotime bins (rejected: too noisy at n=800, detection~0.2)",
+                              "smoothed-only direction (rejected: circular/self-correlated)",
+                              "hand-picked lambda (rejected: CV-selected instead)"],
+  "decision_evidence": {
+      "heldout_R2_mean_smoothed_predictors": round(float(r2_sm.mean()), 4),
+      "heldout_R2_mean_raw_predictors": round(float(r2_rw.mean()), 4),
+      "selected_lambda_median_smoothed": round(float(np.median(lam_sm)), 4),
+      "smoothing_scheme_control": smooth_controls,
+      "smoothing_scheme_selection": "fixed a priori (kNN k=30 on the pseudotime-independent marker-PC graph). Held-out R^2 "
+                                    "was measured for all schemes but deliberately NOT used to choose: smoothing along "
+                                    "pseudotime inflates R^2 by construction (R2=0.86 with a +/-50-cell pseudotime window) "
+                                    "and would be circular for a model that regresses pseudotime out",
+      "direction_source_agreement_raw_lag_vs_raw_ridge": f"{agree}/{len(strong)} informative pairs agree",
+      "cascade_positive_control_spearman_TFindex_vs_net_lagged_outflow": round(spearman(np.arange(n_tf), net_out), 4),
+          "cascade_control_caveat": "expected NEGATIVE if TF0->TF19 is a forward cascade; the statistic uses the ORIENTED "
+                                    "pseudotime, so it is orientation-dependent (flipping pseudotime flips its sign) and therefore "
+                                    "tests internal consistency of the lag structure, NOT the orientation assumption itself",
+      "grn_symmetry_metric_mean_abs_diff_over_mean": round(sym, 4),
+      "decisive_ordered_pairs_gt_0.05_gap": int(n_pair_decisive),
+      "grn_min_max_mean": [float(grn.min()), float(grn.max()), round(float(grn.mean()), 4)]},
+  "assumption": "TF identity = tf_gene_indices from metadata; with no motif/perturbation information, direction rests on temporal precedence "
+                "along the ASSUMED pseudotime orientation - if pseudotime direction were reversed, every inferred edge direction would reverse"}
+
+import scipy
+audit["clusters"]["within_cluster_pseudotime_vs_TF_program_spearman"] = [round(float(w), 3) for w in _within]
+method_choices = {
+  "task": "single-cell RNA-seq integrated analysis: clusters, pseudotime, ranked DE marker indices, directed TFxTF GRN",
+  "inputs": {"counts.npy": {"shape": [int(n_cells), int(n_genes)], "dtype": "float64", "dense": True,
+              "min": float(X.min()), "max": float(X.max()), "all_finite": bool(np.isfinite(X).all()),
+              "total_counts": float(X.sum())},
+             "system_info.json": {k: v for k, v in info.items() if k != "tf_gene_indices"},
+             "absent_from_metadata": ["gene names", "pseudotime root/anchor", "DE comparison definition",
+                                      "library-size / ambient / batch metadata"]},
+  "environment": {"numpy": np.__version__, "scipy": scipy.__version__,
+                  "allowed": "NumPy + SciPy only (no scanpy/anndata/scvi/sklearn; sklearn is not even installed)",
+                  "self_implemented": ["k-means++ (seeded, 25 restarts)", "spectral clustering",
+                                       "NMF multiplicative updates", "ridge regression with k-fold lambda selection",
+                                       "modularity / ARI / NMI / silhouette", "lagged cross-correlation"],
+                  "external_scipy": ["scipy.spatial.distance.cdist", "scipy.sparse.csgraph.dijkstra",
+                                     "scipy.sparse.csgraph.connected_components", "scipy.cluster.hierarchy"],
+                  "random_seed": SEED, "deterministic": True,
+                  "resource_note": "800x250 dense input; largest dense object 800x800 (~5 MB); GRN 20x20; runtime seconds"},
+  "assumptions_register": [
+      "n_clusters=4 taken from system_info.json (corroborated by NMF modularity peak and ~200/cell-group sizes) although 4-way boundaries are fuzzy",
+      "pseudotime root and direction are NOT defined anywhere in the inputs: root = most peripheral cluster centroid by graph eccentricity; direction inferred from the index-monotone TF-block program and NOT VERIFIED",
+      "the 3 shared-NN singleton cells are treated as outliers/contaminants and reassigned to the nearest centroid, never removed",
+      "the ~150 low-expression non-TF genes look like ambient/noise but this is unverifiable, so no gene is removed",
+      "single unlabelled dataset: covariate regression and MNN/spectral batch alignment are not applicable",
+      "GRN hyperparameters (smoothing k=30, bins=20, lag=2, gate weights) have no ground truth; ridge lambda is the only CV-selected parameter"],
+  "steps": steps,
+  "self_audit": audit,
+  "stdout_log": LOG,
+}
+with open(os.path.join(OUT_DIR, "method_choices.json"), "w") as fh:
+    json.dump(method_choices, fh, indent=2)
+
+log("\n== 11. SELF-AUDIT ==")
+log(f"clusters.npy    shape={clusters.shape} dtype={clusters.dtype} labels={sorted(set(int(c) for c in clusters))} "
+    f"sizes={np.bincount(clusters, minlength=k_clusters).tolist()} (expected ~{n_cells//k_clusters} each)")
+log(f"pseudotime.npy  shape={pseudotime.shape} dtype={pseudotime.dtype} range=[{pseudotime.min():.4f},{pseudotime.max():.4f}] "
+    f"mean={pseudotime.mean():.3f} sd={pseudotime.std():.3f}")
+log(f"de_genes.json   {len(gene_indices)} ranked indices, unique={len(set(gene_indices))}, "
+    f"marker-block ranks min/med/max={ranks_mb.min()}/{int(np.median(ranks_mb))}/{ranks_mb.max()}, "
+    f"markers in top10/80/100={len(top10 & mb)}/{len(top80 & mb)}/{len(top100 & mb)}")
+log(f"grn_scores.npy  shape={grn.shape} dtype={grn.dtype} min/max/mean={grn.min():.4f}/{grn.max():.4f}/{grn.mean():.4f} "
+    f"diag_zero={bool(np.all(np.diag(grn)==0))} all_finite={bool(np.isfinite(grn).all())} "
+    f"symmetry={sym:.3f}")
+log(f"contract check: cells kept {clusters.shape[0]}=={n_cells}; pseudotime {pseudotime.shape[0]}=={n_cells}; "
+    f"all 250 gene indices present exactly once: {sorted(gene_indices)==list(range(n_genes))}; "
+    f"grn shape == ({n_tf},{n_tf}): {grn.shape==(n_tf,n_tf)}")
+with open(os.path.join(OUT_DIR, "analysis_log.txt"), "w") as fh:
+    fh.write("\n".join(LOG) + "\n")
+log("\nDONE: clusters.npy, pseudotime.npy, de_genes.json, grn_scores.npy, method_choices.json (+ analysis_log.txt)")

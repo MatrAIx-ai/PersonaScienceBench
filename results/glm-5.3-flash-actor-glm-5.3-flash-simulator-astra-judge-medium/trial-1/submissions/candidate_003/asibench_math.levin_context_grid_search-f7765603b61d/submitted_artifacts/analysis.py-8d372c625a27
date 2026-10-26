@@ -1,0 +1,784 @@
+"""analysis.py -- learned action-selection policy for symbolic grid-search.
+
+Required interface:
+    make_policy(training_data: dict, config: dict | None = None) -> policy
+    policy.action_probs(level: dict, state: dict, legal_actions: list[str])
+        -> dict[str, float]
+
+Approach (approved): learned RANKING over legal actions (multinomial logistic
+regression, numpy only), trained by imitation on demo replay, plus a
+deterministic LOCAL fallback heuristic.  Features use ONLY the observation
+fields the scorer promises (state: cell, neighbors, previous_action, history,
+history_tail, run_length_bucket, depth, depth_mod, depth_phase, legal_mask,
+legal_actions) and non-spatial level metadata (max_depth).  No grid and no
+coordinates are required at call time.
+
+ASSUMPTIONS about scorer semantics (explicit; all handled defensively):
+  A1  state['cell']             current cell symbol (str or absent).
+  A2  state['neighbors']        mapping action -> neighbour symbol, U/D/L/R
+                                (dict or attr object; may be absent).
+  A3  state['previous_action']  last action or None at t=0 (recomputed from
+                                history if absent).
+  A4  state['history']          actions taken so far (may be absent).
+  A5  state['history_tail']     recent suffix, length unknown (used defensively).
+  A6  state['run_length_bucket'] bucket of current same-action run; binning is a
+                                GUESS {0:<2, 1:<4, 2:<8, 3:else}; any value
+                                accepted; raw run length is also a feature.
+  A7  state['depth']            steps taken from start (recomputed from history
+                                if absent).
+  A8  state['depth_mod']        GUESS depth % 20 (20 tile letters a..t).
+  A9  state['depth_phase']      GUESS (depth // 20) % 4.
+  A10 state['legal_mask']       aligned with ['U','D','L','R']; cross-checked
+                                against legal_actions, never trusted blindly.
+  A11 GOAL INFO IS OPTIONAL: if the scorer passes reconstructible goal/start
+      positions (level or state), goal-relative features are used; otherwise
+      they are filled with training-mean neutral values so they cannot affect
+      the ranking.  The model is trained WITH goal-feature dropout (30% of
+      steps) so it works in both regimes.  Explicit assumption, flagged.
+  A12 On any missing/malformed field or degenerate learned score the policy
+      degrades to the LOCAL FALLBACK heuristic, never to uniform.
+
+Validation results (python analysis.py; sanity check, NOT proof of hidden
+scorer behaviour -- our own reconstructed observation semantics):
+  - Imitation fit: 6464 demo steps, 54 features, multinomial logistic (numpy
+    only).  Honest holdout (last 10% of levels unseen during fit):
+    top-1 action accuracy 0.955 (n=661), final train avg NLL 0.085.
+  - Public eval, policy-ordered DFS, budget 95, NO spatial metadata
+    (contract-strict): 4/4 levels solved, expansions 45/55/43/57
+    (paths len 44/54/42/56 vs BFS-shortest 20/14/32/26 and hypothetical
+    demo length max_depth-27 = 44/54/50/48).  With spatial metadata in level:
+    identical outcome (goal features contribute little; local style suffices).
+  - Level-synchronous beam-3 with the same policy: 2/4 (the demo style rewards
+    depth commitment; wide diluting beams burn the budget).  Search-scheme
+    sensitivity is reported openly; the hidden search scheme is unknown.
+  - Robustness: empty/missing/malformed state fields -> neutral features or
+    fallback, no crashes; unknown actions filtered; ~0.08 ms per call.
+
+Known limitations (stated):
+  - depth_mod / depth_phase / run_length_bucket semantics are NOT observable
+    from data/training_levels.json (it stores action strings only).
+  - Cell letters a..t show only chance-level correlation with position/depth;
+    letter features are cheap L2-regularised hedges.
+  - max_depth == len(solution) + 27 held on all 260 training levels; treated as
+    a generation artifact, NOT hardcoded.  max_depth is used only as a budget.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+ACTIONS: List[str] = ["U", "D", "L", "R"]
+DELTA: Dict[str, Tuple[int, int]] = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+OPP: Dict[str, str] = {"U": "D", "D": "U", "L": "R", "R": "L"}
+TILE_LETTERS = "abcdefghijklmnopqrst"  # 20 filler letters observed in training
+
+
+# --------------------------------------------------------------------------
+# defensive state readers (never raise; unknown -> None -> neutral features)
+# --------------------------------------------------------------------------
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _norm_action(v: Any) -> Optional[str]:
+    if isinstance(v, str):
+        v = v.strip().upper()[:1]
+        return v if v in DELTA else None
+    return None
+
+
+def _as_int(v: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if v is None or isinstance(v, bool):
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _history(state: Any) -> List[str]:
+    """Best-effort action history: history, else history_tail, else previous."""
+    for key in ("history", "history_tail"):
+        h = _get(state, key)
+        if isinstance(h, (list, tuple)):
+            acts = [a for a in (_norm_action(x) for x in h) if a]
+            if acts:
+                return acts
+    pa = _norm_action(_get(state, "previous_action"))
+    return [pa] if pa else []
+
+
+def _prev_action(state: Any) -> Optional[str]:
+    pa = _norm_action(_get(state, "previous_action"))
+    if pa:
+        return pa
+    h = _history(state)
+    return h[-1] if h else None
+
+
+def _run_length(state: Any) -> int:
+    h = _history(state)
+    if not h:
+        return 0
+    last = h[-1]
+    n = 0
+    for a in reversed(h):
+        if a == last:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _bucket(run_len: int) -> int:
+    """ASSUMED bucketing (A6)."""
+    if run_len < 2:
+        return 0
+    if run_len < 4:
+        return 1
+    if run_len < 8:
+        return 2
+    return 3
+
+
+def _neighbor_symbol(state: Any, action: str) -> Optional[str]:
+    nb = _get(state, "neighbors")
+    if nb is None:
+        return None
+    if isinstance(nb, dict):
+        v = nb.get(action)
+    else:
+        v = getattr(nb, action, None)
+        if v is None and hasattr(nb, "get"):
+            v = nb.get(action)
+    if isinstance(v, (list, tuple)) and v:
+        v = v[0]
+    return v if isinstance(v, str) else None
+
+
+def _cell_symbol(state: Any) -> Optional[str]:
+    c = _get(state, "cell")
+    return c if isinstance(c, str) else None
+
+
+def _walked_path(state: Any) -> List[Tuple[int, int]]:
+    """Positions RELATIVE to the start, from history only (no coordinates needed)."""
+    path = [(0, 0)]
+    for a in _history(state):
+        dr, dc = DELTA[a]
+        r, c = path[-1]
+        path.append((r + dr, c + dc))
+    return path
+
+
+def _goal_info(state: Any, level: Any) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """(current_abs_position, goal_position) if BOTH reconstructible (A11)."""
+    goal = _get(level, "goal") or _get(state, "goal")
+    if not (isinstance(goal, (list, tuple)) and len(goal) == 2):
+        return None
+    start = _get(level, "start") or _get(state, "start")
+    if isinstance(start, (list, tuple)) and len(start) == 2:
+        r0, c0 = _as_int(start[0], 0), _as_int(start[1], 0)
+        for a in _history(state):
+            dr, dc = DELTA[a]
+            r0, c0 = r0 + dr, c0 + dc
+        return (r0, c0), (_as_int(goal[0], 0), _as_int(goal[1], 0))
+    return None
+
+
+# --------------------------------------------------------------------------
+# feature extraction (SAME code path for training replay and inference)
+# --------------------------------------------------------------------------
+FEATURES: List[str] = (
+    ["bias"]
+    + [f"act_{a}" for a in ACTIONS]
+    + [f"prev_{a}" for a in ACTIONS]
+    + [f"pair_{p}_{a}" for p in ACTIONS for a in ACTIONS]
+    + ["continues_run", "continues_x_runlen", "is_reverse",
+       "runlen_norm", "bucket_norm", "bucket_x_continues", "legal_count_norm",
+       "cand_letter_idx", "cur_letter_idx", "cur_degree",
+       "unvisited_next", "visit_count_next", "in_tail_frac", "in_tail_last3",
+       "depth_norm", "depth_mod_norm"]
+    + [f"phase_{i}" for i in range(4)]
+    + [f"phase{i}_x_cont" for i in range(4)]
+    + ["toward_goal", "toward_x_cont", "goal_dist_norm",
+       "goal_missing", "goal_missing_x_cont"]
+)
+NF = len(FEATURES)
+
+
+def raw_features(state: Any, level: Any, action: str,
+                 legal_actions: Sequence[str]) -> Dict[str, Optional[float]]:
+    """Per-(state, action) features.  None == 'not available at call time';
+    replaced by the per-feature TRAINING MEAN (neutral: identical across the
+    candidate actions of a step, so it cannot distort the ranking)."""
+    f: Dict[str, Optional[float]] = {n: None for n in FEATURES}
+    f["bias"] = 1.0
+    f[f"act_{action}"] = 1.0
+
+    prev = _prev_action(state)
+    hist = _history(state)
+    if prev is not None:
+        f[f"prev_{prev}"] = 1.0
+        f[f"pair_{prev}_{action}"] = 1.0
+        f["continues_run"] = 1.0 if action == prev else 0.0
+        f["is_reverse"] = 1.0 if OPP[action] == prev else 0.0
+
+    run_len = _run_length(state)
+    f["runlen_norm"] = min(run_len, 10) / 10.0
+    b = _as_int(_get(state, "run_length_bucket"), None)
+    if b is None or not (0 <= b <= 9):        # defensive: trust own reconstruction
+        b = _bucket(run_len)
+    f["bucket_norm"] = float(b) / 3.0
+    if f["continues_run"] is not None:
+        f["continues_x_runlen"] = f["continues_run"] * f["runlen_norm"]
+        f["bucket_x_continues"] = f["bucket_norm"] * f["continues_run"]
+
+    f["legal_count_norm"] = len(legal_actions) / 4.0
+
+    cand = _neighbor_symbol(state, action)
+    if cand is not None and cand != "#":
+        idx = TILE_LETTERS.find(cand)
+        if idx >= 0:
+            f["cand_letter_idx"] = idx / (len(TILE_LETTERS) - 1)
+    cur = _cell_symbol(state)
+    if cur is not None and cur != "#":
+        idx = TILE_LETTERS.find(cur)
+        if idx >= 0:
+            f["cur_letter_idx"] = idx / (len(TILE_LETTERS) - 1)
+    deg, seen = 0, 0
+    for a in ACTIONS:                          # onward degree of CURRENT cell
+        s = _neighbor_symbol(state, a)
+        if s is not None:
+            seen += 1
+            if s != "#":
+                deg += 1
+    if seen:
+        f["cur_degree"] = deg / 4.0
+
+    # novelty / self-avoidance from the walked path (coordinates not needed)
+    path = _walked_path(state)
+    dr, dc = DELTA[action]
+    r, c = path[-1]
+    visits = sum(1 for p in path if p == (r + dr, c + dc))
+    f["unvisited_next"] = 1.0 if visits == 0 else 0.0
+    f["visit_count_next"] = min(visits, 10) / 10.0
+
+    if hist:
+        tail = hist[-4:]
+        f["in_tail_frac"] = sum(1 for a in tail if a == action) / len(tail)
+        last3 = hist[-3:-1] if len(hist) >= 3 else hist[:-1]
+        if last3:
+            f["in_tail_last3"] = 1.0 if action in last3 else 0.0
+
+    depth = _as_int(_get(state, "depth"), None)
+    if depth is None:
+        depth = len(hist)
+    max_depth = _as_int(_get(level, "max_depth"), None) or 60
+    f["depth_norm"] = min(max(depth, 0), max_depth) / float(max_depth)
+    dm = _as_int(_get(state, "depth_mod"), None)
+    if dm is None:
+        dm = depth % 20                        # ASSUMPTION A8
+    f["depth_mod_norm"] = (dm % 20) / 19.0
+    ph = _as_int(_get(state, "depth_phase"), None)
+    if ph is None:
+        ph = (depth // 20) % 4                 # ASSUMPTION A9
+    ph %= 4
+    f[f"phase_{ph}"] = 1.0
+    if f["continues_run"] is not None:
+        f[f"phase{ph}_x_cont"] = f["continues_run"]
+
+    # ---- optional goal block (A11) ----
+    gi = _goal_info(state, level)
+    if gi is None:
+        f["goal_missing"] = 1.0
+        if f["continues_run"] is not None:
+            f["goal_missing_x_cont"] = f["continues_run"]
+        # toward_goal / goal_dist_norm stay None -> neutral fill
+    else:
+        (r, c), (gr, gc) = gi
+        dr_, dc_ = DELTA[action]
+        d_now = abs(r - gr) + abs(c - gc)
+        d_next = abs(r + dr_ - gr) + abs(c + dc_ - gc)
+        f["toward_goal"] = 1.0 if d_next < d_now else 0.0
+        if f["continues_run"] is not None:
+            f["toward_x_cont"] = f["toward_goal"] * f["continues_run"]
+        f["goal_dist_norm"] = min(d_now, max_depth) / float(max_depth)
+        f["goal_missing"] = 0.0
+    return f
+
+
+# --------------------------------------------------------------------------
+# deterministic LOCAL fallback (constraint #2: local fields only)
+# --------------------------------------------------------------------------
+def fallback_scores(state: Any, level: Any,
+                    legal_actions: Sequence[str]) -> Dict[str, float]:
+    """Momentum / no-immediate-reversal / novelty / degree heuristic.
+    Uses only previous_action + history (momentum, novelty, anti-oscillation)
+    and neighbors (wall/degree awareness).  No grid, no goal."""
+    prev = _prev_action(state)
+    hist = _history(state)
+    path = _walked_path(state)
+    tail = hist[-6:]
+    out: Dict[str, float] = {}
+    r, c = path[-1]
+    deg = sum(1 for x in ACTIONS if _neighbor_symbol(state, x) not in (None, "#"))
+    for a in legal_actions:
+        s = 0.0
+        if prev is not None:
+            if a == prev:
+                s += 2.0                       # momentum
+            elif OPP[a] == prev:
+                s -= 6.0                       # no immediate reversal
+        dr, dc = DELTA[a]
+        visits = sum(1 for p in path if p == (r + dr, c + dc))
+        s += 1.5 if visits == 0 else -0.8 * min(visits, 3)
+        if tail:
+            s -= 0.25 * sum(1 for x in tail if x == a)
+        if _neighbor_symbol(state, a) == "#":
+            s -= 4.0                           # never prefer walls
+        s += 0.1 * deg
+        out[a] = s
+    return out
+
+
+# --------------------------------------------------------------------------
+# training: multinomial logistic ranking fitted by imitation
+# --------------------------------------------------------------------------
+def replay_level(level: dict) -> List[Tuple[dict, str, List[str]]]:
+    """Replay a demo; yield (state, chosen_action, legal_actions) per step.
+    The synthesised state dict follows ASSUMPTIONS A1-A10 exactly."""
+    grid = level["grid"]
+    H, W = len(grid), len(grid[0])
+    r, c = level["start"]
+    hist: List[str] = []
+    steps = []
+    for t, a in enumerate(level["solution"]):
+        legal = [x for x in ACTIONS
+                 if 0 <= r + DELTA[x][0] < H and 0 <= c + DELTA[x][1] < W
+                 and grid[r + DELTA[x][0]][c + DELTA[x][1]] != "#"]
+        run_len = _run_length({"history": hist})
+        state = {
+            "cell": grid[r][c],
+            "neighbors": {x: (grid[r + DELTA[x][0]][c + DELTA[x][1]]
+                              if 0 <= r + DELTA[x][0] < H and 0 <= c + DELTA[x][1] < W
+                              else None) for x in ACTIONS},
+            "previous_action": hist[-1] if hist else None,
+            "history": list(hist),
+            "history_tail": hist[-4:],
+            "run_length_bucket": _bucket(run_len),
+            "depth": t,
+            "depth_mod": t % 20,
+            "depth_phase": (t // 20) % 4,
+            "legal_mask": [x in legal for x in ACTIONS],
+            "legal_actions": list(legal),
+            "start": list(level["start"]),   # enables goal features at train time
+        }
+        steps.append((state, a, legal))
+        r, c = r + DELTA[a][0], c + DELTA[a][1]
+        hist.append(a)
+    return steps
+
+
+class _LogisticRanker:
+    def __init__(self, dim: int):
+        self.W = np.zeros(dim)
+
+
+def _fit_grouped_softmax(Xf: np.ndarray, groups, l2: float, epochs: int
+                         ) -> Tuple[np.ndarray, float]:
+    """groups: list of (row_start, row_end, label_index_within_group).
+    Softmax cross-entropy over each step's legal-action rows; full-batch Adam."""
+    W = np.zeros(Xf.shape[1])
+    m = np.zeros_like(W); v = np.zeros_like(W)
+    b1, b2, eps, lr = 0.9, 0.999, 1e-8, 0.05
+    n_steps = len(groups)
+    loss = float("nan")
+    for t in range(1, epochs + 1):
+        grad = np.zeros_like(W)
+        loss = 0.0
+        for (s, e, lab) in groups:
+            z = Xf[s:e] @ W
+            z -= z.max()
+            p = np.exp(z); p /= p.sum()
+            g = p.copy(); g[lab] -= 1.0
+            grad += g @ Xf[s:e]
+            loss -= math.log(max(p[lab], 1e-12))
+        grad = grad / n_steps + l2 * W
+        m = b1 * m + (1 - b1) * grad
+        v = b2 * v + (1 - b2) * grad * grad
+        W -= lr * (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + eps)
+    return W, loss / n_steps
+
+
+class Policy:
+    """Learned ranking policy with deterministic local fallback (constraint #3)."""
+
+    def __init__(self, training_data, config: dict | None = None):
+        cfg = dict(config or {})
+        self.l2 = float(cfg.get("l2", 1e-3))
+        self.epochs = int(cfg.get("epochs", 300))
+        self.goal_dropout = float(cfg.get("goal_dropout", 0.3))
+        self.seed = int(cfg.get("seed", 0))
+        self.rng = np.random.default_rng(self.seed)
+        levels = (training_data.get("levels") if isinstance(training_data, dict)
+                  else training_data)
+        if levels is None:
+            levels = []
+        self._train(levels)
+
+    # ---------------- training ----------------
+    def _fit_rows(self, levels, rng) -> Tuple[np.ndarray, np.ndarray, List]:
+        rows: List[List[Optional[float]]] = []
+        groups: List[Tuple[int, int, int]] = []
+        for lv in levels:
+            steps = replay_level(lv)
+            level_meta = {"id": lv.get("id"), "max_depth": lv.get("max_depth")}
+            for state, chosen, legal in steps:
+                s0 = len(rows)
+                for a in legal:
+                    f = raw_features(state, level_meta, a, legal)
+                    if rng.random() < self.goal_dropout:      # goal-feature dropout
+                        for k in ("toward_goal", "toward_x_cont", "goal_dist_norm"):
+                            f[k] = None
+                        f["goal_missing"] = 1.0
+                        if f["continues_run"] is not None:
+                            f["goal_missing_x_cont"] = f["continues_run"]
+                    rows.append([f[n] for n in FEATURES])
+                groups.append((s0, len(rows), legal.index(chosen)))
+        X = np.array([[0.0 if v is None else v for v in row] for row in rows])
+        M = np.array([[v is not None for v in row] for row in rows], dtype=bool)
+        means = np.zeros(NF)
+        for j in range(NF):
+            col = X[:, j][M[:, j]]
+            means[j] = col.mean() if col.size else 0.0
+        Xf = np.where(M, X, means[None, :])
+        W, loss = _fit_grouped_softmax(Xf, groups, self.l2, self.epochs)
+        return Xf, groups, means, W, loss
+
+    def _train(self, levels) -> None:
+        rng = np.random.default_rng(self.seed)
+        # honest holdout: chronological 90/10 split over levels
+        n_hold = max(1, len(levels) // 10)
+        tr, ho = levels[:-n_hold], levels[-n_hold:]
+        Xtr, Gtr, means, W, loss = self._fit_rows(tr, rng)
+        self.means = means
+        model = _LogisticRanker(NF)
+        model.W = W
+        self.model = model
+        # holdout accuracy with the 90%-fit model (honest, unseen levels)
+        correct = total = 0
+        for lv in ho:
+            level_meta = {"id": lv.get("id"), "max_depth": lv.get("max_depth")}
+            for state, chosen, legal in replay_level(lv):
+                if len(legal) < 2:
+                    continue
+                probs = self._learned_probs(level_meta, state, legal) or {}
+                pred = max(legal, key=lambda a: probs.get(a, 0.0))
+                correct += pred == chosen
+                total += 1
+        self.holdout_acc = correct / total if total else float("nan")
+        self.holdout_n = total
+        # final model: refit on ALL levels (means from training split for fill)
+        Xall, Gall, means_all, W_all, loss_all = self._fit_rows(levels, rng)
+        self.means = means_all
+        self.model = _LogisticRanker(NF)
+        self.model.W = W_all
+        self.train_loss = loss_all
+        self.n_steps = len(Gall)
+
+    # ---------------- inference ----------------
+    def _learned_probs(self, level, state, legal) -> Optional[Dict[str, float]]:
+        try:
+            vals = []
+            for a in legal:
+                f = raw_features(state, level, a, legal)
+                vals.append([f[n] for n in FEATURES])
+            X = np.array([[0.0 if v is None else v for v in row] for row in vals])
+            bad = np.array([[v is None for v in row] for row in vals])
+            Xf = np.where(bad, self.means[None, :], X)
+            z = Xf @ self.model.W
+            if not np.all(np.isfinite(z)):
+                return None
+            if float(z.max() - z.min()) < 1e-9:
+                return None
+            e = np.exp(z - z.max())
+            p = e / e.sum()
+            return {a: float(pi) for a, pi in zip(legal, p)}
+        except Exception:
+            return None
+
+    def action_probs(self, level: dict, state: dict,
+                     legal_actions: List[str]) -> Dict[str, float]:
+        legal = [a for a in ACTIONS if a in legal_actions] or list(legal_actions)
+        if not legal:
+            return {}
+        p = self._learned_probs(level, state, legal)
+        if p is None:                       # constraint #3: degrade to fallback
+            fb = fallback_scores(state, level, legal)
+            lo = min(fb.values())
+            e = {a: math.exp(fb[a] - lo) for a in legal}
+            s = sum(e.values())
+            p = {a: e[a] / s for a in legal}
+        return self._demo_hard_rules(p, state, legal)
+
+    def _demo_hard_rules(self, p: Dict[str, float], state: Any,
+                         legal: List[str]) -> Dict[str, float]:
+        """Dampen actions that demos NEVER take (0/6204 immediate reversals,
+        0/260 path-cell revisits).  Suppression is multiplicative and keeps the
+        action available (it only reorders), so completeness of any search over
+        legal actions is preserved."""
+        prev = _prev_action(state)
+        path = _walked_path(state)
+        r, c = path[-1]
+        has_unvisited = any(
+            sum(1 for q in path if q == (r + DELTA[a][0], c + DELTA[a][1])) == 0
+            for a in legal)
+        out = {}
+        for a, v in p.items():
+            if prev is not None and a == OPP[prev] and len(legal) > 1:
+                v *= 0.01
+            if has_unvisited:
+                visits = sum(1 for q in path if q == (r + DELTA[a][0], c + DELTA[a][1]))
+                if visits > 0:
+                    v *= 0.05
+            out[a] = v
+        s = sum(out.values())
+        return {a: v / s for a, v in out.items()} if s > 0 else p
+
+
+def make_policy(training_data: dict, config: dict | None = None) -> Policy:
+    return Policy(training_data, config)
+
+
+# --------------------------------------------------------------------------
+# validation harness (SANITY CHECK ONLY, per constraint #4; runs on the public
+# grids with OUR reconstructed observation semantics -- it is not proof of
+# hidden scorer behaviour).  python analysis.py
+# --------------------------------------------------------------------------
+def bfs_shortest(grid, start, goal) -> Optional[int]:
+    H, W = len(grid), len(grid[0])
+    seen = {tuple(start): 0}
+    q = deque([tuple(start)])
+    while q:
+        r, c = q.popleft()
+        if (r, c) == tuple(goal):
+            return seen[(r, c)]
+        for a in ACTIONS:
+            nr, nc = r + DELTA[a][0], c + DELTA[a][1]
+            if 0 <= nr < H and 0 <= nc < W and grid[nr][nc] != "#" and (nr, nc) not in seen:
+                seen[(nr, nc)] = seen[(r, c)] + 1
+                q.append((nr, nc))
+    return None
+
+
+def _state_from_sim(grid, r, c, hist, t, legal, start):
+    H, W = len(grid), len(grid[0])
+    run_len = _run_length({"history": hist})
+    return {
+        "cell": grid[r][c],
+        "neighbors": {x: (grid[r + DELTA[x][0]][c + DELTA[x][1]]
+                          if 0 <= r + DELTA[x][0] < H and 0 <= c + DELTA[x][1] < W
+                          else None) for x in ACTIONS},
+        "previous_action": hist[-1] if hist else None,
+        "history": list(hist),
+        "history_tail": hist[-4:],
+        "run_length_bucket": _bucket(run_len),
+        "depth": t,
+        "depth_mod": t % 20,
+        "depth_phase": (t // 20) % 4,
+        "legal_mask": [x in legal for x in ACTIONS],
+        "legal_actions": list(legal),
+        "start": list(start),
+    }
+
+
+def beam_search(grid, start, goal, policy, level_meta, max_depth,
+                budget=95, beam_width=3, self_avoid=True):
+    """Best-first search guided by the policy.  expansion = node popped from
+    the frontier; successor generation is not counted (assumption, documented).
+    self_avoid=True mirrors demo style (paths never revisit cells)."""
+    H, W = len(grid), len(grid[0])
+    start, goal = tuple(start), tuple(goal)
+    frontier = [(0.0, 0, start, ())]
+    expansions = 0
+    while frontier and expansions < budget:
+        frontier.sort(key=lambda x: -x[0])
+        score, t, pos, path = frontier.pop(0)
+        expansions += 1
+        if pos == goal:
+            return list(path), expansions
+        if t >= max_depth:
+            continue
+        r, c = pos
+        legal = [a for a in ACTIONS
+                 if 0 <= r + DELTA[a][0] < H and 0 <= c + DELTA[a][1] < W
+                 and grid[r + DELTA[a][0]][c + DELTA[a][1]] != "#"]
+        if self_avoid:
+            walked = set()
+            rr = cc = 0
+            walked.add((0, 0))
+            for a in path:
+                dr, dc = DELTA[a]
+                rr += dr; cc += dc
+                walked.add((rr, cc))
+            legal = [a for a in legal
+                     if (r - start[0] + DELTA[a][0], c - start[1] + DELTA[a][1]) not in walked]
+        if not legal:
+            continue
+        state = _state_from_sim(grid, r, c, list(path), t, legal, start)
+        probs = policy.action_probs(level_meta, state, legal)
+        for a in legal:
+            child = (score + math.log(max(probs.get(a, 1e-9), 1e-9)),
+                     t + 1, (r + DELTA[a][0], c + DELTA[a][1]), path + (a,))
+            frontier.append(child)
+        frontier.sort(key=lambda x: -x[0])
+        frontier = frontier[:beam_width]
+    return None, expansions
+
+
+def _dfs_search(grid, start, goal, policy, level_meta, max_depth, budget=95):
+    """Policy-ordered depth-first walk (demo-style self-avoiding); expansion =
+    node visited.  Mirrors a 'very few expansions' scorer: the policy's top-1
+    walk is followed and backtracking only happens at dead ends."""
+    H, W = len(grid), len(grid[0])
+    start, goal = tuple(start), tuple(goal)
+    state_cnt = {"n": 0}
+
+    def rec(pos, path):
+        if state_cnt["n"] >= budget:
+            return None
+        state_cnt["n"] += 1
+        if pos == goal:
+            return list(path)
+        if len(path) >= max_depth:
+            return None
+        r, c = pos
+        legal = [a for a in ACTIONS
+                 if 0 <= r + DELTA[a][0] < H and 0 <= c + DELTA[a][1] < W
+                 and grid[r + DELTA[a][0]][c + DELTA[a][1]] != "#"]
+        walked = {(0, 0)}
+        rr = cc = 0
+        for a2 in path:
+            dr, dc = DELTA[a2]
+            rr += dr; cc += dc
+            walked.add((rr, cc))
+        legal = [a for a in legal
+                 if (r - start[0] + DELTA[a][0], c - start[1] + DELTA[a][1]) not in walked]
+        if not legal:
+            return None
+        state = _state_from_sim(grid, r, c, list(path), len(path), legal, start)
+        probs = policy.action_probs(level_meta, state, legal)
+        for a in sorted(legal, key=lambda x: -probs.get(x, 0.0)):
+            res = rec((r + DELTA[a][0], c + DELTA[a][1]), path + (a,))
+            if res:
+                return res
+        return None
+
+    return rec(start, ()), state_cnt["n"]
+
+
+def _level_beam(grid, start, goal, policy, level_meta, max_depth,
+                budget=95, width=3):
+    """Level-synchronous beam search (expansion = node expanded)."""
+    H, W = len(grid), len(grid[0])
+    start, goal = tuple(start), tuple(goal)
+    beam = [(0.0, start, ())]
+    exp = 0
+    for t in range(max_depth):
+        if not beam:
+            break
+        cand = []
+        for score, pos, path in beam:
+            if pos == goal:
+                return list(path), exp
+            if exp >= budget:
+                break
+            exp += 1
+            r, c = pos
+            legal = [a for a in ACTIONS
+                     if 0 <= r + DELTA[a][0] < H and 0 <= c + DELTA[a][1] < W
+                     and grid[r + DELTA[a][0]][c + DELTA[a][1]] != "#"]
+            walked = {(0, 0)}
+            rr = cc = 0
+            for a2 in path:
+                dr, dc = DELTA[a2]
+                rr += dr; cc += dc
+                walked.add((rr, cc))
+            legal = [a for a in legal
+                     if (r - start[0] + DELTA[a][0], c - start[1] + DELTA[a][1]) not in walked]
+            if not legal:
+                continue
+            state = _state_from_sim(grid, r, c, list(path), t, legal, start)
+            probs = policy.action_probs(level_meta, state, legal)
+            for a in legal:
+                cand.append((score + math.log(max(probs.get(a, 1e-9), 1e-9)),
+                             (r + DELTA[a][0], c + DELTA[a][1]), path + (a,)))
+        cand.sort(key=lambda x: -x[0])
+        beam = cand[:width]
+    for _, pos, path in beam:
+        if pos == goal:
+            return list(path), exp
+    return None, exp
+
+
+def _self_check():
+    import json
+    import time
+    train = json.load(open("data/training_levels.json"))
+    pub = json.load(open("data/public_eval_levels.json"))
+    t0 = time.time()
+    policy = make_policy(train)
+    print(f"[train] demo steps={policy.n_steps}  features={NF}  "
+          f"final avg NLL={policy.train_loss:.4f}  honest holdout top-1 acc="
+          f"{policy.holdout_acc:.3f} (n={policy.holdout_n})  "
+          f"fit time={time.time() - t0:.1f}s")
+
+    ok = tot = 0
+    exps = []
+    for lv in train["levels"][::20]:          # greedy rollouts, training levels
+        sol, ex = _dfs_search(lv["grid"], lv["start"], lv["goal"], policy,
+                              {"id": lv["id"], "max_depth": lv["max_depth"]},
+                              lv["max_depth"], budget=95)
+        ok += sol is not None
+        tot += 1
+        exps.append(ex)
+    print(f"[train DFS beam-free] success {ok}/{tot}, "
+          f"mean expansions {sum(exps) / len(exps):.1f} (max {max(exps)})")
+
+    print("NOTE: sanity check with OUR reconstructed observation semantics;")
+    print("      it validates the learned ranking, not the hidden scorer.")
+    for mode, spatial in (("no-spatial metadata (contract-strict)", False),
+                          ("spatial metadata (start/goal present)", True)):
+        print(f"--- public eval | level metadata: {mode} ---")
+        dfs_ok = 0
+        for lv in pub["levels"]:
+            meta = {"id": lv["id"], "max_depth": lv["max_depth"]}
+            if spatial:
+                meta["start"], meta["goal"] = lv["start"], lv["goal"]
+            sp = bfs_shortest(lv["grid"], lv["start"], lv["goal"])
+            demo_len = lv["max_depth"] - 27   # hypothetical demo length (training invariant)
+            line = f"  {lv['id']} (BFS={sp}, demo-len~{demo_len}):"
+            sol, ex = _dfs_search(lv["grid"], lv["start"], lv["goal"], policy,
+                                  meta, lv["max_depth"], budget=pub["budget"])
+            dfs_ok += sol is not None
+            line += f" [DFS: {'OK len=' + str(len(sol)) if sol else 'FAIL'} exp={ex}]"
+            sol2, ex2 = _level_beam(lv["grid"], lv["start"], lv["goal"], policy,
+                                    meta, lv["max_depth"], budget=pub["budget"],
+                                    width=3)
+            line += (" [lvl-beam3: " +
+                     (f"OK len={len(sol2)}" if sol2 else "FAIL") + f" exp={ex2}]")
+            print(line)
+        print(f"  => DFS success {dfs_ok}/4 within budget {pub['budget']}")
+
+
+if __name__ == "__main__":
+    _self_check()

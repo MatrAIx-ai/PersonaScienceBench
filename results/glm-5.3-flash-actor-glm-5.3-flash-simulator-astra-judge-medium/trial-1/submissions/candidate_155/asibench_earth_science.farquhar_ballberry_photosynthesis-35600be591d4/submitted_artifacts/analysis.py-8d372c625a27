@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Leaf Physiological Response Reconstruction
+==========================================
+Coupled Collatz (C4) photosynthesis + Ball-Berry stomatal conductance in the
+land-surface (CLM/Noah-MP) convention, driven by data/leaf_params.json,
+data/forcing.csv, data/test_cases.json.  The supplied leaf is C4.
+
+APPROVED ASSUMPTIONS (集中声明):
+  * UNITS: Vcmax25, Vcmax(T), J, Wc/Wj/We, Rd, A in umol CO2 m^-2 s^-1;
+    A_mol = A*1e-6 (mol m^-2 s^-1) enters the gas chain; gs, b0 in
+    mol m^-2 s^-1; rs = cf/gs in s m^-1 (stomatal resistance only; rb is a
+    separate boundary-layer resistance appearing only in the cs chain);
+    cs, Ci, ca in Pa.
+  * Q10 TRIPLE (2.1, 1.2, 2.4) -> Kc, Ko, Vcmax respectively:
+      Kc = 30*2.1^((Tc-25)/10) Pa ; Ko = 30000*1.2^((Tc-25)/10) Pa
+      Vcmax(T) = Vcmax25 * 2.4^((Tc-25)/10)
+                 / (1 + exp((-2.2e5 + 710*(Tc+273.16))/(R*(Tc+273.16))))
+    with Vcmax25_eff = vcmax25 * n_factor * btran (n_factor and btran scale
+    photosynthetic capacity only, NOT the Ball-Berry intercept b0).
+  * Gamma_star = 0.5*(Kc/Ko)*O2*0.21, O2 = o2_pa substituted directly in Pa.
+  * Rd = 0.015*Vcmax(T) (no independent Q10; follows Vcmax(T)).
+  * esat(T): Magnus/AEK over water, esat = 610.78*exp(17.269*Tc/(Tc+238.92))
+    Pa (task-unspecified choice, approved).  hs = clip(1 - vpd/esat, 0.25, 1).
+  * Leaf temperature = air temperature; Tc = t_air_K - 273.16.
+  * NIGHT BRANCH (PAR == 0): A = -Rd (respiratory assimilation, negative),
+    gs = b0 (intercept conductance, no Ball-Berry slope term), rs = cf/b0;
+    cs, Ci from the SAME gas chain with that (A, gs): finite and consistent.
+  * GAS CHAIN (cf = p_atm/(R*T)):
+      cs = ca - 1.37*rb*A_mol/cf*p_atm ; gs = m*A_mol*hs/cs*p_atm + b0
+      rs = cf/gs ; Ci = cs - 1.65*rs*A_mol/cf*p_atm
+  * COUPLING: hard minimum.  C4: Wc = Vcmax, Wj = alpha_q*APAR,
+    We = 4000*Vcmax*Ci/p_atm, A = min(Wc,Wj,We) - Rd, APAR = 4.6*PAR.
+  * SOLVER: Picard fixed-point iteration on Ci (|dCi| < 1e-9, max 200 iters);
+    bisection fallback on f(Ci) = Ci - Ci_calc(Ci) over [1e-9, 2*ca].
+    n_iterations counts every full coupled update INCLUDING the one that
+    produced the converged value.  test_cases iterate from ci_init_pa on the
+    specified forcing row to convergence (guess never copied).
+  * FIGURE: matplotlib verified unavailable (no network/wheels/PIL); figure
+    rendered by pngfig.py, a pure-python zlib+struct PNG encoder with an
+    embedded 5x7 bitmap font (1100x760 px, axes/ticks/labels/legend).
+
+Outputs: results/leaf_fluxes.csv (120 rows), results/case_convergence.csv
+(5 rows), results/diurnal.png.
+"""
+import json
+import math
+import os
+
+import numpy as np
+import pandas as pd
+
+from pngfig import make_figure
+
+try:
+    import matplotlib  # noqa: F401
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+print(f"[env] matplotlib available: {HAS_MPL} "
+      f"(fallback: pure-python PNG encoder in pngfig.py)")
+
+R_GAS = 8.314462618  # J mol^-1 K^-1
+DATA_DIR, OUT_DIR = "data", "results"
+
+
+def esat_pa(tc):
+    """Magnus/AEK saturation vapour pressure over water (Pa)."""
+    return 610.78 * math.exp(17.269 * tc / (tc + 238.92))
+
+
+def q10(base, tc, q):
+    return base * q ** ((tc - 25.0) / 10.0)
+
+
+class LeafModel:
+    def __init__(self, params):
+        self.pathway = params["pathway"].upper()
+        self.vcmax25 = float(params["vcmax25"])
+        self.m = float(params["bb_slope"])
+        self.b0 = float(params["bb_intercept"])
+        self.alpha_q = float(params["alpha_q"])
+        self.n_factor = float(params["n_factor"])
+
+    def solve_row(self, row, ci_init=None):
+        """Coupled fixed point for one forcing row (C4 leaf).
+
+        Returns dict: A (umol), cs, gs, rs, ci, n_iterations, method, ...
+        ci_init: starting guess for Ci (test cases); default ca.
+        """
+        t_k = float(row.t_air_K); tc = t_k - 273.16
+        p_atm = float(row.p_atm_Pa); ca = float(row.co2_pa)
+        o2 = float(row.o2_pa); vpd = float(row.vpd_Pa)
+        rb = float(row.rb_sm); btran = float(row.btran)
+        par = float(row.par_sun_wm2)
+
+        vc25_eff = self.vcmax25 * self.n_factor * btran
+        inh = 1.0 + math.exp((-2.2e5 + 710.0 * t_k) / (R_GAS * t_k))
+        vcmax = vc25_eff * 2.4 ** ((tc - 25.0) / 10.0) / inh
+        kc = q10(30.0, tc, 2.1)
+        ko = q10(30000.0, tc, 1.2)
+        gamma_star = 0.5 * (kc / ko) * o2 * 0.21   # (unused by C4 branch)
+        rd = 0.015 * vcmax
+        cf = p_atm / (R_GAS * t_k)
+        hs = min(max(1.0 - vpd / esat_pa(tc), 0.25), 1.0)
+
+        def aci(ci):
+            we = 4000.0 * vcmax * ci / p_atm
+            return min(vcmax, self.alpha_q * 4.6 * par, we) - rd
+
+        def chain(ci):
+            a = aci(ci); a_mol = a * 1e-6
+            cs = ca - 1.37 * rb * a_mol / cf * p_atm
+            gs = self.m * a_mol * hs / cs * p_atm + self.b0
+            if gs <= 1e-12:              # defensive; not triggered here
+                gs = self.b0
+            rs = cf / gs
+            ci_new = cs - 1.65 * rs * a_mol / cf * p_atm
+            return a, cs, gs, rs, ci_new
+
+        if par <= 0.0:
+            a = -rd; a_mol = a * 1e-6
+            gs = self.b0; rs = cf / gs
+            cs = ca - 1.37 * rb * a_mol / cf * p_atm
+            ci = cs - 1.65 * rs * a_mol / cf * p_atm
+            return {"A": a, "cs": cs, "gs": gs, "rs": rs, "ci": ci,
+                    "n_iterations": 0, "method": "night", "vcmax": vcmax,
+                    "rd": rd, "hs": hs}
+
+        def residual(ci):
+            return ci - chain(ci)[4]
+
+        tol, max_iter = 1e-9, 200
+        ci = ca if ci_init is None else float(ci_init)
+        n_it, method = 0, "picard"
+        for _ in range(max_iter):
+            ci_new = chain(ci)[4]
+            n_it += 1
+            done = abs(ci_new - ci) < tol
+            ci = ci_new
+            if done:
+                break
+        else:
+            method = "bisection"
+            lo, hi = 1e-9, 2.0 * ca
+            flo, fhi = residual(lo), residual(hi)
+            if flo * fhi > 0:
+                raise RuntimeError(f"no bracketed root: f(lo)={flo} f(hi)={fhi}")
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                fm = residual(mid)
+                n_it += 1
+                if abs(fm) < 1e-12 or (hi - lo) < 1e-12:
+                    break
+                if flo * fm <= 0:
+                    hi, fhi = mid, fm
+                else:
+                    lo, flo = mid, fm
+            ci = 0.5 * (lo + hi)
+        a, cs, gs, rs, ci = chain(ci)
+        return {"A": a, "cs": cs, "gs": gs, "rs": rs, "ci": ci,
+                "n_iterations": n_it, "method": method, "vcmax": vcmax,
+                "rd": rd, "hs": hs}
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(os.path.join(DATA_DIR, "leaf_params.json")) as f:
+        params = json.load(f)
+    with open(os.path.join(DATA_DIR, "test_cases.json")) as f:
+        cases = json.load(f)
+    df = pd.read_csv(os.path.join(DATA_DIR, "forcing.csv"))
+    model = LeafModel(params)
+
+    # per-row coupled fixed points, sunlit + shaded
+    rows = []
+    for _, row in df.iterrows():
+        sun = model.solve_row(row)
+        shade_row = row.copy()
+        shade_row["par_sun_wm2"] = row["par_shade_wm2"]
+        shd = model.solve_row(shade_row)
+        rows.append({"time_hr": row["time_hr"],
+                     "A_sun": sun["A"], "A_shade": shd["A"],
+                     "rs_sun": sun["rs"], "rs_shade": shd["rs"],
+                     "ci_sun": sun["ci"], "ci_shade": shd["ci"],
+                     "gs_sun": sun["gs"], "gs_shade": shd["gs"],
+                     "_m_sun": sun["method"], "_m_shade": shd["method"]})
+    flux = pd.DataFrame(rows)
+    flux_out = flux[["time_hr", "A_sun", "A_shade", "rs_sun", "rs_shade",
+                     "ci_sun", "ci_shade", "gs_sun", "gs_shade"]]
+
+    # test cases: from ci_init_pa on the specified forcing row, iterate
+    case_rows = []
+    for case in cases:
+        row = df.iloc[int(case["forcing_index"])]
+        res = model.solve_row(row, ci_init=case["ci_init_pa"])
+        case_rows.append({"case_id": case["case_id"],
+                          "ci_init_pa": case["ci_init_pa"],
+                          "ci_final_pa": res["ci"], "A_final": res["A"],
+                          "rs_final": res["rs"],
+                          "n_iterations": res["n_iterations"],
+                          "_method": res["method"]})
+    cases_df = pd.DataFrame(case_rows)
+    cases_out = cases_df[["case_id", "ci_init_pa", "ci_final_pa",
+                          "A_final", "rs_final", "n_iterations"]]
+
+    # self-checks
+    num = flux_out.drop(columns=["time_hr"]).to_numpy(dtype=float)
+    assert np.all(np.isfinite(num)), "non-finite value in leaf_fluxes"
+    assert np.all(np.isfinite(cases_out.drop(columns=["case_id"])
+                              .to_numpy(dtype=float))), "non-finite case values"
+    assert len(flux_out) == 120
+    assert list(flux_out.columns) == ["time_hr", "A_sun", "A_shade", "rs_sun",
+                                      "rs_shade", "ci_sun", "ci_shade",
+                                      "gs_sun", "gs_shade"]
+    assert len(cases_out) == 5
+
+    flux_out.to_csv(os.path.join(OUT_DIR, "leaf_fluxes.csv"), index=False)
+    cases_out.to_csv(os.path.join(OUT_DIR, "case_convergence.csv"), index=False)
+    make_figure(df, flux_out, os.path.join(OUT_DIR, "diurnal.png"))
+
+    # printed evidence
+    print("\n[leaf_fluxes] day peak row 12 (sunlit):")
+    print(flux_out.iloc[12].to_string())
+    print("\n[leaf_fluxes] night row 0 (sunlit):")
+    print(flux_out.iloc[0].to_string())
+    print("\n[methods] sun:", flux["_m_sun"].value_counts().to_dict(),
+          "| shade:", flux["_m_shade"].value_counts().to_dict())
+    day = df.par_sun_wm2 > 0
+    print(f"[diag] day rows: {int(day.sum())}, night rows: {int((~day).sum())}")
+    print(f"[diag] A_sun day: {flux_out.A_sun[day].min():.4f}.."
+          f"{flux_out.A_sun[day].max():.4f} umol m-2 s-1")
+    print(f"[diag] A_sun night (=-Rd): {flux_out.A_sun[~day].min():.4f}.."
+          f"{flux_out.A_sun[~day].max():.4f} umol m-2 s-1")
+    print(f"[diag] rs_sun night (=cf/b0): {flux_out.rs_sun[~day].min():.2f}.."
+          f"{flux_out.rs_sun[~day].max():.2f} s m-1 | day: "
+          f"{flux_out.rs_sun[day].min():.2f}..{flux_out.rs_sun[day].max():.2f} s m-1")
+    print(f"[diag] gs_sun night (=b0): {flux_out.gs_sun[~day].unique()}")
+    print("\n[case_convergence]")
+    print(cases_out.to_string(index=False))
+    spread = cases_out.ci_final_pa.max() - cases_out.ci_final_pa.min()
+    print(f"[diag] ci_final spread across 5 cases: {spread:.3e} Pa")
+    print(f"[diag] case methods: {cases_df['_method'].tolist()}")
+    print("\n[files]")
+    for p in ["analysis.py", "pngfig.py", "results/leaf_fluxes.csv",
+              "results/case_convergence.csv", "results/diurnal.png"]:
+        print(f"  {p}: exists={os.path.exists(p)} "
+              f"size={os.path.getsize(p) if os.path.exists(p) else 0}")
+
+
+if __name__ == "__main__":
+    main()

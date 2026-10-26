@@ -1,0 +1,560 @@
+"""
+Stable latent-state fitting for long categorical streams.
+
+Self-implemented Baum-Welch EM for a first-order latent-state Markov model
+(HMM) with K latent rows, shared across the six streams.  Only numpy, pandas
+and scipy are used (plus stdlib zlib/struct for rasterizing the diagnostics
+PNG, since matplotlib is unavailable in this runtime).  No black-box
+sequence-model or probabilistic-programming package is imported.
+
+Outputs (all under results/):
+  candidate_summary.csv, matrix_a.csv, matrix_b.csv, vector_a.csv,
+  fit_trace.csv, local_weights.npy, neighbor_summary.csv,
+  local_assignments.csv, stream_diagnostics.csv, diagnostics.png
+plus one supporting table, selection_evidence.csv (multi-evidence model
+comparison), and per-candidate fit caches (_cache_K*.npz, _chosen.json)
+used to make long runs resumable; these are supplementary only.
+
+Usage:
+  python3 analysis.py            # fit any missing candidates, then finalize
+  python3 analysis.py fit K      # fit candidate K only (resumable chunks)
+  python3 analysis.py finalize   # selection + outputs from caches
+  python3 analysis.py verify     # refit chosen K from seeds, check identity
+"""
+import json
+import sys
+import zlib
+import struct
+import numpy as np
+import pandas as pd
+
+DATA_CSV = "data/sequences.csv"
+META_JSON = "data/metadata.json"
+OUT = "results/"
+ALPHABET_SIZE = 32
+K_GRID = [2, 3, 4, 5, 6, 7, 8, 10, 12]
+N_RESTARTS = 12          # >= 10 seeded restarts per candidate
+MAX_ITERS = 300
+TOL = 1e-7
+SEED_BASE = 20260101
+PSEUDO_A = 1.0           # MAP Dirichlet pseudo-counts: regularization ONLY
+PSEUDO_B = 1.0           # (excluded from all reported likelihoods)
+
+# ----------------------------------------------------------------------------
+# Data loading
+# ----------------------------------------------------------------------------
+meta = json.load(open(META_JSON))
+df = pd.read_csv(DATA_CSV).sort_values("global_index").reset_index(drop=True)
+assert (df.global_index.values == np.arange(len(df))).all()
+sym = df.symbol.values.astype(int)
+seq_ids = df.sequence_id.values
+positions = df.position.values
+gidx = df.global_index.values
+bounds = (df.groupby("sequence_id", sort=True).global_index.agg(["min", "max"])
+          .sort_values("min"))
+starts, ends = bounds["min"].values, bounds["max"].values + 1
+stream_names = list(bounds.index)
+N = len(sym)
+LOGN = float(np.log(N))
+ONEHOT = np.eye(ALPHABET_SIZE)[sym]
+
+# ----------------------------------------------------------------------------
+# Baum-Welch EM (scaled forward-backward), MAP-regularized updates
+# ----------------------------------------------------------------------------
+def forward_backward(A, B, pi):
+    """Scaled forward-backward over all streams. Returns LL, gammas, xi parts."""
+    K_ = A.shape[0]
+    LL = 0.0
+    gammas, xis = [], []
+    for s, e in zip(starts, ends):
+        T = e - s
+        lik = B[:, sym[s:e]].T                      # (T, K) emission likelihoods
+        alpha = np.empty((T, K_))
+        c = np.empty(T)
+        a = pi * lik[0]; c[0] = a.sum(); alpha[0] = a / c[0]
+        LL += np.log(c[0])
+        for t in range(1, T):
+            a = (alpha[t - 1] @ A) * lik[t]
+            c[t] = a.sum(); alpha[t] = a / c[t]
+            LL += np.log(c[t])
+        beta = np.empty((T, K_))
+        beta[-1] = 1.0
+        for t in range(T - 2, -1, -1):
+            beta[t] = (A @ (lik[t + 1] * beta[t + 1])) / c[t + 1]
+        gamma = alpha * beta
+        gamma /= gamma.sum(1, keepdims=True)        # guard fp drift
+        gammas.append(gamma)
+        xis.append((alpha[:-1], lik[1:] * beta[1:]))
+    return LL, gammas, xis
+
+def em_fit(K, seed, collect_trace=False):
+    rng = np.random.default_rng(seed)
+    A = rng.dirichlet(np.ones(K), size=K)
+    B = rng.dirichlet(np.ones(ALPHABET_SIZE), size=K)
+    pi = rng.dirichlet(np.ones(K))
+    prev = None
+    trace = []
+    for it in range(MAX_ITERS + 1):
+        LL, gammas, xis = forward_backward(A, B, pi)
+        rel = np.nan if prev is None else (LL - prev) / abs(prev)
+        trace.append((it, LL, rel))
+        if prev is not None and abs(rel) < TOL and it >= 5:
+            break
+        prev = LL
+        if it == MAX_ITERS:
+            break
+        A_num = np.full((K, K), PSEUDO_A)
+        B_num = np.full((K, ALPHABET_SIZE), PSEUDO_B)
+        pi_num = np.full(K, 1.0)
+        for (s, e), g, (al, lb) in zip(zip(starts, ends), gammas, xis):
+            pi_num += g[0]
+            A_num += np.einsum("ti,ij,tj->ij", al, A, lb)
+            B_num += g.T @ ONEHOT[s:e]
+        A = A_num / A_num.sum(1, keepdims=True)
+        B = B_num / B_num.sum(1, keepdims=True)
+        pi = pi_num / pi_num.sum()
+    LL, gammas, _ = forward_backward(A, B, pi)
+    return LL, A, B, pi, gammas, trace
+
+def stationary(A):
+    v = np.ones(A.shape[0]) / A.shape[0]
+    for _ in range(2000):
+        v = v @ A
+        v /= v.sum()
+    return v
+
+def canonical_order(A, B):
+    """Canonical labels: rows ordered by descending stationary weight."""
+    st = stationary(A)
+    order = np.argsort(-st, kind="stable")
+    return order, st[order]
+
+# ----------------------------------------------------------------------------
+# Minimal PNG rasterizer (no matplotlib in this runtime)
+# ----------------------------------------------------------------------------
+FONT = {
+'0':"01110 10001 10011 10101 11001 10001 01110",'1':"00100 01100 00100 00100 00100 00100 01110",
+'2':"01110 10001 00001 00010 00100 01000 11111",'3':"11111 00010 00100 00010 00001 10001 01110",
+'4':"00010 00110 01010 10010 11111 00010 00010",'5':"11111 10000 11110 00001 00001 10001 01110",
+'6':"00110 01000 10000 11110 10001 10001 01110",'7':"11111 00001 00010 00100 01000 01000 01000",
+'8':"01110 10001 10001 01110 10001 10001 01110",'9':"01110 10001 10001 01111 00001 00010 01100",
+'A':"01110 10001 10001 11111 10001 10001 10001",'B':"11110 10001 10001 11110 10001 10001 11110",
+'C':"01110 10001 10000 10000 10000 10001 01110",'D':"11100 10010 10001 10001 10001 10010 11100",
+'E':"11111 10000 10000 11110 10000 10000 11111",'F':"11111 10000 10000 11110 10000 10000 10000",
+'G':"01110 10001 10000 10111 10001 10001 01111",'H':"10001 10001 10001 11111 10001 10001 10001",
+'I':"01110 00100 00100 00100 00100 00100 01110",'J':"00111 00010 00010 00010 00010 10010 01100",
+'K':"10001 10010 10100 11000 10100 10010 10001",'L':"10000 10000 10000 10000 10000 10000 11111",
+'M':"10001 11011 10101 10101 10001 10001 10001",'N':"10001 10001 11001 10101 10011 10001 10001",
+'O':"01110 10001 10001 10001 10001 10001 01110",'P':"11110 10001 10001 11110 10000 10000 10000",
+'Q':"01110 10001 10001 10001 10101 10010 01101",'R':"11110 10001 10001 11110 10100 10010 10001",
+'S':"01111 10000 10000 01110 00001 00001 11110",'T':"11111 00100 00100 00100 00100 00100 00100",
+'U':"10001 10001 10001 10001 10001 10001 01110",'V':"10001 10001 10001 10001 10001 01010 00100",
+'W':"10001 10001 10001 10101 10101 10101 01010",'X':"10001 10001 01010 00100 01010 10001 10001",
+'Y':"10001 10001 01010 00100 00100 00100 00100",'Z':"11111 00001 00010 00100 01000 10000 11111",
+'-':"00000 00000 00000 11111 00000 00000 00000",".":"00000 00000 00000 00000 00000 01100 01100",
+":":"00000 01100 01100 00000 01100 01100 00000","(":"00010 00100 01000 01000 01000 00100 00010",
+")":"01000 00100 00010 00010 00010 00100 01000","/":"00001 00010 00010 00100 01000 01000 10000",
+"=":"00000 00000 11111 00000 11111 00000 00000",",":"00000 00000 00000 00000 01100 00100 01000",
+"_":"00000 00000 00000 00000 00000 00000 11111","%":"11001 11010 00010 00100 01000 01011 10011",
+"+":"00000 00100 00100 11111 00100 00100 00000"," ":"00000 00000 00000 00000 00000 00000 00000",
+">":"01000 00100 00010 00001 00010 00100 01000"}
+
+def _crc(b): return zlib.crc32(b) & 0xFFFFFFFF
+
+def png_write(path, img):
+    h, w, _ = img.shape
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(h))
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", _crc(tag + data))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    open(path, "wb").write(png)
+
+def draw_text(img, x, y, s, scale=2, color=(0, 0, 0)):
+    for ch in s.upper():
+        g = FONT.get(ch, FONT[" "])
+        for r, row in enumerate(g.split()):
+            for cc, bit in enumerate(row):
+                if bit == "1":
+                    ys = y + r * scale; xs = x + cc * scale
+                    img[ys:ys + scale, xs:xs + scale] = color
+        x += 6 * scale
+
+def draw_line(img, x0, y0, x1, y1, color):
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1; sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        if 0 <= y0 < img.shape[0] and 0 <= x0 < img.shape[1]:
+            img[y0, x0] = color
+        if x0 == x1 and y0 == y1: break
+        e2 = 2 * err
+        if e2 > -dy: err -= dy; x0 += sx
+        if e2 < dx: err += dx; y0 += sy
+
+def draw_rect(img, x0, y0, x1, y1, color, fill=None):
+    if fill is not None:
+        img[y0:y1, x0:x1] = fill
+    draw_line(img, x0, y0, x1, y0, color); draw_line(img, x0, y1, x1, y1, color)
+    draw_line(img, x0, y0, x0, y1, color); draw_line(img, x1, y0, x1, y1, color)
+
+def cmap_viridis(t):
+    anchors = np.array([(68,1,84),(59,82,139),(33,145,140),(94,201,98),(253,231,37)])
+    t = np.clip(t, 0, 1)
+    i = np.minimum((t * 4).astype(int), 3); f = t * 4 - i
+    return (anchors[i] * (1 - f[..., None]) + anchors[i + 1] * f[..., None]).astype(np.uint8)
+
+def cmap_magma(t):
+    anchors = np.array([(0,0,4),(87,16,110),(188,55,84),(249,142,9),(252,253,191)])
+    t = np.clip(t, 0, 1)
+    i = np.minimum((t * 4).astype(int), 3); f = t * 4 - i
+    return (anchors[i] * (1 - f[..., None]) + anchors[i + 1] * f[..., None]).astype(np.uint8)
+
+class Panel:
+    """Simple axis frame with data-to-pixel mapping (y up)."""
+    def __init__(self, img, x0, y0, x1, y1, title="", xlabel="", ylabel=""):
+        self.img, self.x0, self.y0, self.x1, self.y1 = img, x0, y0, x1, y1
+        draw_rect(img, x0, y0, x1, y1, (0, 0, 0), fill=(255, 255, 255))
+        if title: draw_text(img, x0 + 8, y0 - 26, title, 2)
+        if xlabel: draw_text(img, (x0 + x1)//2 - 6*len(xlabel), y1 + 22, xlabel, 2)
+        if ylabel:
+            for i, ch in enumerate(ylabel):
+                draw_text(img, x0 - 34, (y0 + y1)//2 - 8*len(ylabel) + i*16, ch, 2)
+    def map(self, xr, yr, x, y):
+        px = self.x0 + (x - xr[0]) / (xr[1] - xr[0]) * (self.x1 - self.x0)
+        py = self.y1 - (y - yr[0]) / (yr[1] - yr[0]) * (self.y1 - self.y0)
+        return int(round(px)), int(round(py))
+    def xticks(self, xr, vals, fmt="{:.0f}"):
+        for v in vals:
+            px, _ = self.map(xr, (0, 1), v, 0)
+            draw_line(self.img, px, self.y1, px, self.y1 + 5, (0, 0, 0))
+            s = fmt.format(v)
+            draw_text(self.img, px - 3 * len(s), self.y1 + 9, s, 2)
+    def yticks(self, yr, vals, fmt="{:.1f}"):
+        for v in vals:
+            _, py = self.map((0, 1), yr, 0, v)
+            draw_line(self.img, self.x0 - 5, py, self.x0, py, (0, 0, 0))
+            s = fmt.format(v)
+            draw_text(self.img, self.x0 - 12 - 6 * len(s), py - 7, s, 2)
+    def plot(self, xr, yr, xs, ys, color, marker=None):
+        pts = [self.map(xr, yr, x, y) for x, y in zip(xs, ys)]
+        for (px, py), (qx, qy) in zip(pts[:-1], pts[1:]):
+            draw_line(self.img, px, py, qx, qy, color)
+        if marker:
+            for px, py in pts:
+                draw_rect(self.img, px - 3, py - 3, px + 3, py + 3, color, fill=color)
+    def vline(self, xr, yr, x, color=(0, 0, 0)):
+        px, _ = self.map(xr, yr, x, 0)
+        draw_line(self.img, px, self.y0, px, self.y1, color)
+
+# ----------------------------------------------------------------------------
+# Candidate fitting with per-K caches (resumable), selection diagnostics
+# ----------------------------------------------------------------------------
+def fit_and_cache(K):
+    best = None
+    traces = []
+    for r in range(N_RESTARTS):
+        LL, A, B, pi, _, trace = em_fit(K, SEED_BASE + 1000 * K + r,
+                                        collect_trace=True)
+        traces.append(trace)
+        if best is None or LL > best[0]:
+            best = (LL, A, B, pi)
+    LL, A, B, pi = best
+    order, st = canonical_order(A, B)
+    A, B, pi = A[np.ix_(order, order)], B[order], pi[order]
+    _, gammas, _ = forward_backward(A, B, pi)
+    G = np.vstack(gammas); G /= G.sum(1, keepdims=True)
+    runs = np.concatenate([np.full(len(t), r) for r, t in enumerate(traces)])
+    steps = np.concatenate([t[:, 0] for t in [np.array(x) for x in traces]])
+    objs = np.concatenate([np.array(x)[:, 1] for x in traces])
+    rels = np.concatenate([np.array(x)[:, 2] for x in traces])
+    np.savez(OUT + f"_cache_K{K}.npz", A=A, B=B, pi=pi, LL=LL, G=G,
+             run=runs, step=steps, obj=objs, rel=rels)
+    print(f"K={K:2d}  best LL = {LL:.4f}  (cached, {N_RESTARTS} restarts)", flush=True)
+
+def load_all():
+    res = {}
+    for K in K_GRID:
+        z = np.load(OUT + f"_cache_K{K}.npz")
+        res[K] = dict(LL=float(z["LL"]), A=z["A"], B=z["B"], pi=z["pi"],
+                      G=z["G"], trace=(z["run"], z["step"], z["obj"], z["rel"]))
+    return res
+
+def kl_sym(p, q, eps=1e-12):
+    p, q = p + eps, q + eps
+    p /= p.sum(); q /= q.sum()
+    return 0.5 * (p * np.log(p / q)).sum() + 0.5 * (q * np.log(q / p)).sum()
+
+def selection_diagnostics(res):
+    rows = []
+    for K, d in res.items():
+        A, B, G = d["A"], d["B"], d["G"]
+        usage = G.mean(0)
+        unc = float((1.0 - G.max(1)).mean())
+        ent = float(-(G * np.log(G + 1e-300)).sum(1).mean())
+        n_free = K * K + (ALPHABET_SIZE - 1) * K - 1
+        bic = -2 * d["LL"] + n_free * LOGN
+        aic = -2 * d["LL"] + 2 * n_free
+        pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
+        ekl = min(kl_sym(B[i], B[j]) for i, j in pairs) if pairs else np.nan
+        tl1 = min(np.abs(A[i] - A[j]).sum() for i, j in pairs) if pairs else np.nan
+        dup = any((kl_sym(B[i], B[j]) < 0.05 and np.abs(A[i] - A[j]).sum() < 0.1)
+                  for i, j in pairs)
+        rows.append(dict(candidate=K, n_free_values=n_free, objective=d["LL"],
+                         criterion=bic, aic=aic, min_row_usage=usage.min(),
+                         mean_assignment_uncertainty=unc, mean_weight_entropy=ent,
+                         min_emission_kl=ekl, min_transition_l1=tl1,
+                         near_duplicate_rows=dup))
+    ev = pd.DataFrame(rows).sort_values("candidate").reset_index(drop=True)
+    ev["delta_LL_vs_prev_K"] = ev["objective"].diff()
+    ev["delta_LL_per_added_row"] = ev["delta_LL_vs_prev_K"] / ev["candidate"].diff()
+    ev["delta_BIC_vs_prev_K"] = ev["criterion"].diff()
+    return ev
+
+# ----------------------------------------------------------------------------
+# Dispatch: resumable chunked execution
+# ----------------------------------------------------------------------------
+mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+if mode == "fit":
+    fit_and_cache(int(sys.argv[2]))
+    sys.exit(0)
+
+res = load_all()
+
+if mode == "verify":
+    chosen_K = int(json.load(open(OUT + "_chosen.json"))["chosen_K"])
+    LL2, A2, B2, pi2, _, _ = em_fit(chosen_K, SEED_BASE + 1000 * chosen_K + 0)
+    for r in range(1, N_RESTARTS):
+        L2, a2, b2, p2, _, _ = em_fit(chosen_K, SEED_BASE + 1000 * chosen_K + r)
+        if L2 > LL2:
+            LL2, A2, B2, pi2 = L2, a2, b2, p2
+    order2, _ = canonical_order(A2, B2)
+    A2, B2, pi2 = A2[np.ix_(order2, order2)], B2[order2], pi2[order2]
+    A1, B1, pi1 = res[chosen_K]["A"], res[chosen_K]["B"], res[chosen_K]["pi"]
+    gap = max(np.abs(A1 - A2).max(), np.abs(B1 - B2).max(), np.abs(pi1 - pi2).max())
+    ll_gap = abs(res[chosen_K]["LL"] - LL2)
+    print(f"VERIFY: max |param difference| = {gap:.3e}, |LL difference| = {ll_gap:.3e}")
+    assert gap < 1e-10 and ll_gap < 1e-6, "chosen model did not reproduce identically"
+    print("VERIFY PASSED: identical parameters and objective from fixed seeds")
+    sys.exit(0)
+
+# ----------------------------------------------------------------------------
+# Finalize: selection, required outputs, diagnostics figure, checks
+# ----------------------------------------------------------------------------
+ev = selection_diagnostics(res)
+print(ev.to_string(index=False), flush=True)
+
+eligible = ev[(~ev.near_duplicate_rows) & (ev.min_row_usage >= 0.01)]
+chosen_K = int(eligible.loc[eligible.criterion.idxmin(), "candidate"])
+print(f"\nChosen K = {chosen_K} "
+      f"(eligible candidates: {sorted(eligible.candidate.tolist())})", flush=True)
+json.dump({"chosen_K": chosen_K,
+           "rule": "min BIC among candidates without near-duplicate rows "
+                   "and with min row usage >= 1%"},
+          open(OUT + "_chosen.json", "w"))
+d = res[chosen_K]
+A, B, pi, G = d["A"], d["B"], d["pi"], d["G"]
+st = stationary(A)
+Kc = chosen_K
+
+# 1. candidate_summary.csv
+cand = ev[["candidate", "n_free_values", "objective", "criterion"]].copy()
+cand["chosen"] = (cand.candidate == chosen_K)
+cand.to_csv(OUT + "candidate_summary.csv", index=False)
+
+# 2-4. matrices and initial vector
+pd.DataFrame([(i, j, A[i, j]) for i in range(Kc) for j in range(Kc)],
+             columns=["row", "column", "value"]).to_csv(OUT + "matrix_a.csv", index=False)
+sym_labels = {s["symbol"]: s["label"] for s in meta["alphabet"]}
+pd.DataFrame([(i, s, sym_labels[s], B[i, s]) for i in range(Kc) for s in range(ALPHABET_SIZE)],
+             columns=["row", "symbol", "symbol_label", "value"]).to_csv(OUT + "matrix_b.csv", index=False)
+pd.DataFrame([(i, pi[i]) for i in range(Kc)], columns=["row", "value"]).to_csv(OUT + "vector_a.csv", index=False)
+
+# 5. fit_trace.csv (chosen K only, all restarts; step 0 = random init, rel undefined)
+run, step, obj, rel = d["trace"]
+pd.DataFrame({"run": run.astype(int), "step": step.astype(int),
+              "objective": obj, "relative_change": rel}) \
+    .to_csv(OUT + "fit_trace.csv", index=False)
+
+# 6. local_weights.npy (rows in global_index order, one column per fitted row)
+assert G.shape == (N, Kc) and np.isfinite(G).all()
+assert np.abs(G.sum(1) - 1).max() < 1e-8
+np.save(OUT + "local_weights.npy", G)
+
+# 7. neighbor_summary.csv
+#    Interpretation: outgoing transition profile of each fitted row.
+#    weight = A[row, column]; joint_fraction = expected share of adjacent
+#    state pairs equal to (row, column) among all adjacent pairs;
+#    conditional_value = max_s B[column, s] (modal emission prob of successor).
+_, _, xis = forward_backward(A, B, pi)
+xi_sum = np.zeros((Kc, Kc))
+for al, lb in xis:
+    xi_sum += np.einsum("ti,ij,tj->ij", al, A, lb)
+joint = xi_sum / xi_sum.sum()
+nb = [(i, j, A[i, j], joint[i, j], B[j].max())
+      for i in range(Kc) for j in range(Kc) if A[i, j] > 1e-8]
+pd.DataFrame(nb, columns=["row", "column", "weight", "joint_fraction", "conditional_value"]) \
+    .to_csv(OUT + "neighbor_summary.csv", index=False)
+
+# 8. local_assignments.csv
+labels = G.argmax(1)
+pd.DataFrame({"sequence_id": seq_ids, "position": positions,
+              "global_index": gidx, "label": labels}).to_csv(
+    OUT + "local_assignments.csv", index=False)
+
+# 9. stream_diagnostics.csv
+ent_pos = -(G * np.log(G + 1e-300)).sum(1)
+sd = []
+for si, name in enumerate(stream_names):
+    s, e = starts[si], ends[si]
+    labs = labels[s:e]
+    dom = np.bincount(labs, minlength=Kc).max() / (e - s)
+    lik_all = B[:, sym[s:e]].T          # per-position filtered log-likelihood
+    sd.append(dict(sequence_id=name, n_positions=int(e - s),
+                   mean_objective=float(np.log(np.clip((lik_all * G[s:e]).sum(1), 1e-300, None)).mean()),
+                   weight_entropy_mean=float(ent_pos[s:e].mean()),
+                   dominant_label_fraction=float(dom)))
+pd.DataFrame(sd).to_csv(OUT + "stream_diagnostics.csv", index=False)
+
+# 10. diagnostics.png (rasterized with the mini-plotter above)
+W, H = 1860, 1240
+img = np.full((H, W, 3), 255, np.uint8)
+draw_text(img, 20, 8, f"latent-state model diagnostics (chosen K={chosen_K})", 3)
+
+# Panel A: objective and BIC vs K
+p = Panel(img, 90, 90, 640, 530, title="Objective and BIC vs K",
+          xlabel="K", ylabel="value")
+kvals = ev.candidate.values.astype(float)
+ll_rng = (float(ev.objective.min()) - 50, float(ev.objective.max()) + 50)
+bic_rng = (float(ev.criterion.min()) - 50, float(ev.criterion.max()) + 50)
+p.yticks(ll_rng, np.linspace(*ll_rng, 5), "{:.0f}")
+p.xticks((1.5, 12.5), [2, 4, 6, 8, 10, 12])
+p.plot((1.5, 12.5), ll_rng, kvals, ev.objective.values, (31, 119, 180), marker="o")
+p.plot((1.5, 12.5), bic_rng, kvals,
+       (ev.criterion.values - bic_rng[0]) / (bic_rng[1] - bic_rng[0]) *
+       (ll_rng[1] - ll_rng[0]) + ll_rng[0], (214, 39, 40), marker="s")
+p.vline((1.5, 12.5), ll_rng, chosen_K)
+draw_text(img, 100, 550, "BLUE: log-likelihood  RED: BIC (rescaled)", 2)
+draw_text(img, 100, 572, f"chosen K={chosen_K} (vertical line)", 2)
+
+# Panel B: marginal LL gain per added row
+p = Panel(img, 760, 90, 1280, 530, title="Marginal LL gain per added row",
+          xlabel="K", ylabel="dLL/row")
+dv = ev.delta_LL_per_added_row.values[1:]
+kdv = ev.candidate.values[1:].astype(float)
+rng = (0, float(max(dv.max() * 1.05, 1e-9)))
+p.yticks(rng, np.linspace(0, rng[1], 5), "{:.0f}")
+p.xticks((1.5, 12.5), [2, 4, 6, 8, 10, 12])
+p.plot((1.5, 12.5), rng, kdv, dv, (31, 119, 180), marker="o")
+p.vline((1.5, 12.5), rng, chosen_K)
+draw_text(img, 770, 550, "flattening => extra rows add little fit", 2)
+
+# Panel C: EM traces for chosen K
+p = Panel(img, 1380, 90, 1840, 530, title=f"EM traces, K={chosen_K}",
+          xlabel="EM step", ylabel="LL")
+tr_run, tr_step, tr_obj, tr_rel = d["trace"]
+srng = (0, float(tr_step.max()))
+orng = (float(tr_obj.min()), float(tr_obj.max()))
+p.yticks(orng, np.linspace(*orng, 4), "{:.0f}")
+p.xticks((0, srng[1]), [0, srng[1]])
+colors = [(31,119,180),(255,127,14),(44,160,44),(214,39,40),(148,103,189),
+          (140,86,75),(227,119,194),(127,127,127),(188,189,34),(23,190,207),
+          (102,0,102),(0,102,102)]
+for r in range(N_RESTARTS):
+    m = tr_run == r
+    p.plot(srng, orng, tr_step[m].astype(float), tr_obj[m], colors[r % len(colors)])
+draw_text(img, 1390, 550, f"{N_RESTARTS} seeded restarts converge", 2)
+
+# Panel D: emission heatmap
+p = Panel(img, 100, 720, 680, 1130, title="Emission matrix B (rows x 32 symbols)",
+          xlabel="symbol", ylabel="row")
+block = cmap_viridis(B / B.max(1, keepdims=True).clip(1e-9))
+bx0, by0 = p.x0 + 40, p.y0 + 10
+cw = (p.x1 - p.x0 - 50) / ALPHABET_SIZE
+ch = (p.y1 - p.y0 - 20) / Kc
+for i in range(Kc):
+    for j in range(ALPHABET_SIZE):
+        y0 = int(by0 + i * ch); x0 = int(bx0 + j * cw)
+        img[y0:int(y0 + ch) + 1, x0:int(x0 + cw) + 1] = block[i, j]
+draw_text(img, bx0, p.y1 + 40, "0        8       16       24       31", 2)
+for i in range(Kc):
+    draw_text(img, p.x0 + 6, int(by0 + i * ch + ch / 2 - 7), f"{i}", 2)
+
+# Panel E: transition heatmap
+p = Panel(img, 760, 720, 1280, 1130, title="Transition matrix A",
+          xlabel="successor row", ylabel="row")
+block = cmap_magma(A / max(A.max(), 0.05))
+side = min(p.x1 - p.x0 - 60, p.y1 - p.y0 - 30) / Kc
+bx0, by0 = p.x0 + 40, p.y0 + 10
+for i in range(Kc):
+    for j in range(Kc):
+        y0 = int(by0 + i * side); x0 = int(bx0 + j * side)
+        img[y0:int(y0 + side) + 1, x0:int(x0 + side) + 1] = block[i, j]
+for i in range(Kc):
+    draw_text(img, p.x0 + 6, int(by0 + i * side + side / 2 - 7), f"{i}", 2)
+    draw_text(img, int(bx0 + i * side + side / 2 - 3), p.y1 + 9, f"{i}", 2)
+draw_text(img, bx0, p.y1 + 40, "rows normalized: each sums to 1", 2)
+
+# Panel F: per-stream bars
+p = Panel(img, 1380, 720, 1840, 1130, title="Per-stream stability",
+          xlabel="stream", ylabel="frac")
+p.yticks((0, 1), [0, 0.25, 0.5, 0.75, 1.0], "{:.2f}")
+nb_streams = len(stream_names)
+bw = (p.x1 - p.x0 - 40) / nb_streams
+for si, r in enumerate(sd):
+    x0 = int(p.x0 + 20 + si * bw)
+    h1 = r["dominant_label_fraction"] * (p.y1 - p.y0 - 10)
+    draw_rect(img, x0, p.y1 - int(h1), x0 + int(bw * 0.35), p.y1,
+              (31, 119, 180), fill=(31, 119, 180))
+    h2 = r["weight_entropy_mean"] / np.log(Kc) * (p.y1 - p.y0 - 10)
+    draw_rect(img, x0 + int(bw * 0.4), p.y1 - int(h2), x0 + int(bw * 0.75), p.y1,
+              (255, 127, 14), fill=(255, 127, 14))
+    draw_text(img, x0, p.y1 + 9, f"s{si}", 2)
+draw_text(img, 1390, 1150, "BLUE: dominant-label fraction", 2)
+draw_text(img, 1390, 1172, "ORANGE: mean weight entropy / log K", 2)
+
+png_write(OUT + "diagnostics.png", img)
+print("wrote diagnostics.png", img.shape, flush=True)
+
+# ----------------------------------------------------------------------------
+# Supplementary: selection evidence + residual-dependence check
+# ----------------------------------------------------------------------------
+ev.to_csv(OUT + "selection_evidence.csv", index=False)
+
+inside = np.zeros(N, dtype=bool)
+for s, e in zip(starts, ends):
+    inside[s:e - 1] = True
+print("\nResidual lag-1 symbol MI within assigned states (nats):")
+for k in range(Kc):
+    i1 = np.where((labels == k) & inside)[0]
+    cnt = np.zeros((ALPHABET_SIZE, ALPHABET_SIZE))
+    for u, v in zip(sym[i1], sym[i1 + 1]):
+        cnt[u, v] += 1
+    if cnt.sum() < 50:
+        print(f"  row {k}: too few positions for MI")
+        continue
+    pmat = cnt / cnt.sum(); pu = pmat.sum(1); pv = pmat.sum(0)
+    mi = sum(pmat[i, j] * np.log(pmat[i, j] / (pu[i] * pv[j]))
+             for i in range(ALPHABET_SIZE) for j in range(ALPHABET_SIZE)
+             if pmat[i, j] > 0 and pu[i] > 0 and pv[j] > 0)
+    print(f"  row {k}: n={i1.size:6d}  MI={mi:.4f}")
+print("(unconditional lag-1 MI before conditioning: 0.377 nats)")
+
+checks = {
+    "rows_A_sum_to_1_max_err": float(np.abs(A.sum(1) - 1).max()),
+    "rows_B_sum_to_1_max_err": float(np.abs(B.sum(1) - 1).max()),
+    "pi_sums_to_1_max_err": float(abs(pi.sum() - 1)),
+    "weights_row_sums_max_err": float(np.abs(G.sum(1) - 1).max()),
+    "all_finite": bool(np.isfinite(A).all() and np.isfinite(B).all()
+                       and np.isfinite(pi).all() and np.isfinite(G).all()),
+}
+print("\nConsistency checks:", json.dumps(checks, indent=2))
+print("\nChosen model summary:")
+print("  stationary weights:", np.round(st, 4))
+print("  per-row usage share:", np.round(G.mean(0), 4))
+print("  per-row modal symbol:", [int(B[k].argmax()) for k in range(Kc)])
+print("Done.")

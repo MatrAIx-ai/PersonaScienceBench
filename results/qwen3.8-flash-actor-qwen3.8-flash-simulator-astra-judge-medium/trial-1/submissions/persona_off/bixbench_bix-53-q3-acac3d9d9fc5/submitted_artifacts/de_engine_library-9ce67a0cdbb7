@@ -1,0 +1,270 @@
+"""DESeq2-equivalent negative-binomial DE machinery, pure numpy/scipy.
+
+Written because neither R/DESeq2 nor pydeseq2 can be installed in this runner
+(no network egress at all: DNS fails AND raw TCP/UDP is unreachable). Steps, in
+DESeq2 order:
+  1. median-of-ratios size factors              (estimateSizeFactors)
+  2. gene-wise NB2 dispersion via Cox-Reid
+     adjusted profile likelihood                (nbinomDispersions)
+  3. parametric dispersion trend  a1 + a2/mu    (fitDispersion type="parametric")
+  4. empirical-Bayes shrinkage of gene-wise
+     dispersion toward the trend                (MAP on log alpha)
+  5. NB2 Wald test of the condition contrast    (nbinomWaldTest)
+  6. LFC shrinkage: ash-style EB normal mixture (apeglm stand-in)
+All functions are vectorised over genes.
+"""
+import numpy as np
+from scipy import stats, optimize
+from scipy.special import gammaln
+
+
+# ---------------------------------------------------------------- size factors
+def size_factors(counts):
+    """Median-of-ratios. counts:(G,n) -> sf:(n,), used:(G,) mask of all>0 rows."""
+    used = np.all(counts > 0, axis=1)
+    logs = np.log(counts[used])
+    logratio = logs - logs.mean(axis=1, keepdims=True)
+    logsf = np.median(logratio, axis=0)
+    return np.exp(logsf), used
+
+
+# ------------------------------------------------------ vectorised NB2 GLM fit
+def nb2_glm(y, X, sf, alpha, n_iter=100, tol=1e-9, steps=(1.0, 0.5, 0.25, 0.1)):
+    """mean mu_ij = exp(x_i . b_j) * sf_i , var = mu + alpha_j mu^2 (NB2).
+
+    IRLS: beta_new = (X'WX)^-1 X'W z with z = X beta + (y-mu)/mu,
+    damped by a vectorised log-likelihood line search.
+    """
+    G, n = y.shape
+    p = X.shape[1]
+    off = np.log(sf)[None, :] * np.ones((G, n))
+    beta = np.zeros((G, p))
+    beta[:, 0] = np.log(np.maximum((y / sf[None, :]).mean(axis=1), 1e-8))
+    beta[:, 1] = 0.0
+    ll_best = nb2_loglik(y, np.exp(np.clip(beta @ X.T + off, -30, 30)), alpha).sum(axis=1)
+    eye = np.eye(p)[None]
+    for it in range(n_iter):
+        eta = np.clip(beta @ X.T + off, -30, 30)
+        mu = np.exp(eta)
+        V = mu + alpha[:, None] * mu ** 2
+        W = mu ** 2 / V
+        z = (eta - off) + (y - mu) / mu
+        XtW = W[:, None, :] * X.T[None, :, :]
+        A = XtW @ X[None, :, :] + 1e-10 * eye
+        b = XtW @ z[:, :, None]
+        cand = np.linalg.solve(A, b)[:, :, 0]
+        cand = np.clip(cand, -25, 25)
+        best_ll = ll_best.copy(); best_b = beta
+        for lam in steps:
+            bc = beta + lam * (cand - beta)
+            llc = nb2_loglik(y, np.exp(np.clip(bc @ X.T + off, -30, 30)), alpha).sum(axis=1)
+            upd = llc > best_ll
+            best_ll = np.where(upd, llc, best_ll)
+            best_b = np.where(upd[:, None], bc, best_b)
+        delta = np.max(np.abs(best_b - beta))
+        beta, ll_best = best_b, best_ll
+        if delta < tol:
+            break
+    mu = np.exp(np.clip(beta @ X.T + off, -30, 30))
+    return beta, mu
+
+
+def nb2_loglik(y, mu, alpha):
+    r = 1.0 / alpha
+    return (gammaln(y + r[:, None]) - gammaln(r[:, None])
+            - gammaln(y + 1.0)
+            + r[:, None] * np.log(r[:, None] / (r[:, None] + mu))
+            + y * np.log(mu / (r[:, None] + mu)))
+
+
+# -------------------------------------- gene-wise dispersion (Cox-Reid APDL)
+def dispersion_genewise(y, X, sf, used, grid=None, chunk=3000):
+    """(alpha_hat, se_log_alpha) maximising the Cox-Reid adjusted profile."""
+    G, n = y.shape
+    p = X.shape[1]
+    if grid is None:
+        grid = np.exp(np.linspace(np.log(1e-4), np.log(5e2), 81))
+    lg = np.log(grid)
+    h = lg[1] - lg[0]
+    alpha_hat = np.full(G, np.nan)
+    se_loga = np.full(G, np.nan)
+    idx = np.where(used)[0]
+    eye = np.eye(p)[None]
+    for s in range(0, len(idx), chunk):
+        sel = idx[s:s + chunk]
+        ys = y[sel]
+        m = len(sel)
+        lcr = np.empty((m, len(grid)))
+        for gi, a in enumerate(grid):
+            al = np.full(m, a)
+            beta, mu = nb2_glm(ys, X, sf, al)
+            ll = nb2_loglik(ys, mu, al).sum(axis=1)
+            V = mu + a * mu ** 2
+            W = mu ** 2 / V
+            XtWX = np.einsum('gn,ni,nj->gij', W, X, X) + 1e-12 * eye
+            _, logdet = np.linalg.slogdet(XtWX)
+            lcr[:, gi] = ll - 0.5 * logdet
+        j = np.argmax(lcr, axis=1)
+        la = lg[j].copy()
+        interior = (j > 0) & (j < len(grid) - 1)
+        if interior.any():
+            k = np.where(interior)[0]
+            y0 = lcr[k, j[k] - 1]; y1 = lcr[k, j[k]]; y2 = lcr[k, j[k] + 1]
+            d = y0 - 2 * y1 + y2
+            ok = d < 0
+            shift = np.where(ok, 0.5 * (y0 - y2) / np.where(d != 0, d, 1.0), 0.0)
+            la[k] = np.clip(lg[j[k]] + shift * h, lg[j[k]] - h, lg[j[k]] + h)
+        alpha_hat[sel] = np.exp(la)
+        jj = np.clip(np.round((la - lg[0]) / h).astype(int), 1, len(grid) - 2)
+        d2 = (lcr[np.arange(m), jj - 1] - 2 * lcr[np.arange(m), jj]
+              + lcr[np.arange(m), jj + 1]) / h ** 2
+        se = np.where(d2 < 0, 1.0 / np.sqrt(-d2), np.nan)
+        se_loga[sel] = np.clip(se, 0.05, 25.0)
+    return alpha_hat, se_loga
+
+
+# ------------------------------------------------- dispersion trend + EB prior
+def disp_trend(mu_norm, alpha_gw, se_loga, used, min_mu=0.5, n_bins=25,
+               prior_sd_floor=0.05, prior_sd_cap=3.0, se_informative=1.0, verbose=None):
+    """Trend alpha(mu)=a1+a2/mu fitted to log bin medians (robust, like the
+    DESeq2 parametric fit), plus an empirical-Bayes prior sd on the log scale
+    estimated on informative genes (method of moments, with DESeq2-style floor).
+
+    Returns (trend_per_gene, a1, a2, prior_sd, n_used).
+    """
+    se = np.where(np.isfinite(se_loga), se_loga, np.nanmedian(se_loga))
+    ok = used & np.isfinite(alpha_gw) & (alpha_gw > 0) & (mu_norm > min_mu)
+    x = mu_norm[ok]; a = alpha_gw[ok]
+    hi = max(float(np.nanpercentile(x, 99.9)), 10.0)
+    edges = np.exp(np.linspace(np.log(min_mu), np.log(hi), n_bins + 1))
+    idx = np.clip(np.digitize(x, edges) - 1, 0, n_bins - 1)
+    cen, med, cnt_ = [], [], []
+    for i in range(n_bins):
+        m = idx == i
+        if m.sum() >= 25:
+            cen.append(np.exp(np.mean(np.log(np.maximum(x[m], 1e-6)))))
+            med.append(np.median(a[m])); cnt_.append(int(m.sum()))
+    cen = np.array(cen); med = np.array(med); cnt_ = np.array(cnt_)
+    popt, _ = optimize.curve_fit(lambda m, a1, a2: np.log(a1 + a2 / np.maximum(m, 1e-6)),
+                                 cen, np.log(med), p0=[0.02, 1.0], sigma=np.ones(len(cen)),
+                                 maxfev=60000, bounds=([1e-6, 1e-6], [1e2, 1e4]))
+    a1, a2 = float(popt[0]), float(popt[1])
+    trend = a1 + a2 / np.maximum(mu_norm, 1e-6)
+    # EB prior variance from informative genes only (small se), MoM
+    inf_ = ok & (se <= se_informative)
+    resid = np.log(alpha_gw[inf_]) - np.log(trend[inf_])
+    prior_var = float(np.mean(resid ** 2) - np.mean(se[inf_] ** 2)) if inf_.sum() else 0.0
+    prior_sd = float(np.clip(np.sqrt(max(prior_var, prior_sd_floor ** 2)),
+                             prior_sd_floor, prior_sd_cap))
+    if verbose:
+        ratio = med / (a1 + a2 / np.maximum(cen, 1e-6))
+        verbose(f'disp_trend: a1={a1:.4f} a2={a2:.3f} bins={len(cen)} genes_in_fit={int(ok.sum())} '
+                f'| trend/empirical-median ratio: min={ratio.min():.2f} med={np.median(ratio):.2f} max={ratio.max():.2f}')
+        verbose(f'disp_trend: informative genes (se<= {se_informative}) n={int(inf_.sum())} '
+                f'MoM prior_var={prior_var:.3f} -> prior_sd(log alpha)={prior_sd:.3f}')
+    return trend, a1, a2, prior_sd, int(ok.sum())
+
+
+def disp_shrink(alpha_gw, se_loga, trend, prior_sd, floor=1e-7, cap=100.0):
+    """Normal-normal MAP of log alpha given log-normal prior around the trend."""
+    out = np.full(alpha_gw.shape, np.nan)
+    se_loga = np.where(np.isfinite(se_loga), se_loga, 1.0)
+    ok = np.isfinite(alpha_gw) & (trend > 0) & np.isfinite(trend)
+    la = np.log(alpha_gw[ok]); lt = np.log(trend[ok]); se = se_loga[ok]
+    tau2 = prior_sd ** 2
+    post_mean = (la / se ** 2 + lt / tau2) / (1.0 / se ** 2 + 1.0 / tau2)
+    shrunk = np.exp(post_mean)
+    # DESeq2-style variance floor for the shrunken value
+    var = 1.0 / (1.0 / se ** 2 + 1.0 / tau2)
+    shrunk = np.maximum(shrunk, np.exp(np.clip(np.log(trend[ok]) - 2 * np.sqrt(var), -20, 10)))
+    shrunk = np.clip(shrunk, floor, cap)
+    out[ok] = shrunk
+    return out
+
+
+# ------------------------------------------------------------ Wald test + BH
+def wald(y, X, sf, alpha):
+    beta, mu = nb2_glm(y, X, sf, alpha)
+    eta = np.clip(beta @ X.T + np.log(sf)[None, :], -30, 30)
+    mu = np.exp(eta)
+    V = mu + alpha[:, None] * mu ** 2
+    W = mu ** 2 / V
+    XtWX = np.einsum('gn,ni,nj->gij', W, X, X) + 1e-10 * np.eye(X.shape[1])[None]
+    cov = np.linalg.inv(XtWX)
+    se = np.sqrt(np.maximum(cov[:, 1, 1], 0.0))          # coefficient = contrast
+    lfc = beta[:, 1] / np.log(2.0)                        # to log2
+    se_lfc = se / np.log(2.0)
+    safe = se_lfc > 0
+    z = np.where(safe, lfc / np.where(safe, se_lfc, np.nan), 0.0)
+    pval = 2 * stats.norm.sf(np.abs(z))
+    pval = np.where(np.isfinite(pval), pval, 1.0)
+    return dict(lfc=lfc, se_lfc=se_lfc, z=z, pvalue=pval, beta=beta, mu=mu)
+
+
+def bh(p):
+    p = np.asarray(p, float)
+    ok = np.isfinite(p)
+    q = np.ones_like(p)
+    pv = p[ok]
+    n = pv.size
+    order = np.argsort(pv)
+    ranked = pv[order] * n / np.arange(1, n + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    tmp = np.empty(n)
+    tmp[order] = np.minimum(ranked, 1.0)
+    q[ok] = tmp
+    return q
+
+
+# ------------------------------------------- LFC shrinkage: ash-like EB mixt.
+def ash_shrink(lfc, se, s_grid=None, n_comp=40, max_sd=10.0, tol=1e-8, itmax=800):
+    """ashr-style empirical-Bayes with a point mass at 0 + normal components.
+    Returns (posterior_mean_lfc, lfsr, pi_hat, s_grid)."""
+    ok = np.isfinite(lfc) & np.isfinite(se) & (se > 0)
+    x = lfc[ok]; s = se[ok]
+    if s_grid is None:
+        s_grid = np.concatenate([[0.0], np.exp(np.linspace(np.log(0.02), np.log(max_sd), n_comp))])
+    S2 = s_grid ** 2
+    m = (S2[None, :] + s[:, None] ** 2)
+    loglik_c = -0.5 * (np.log(2 * np.pi * m) + (x[:, None] ** 2) / m)
+    loglik_c[:, 0] = np.where(x == 0, 0.0, -np.inf)      # point mass
+    mx = loglik_c.max(axis=1, keepdims=True)
+    L = np.exp(loglik_c - mx)
+    pi = np.full(len(s_grid), 1.0 / len(s_grid)); pi[0] = 0.5; pi[1:] = 0.5 / (len(s_grid) - 1)
+    pi = pi / pi.sum()
+    for it in range(itmax):
+        Wt = L * pi[None, :]
+        tot = Wt.sum(axis=1, keepdims=True) + 1e-300
+        R = Wt / tot
+        newpi = R.mean(axis=0)
+        if np.max(np.abs(newpi - pi)) < tol:
+            pi = newpi
+            break
+        pi = newpi
+    Wt = L * pi[None, :]; tot = Wt.sum(axis=1, keepdims=True) + 1e-300
+    R = Wt / tot
+    # posterior mean under each component: N(x * s_c^2/(s^2+s_c^2), ...)
+    scale = np.where(S2[None, :] > 0, S2[None, :] / (S2[None, :] + s[:, None] ** 2), 0.0)
+    post_mean_comp = x[:, None] * scale
+    pm = (R * post_mean_comp).sum(axis=1)
+    # local fdr = posterior prob of the point mass (component 0)
+    lfsr = R[:, 0]
+    out_lfc = np.full(lfc.shape, np.nan); out_l = np.full(lfc.shape, np.nan)
+    out_lfc[ok] = pm; out_l[ok] = lfsr
+    return out_lfc, out_l, pi, s_grid
+
+
+def normal_prior_shrink(lfc, se):
+    """Simple EB single-normal prior (sd MLE); stand-in for lfcShrink(normal)."""
+    ok = np.isfinite(lfc) & np.isfinite(se) & (se > 0)
+    x = lfc[ok]; s = se[ok]
+
+    def nll(logsd):
+        sd = np.exp(logsd)
+        return np.sum(0.5 * np.log(s ** 2 + sd ** 2) + x ** 2 / (2 * (s ** 2 + sd ** 2)))
+
+    r = optimize.minimize_scalar(nll, bounds=(-6, 4), method="bounded")
+    sd = float(np.exp(r.x))
+    out = np.full(lfc.shape, np.nan)
+    out[ok] = x * sd ** 2 / (sd ** 2 + s ** 2)
+    return out, sd

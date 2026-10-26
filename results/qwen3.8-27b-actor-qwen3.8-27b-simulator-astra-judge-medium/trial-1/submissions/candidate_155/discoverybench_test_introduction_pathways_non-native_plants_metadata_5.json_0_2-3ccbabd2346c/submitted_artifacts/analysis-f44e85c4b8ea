@@ -1,0 +1,312 @@
+import numpy as np, pandas as pd, json, warnings
+warnings.filterwarnings('ignore')
+from scipy.special import gammaln, expit
+from scipy.optimize import minimize
+import statsmodels.api as sm
+from scipy.stats import chi2_contingency, kruskal, spearmanr, norm as snorm
+
+RNG = np.random.default_rng(42)
+OUT = {}
+d = pd.read_csv('data/invaded_niche_pathways.csv', sep='\t')
+d.columns = [c.replace('.', '_') for c in d.columns]
+N = len(d)
+OUT['n_plots'] = N
+covs = ['elevation', 'distance_road', 'distance_stream', 'annual_temperature',
+        'annual_rainfall', 'annual_radiation']
+hab_levels = list(pd.Categorical(d['habitat']).categories)
+for c in covs:
+    d[f'{c}_z'] = (d[c] - d[c].mean()) / d[c].std()
+d['cropland_2009_50m_z'] = (d['cropland_2009_50m'] - d['cropland_2009_50m'].mean()) / d['cropland_2009_50m'].std()
+for h in hab_levels[1:]:
+    d[f'hab_{h}'] = (d['habitat'] == h).astype(float)
+PATHS = [('n_gard', 'Gardening'), ('n_unint', 'Unintentional'), ('n_agfo', 'AgriForest')]
+
+# ---------- generic GLM helpers ----------
+def design(df, urban_col, with_habitat, extra=()):
+    cols = [urban_col] + [f'{c}_z' for c in covs] + ['cropland_2009_50m_z'] + list(extra)
+    if with_habitat:
+        cols += [f'hab_{h}' for h in hab_levels[1:]]
+    X = pd.DataFrame(index=df.index); X['const'] = 1.0
+    for c in cols: X[c] = df[c]
+    X = X[['const'] + cols]
+    return X, ['const'] + cols
+
+def coef_ci(fit, names, name):
+    pos = names.index(name)
+    b = float(np.asarray(fit.params)[pos]); se = float(np.asarray(fit.bse)[pos])
+    pv = np.asarray(fit.pvalues)
+    p = float(pv[pos]) if (pv.size == len(names) and np.isfinite(pv).all()) else float('nan')
+    return dict(coef=round(b, 4), se=round(se, 4),
+                ratio=round(float(np.exp(b)), 3),
+                lo=round(float(np.exp(b - 1.96 * se)), 3),
+                hi=round(float(np.exp(b + 1.96 * se)), 3),
+                p=round(p, 5))
+
+# ---------- ridge (Firth-like) logistic for quasi-separation ----------
+def ridge_logit(y, X, names, lam=1.0):
+    n, k = X.shape
+    mask = np.ones(k); mask[0] = 0.0  # don't penalize intercept
+    def nll(beta):
+        eta = X @ beta
+        p = expit(eta)
+        p = np.clip(p, 1e-12, 1 - 1e-12)
+        ll = (y * np.log(p) + (1 - y) * np.log(1 - p)).sum()
+        return -(ll - 0.5 * lam * (mask * beta) @ (mask * beta))
+    res = minimize(nll, np.zeros(k), method='L-BFGS-B', options={'maxiter': 5000})
+    beta = res.x
+    # Hessian of penalized nll
+    p = np.clip(expit(X @ beta), 1e-9, 1 - 1e-9)
+    W = X.T @ (p * (1 - p)[:, None]) @ X - lam * np.diag(mask)
+    try:
+        se = np.sqrt(np.clip(np.diag(np.linalg.pinv(-W)), 0, None))
+    except Exception:
+        se = np.full(k, np.nan)
+    class R: pass
+    r = R(); r.params = pd.Series(beta, index=names); r.bse = pd.Series(se, index=names)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        z = np.abs(beta / se)
+        r.pvalues = pd.Series(2 * (1 - snorm.cdf(z)), index=names)
+    r.llf = -res.fun + 0.5 * lam * (mask * beta) @ (mask * beta)
+    return r
+
+# ---------- TWO-PART (hurdle) model: presence logit + Poisson count on y>0 ----------
+def two_part(df, yname, urban_col, with_habitat):
+    y = df[yname].values
+    pres = (y > 0).astype(float)
+    X, names = design(df, urban_col, with_habitat)
+    Xv = X.values
+    if with_habitat:
+        lf = ridge_logit(pres, Xv, names, lam=1.0)
+    else:
+        lf = sm.Logit(pres, Xv).fit(disp=0, maxiter=5000)
+    nz = y > 0
+    cf = sm.GLM(y[nz], Xv[nz], family=sm.families.Poisson()).fit(disp=0, maxiter=5000)
+    mu = cf.mu; resid = (y[nz] - mu) ** 2 / mu
+    disp = float(resid.sum() / (nz.sum() - len(names)))
+    return dict(presence=coef_ci(lf, names, urban_col), count=coef_ci(cf, names, urban_col),
+                n_nonzero=int(nz.sum()), overdisp_ratio=round(disp, 2),
+                presence_all={nm: coef_ci(lf, names, nm) for nm in names if nm != 'const'},
+                count_all={nm: coef_ci(cf, names, nm) for nm in names if nm != 'const'})
+
+tp = {}
+for yname, label in PATHS:
+    for wh, tag in [(False, 'no_habitat'), (True, 'with_habitat')]:
+        tp[f'{label}|{tag}'] = two_part(d, yname, 'urban_2009_50m', wh)
+OUT['twopart_2009_50m'] = tp
+
+# ---------- FULL ZINB (as requested) with caveat ----------
+def zinb_nll(theta, Xc, Xz, y, J):
+    p, q = J
+    b, a = theta[:p], theta[p:p+q]
+    alpha = np.exp(np.clip(theta[-1], -4, 6))
+    mu = np.exp(np.clip(Xc @ b, -30, 30)); pi = expit(Xz @ a)
+    lnb = (gammaln(y + alpha) - gammaln(alpha) - gammaln(y + 1)
+           + alpha * np.log(alpha / (alpha + mu)) + y * np.log(mu / (alpha + mu)))
+    lp0 = np.log(np.clip(1 - pi + pi * np.exp(lnb), 1e-300, None))
+    lpg = np.log(np.clip(1 - pi, 1e-300, None)) + lnb
+    return -np.where(y == 0, lp0, lpg).sum()
+
+def fit_zinb(Xc, Xz, y, names):
+    p, q = Xc.shape[1], Xz.shape[1]
+    try: a0 = sm.Logit((y == 0).astype(float), Xz).fit(disp=0).params
+    except Exception: a0 = np.full(q, -2.0)
+    try: b0 = sm.GLM(y, Xc, family=sm.families.Poisson()).fit(disp=0).params
+    except Exception: b0 = np.zeros(p)
+    best = None
+    for t0 in [np.concatenate([b0, a0, [0.0]]), np.concatenate([np.zeros(p), np.full(q, -2.0), [0.0]])]:
+        res = minimize(zinb_nll, t0, args=(Xc, Xz, y, (p, q)), method='L-BFGS-B',
+                       options={'maxiter': 6000, 'ftol': 1e-12})
+        if best is None or res.fun < best.fun: best = res
+    theta = best.x
+    idx = list(names).index('urban_2009_50m')
+    b, a = theta[:p], theta[p:p+q]
+    return dict(alpha=float(np.exp(np.clip(theta[-1], -4, 6))), llf=round(-best.fun, 2),
+                count_urban=dict(coef=round(float(b[idx]), 4), ratio=round(float(np.exp(b[idx])), 3)),
+                zi_urban=dict(coef=round(float(a[idx]), 4), ratio=round(float(np.exp(a[idx])), 3)),
+                ok=bool(best.success))
+
+zinb = {}
+for yname, label in PATHS:
+    y = d[yname].values
+    for wh, tag in [(False, 'no_habitat'), (True, 'with_habitat')]:
+        X, names = design(d, 'urban_2009_50m', wh)
+        zinb[f'{label}|{tag}'] = fit_zinb(X.values, X.values, y, names)
+OUT['zinb_2009_50m'] = zinb
+OUT['zinb_caveat'] = ('alpha -> infinity (Poisson limit): no supported overdispersion; the urban effect on '
+                      'presence is identifiable but its split between the Poisson mean and the excess-zero '
+                      'probability is not (flat likelihood ridge, very large ZI SEs). Two-part model reported as '
+                      'the well-identified equivalent.')
+
+# ---------- SCALE sensitivity (two-part, no habitat) ----------
+scale = {}
+for scol in ['urban_2009_500m', 'urban_2009_1000m']:
+    for yname, label in PATHS:
+        r = two_part(d, yname, scol, False)
+        scale[f'{label}|{scol}'] = dict(presence=r['presence'], count=r['count'])
+OUT['scale_2009'] = scale
+
+# ---------- CHANGE model 1956->2009 (filter sum~1) ----------
+s1956 = (d['progressive_1956_2009_50m'] + d['regressive_1956_2009_50m'] + d['no_changes_1956_2009_50m'])
+keep = (np.abs(s1956 - 1) <= 0.05)
+d['net_change'] = d['progressive_1956_2009_50m'] - d['regressive_1956_2009_50m']
+d['net_change_z'] = (d['net_change'] - d['net_change'].mean()) / d['net_change'].std()
+OUT['change_filter'] = dict(n_kept=int(keep.sum()), n_total=N, share=round(float(keep.mean()), 3),
+                            rule='keep rows where |progressive+regressive+no.changes - 1| <= 0.05 (1956-2009, 50m)')
+sub = d[keep]
+change = {}
+for yname, label in PATHS:
+    y = sub[yname].values
+    pres = (y > 0).astype(float)
+    cols = ['net_change_z'] + [f'{c}_z' for c in covs] + ['cropland_2009_50m_z']
+    X = pd.DataFrame(index=sub.index); X['const'] = 1.0
+    for c in cols: X[c] = sub[c]
+    X = X[['const'] + cols]
+    lf = sm.Logit(pres, X.values).fit(disp=0, maxiter=5000)
+    change[label] = dict(presence=coef_ci(lf, list(X.columns), 'net_change_z'))
+OUT['change_1956_2009'] = change
+
+json.dump(OUT, open('results_A.json', 'w'), indent=2, default=float)
+print("PART A done")
+for k, v in tp.items():
+    print(f"{k:32s} presOR={v['presence']['ratio']} [{v['presence']['lo']},{v['presence']['hi']}] p={v['presence']['p']} | "
+          f"countIRR(nz)={v['count']['ratio']} [{v['count']['lo']},{v['count']['hi']}] | ovdisp={v['overdisp_ratio']}")
+print("--- ZINB (urban coef, count / ZI) ---")
+for k, v in zinb.items():
+    print(f"{k:32s} alpha={v['alpha']:.0f} count coef={v['count_urban']['coef']} (IRR {v['count_urban']['ratio']}) | "
+          f"ZI coef={v['zi_urban']['coef']} (OR {v['zi_urban']['ratio']}) conv={v['ok']}")
+print("--- scale ---")
+for k, v in scale.items():
+    print(f"{k:34s} presOR={v['presence']['ratio']} [{v['presence']['lo']},{v['presence']['hi']}] | countIRR={v['count']['ratio']}")
+print("--- change (kept %d/%d) ---" % (OUT['change_filter']['n_kept'], N))
+for k, v in change.items():
+    print(f"{k:15s} presOR/1SD change={v['presence']['ratio']} [{v['presence']['lo']},{v['presence']['hi']}] p={v['presence']['p']}")
+import numpy as np, pandas as pd, json, warnings, re
+warnings.filterwarnings('ignore')
+from scipy.stats import chi2_contingency, kruskal
+import json
+A = json.load(open('results_A.json'))
+RNG = np.random.default_rng(42)
+
+# ---------------- TEMPORAL contingency ----------------
+t = pd.read_csv('data/temporal_trends_contingency_table.csv', sep='\t')
+tab = t.pivot(index='introduction.period', columns='pathway', values='n').fillna(0)
+order = ['Before 1500', '1501-1900', '1901-1984', '1985-2019']
+tab = tab.reindex(order)
+chi2, p, dof, _ = chi2_contingency(tab.values)
+n_tot = int(tab.values.sum()); k = min(tab.shape) - 1
+cramers_v = float(np.sqrt(chi2 / (n_tot * k)))
+row_pct = tab.div(tab.sum(axis=1), axis=0) * 100
+A['temporal'] = dict(chi2=round(float(chi2), 2), p=float(p), dof=int(dof),
+                     cramers_v=round(cramers_v, 3), n_total=n_tot,
+                     table={i: {c: int(tab.loc[i, c]) for c in tab.columns} for i in order},
+                     row_pct={i: {c: round(float(row_pct.loc[i, c]), 1) for c in tab.columns} for i in order})
+
+# ---------------- INVASION SUCCESS by pathway ----------------
+s = pd.read_csv('data/invasion_success_pathways.csv')
+success = {}
+for var in ['number.of.invaded.plots', 'area.of.occupancy.10km', 'invaded.niche.breadth', 'mrt']:
+    groups = [s.loc[s['intro.pathway'] == p, var].dropna().values for p in ['Gardening', 'Unintentional', 'AgriForest']]
+    H, p = kruskal(*groups)
+    success[var] = dict(H=round(float(H), 2), p=float(p),
+                        med={p_: float(np.median(g)) for p_, g in zip(['Gardening', 'Unintentional', 'AgriForest'], groups)},
+                        n={p_: int(len(g)) for p_, g in zip(['Gardening', 'Unintentional', 'AgriForest'], groups)})
+A['invasion_success'] = success
+A['invasion_success_note'] = 'Kruskal-Wallis across pathways; differences modest (see p).'
+
+# ---------------- PHYLOGENETIC ----------------
+def parse_newick(txt):
+    txt = txt.strip()
+    if txt.endswith(';'): txt = txt[:-1]
+    pos = 0
+    def read_num():
+        nonlocal pos
+        st = pos
+        while pos < len(txt) and (txt[pos].isdigit() or txt[pos] in '.eE+-'):
+            pos += 1
+        return float(txt[st:pos]) if pos > st else 0.0
+    def parse():
+        nonlocal pos
+        if txt[pos] == '(':
+            pos += 1
+            children = []
+            while True:
+                children.append(parse())
+                if txt[pos] == ',': pos += 1; continue
+                if txt[pos] == ')': pos += 1; break
+            node = {'children': children, 'name': None}
+        else:
+            st = pos
+            while pos < len(txt) and txt[pos] not in ':,)': pos += 1
+            node = {'children': None, 'name': txt[st:pos]}
+        if pos < len(txt) and txt[pos] == ':':
+            pos += 1; node['bl'] = read_num()
+        else:
+            node['bl'] = 0.0
+        return node
+    return parse()
+
+tree_txt = open('data/phylogenetic_tree.txt').read()
+root = parse_newick(tree_txt)
+tips = {}
+def walk(node, depth, level):
+    nd = depth + node['bl']; node['_depth'] = nd; node['_level'] = level
+    if node['children'] is None:
+        tips[node['name']] = nd
+    else:
+        for c in node['children']: walk(c, nd, level + 1)
+walk(root, 0.0, 0)
+A['phylo_n_tips'] = len(tips)
+
+labels = s['phylo.tip.label'].dropna().tolist()
+present = [l for l in labels if l in tips]
+missing = [l for l in labels if l not in tips]
+A['phylo_labels_total'] = len(labels)
+A['phylo_labels_in_tree'] = len(present)
+A['phylo_labels_missing'] = missing
+
+parent = {}
+def build_parent(node):
+    if node['children'] is not None:
+        for c in node['children']:
+            parent[id(c)] = node; build_parent(c)
+build_parent(root)
+tipnode = {}
+def collect(node):
+    if node['children'] is None: tipnode[node['name']] = node
+    else:
+        for c in node['children']: collect(c)
+collect(root)
+def lca_depth(a, b):
+    na, nb = tipnode[a], tipnode[b]
+    while na['_level'] > nb['_level']: na = parent[id(na)]
+    while nb['_level'] > na['_level']: nb = parent[id(nb)]
+    while na is not nb:
+        na = parent[id(na)]; nb = parent[id(nb)]
+    return na['_depth']
+def coph(a, b): return tips[a] + tips[b] - 2 * lca_depth(a, b)
+def mean_pw(names):
+    if len(names) < 2: return np.nan
+    return float(np.mean([coph(a, b) for i, a in enumerate(names) for b in names[i+1:]]))
+
+pair = list(zip(labels, s['intro.pathway']))
+alltips = present
+cluster = {}
+for p in ['Gardening', 'Unintentional', 'AgriForest']:
+    grp = [l for l, p2 in pair if p2 == p and l in tips]
+    obs = mean_pw(grp)
+    null = [mean_pw(list(RNG.permutation(alltips)[:len(grp)])) for _ in range(999)]
+    null = np.array([x for x in null if np.isfinite(x)])
+    pv = float((np.sum(null >= obs) + 1) / (len(null) + 1))
+    cluster[p] = dict(n_species=len(grp), obs_mean_pw=round(obs, 4),
+                      null_mean=round(float(np.mean(null)), 4), p_monophyly_signal=pv)
+A['phylo_clustering'] = cluster
+A['phylo_note'] = ('Test: mean pairwise cophenetic distance within each pathway vs 999 tip permutations. '
+                   'Lower obs than null = phylogenetic clustering of that pathway.')
+
+json.dump(A, open('results_A.json', 'w'), indent=2, default=float)
+print("TEMPORAL: chi2=%.1f p=%.3g CV=%.3f" % (A['temporal']['chi2'], A['temporal']['p'], A['temporal']['cramers_v']))
+print("  row_pct:", json.dumps(A['temporal']['row_pct']))
+print("\nINVASION SUCCESS (Kruskal p):")
+for k, v in success.items(): print(f"  {k}: p={v['p']:.4f} med={v['med']}")
+print("\nPHYLO: tips=%d labels_in_tree=%d/%d missing=%s" % (A['phylo_n_tips'], A['phylo_labels_in_tree'], A['phylo_labels_total'], missing))
+for k, v in cluster.items(): print(f"  {k}: n={v['n_species']} obs={v['obs_mean_pw']} null={v['null_mean']} p={v['p_monophyly_signal']}")

@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+Multi-sensor motion record audit: LiDAR/IMU time-offset & yaw calibration.
+==========================================================================
+
+Model
+-----
+Planar robot with unicycle kinematics: the robot translates along the forward
+axis of the body/IMU frame with an (unknown) speed v(t); body heading theta(t).
+
+* Gyro:  omega_g(t) = theta_dot(t) + gyro_bias + noise, on its OWN clock.
+* LiDAR: mounted with constant extrinsic yaw e w.r.t. the body frame; measures
+  relative motion between consecutive scans in the LIDAR frame.
+
+SIGN CONVENTIONS (documented per researcher request):
+* time_offset_s :  t_imu = t_lidar + time_offset
+  (offset to ADD to a LiDAR timestamp to index the gyro stream; the yaw change
+  over a LiDAR interval [t0,t1] is predicted by integrating the gyro over
+  [t0+tau, t1+tau]).
+* yaw_extrinsic_rad (e): LiDAR frame = body frame rotated by +e, so a
+  body-frame vector v is (cos e, -sin e)-rotated in the LiDAR frame. With
+  pure forward velocity, (dx,dy) in the LiDAR frame points in fixed
+  direction -e, i.e. e = atan2(-dy, dx).
+
+Fitting (TRAIN rows only):
+* e: closed-form LS on the perpendicular component of each translation:
+     min_e sum (dx sin e + dy cos e)^2  =>  e* = atan2(-sum dy, sum dx).
+* (bias, tau): min sum wrap(dyaw - int_{t0+tau}^{t1+tau}(omega_g - bias) dt)^2;
+  closed-form bias for fixed tau, coarse grid over tau refined with
+  scipy.optimize.least_squares. Parameters decouple: e enters only the
+  translation direction, (bias, tau) only the dyaw channels.
+
+Outputs: calibration.csv, observability.csv, residuals.csv (ALL held-out
+rows), calibration_diagnostics.png, metrics.json.
+"""
+import csv
+import json
+import os
+
+import numpy as np
+from scipy.optimize import least_squares
+
+TWO_PI = 2 * np.pi
+
+
+def wrap(a):
+    """Wrap angles to [-pi, pi)."""
+    return (a + np.pi) % TWO_PI - np.pi
+
+
+# ----------------------------------------------------------------------
+# 1. Load data
+# ----------------------------------------------------------------------
+imu = np.genfromtxt("data/imu_gyro.csv", delimiter=",", names=True)
+t_imu = imu["imu_time_s"]
+omega = imu["omega_z_rad_s"]
+
+lid = np.genfromtxt("data/lidar_scan_matches.csv", delimiter=",", names=True)
+scan_id = lid["scan_id"].astype(int)
+t0 = lid["t0_lidar_s"]
+t1 = lid["t1_lidar_s"]
+dx = lid["dx_lidar_m"]
+dy = lid["dy_lidar_m"]
+dyaw = lid["dyaw_lidar_rad"]
+sigma_trans = float(lid["sigma_trans_m"][0])   # constant 0.018 m
+sigma_yaw = float(lid["sigma_yaw_rad"][0])     # constant 0.006 rad
+
+with open("data/lidar_scan_matches.csv") as f:
+    split = np.array([r[-1] for r in list(csv.reader(f))[1:]])
+train = split == "train"
+heldout = split == "heldout"
+assert len(scan_id) == 854 and heldout.sum() == 154 and train.sum() == 700
+
+seg = np.genfromtxt("data/segment_windows.csv", delimiter=",", names=True)
+seg_id = seg["segment_id"].astype(int)
+seg_t1 = seg["t1_lidar_s"]
+
+# segment membership of each scan (by its t0; windows tile the timeline)
+scan_seg = np.searchsorted(seg_t1, t0, side="right")
+assert scan_seg.min() >= 0 and scan_seg.max() <= 8
+
+# ----------------------------------------------------------------------
+# 2. Fit yaw extrinsic e (train only)
+# ----------------------------------------------------------------------
+e_hat = float(np.arctan2(-dy[train].sum(), dx[train].sum()))
+ang = np.arctan2(dy[train], dx[train])
+circ_std = float(np.sqrt(-2.0 * np.log(abs(np.mean(np.exp(1j * ang))))))
+se_e = circ_std / np.sqrt(train.sum())
+
+# ----------------------------------------------------------------------
+# 3. Fit (gyro_bias, time_offset) from dyaw channels (train only)
+# ----------------------------------------------------------------------
+cum = np.concatenate([[0.0], np.cumsum(0.5 * (omega[1:] + omega[:-1]) *
+                                       (t_imu[1:] - t_imu[:-1]))])
+
+
+def F(t):
+    """Integral of omega_g from t_imu[0] to t (piecewise-linear interp)."""
+    return np.interp(t, t_imu, cum)
+
+
+def residuals(params):
+    tau, bias = params
+    pa = t0[train] + tau
+    pb = t1[train] + tau
+    pred = F(pb) - F(pa) - bias * (pb - pa)   # predicted dyaw
+    return wrap(dyaw[train] - pred)
+
+
+best = None
+for tau in np.arange(-0.06, 0.0601, 0.001):
+    pa = t0[train] + tau
+    pb = t1[train] + tau
+    base = F(pb) - F(pa)
+    dt = pb - pa
+    b = float(-np.sum((dyaw[train] - base) * dt) / np.sum(dt * dt))
+    s = float(np.sum(wrap(dyaw[train] - base + b * dt) ** 2))
+    if best is None or s < best[0]:
+        best = (s, tau, b)
+_s, tau0, b0 = best
+
+fit = least_squares(residuals, x0=[tau0, b0], method="lm", max_nfev=20000)
+tau_hat, bias_hat = (float(v) for v in fit.x)
+res_tr = residuals(fit.x)
+
+J = fit.jac
+pcov = np.linalg.inv(J.T @ J) * np.sum(res_tr ** 2) / (len(res_tr) - 2)
+se_tau, se_bias = (float(np.sqrt(v)) for v in np.diag(pcov))
+
+# ----------------------------------------------------------------------
+# 4. Residuals (train + heldout); heldout written to residuals.csv
+# ----------------------------------------------------------------------
+def all_residuals(mask):
+    pa = t0[mask] + tau_hat
+    pb = t1[mask] + tau_hat
+    r_yaw = wrap(dyaw[mask] - (F(pb) - F(pa)) + bias_hat * (pb - pa))
+    # perpendicular component w.r.t. predicted forward dir u=(cos e,-sin e):
+    # perp unit vector = (sin e, cos e)
+    r_trans = dx[mask] * np.sin(e_hat) + dy[mask] * np.cos(e_hat)
+    return r_yaw, r_trans
+
+
+r_yaw_tr, r_trans_tr = all_residuals(train)
+r_yaw_ho, r_trans_ho = all_residuals(heldout)
+
+ho_idx = np.where(heldout)[0]
+with open("residuals.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["scan_id", "residual_yaw_rad", "residual_trans_m"])
+    for k, i in enumerate(ho_idx):
+        w.writerow([int(scan_id[i]), f"{r_yaw_ho[k]:.6f}",
+                    f"{r_trans_ho[k]:.6f}"])
+assert len(ho_idx) == 154
+
+# ----------------------------------------------------------------------
+# 5. Per-segment observability scores
+# ----------------------------------------------------------------------
+# Information per segment (train scans in the segment) for each parameter:
+#  bias : sum dt^2 / s2  -- nearly constant across segments (77-79 scans
+#         each), so it does NOT differentiate windows and is excluded from
+#         the relative score (documented, not a fitting choice).
+#  tau  : sum (dt*(omega_s(t1)-omega_s(t0)))^2 / s2  = (dt^3/s2)*int (domega/dt)^2 dt
+#         for a smooth profile: a segment constrains the time offset only
+#         where the angular velocity actually changes (sharp maneuvers);
+#         omega_s is a Savitzky-Golay denoised gyro profile (~0.5 s) so the
+#         information reflects real maneuvers, not gyro-noise slopes.
+#  e    : (sum |dp|)^2 / s2 -- total travel distance: the direction of the
+#         displacement estimates the extrinsic with std ~ s / distance.
+from scipy.signal import savgol_filter
+omega_smooth = savgol_filter(omega, 67, 3)
+d_omega = np.gradient(omega_smooth, t_imu)
+I_b, I_t, I_e = [], [], []
+for k in range(len(seg_id)):
+    m = (scan_seg == k) & train
+    dts = t1[m] - t0[m]
+    dw = np.interp(t1[m], t_imu, omega_smooth) - np.interp(t0[m], t_imu, omega_smooth)
+    I_b.append(float(np.sum(dts ** 2) / sigma_yaw ** 2))
+    I_t.append(float(np.sum((dts * dw) ** 2) / sigma_yaw ** 2))
+    I_e.append(float(np.sum(np.hypot(dx[m], dy[m])) ** 2) / sigma_trans ** 2)
+I_b = np.array(I_b); I_t = np.array(I_t); I_e = np.array(I_e)
+
+# relative score: official parameter weights (0.40 tau, 0.35 e), each term
+# expressed as a fraction of the most informative segment; rescaled to [0,1]
+obs = (0.40 * I_t / I_t.max() + 0.35 * I_e / I_e.max()) / 0.75
+
+with open("observability.csv", "w", newline="") as f:
+    wc = csv.writer(f)
+    wc.writerow(["segment_id", "observability_score"])
+    for k in range(len(seg_id)):
+        wc.writerow([int(seg_id[k]), f"{obs[k]:.6f}"])
+
+# ----------------------------------------------------------------------
+# 6. calibration.csv
+# ----------------------------------------------------------------------
+with open("calibration.csv", "w", newline="") as f:
+    wc = csv.writer(f)
+    wc.writerow(["gyro_bias_rad_s", "time_offset_s", "yaw_extrinsic_rad"])
+    wc.writerow([f"{bias_hat:.8f}", f"{tau_hat:.8f}", f"{e_hat:.8f}"])
+
+
+# ----------------------------------------------------------------------
+# 7. Diagnostics figure
+# ----------------------------------------------------------------------
+t_scan_mid = 0.5 * (t0 + t1)
+yaw_lidar = np.concatenate([[0.0], np.cumsum(dyaw)])
+gyro_yaw = F(t_imu) - F(0.0) - bias_hat * (t_imu - 0.0)
+gyro_yaw_at_mids = np.interp(t_scan_mid, t_imu, gyro_yaw)
+dir_ang = np.arctan2(dy, dx)
+rms_tr_y = float(np.sqrt(np.mean(r_yaw_tr ** 2)))
+rms_ho_y = float(np.sqrt(np.mean(r_yaw_ho ** 2)))
+
+
+def make_figure_mpl():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    ax = axes[0, 0]
+    ax.plot(t_imu, omega, lw=0.5, color="tab:blue")
+    ax.axhline(bias_hat, color="red", ls="--",
+               label=f"fit bias = {bias_hat:.5f} rad/s")
+    ax.set_xlabel("t (s)"); ax.set_ylabel(r"$\omega_z$ (rad/s)")
+    ax.set_title("Gyro stream + fitted bias"); ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(t_scan_mid[1:], yaw_lidar[1:], lw=1.0, color="tab:green",
+            label="LiDAR (cum. $\\Delta$yaw)")
+    ax.plot(t_scan_mid, gyro_yaw_at_mids, lw=0.7, alpha=0.7, color="tab:blue",
+            label=f"gyro (bias/offset removed, $\\tau$={tau_hat * 1000:.2f} ms)")
+    ax.set_xlabel("t (s)"); ax.set_ylabel("integrated yaw (rad)")
+    ax.set_title("Integrated yaw: gyro vs LiDAR"); ax.legend()
+
+    ax = axes[1, 0]
+    ax.scatter(t_scan_mid[train], r_yaw_tr, s=6, alpha=0.5, color="tab:blue",
+               label=f"train (n={int(train.sum())})")
+    ax.scatter(t_scan_mid[heldout], r_yaw_ho, s=14, alpha=0.8, color="tab:red",
+               label=f"held-out (n={int(heldout.sum())})")
+    ax.axhline(0, color="k", lw=0.8)
+    ax.set_xlabel("t (s)"); ax.set_ylabel("residual yaw (rad)")
+    ax.set_title(f"Yaw residuals (train RMS {rms_tr_y:.4f}, "
+                 f"held-out RMS {rms_ho_y:.4f})")
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.scatter(t_scan_mid, dir_ang, s=6, alpha=0.4, color="tab:blue",
+               label="translation direction (lidar frame)")
+    ax.axhline(-e_hat, color="red", ls="--",
+               label=f"$-e$ (fit e = {e_hat:.5f} rad)")
+    ax.set_xlabel("t (s)"); ax.set_ylabel("direction (rad)")
+    ax.set_title("Translation direction vs fitted extrinsic"); ax.legend()
+
+    fig.suptitle("LiDAR/IMU calibration diagnostics", fontsize=13)
+    fig.tight_layout()
+    fig.savefig("calibration_diagnostics.png", dpi=130)
+    plt.close(fig)
+
+
+_FALLBACK_RENDERER = r'''
+import json, math
+from PIL import Image, ImageDraw, ImageFont
+
+d = json.load(open("figure_data.json"))
+W, H = d["W"], d["H"]
+img = Image.new("RGB", (W, H), (255, 255, 255))
+dr = ImageDraw.Draw(img)
+try:
+    font = ImageFont.load_default(14); font_s = ImageFont.load_default(11)
+except TypeError:
+    font = font_s = ImageFont.load_default()
+C = {"blue": (31, 119, 180), "red": (214, 39, 40), "green": (44, 160, 44)}
+
+def ticks(lo, hi, n=6):
+    span = hi - lo
+    if span <= 0: return [lo]
+    step0 = span / n
+    mag = 10 ** math.floor(math.log10(step0))
+    step = 10 * mag
+    for m in (1, 2, 5, 10):
+        if span / (m * mag) <= n: step = m * mag; break
+    out, v = [], math.ceil(lo / step) * step
+    while v <= hi + 1e-9: out.append(v); v += step
+    return out
+
+def fmt(v):
+    if abs(v) < 1e-12: return "0"
+    return f"{v:.4f}".rstrip("0").rstrip(".")
+
+pw, ph = W // 2, H // 2
+for pi, p in enumerate(d["panels"]):
+    ox, oy = (pi % 2) * pw, (pi // 2) * ph
+    ml, mr, mt, mb = 66, 18, 30, 46
+    x0, y0, x1, y1 = ox + ml, oy + mt, ox + pw - mr, oy + ph - mb
+    xs, ys = p["xlim"], p["ylim"]
+    X = lambda v: x0 + (v - xs[0]) / (xs[1] - xs[0]) * (x1 - x0)
+    Y = lambda v: y1 - (v - ys[0]) / (ys[1] - ys[0]) * (y1 - y0)
+    dr.rectangle([x0, y0, x1, y1], outline=(0, 0, 0))
+    for tv in ticks(*xs):
+        px = X(tv)
+        dr.line([(px, y1), (px, y1 + 4)], fill=(0, 0, 0))
+        t = fmt(tv); bb = dr.textbbox((0, 0), t, font=font_s)
+        dr.text((px - (bb[2] - bb[0]) / 2, y1 + 6), t, font=font_s, fill=(0, 0, 0))
+    for tv in ticks(*ys):
+        py = Y(tv)
+        dr.line([(x0 - 4, py), (x0, py)], fill=(0, 0, 0))
+        t = fmt(tv); bb = dr.textbbox((0, 0), t, font=font_s)
+        dr.text((x0 - 8 - (bb[2] - bb[0]), py - (bb[3] - bb[1]) / 2),
+                t, font=font_s, fill=(0, 0, 0))
+    for s in p.get("lines", []):
+        c = C[s["color"]]
+        pts = [(X(x), Y(y)) for x, y in zip(s["x"], s["y"])]
+        if s.get("dash"):
+            a, b = s["dash"]
+            for i in range(len(pts) - 1):
+                (ax_, ay_), (bx_, by_) = pts[i], pts[i + 1]
+                L = math.hypot(bx_ - ax_, by_ - ay_)
+                if L == 0: continue
+                t = 0.0
+                while t < L:
+                    t2 = min(t + a, L)
+                    dr.line([(ax_ + (bx_ - ax_) * t / L, ay_ + (by_ - ay_) * t / L),
+                             (ax_ + (bx_ - ax_) * t2 / L, ay_ + (by_ - ay_) * t2 / L)],
+                            fill=c, width=2)
+                    t = t2 + b
+        else:
+            dr.line(pts, fill=c, width=s.get("w", 1))
+    for s in p.get("scatter", []):
+        c = C[s["color"]]; r = s.get("r", 2)
+        for x, y in zip(s["x"], s["y"]):
+            px, py = X(x), Y(y)
+            dr.ellipse([px - r, py - r, px + r, py + r], fill=c)
+    t = p["title"]; bb = dr.textbbox((0, 0), t, font=font)
+    dr.text(((x0 + x1 - (bb[2] - bb[0])) / 2, oy + 4), t, font=font, fill=(0, 0, 0))
+    t = p["xlabel"]; bb = dr.textbbox((0, 0), t, font=font)
+    dr.text(((x0 + x1 - (bb[2] - bb[0])) / 2, y1 + 24), t, font=font, fill=(0, 0, 0))
+    t = p["ylabel"]; bb = dr.textbbox((0, 0), t, font=font)
+    dr.text((8, (y0 + y1 - (bb[3] - bb[1])) / 2), t, font=font, fill=(0, 0, 0))
+    ly = y0 + 8
+    for item, ckey in p.get("legend", []):
+        dr.line([(x1 - 165, ly + 5), (x1 - 135, ly + 5)], fill=C[ckey], width=3)
+        dr.text((x1 - 128, ly), item, font=font_s, fill=(0, 0, 0))
+        ly += 16
+img.save("calibration_diagnostics.png")
+print("fallback figure written")
+'''
+
+
+def make_figure_fallback():
+    """PIL-based renderer for environments without matplotlib."""
+    import os
+    import subprocess
+    import sys
+
+    def dec(a, b, n):
+        idx = np.linspace(0, len(a) - 1, min(n, len(a))).astype(int)
+        return [float(a[i]) for i in idx], [float(b[i]) for i in idx]
+
+    t1_, w1_ = dec(t_imu[::4], omega[::4], 1600)
+    t2g, y2g = dec(t_scan_mid, gyro_yaw_at_mids, 1200)
+    t2l, y2l = dec(t_scan_mid[1:], yaw_lidar[1:], 854)
+    data = {"W": 1300, "H": 900, "panels": [
+        {"title": "Gyro stream + fitted bias", "xlabel": "t (s)",
+         "ylabel": "omega_z (rad/s)",
+         "xlim": [float(t_imu[0]), float(t_imu[-1])],
+         "ylim": [float(omega.min()) - 0.02, float(omega.max()) + 0.02],
+         "lines": [{"x": t1_, "y": w1_, "color": "blue", "w": 1},
+                   {"x": [0.0, 94.0], "y": [bias_hat, bias_hat],
+                    "color": "red", "dash": [8, 5]}],
+         "legend": [("gyro stream", "blue"),
+                    (f"fit bias = {bias_hat:.5f} rad/s", "red")]},
+        {"title": "Integrated yaw: gyro vs LiDAR", "xlabel": "t (s)",
+         "ylabel": "integrated yaw (rad)",
+         "xlim": [0.0, 94.0],
+         "ylim": [min(float(yaw_lidar.min()), float(gyro_yaw_at_mids.min())) - 0.3,
+                  max(float(yaw_lidar.max()), float(gyro_yaw_at_mids.max())) + 0.3],
+         "lines": [{"x": t2l, "y": y2l, "color": "green", "w": 2},
+                   {"x": t2g, "y": y2g, "color": "blue", "w": 1}],
+         "legend": [("LiDAR (cum. dyaw)", "green"),
+                    (f"gyro (bias/offset removed, tau={tau_hat*1000:.2f} ms)", "blue")]},
+        {"title": f"Yaw residuals (train RMS {rms_tr_y:.4f}, held-out RMS {rms_ho_y:.4f})",
+         "xlabel": "t (s)", "ylabel": "residual yaw (rad)",
+         "xlim": [0.0, 94.0],
+         "ylim": [-0.02, 0.02],
+         "scatter": [{"x": [float(v) for v in t_scan_mid[train]],
+                      "y": [float(v) for v in r_yaw_tr], "color": "blue", "r": 2},
+                     {"x": [float(v) for v in t_scan_mid[heldout]],
+                      "y": [float(v) for v in r_yaw_ho], "color": "red", "r": 3}],
+         "legend": [f"train (n={int(train.sum())})", ""]},
+        {"title": "Translation direction vs fitted extrinsic", "xlabel": "t (s)",
+         "ylabel": "direction (rad)",
+         "xlim": [0.0, 94.0], "ylim": [-0.5, 0.5],
+         "scatter": [{"x": [float(v) for v in t_scan_mid],
+                      "y": [float(v) for v in dir_ang], "color": "blue", "r": 2}],
+         "lines": [{"x": [0.0, 94.0], "y": [-e_hat, -e_hat],
+                    "color": "red", "dash": [8, 5]}],
+         "legend": [("translation direction (lidar frame)", "blue"),
+                    (f"-e (fit e = {e_hat:.5f} rad)", "red")]},
+    ]}
+    # fix panel-3 legend (two entries, colors blue/red)
+    data["panels"][2]["legend"] = [("train (n=%d)" % int(train.sum()), "blue"),
+                                   ("held-out (n=%d)" % int(heldout.sum()), "red")]
+    with open("figure_data.json", "w") as f:
+        json.dump(data, f)
+    with open("_fallback_render.py", "w") as f:
+        f.write(_FALLBACK_RENDERER)
+    cands = [sys.executable, "/usr/bin/python3", "/usr/bin/python3.14",
+             "/usr/bin/python3.12"]
+    for py in cands:
+        if not os.path.exists(py):
+            continue
+        r = subprocess.run([py, "_fallback_render.py"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists("calibration_diagnostics.png"):
+            return
+        print("fallback renderer failed with", py, ":", r.stderr[-300:])
+    raise RuntimeError("could not render calibration_diagnostics.png "
+                       "(no matplotlib, no working PIL interpreter)")
+
+
+if os.path.exists("calibration_diagnostics.png"):
+    os.remove("calibration_diagnostics.png")
+try:
+    make_figure_mpl()
+    print("figure rendered with matplotlib")
+except Exception as _e:
+    print("matplotlib unavailable (%s); using PIL fallback" % _e)
+    make_figure_fallback()
+
+# ----------------------------------------------------------------------
+# 8. metrics.json
+# ----------------------------------------------------------------------
+metrics = {
+    "parameters": {
+        "gyro_bias_rad_s": bias_hat,
+        "time_offset_s": tau_hat,
+        "yaw_extrinsic_rad": e_hat,
+    },
+    "parameter_std_errors": {
+        "gyro_bias_rad_s": se_bias,
+        "time_offset_s": se_tau,
+        "yaw_extrinsic_rad": se_e,
+    },
+    "conventions": {
+        "time_offset_s": "t_imu = t_lidar + time_offset (offset added to "
+                         "LiDAR time to index the gyro)",
+        "yaw_extrinsic_rad": "LiDAR frame = body frame rotated by +e; "
+                             "LiDAR-frame translation direction = -e for "
+                             "forward motion",
+        "residual_trans_m": "component of (dx,dy) perpendicular to the "
+                            "predicted forward direction (sin e, cos e)",
+        "angle_wrap": "[-pi, pi)",
+    },
+    "residuals": {
+        "train": {"n": int(train.sum()),
+                  "rms_yaw_rad": rms_tr_y,
+                  "rms_trans_m": float(np.sqrt(np.mean(r_trans_tr ** 2)))},
+        "heldout": {"n": int(heldout.sum()),
+                    "rms_yaw_rad": rms_ho_y,
+                    "rms_trans_m": float(np.sqrt(np.mean(r_trans_ho ** 2)))},
+    },
+    "observability": {f"segment_{int(seg_id[k])}": float(obs[k])
+                      for k in range(len(seg_id))},
+    "observability_ranking": [int(seg_id[k]) for k in np.argsort(-obs)],
+    "fit_diagnostics": {
+        "least_squares_cost": float(fit.cost),
+        "dyaw_sigma_rad": sigma_yaw,
+        "trans_sigma_m": sigma_trans,
+        "circular_std_direction_rad": circ_std,
+    },
+}
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print("=== calibration ===")
+print(f"gyro_bias_rad_s   = {bias_hat:.6f}  (se {se_bias:.6f})")
+print(f"time_offset_s     = {tau_hat:.6f}  (se {se_tau:.6f})  "
+      f"[{tau_hat / (t_imu[1] - t_imu[0]):.3f} gyro samples]")
+print(f"yaw_extrinsic_rad = {e_hat:.6f}  (se {se_e:.6f})")
+print("=== residuals ===")
+print(f"train   : rms_yaw = {rms_tr_y:.5f} rad, "
+      f"rms_trans = {np.sqrt(np.mean(r_trans_tr**2)):.5f} m")
+print(f"heldout : rms_yaw = {rms_ho_y:.5f} rad, "
+      f"rms_trans = {np.sqrt(np.mean(r_trans_ho**2)):.5f} m")
+print("=== observability ===")
+for k in range(len(seg_id)):
+    print(f"segment {int(seg_id[k])}: {obs[k]:.4f}")
+print("done: calibration.csv observability.csv residuals.csv "
+      "calibration_diagnostics.png metrics.json")

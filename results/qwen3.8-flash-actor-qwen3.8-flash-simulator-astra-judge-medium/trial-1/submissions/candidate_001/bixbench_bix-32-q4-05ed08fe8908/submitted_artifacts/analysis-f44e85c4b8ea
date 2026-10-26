@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""KEGG over-representation analysis (ORA) for QS mutants 97/98/99 vs wildtype 1.
+
+Question: which KEGG pathways are enriched (BH-adjusted p < 0.05) in the
+significant down-regulated genes (pvalue < 0.05 AND log2FoldChange < -1.5) of
+ALL THREE mutants, each strain tested separately?
+
+Steps
+  1. Read data/res_1vs9{7,8,9}.rds.  No R / pyreadr / install is possible here,
+     so the RDS (gzip + R XDR binary serialization) is parsed by rdsinspect.py;
+     the parse is gated on three internal invariants (validate_extraction).
+  2. Build the per-strain down-regulated gene sets.
+  3. Gene -> KEGG pathway mapping, resolved as: local cache in data/kegg/ if
+     present, else download from rest.kegg.jp and cache.  Species code is chosen
+     by MEASURED overlap with the PA14_ locus tags (pau first, pae as fallback)
+     and coverage % is reported.  If neither cache nor network is available the
+     script exits 2 and writes NO pathway table - nothing is invented.
+  4. ORA per strain: one-sided hypergeometric (scipy.stats.hypergeom,
+     alternative='greater') + BH within-strain (statsmodels), padj < 0.05.
+     Universes: primary = measured genes mapped in KEGG; sensitivity = KEGG
+     genome-wide background.
+  5. Intersection of padj<0.05 pathway sets across the three strains.
+
+Outputs: results/down_genes_1vs9*.tsv, results/ora_1vs9*.tsv,
+         results/ora_common*.tsv, results/run_log.txt
+"""
+from __future__ import annotations
+import argparse, os, sys
+import numpy as np
+import pandas as pd
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rdsinspect import read_table
+
+DATA, KEGG, OUT = 'data', 'data/kegg', 'results'
+STRAINS = ['97', '98', '99']
+P_CUT, LFC_CUT, PADJ_CUT = 0.05, -1.5, 0.05
+ORG_CANDIDATES = ['pau', 'pae']       # PA14 (UCBPP-PA14) then PAO1
+REST = 'https://rest.kegg.jp'
+OVERVIEW = {'01100', '01110'}         # KEGG "overview" maps, dropped by default
+LOG = []
+
+def log(msg=''):
+    print(msg); LOG.append(str(msg))
+
+def dump_log():
+    os.makedirs(OUT, exist_ok=True)
+    open(os.path.join(OUT, 'run_log.txt'), 'w').write('\n'.join(LOG) + '\n')
+
+# ------------------------------------------------------- 1. inputs + checks
+def load_tables():
+    tabs, meta = {}, {}
+    for s in STRAINS:
+        t, m = read_table(os.path.join(DATA, 'res_1vs%s.rds' % s))
+        t.index.name = 'gene_id'
+        tabs[s], meta[s] = t, m
+        log('read data/res_1vs%s.rds : %d rows x %d cols %s ; contrast in file = %r'
+            % (s, t.shape[0], t.shape[1], list(t.columns), m['contrast']))
+    return tabs
+
+def validate_extraction(tabs):
+    """Three independent invariants proving the pure-Python RDS parse is correct."""
+    d = tabs['97']
+    inv1 = float(np.nanmax(np.abs(d.stat - d.log2FoldChange / d.lfcSE)))
+    inv2 = float(np.nanmax(np.abs(
+        multipletests(d.pvalue.values, method='fdr_bh')[1] - d.padj.values)))
+    inv3 = float(max(np.nanmax(np.abs(tabs[s].baseMean.loc[d.index].values - d.baseMean.values))
+                     for s in STRAINS))
+    log('R-reader validation invariants:')
+    log('  1) max |stat - log2FoldChange/lfcSE|      = %.3e   (must be 0)' % inv1)
+    log('  2) max |BH(pvalue) - padj|                = %.3e   (must be ~0)' % inv2)
+    log('  3) max |baseMean(strain) - baseMean(97)|  = %.3e   (must be 0: one DESeq2 run)' % inv3)
+    if inv1 > 1e-8 or inv2 > 1e-6 or inv3 > 1e-6:
+        raise SystemExit('RDS extraction failed internal invariants; refusing to continue')
+    log('  -> all three invariants hold: extraction accepted')
+    return dict(stat_identity=inv1, bh_identity=inv2, basemean_identity=inv3)
+
+def down_sets(tabs):
+    sets = {}
+    for s, d in tabs.items():
+        sel = d[(d.pvalue < P_CUT) & (d.log2FoldChange < LFC_CUT)].copy()
+        sets[s] = set(sel.index)
+        sel.to_csv(os.path.join(OUT, 'down_genes_1vs%s.tsv' % s), sep='\t')
+        alt = d[(d.padj < P_CUT) & (d.log2FoldChange < LFC_CUT)]
+        log('strain %s: down genes (pvalue<%.2f & lfc<%.1f) = %d  '
+            '[padj<0.05 variant: %d, identical set = %s]'
+            % (s, P_CUT, LFC_CUT, len(sets[s]), len(alt), set(alt.index) == sets[s]))
+    inter = set.intersection(*[sets[s] for s in STRAINS])
+    log('overlaps: 97&98=%d 97&99=%d 98&99=%d triple=%d union=%d'
+        % (len(sets['97'] & sets['98']), len(sets['97'] & sets['99']),
+           len(sets['98'] & sets['99']), len(inter), len(set().union(*sets.values()))))
+    return sets
+
+# ------------------------------------------------- 2. gene -> pathway mapping
+def cache_files(org):
+    return (os.path.join(KEGG, 'link_%s_pathway.tsv' % org),
+            os.path.join(KEGG, 'list_%s_pathway.tsv' % org),
+            os.path.join(KEGG, 'pathway_category.tsv'))
+
+def fetch(url, timeout=20):
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': 'kegg_ora/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode('utf-8', 'replace')
+
+def try_org(org, cache_only=False):
+    f_link, f_name, f_cat = cache_files(org)
+    if os.path.exists(f_link) and os.path.getsize(f_link):
+        src = 'local cache (%s)' % f_link
+        link_txt = open(f_link).read()
+        name_txt = open(f_name).read() if os.path.exists(f_name) else ''
+        cat_txt = open(f_cat).read() if os.path.exists(f_cat) else ''
+    else:
+        if cache_only:
+            log('  %s: no cache, --cache-only set -> skip' % org); return None
+        try:
+            log('  fetching %s/link/%s/pathway and /list/pathway/%s ...' % (REST, org, org))
+            link_txt = fetch('%s/link/%s/pathway' % (REST, org))
+            name_txt = fetch('%s/list/pathway/%s' % (REST, org))
+            os.makedirs(KEGG, exist_ok=True)
+            open(f_link, 'w').write(link_txt); open(f_name, 'w').write(name_txt)
+            cat_txt = ''
+            src = 'KEGG REST (%s)' % REST
+        except Exception as e:
+            log('  FETCH FAILED for %s: %s: %s' % (org, type(e).__name__, e)); return None
+    links = pd.DataFrame(
+        [(a.split(':')[-1].upper(), b.split(':')[-1]) for a, b in
+         (l.split('\t') for l in link_txt.splitlines() if l.strip())],
+        columns=['gene', 'pathway'])
+    names = {}
+    for l in name_txt.splitlines():
+        if '\t' in l:
+            k, v = l.split('\t', 1)
+            names[k.split(':')[-1]] = v.strip()
+    cats = {}
+    for l in cat_txt.splitlines():
+        if '\t' in l:
+            k, v = l.split('\t', 1); cats[k.split(':')[-1]] = v.strip()
+    return links, names, cats, src
+
+
+def try_gmt(files):
+    """Alternative offline mapping: GMT gene-set files (term\turl\tg1\tg2...)."""
+    rows, names = [], {}
+    for f in files:
+        for line in open(f):
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 3:
+                continue
+            term = parts[0].strip(); names[term] = parts[1].strip() or term
+            for g in parts[2:]:
+                if g.strip():
+                    rows.append((g.strip().upper(), term))
+    if not rows:
+        return None
+    return pd.DataFrame(rows, columns=['gene', 'pathway']), names, {}, 'GMT file(s) %s' % files
+
+def discover_gmt():
+    if not os.path.isdir(KEGG):
+        return []
+    return [os.path.join(KEGG, f) for f in sorted(os.listdir(KEGG))
+            if f.lower().endswith(('.gmt', '.gmt.gz'))] or None
+
+def pick_org(measured, orgs, cache_only=False):
+    gm = discover_gmt()
+    if gm:
+        got = try_gmt(gm)
+        if got:
+            links, names, cats, src = got
+            cov = len(measured & set(links.gene.str.upper()))
+            log('GMT mapping found: %d terms, %d gene-term links, locus-tag overlap '
+                '%d/%d (%.1f%%)' % (len(names), len(links), cov, len(measured),
+                                     100.0 * cov / len(measured)))
+            if cov:
+                return 'GMT', got, 100.0 * cov / len(measured)
+    best = None
+    for org in orgs:
+        got = try_org(org, cache_only)
+        if got is None:
+            continue
+        links, names, cats, src = got
+        genes = set(links.gene.str.upper())
+        cov = len(measured & genes); pct = 100.0 * cov / len(measured)
+        log('species %-4s: %d KEGG genes, %d gene-pathway links, %d pathways with names, '
+            'locus-tag overlap = %d/%d (%.1f%%)  [%s]'
+            % (org, len(genes), len(links), len(names), cov, len(measured), pct, src))
+        if pct >= 50.0:
+            return org, got, pct
+        if best is None or pct > best[2]:
+            best = (org, got, pct)
+    if best:
+        log('  no candidate reached 50%% locus-tag overlap; using %s (%.1f%%), '
+            'organism assignment flagged UNCERTAIN' % (best[0], best[2]))
+    return best if best else (None, None, 0.0)
+
+def fetch_categories(org, pathways):
+    """Optional: KEGG top-level category per pathway, from the entry CLASS line.
+    Works only when the network is reachable; writes data/kegg/pathway_category.tsv."""
+    if not pathways or org == 'GMT':
+        return {}
+    cats = {}
+    try:
+        for p in pathways:
+            for line in fetch('%s/get/%s' % (REST, p)).splitlines():
+                if line.startswith('CLASS'):
+                    cats[p] = line[5:].strip()
+                    break
+        os.makedirs(KEGG, exist_ok=True)
+        with open(os.path.join(KEGG, 'pathway_category.tsv'), 'w') as fh:
+            for p, c in cats.items():
+                fh.write('%s\t%s\n' % (p, c))
+    except Exception as e:
+        log('  category fetch failed (%s: %s); category left as NA'
+            % (type(e).__name__, e))
+    return cats
+
+# ---------------------------------------------------------------- 3. the ORA
+def pathway_sets(links, universe, drop_overview=True):
+    pw = links.groupby('pathway').gene.apply(set).to_dict()
+    if drop_overview:
+        pw = {p: g for p, g in pw.items() if p[-5:] not in OVERVIEW}
+    return {p: (g & universe) for p, g in pw.items() if g & universe}
+
+def ora(genes, universe, pw, names, cats, strain, universe_name):
+    N = len(universe); n = len(genes & universe)
+    rows = []
+    for p, bg in pw.items():
+        K = len(bg)
+        k = len(genes & bg)
+        if k == 0:
+            continue                      # only over-representation, as in enrichKEGG
+        pv = float(hypergeom.sf(k - 1, N, K, n))
+        rows.append(dict(strain=strain, universe=universe_name, pathway=p,
+                         name=names.get(p, ''), category=cats.get(p, 'NA'),
+                         k=k, K=K, n=n, N=N, pvalue=pv))
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t
+    t['padj'] = multipletests(t.pvalue.values, method='fdr_bh')[1]
+    return t.sort_values('pvalue').reset_index(drop=True)
+
+def ranked_common(sig, names, cats, universe_name, common):
+    rows = []
+    for p in sorted(common):
+        row = dict(universe=universe_name, pathway=p, name=names.get(p, ''),
+                   category=cats.get(p, 'NA'))
+        for s in STRAINS:
+            r = sig[s][sig[s].pathway == p].iloc[0]
+            row.update({'k_%s' % s: int(r.k), 'K_%s' % s: int(r.K),
+                        'p_%s' % s: '%.3g' % r.pvalue, 'padj_%s' % s: '%.3g' % r.padj})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# -------------------------------------------------------------------- 4. main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--org', default=None, help='force a KEGG species code')
+    ap.add_argument('--cache-only', action='store_true', help='never touch the network')
+    ap.add_argument('--keep-overview', action='store_true',
+                    help='keep KEGG overview maps 01100/01110 in the background')
+    ap.add_argument('--validate', action='store_true',
+                    help='run only input validation + gene-set construction')
+    args = ap.parse_args()
+    os.makedirs(OUT, exist_ok=True)
+
+    tabs = load_tables()
+    inv = validate_extraction(tabs)
+    downs = down_sets(tabs)
+    measured = {g.upper() for g in tabs['97'].index}
+    log('measured universe = %d genes (same ID set in all three tables); '
+        'gene IDs are locus tags matching ^PA14_\\d{5}$' % len(measured))
+    if args.validate:
+        log('--validate mode: stopping after extraction validation and gene sets')
+        dump_log(); return 0
+
+    orgs = [args.org] if args.org else ORG_CANDIDATES
+    log('resolving gene -> KEGG pathway mapping; species candidates: %s' % ', '.join(orgs))
+    org, got, cov = pick_org(measured, orgs, args.cache_only)
+    if got is None:
+        log()
+        log('FATAL: no KEGG gene->pathway mapping obtainable.')
+        log('  - local cache dir %s absent/empty' % KEGG)
+        log('  - KEGG REST fetch failed (this sandbox has no DNS resolver and no IP '
+            'route: errno 101 "Network is unreachable")')
+        log('  NO pathway names are produced or guessed. To finish the analysis, drop '
+            'the KEGG tables into %s as link_<org>_pathway.tsv, list_<org>_pathway.tsv '
+            '(optional pathway_category.tsv) and re-run this script.' % KEGG)
+        dump_log(); return 2
+
+    links, names, cats, src = got
+    log('mapping accepted: species=%s, locus-tag coverage %.1f%%, source=%s' % (org, cov, src))
+    kegg_all = set(links.gene)
+    universes = {'measured': measured & kegg_all, 'genomewide': kegg_all}
+    log('universe sizes: measured&mapped=%d, genomewide=%d'
+        % (len(universes['measured']), len(universes['genomewide'])))
+
+    summary = {}
+    for uname, uni in universes.items():
+        pw = pathway_sets(links, uni, drop_overview=not args.keep_overview)
+        log('--- universe %s (%d genes, %d pathways with >=1 mapped gene) ---'
+            % (uname, len(uni), len(pw)))
+        sig = {}
+        for s in STRAINS:
+            t = ora(downs[s], uni, pw, names, cats, s, uname)
+            sig[s] = t
+            ns = int((t.padj < PADJ_CUT).sum()) if len(t) else 0
+            log('  strain %s: %d pathways tested (k>0), %d significant at padj<%.2f'
+                % (s, len(t), ns, PADJ_CUT))
+            if len(t):
+                t.to_csv(os.path.join(
+                    OUT, 'ora_1vs%s%s.tsv' % (s, '' if uname == 'measured' else '_' + uname)),
+                    sep='\t', index=False)
+        common = (set.intersection(*[set(sig[s].loc[sig[s].padj < PADJ_CUT, 'pathway'])
+                                    for s in STRAINS]) if all(len(v) for v in sig.values())
+                  else set())
+        if not cats:
+            todo = sorted({p for s in STRAINS if len(sig[s])
+                           for p in sig[s].loc[sig[s].padj < PADJ_CUT, 'pathway']})
+            got_cats = fetch_categories(org, todo)
+            if got_cats:
+                cats.update(got_cats)
+                for s in STRAINS:
+                    if len(sig[s]):
+                        sig[s]['category'] = sig[s].pathway.map(cats).fillna('NA')
+        log('  pathways significant in ALL THREE strains: %d %s' % (len(common), sorted(common)))
+        inter = ranked_common(sig, names, cats, uname, common)
+        if len(inter):
+            inter.to_csv(os.path.join(OUT, 'ora_common%s.tsv'
+                                      % ('' if uname == 'measured' else '_' + uname)),
+                         sep='\t', index=False)
+            log('  ranked common table (%s universe):' % uname)
+            log(inter.to_string(index=False))
+        summary[uname] = sorted(common)
+    log()
+    log('ANSWER candidates (padj<0.05 in 97 AND 98 AND 99):')
+    for u, lst in summary.items():
+        log('  universe=%-11s %s' % (u, [ '%s %s' % (p, names.get(p, '')) for p in lst] or 'NONE'))
+    dump_log()
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())

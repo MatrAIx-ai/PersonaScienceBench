@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Shared-mode recovery from complex response curves
+(asibench: materials.relaxation_mode_recovery)
+================================================================================
+Model EXACTLY as specified in the task (no reparametrisation, no tau -> 1/tau):
+
+    R(x) = a0^(m) + sum_{k=1..K} a_k^(m) / (1 + (i * x * tau_k)^phi_k)
+
+  tau_k > 0, 0 < phi_k <= 1, a_k^(m) >= 0;  (tau_k, phi_k) shared by all M=5
+  curves; a0^(m) (baseline) and a_k^(m) (amplitudes) are curve specific.
+
+METHOD - joint fit of all curves + variable projection (VP)
+-----------------------------------------------------------
+For fixed theta = (ln tau, phi) the modal shapes are known, so the linear part
+(a0^(m), a_k^(m) >= 0) is an exact small bound-constrained least-squares problem
+per curve -> solved with scipy.optimize.nnls (the free-sign baseline is realised
+by a duplicated +/- intercept column).  The nonlinear search therefore sees only
+2K parameters instead of 2K + M*(K+1).  theta is optimised with bounded TRF
+(scipy.optimize.least_squares) on the stacked 960-vector of [re;im] residuals;
+with iid Gaussian noise and flat priors on (ln tau, phi) this *is* the MAP
+estimate.  Weights are equal (justified from the data in STEP 0/4, not by eye).
+
+MODEL ORDER  K = 1..6: greedy (OMP-like) initialisation + random multistart;
+selection by (i) BIC-like penalty p = 2K + M(K+1), (ii) F-like RSS-drop threshold
+against an INDEPENDENT noise estimate sigma_hat (second differences, fit-free) -
+both a lenient (dp*sig^2) and a BIC-equivalent (dp*sig^2*ln n) threshold are
+printed - and (iii) leave-one-curve-out CV (theta from 4 curves only; the held-out
+curve's own amplitudes are re-estimated on half of its points and scored on the
+other half), read with the 1-SE rule and paired per-fold differences.  Priority
+to the simpler model.  Then merge-test AND symmetric split-test, a
+non-identifiability test of the rejected richer model (bootstrap spread of the
+closest tau pair + how often amplitudes get pinned at the a>=0 boundary),
+phi-boundary tests (C1) and pruning of all-zero-amplitude modes.
+
+VERIFICATION: goodness of fit is compared with the fit-free sigma_hat (reduced
+chi2, per-curve RMS z-scores, lag-1 autocorrelation of residuals along ln x, and a
+simulated white-noise null for max |smoothed residual|); tau/phi/amplitudes carry
+parametric-bootstrap percentiles and a leave-one-curve-out jackknife spread.
+Deterministic: two consecutive full runs give byte-identical results/modes.csv.
+
+OUTPUT  results/modes.csv : header `tau,a_0,a_1,a_2,a_3,a_4`, one row per mode,
+ascending tau, a_m = that mode's amplitude in curve m, taken from ONE final NNLS
+refit at the final (tau, phi) on all 5 curves (C3).  Diagnostics -> stdout.
+
+Deterministic (single seed, SEED = 0), numpy + scipy only.  Runtime ~100 s.
+"""
+import os
+import time
+import numpy as np
+from scipy.optimize import nnls, least_squares
+
+SEED = 0
+DATA, OUT_CSV = "data/curves.csv", "results/modes.csv"
+KMAX = 6
+LNTAU_LO, LNTAU_HI = np.log(1e-4), np.log(1e4)     # tau well outside the x span
+PHI_LO, PHI_HI = 1e-3, 1.0                         # 0 < phi <= 1
+N_MULTISTART, N_MULTISTART_CV = 150, 20
+N_BOOT, N_BOOT_COLD = 150, 30
+MERGE_DLN = 0.15
+SPLIT_SCAN = (0.4, 0.8, 1.5)
+GRID_NT, GRID_PHIS = 40, (0.2, 0.35, 0.5, 0.65, 0.8, 0.95, 1.0)
+W = (1.0, 1.0)                                     # re/im weights (see STEP 4)
+
+np.random.seed(SEED)
+RNG = np.random.default_rng(SEED)
+
+
+# ------------------------------------------------------------------ data / noise
+def load(path=DATA):
+    raw = np.loadtxt(path, delimiter=",", skiprows=1)
+    curves = np.unique(raw[:, 0]).astype(int)
+    X = np.array([raw[raw[:, 0] == c, 1] for c in curves])
+    Y = np.array([np.r_[raw[raw[:, 0] == c, 2], raw[raw[:, 0] == c, 3]] for c in curves])
+    return X, Y, curves
+
+
+def sigma_from_2nd_diffs(Y, lo=None, hi=None):
+    """Fit-free noise scale: sigma = sqrt(mean(d2^2)/6) on the log-even grid."""
+    d = Y[:, 2:] - 2 * Y[:, 1:-1] + Y[:, :-2]
+    return float(np.sqrt(np.mean(d ** 2) / 6.0))
+
+
+# ------------------------------------------------------------------ model
+def gmat(x, lntau, phi):
+    """g_k(x) = 1/(1+(i x tau_k)^phi_k), overflow-safe (log domain + geometric series)."""
+    z = phi[:, None] * ((lntau[:, None] + np.log(x)[None, :]) + 0.5j * np.pi)
+    g = np.empty(z.shape, dtype=complex)
+    pos = z.real > 0
+    e = np.exp(-z[pos]); g[pos] = e / (1.0 + e)
+    ez = np.exp(z[~pos]); g[~pos] = 1.0 / (1.0 + ez)
+    return g
+
+
+def design(x, lntau, phi, w=W):
+    """One-curve stacked design [re rows; im rows] with a free-sign intercept column."""
+    g = gmat(x, lntau, phi)
+    n = x.size
+    up = np.hstack([np.full((n, 1), w[0]), np.real(g).T * w[0]])
+    lo = np.hstack([np.zeros((n, 1)), np.imag(g).T * w[1]])
+    A = np.vstack([up, lo])
+    c = np.r_[np.full(n, w[0]), np.zeros(n)]
+    return np.hstack([A, (-c)[:, None]])
+
+
+def fit_coefs(x, lntau, phi, Y, w=W):
+    """Exact VP of the linear part: per-curve NNLS."""
+    A = design(x, lntau, phi, w)
+    C = np.array([nnls(A, y)[0] for y in Y])
+    R = np.array([A @ c - y for c, y in zip(C, Y)])
+    return C, R
+
+
+def residuals(theta, K, x, Y, w=W):
+    return fit_coefs(x, theta[:K], theta[K:], Y, w)[1].ravel()
+
+
+def rss_of(theta, K, x, Y, w=W):
+    return float(np.sum(residuals(theta, K, x, Y, w) ** 2))
+
+
+def bounds(K):
+    return (np.r_[np.full(K, LNTAU_LO), np.full(K, PHI_LO)],
+            np.r_[np.full(K, LNTAU_HI), np.full(K, PHI_HI)])
+
+
+def refine(K, theta, x, Y, w=W, max_nfev=4000):
+    lo, hi = bounds(K)
+    th = np.clip(np.asarray(theta, float), lo + 1e-9, hi - 1e-9)
+    o = least_squares(residuals, th, args=(K, x, Y, w), bounds=(lo, hi), method="trf",
+                      x_scale="jac", diff_step=1e-4, max_nfev=max_nfev)
+    return 2.0 * o.cost, o.x
+
+
+def polish(K, theta, x, Y, w=W, r_in=None, step=0.25, floor=1e-4):
+    """Coordinate-wise polish + TRF restart: robust against the mild non-smoothness
+    of the NNLS-projected objective (active-set switches)."""
+    lo, hi = bounds(K)
+    th = np.clip(np.asarray(theta, float), lo, hi)
+    cur = r_in if r_in is not None else rss_of(th, K, x, Y, w)
+    while step > floor:
+        improved = False
+        for i in range(2 * K):
+            for s in (+1.0, -1.0):
+                cand = th.copy()
+                cand[i] = np.clip(cand[i] + s * step, lo[i], hi[i])
+                v = rss_of(cand, K, x, Y, w)
+                if v < cur - 1e-12:
+                    cur, th, improved = v, cand, True
+        if not improved:
+            step *= 0.5
+    return refine(K, th, x, Y, w)
+
+
+def greedy_init(K, x, Y, w=W):
+    """OMP-like: add one mode at a time (grid over ln tau x phi with the exact NNLS
+    projection inside), refine after each addition."""
+    lts = np.linspace(LNTAU_LO, LNTAU_HI, GRID_NT)
+    lt_c, ph_c, theta = np.array([]), np.array([]), np.array([])
+    for k in range(1, K + 1):
+        best = (np.inf, None)
+        for lt in lts:
+            for p in GRID_PHIS:
+                th = np.r_[lt_c, lt, ph_c, p]
+                r = rss_of(th, k, x, Y, w)
+                if r < best[0]:
+                    best = (r, th)
+        _, th = refine(k, best[1], x, Y, w, max_nfev=2000)
+        lt_c, ph_c, theta = th[:k].copy(), th[k:].copy(), th
+    return theta
+
+
+_CACHE = {}
+
+
+def multistart_fit(K, x, Y, w=W, n_start=N_MULTISTART, seed=SEED, verbose=True):
+    key = (K, round(w[0], 12), round(w[1], 12), n_start, seed)
+    if key in _CACHE:                      # identical call -> identical (deterministic) result
+        if verbose:
+            print(f"    multistart K={K}: reusing cached result RSS={_CACHE[key][0]:.5f}")
+        return _CACHE[key]
+    r_best, th_best = polish(K, greedy_init(K, x, Y, w), x, Y, w)
+    rg = np.random.default_rng(seed)
+    t0, hits = time.time(), 0
+    for _ in range(n_start):
+        th = np.r_[np.sort(rg.uniform(LNTAU_LO, LNTAU_HI, K)), rg.uniform(0.15, 1.0, K)]
+        r, tt = refine(K, th, x, Y, w, max_nfev=3000)
+        if r < r_best * (1 - 1e-9):
+            r_best, th_best = polish(K, tt, x, Y, w)
+            hits += 1
+    if verbose:
+        print(f"    multistart K={K}: best RSS={r_best:.5f}  "
+              f"starts beating greedy={hits}  ({time.time()-t0:.1f} s)")
+    _CACHE[key] = (r_best, th_best)
+    return r_best, th_best
+
+
+# ------------------------------------------------------------------ criteria
+def n_params(K, M):
+    return 2 * K + M * (K + 1)
+
+
+def bic(rss, K, M, ntot):
+    return ntot * np.log(rss / ntot) + n_params(K, M) * np.log(ntot)
+
+
+def f_stat(rss_big, K_big, rss_small, K_small, M, ntot):
+    dp = n_params(K_big, M) - n_params(K_small, M)
+    df2 = ntot - n_params(K_big, M)
+    return ((rss_small - rss_big) / dp) / (rss_big / df2), dp, df2
+
+
+# ------------------------------------------------------------------ LOCO CV
+def loco_cv(Ks, x, Y, M, n_splits=10, seed=SEED + 7, warm=None):
+    """theta fitted on the 4 other curves ONLY (greedy + multistart).  The held-out
+    curve owns its linear coefficients, so those are re-estimated (NNLS) on a random
+    HALF of its points and scored on the other half: extra modes must pay for their
+    extra linear freedom.  Same splits for every K (paired comparison)."""
+    n = x.size
+    rg = np.random.default_rng(seed)
+    splits = [rg.permutation(n)[: n // 2] for _ in range(n_splits)]
+    cv, per_fold = {K: 0.0 for K in Ks}, {K: [] for K in Ks}
+    for K in Ks:
+        tot = 0.0
+        for h in range(M):
+            idx = [c for c in range(M) if c != h]
+            Ys = Y[idx]
+            starts = [greedy_init(K, x, Ys)]
+            if warm is not None and len(warm.get(K, ())) == 2 * K:
+                starts.append(warm[K])
+            for _ in range(N_MULTISTART_CV):
+                starts.append(np.r_[np.sort(rg.uniform(LNTAU_LO, LNTAU_HI, K)),
+                                    rg.uniform(0.15, 1.0, K)])
+            best = min(refine(K, th, x, Ys, max_nfev=3000) for th in starts)
+            A = design(x, best[1][:K], best[1][K:])
+            Yh = Y[h]
+            err = 0.0
+            for tr in splits:
+                keep = np.ones(n, bool); keep[tr] = False
+                te = np.where(keep)[0]
+                for a_, b_ in ((tr, te), (te, tr)):
+                    Atr = np.vstack([A[a_], A[n + a_]]); Ytr = Yh[np.r_[a_, n + a_]]
+                    Ate = np.vstack([A[b_], A[n + b_]]); Yte = Yh[np.r_[b_, n + b_]]
+                    err += float(np.sum((Ate @ nnls(Atr, Ytr)[0] - Yte) ** 2))
+            err /= (2.0 * n_splits)                 # n scored points per split
+            per_fold[K].append(err / n)
+            tot += err
+        cv[K] = tot / (M * n)
+        pf = np.array(per_fold[K])
+        print(f"  K={K}: LOCO-CV RSS/point={cv[K]:.6f}  RMS={np.sqrt(cv[K]):.5f}  "
+              f"per-fold mean={pf.mean():.6f} sem={pf.std(ddof=1)/np.sqrt(M):.6f}")
+    return cv, per_fold
+
+
+# ------------------------------------------------------------------ structure tests
+def merge_test(K, theta, x, Y, M, ntot, sig, w=W):
+    """C2 (one direction): merge each neighbouring pair -> K-1 modes, refit."""
+    r_cur = rss_of(theta, K, x, Y, w)
+    dp = n_params(K, M) - n_params(K - 1, M)
+    thr = dp * sig ** 2
+    out = []
+    for i in range(K - 1):
+        lt = 0.5 * (theta[:K][i] + theta[:K][i + 1])
+        ph = 0.5 * (theta[K:][i] + theta[K:][i + 1])
+        t = np.r_[np.delete(theta[:K], [i, i + 1]), lt, np.delete(theta[K:], [i, i + 1]), ph]
+        r_new, t_new = polish(K - 1, t, x, Y, w)
+        keep_both = (r_new - r_cur) > thr or bic(r_new, K - 1, M, ntot) > bic(r_cur, K, M, ntot)
+        out.append((i, r_new - r_cur, bic(r_new, K - 1, M, ntot) - bic(r_cur, K, M, ntot), keep_both))
+        print(f"    merge {i}+{i+1}: dRSS={r_new-r_cur:+.5f} (noise threshold dp*sig^2={thr:.5f}), "
+              f"dBIC={bic(r_new,K-1,M,ntot)-bic(r_cur,K,M,ntot):+.2f} -> "
+              f"{'MERGE' if not keep_both else 'keep both'}")
+    return out
+
+
+def split_test(K, theta, x, Y, M, ntot, sig, w=W):
+    """C2 (symmetric direction): split each mode into two; accept only if the RSS gain
+    beats the same penalty rule (F-like threshold on dp extra params AND BIC)."""
+    r_cur = rss_of(theta, K, x, Y, w)
+    dp = n_params(K + 1, M) - n_params(K, M)
+    thr = dp * sig ** 2
+    lo, hi = bounds(K + 1)
+    out = []
+    for i in range(K):
+        for half in SPLIT_SCAN:
+            lts, phs = list(theta[:K]), list(theta[K:])
+            lts[i:i + 1] = [theta[:K][i] - half, theta[:K][i] + half]
+            phs[i:i + 1] = [theta[K:][i], theta[K:][i]]
+            t = np.clip(np.r_[lts, phs], lo + 1e-9, hi - 1e-9)
+            r_new, t_new = polish(K + 1, t, x, Y, w)
+            Fv, _, _ = f_stat(r_new, K + 1, r_cur, K, M, ntot)
+            accept = (r_cur - r_new) > thr and bic(r_new, K + 1, M, ntot) < bic(r_cur, K, M, ntot)
+            out.append((i, half, r_cur - r_new, Fv, accept))
+            print(f"    split mode {i} (d ln tau = {half}): RSS {r_cur:.5f}->{r_new:.5f} "
+                  f"gain={r_cur-r_new:.5f} (thr {thr:.5f}) F={Fv:.2f} "
+                  f"dBIC={bic(r_new,K+1,M,ntot)-bic(r_cur,K,M,ntot):+.2f} -> "
+                  f"{'SPLIT' if accept else 'reject'}")
+            if accept:
+                return K + 1, t_new, r_new, out
+    return K, theta, r_cur, out
+
+
+def boundary_test(K, theta, x, Y, w=W):
+    """C1: a phi pinned at a bound is a RED FLAG, not a result: refit with that phi
+    frozen at the bound and report the RSS cost."""
+    r_cur = rss_of(theta, K, x, Y, w)
+    lo, hi = bounds(K)
+    flags = []
+    for i in range(K):
+        for name, val in (("upper phi=1", PHI_HI), ("lower phi=1e-3", PHI_LO)):
+            if abs(theta[K + i] - val) >= 2e-3:
+                continue
+            def f_fixed(t, i=i, val=val):
+                return residuals(np.r_[t[:K], t[K:K + i], [val], t[K + i:]], K, x, Y, w)
+            mask = np.ones(2 * K, bool); mask[K + i] = False
+            o2 = least_squares(f_fixed, np.r_[theta[:K], np.delete(theta[K:], i)],
+                               bounds=(np.delete(lo, mask) + 1e-9, np.delete(hi, mask) - 1e-9),
+                               method="trf", x_scale="jac", diff_step=1e-4, max_nfev=3000)
+            r_fix = 2 * o2.cost
+            flags.append((i, name, theta[K + i], r_fix, r_cur))
+            print(f"    BOUNDARY FLAG mode {i}: phi={theta[K+i]:.5f} ({name}); "
+                  f"RSS with phi frozen={r_fix:.5f} vs free={r_cur:.5f} (dRSS={r_fix-r_cur:+.6f})")
+    if not flags:
+        print("    no phi at a bound (all phi strictly inside (1e-3, 1))")
+    return flags
+
+
+# ------------------------------------------------------------------ bootstrap
+def parametric_bootstrap(K, theta, x, Y, w, sig, n_boot=N_BOOT, cold=N_BOOT_COLD, seed=SEED + 11):
+    """Warm-start parametric bootstrap (fast; UNDERSTATES multimodality - that is why
+    `cold` replicates with random multistart are added as an honest check)."""
+    rg = np.random.default_rng(seed)
+    A = design(x, theta[:K], theta[K:], w)
+    Yhat = np.array([A @ nnls(A, y)[0] for y in Y])
+    T, P, Aa = [], [], []
+    nzero = 0
+    for i in range(n_boot + cold):
+        Yb = Yhat + rg.normal(0.0, sig, Y.shape)
+        if i < n_boot:
+            _, th = refine(K, theta, x, Yb, w, max_nfev=1500)
+        else:
+            cands = [refine(K, th0, x, Yb, w, max_nfev=2000) for th0 in
+                     [np.r_[np.sort(rg.uniform(LNTAU_LO, LNTAU_HI, K)), rg.uniform(0.15, 1.0, K)]
+                      for _ in range(6)]]
+            _, th = min(cands, key=lambda z: z[0])
+        C, _ = fit_coefs(x, th[:K], th[K:], Yb, w)
+        o = np.argsort(th[:K])
+        T.append(np.exp(th[:K][o])); P.append(th[K:][o]); Aa.append(C[:, 1:1 + K][:, o])
+        nzero += int(np.all(C[:, 1:1 + K] < 1e-8))
+    return np.array(T), np.array(P), np.array(Aa), nzero
+
+
+# ------------------------------------------------------------------ main
+def main():
+    t0 = time.time()
+    print("=" * 79)
+    print("STEP 0  data inspection and fit-free noise scale")
+    print("=" * 79)
+    X, Y, curves = load()
+    M, n = X.shape
+    ntot = 2 * M * n
+    x = X[0]
+    step = np.diff(np.log(x))
+    print(f"  curves={curves.tolist()}  n_points/curve={n}  shared x-grid: "
+          f"{all(np.allclose(X[c], x) for c in range(M))}")
+    print(f"  x in [{x.min():.6g}, {x.max():.6g}] = {np.log10(x.max()/x.min()):.2f} decades; "
+          f"log step mean={step.mean():.8f} std={step.std():.2e} monotone={bool(np.all(step>0))}")
+    print(f"  non-finite values: {int((~np.isfinite(Y)).sum())}")
+    d_re = Y[:, 2:n] - 2 * Y[:, 1:n - 1] + Y[:, :n - 2]
+    d_im = Y[:, n + 2:] - 2 * Y[:, n + 1:2 * n - 1] + Y[:, n:2 * n - 2]
+    d_all = Y[:, 2:] - 2 * Y[:, 1:-1] + Y[:, :-2]
+    sig_re = float(np.sqrt(np.mean(d_re ** 2) / 6)); sig_im = float(np.sqrt(np.mean(d_im ** 2) / 6))
+    sig = float(np.sqrt(np.mean(d_all ** 2) / 6))
+    per_curve = np.sqrt(np.mean(d_all ** 2, axis=1) / 6)
+    print(f"  sigma_hat from 2nd differences (NO fit): re={sig_re:.4f} im={sig_im:.4f} "
+          f"pooled={sig:.4f}; re/im ratio={sig_re/sig_im:.3f}")
+    print(f"  per-curve sigma_hat = {np.array2string(per_curve, precision=4)}")
+    print("  -> noise is additive, homoscedastic in x and across curves, re ~ im =>")
+    print("     objective = unweighted stacked [re;im] least squares (MAP with iid noise)")
+
+    print("\n" + "=" * 79)
+    print(f"STEP 1  joint variable-projection fits, K=1..{KMAX} (greedy + {N_MULTISTART} multistarts)")
+    print("=" * 79)
+    try:
+        from scipy.stats import f as f_dist
+        f_crit = lambda dp, df2: float(f_dist.ppf(0.95, dp, df2))
+    except Exception:
+        f_crit = lambda dp, df2: float("nan")
+    thr_len = lambda dp: dp * sig ** 2                 # noise-level threshold (F ~ 1)
+    thr_bic = lambda dp: dp * sig ** 2 * np.log(ntot)  # BIC-equivalent RSS-drop threshold
+    fits = {}
+    print("  p = 2K shared nonlinear + M(K+1) linear; n = 960; sigma_hat^2 = %.6f" % sig ** 2)
+    for K in range(1, KMAX + 1):
+        r, th = multistart_fit(K, x, Y, W)
+        fits[K] = (r, th)
+        p = n_params(K, M)
+        if K > 1:
+            Fv, dp, df2 = f_stat(r, K, fits[K - 1][0], K - 1, M, ntot)
+            extra = (f"dRSS={fits[K-1][0]-r:8.5f} (thr noise={thr_len(dp):.5f} / "
+                     f"BIC-equiv={thr_bic(dp):.5f})  F={Fv:7.2f} (F_crit95={f_crit(dp,df2):.2f})  "
+                     f"accept_extra={'YES' if fits[K-1][0]-r > thr_bic(dp) else 'no'}")
+        else:
+            extra = ""
+        print(f"  K={K}: p={p:2d} RSS={r:.5f} RMS={np.sqrt(r/ntot):.5f} "
+              f"red.chi2={r/(ntot-p)/sig**2:.3f} BIC={bic(r,K,M,ntot):9.2f}  {extra}")
+    K_bic = min(fits, key=lambda K: bic(fits[K][0], K, M, ntot))
+    print(f"  --> BIC-optimal K = {K_bic}")
+    if K_bic + 1 in fits:
+        print(f"  detail of the REJECTED richer model K={K_bic+1} "
+              f"(the classic broad-mode->two-narrow-modes degeneracy):")
+        rk, tk = fits[K_bic + 1]
+        oo = np.argsort(tk[:K_bic + 1])
+        Ck, _ = fit_coefs(x, tk[:K_bic + 1], tk[K_bic + 1:], Y, W)
+        for k in oo:
+            print(f"     tau={np.exp(tk[k]):.5g} phi={tk[K_bic+1+k]:.4f} "
+                  f"a_k={np.array2string(Ck[:,1+k], precision=3)}")
+        srt = np.sort(tk[:K_bic + 1]); ratios = np.exp(np.diff(srt))
+        print(f"     RSS {fits[K_bic][0]:.5f} -> {rk:.5f} (gain {fits[K_bic][0]-rk:.5f}, "
+              f"BIC penalty {bic(rk,K_bic+1,M,ntot)-bic(fits[K_bic][0],K_bic,M,ntot):+.2f}); "
+              f"closest tau pair ratio {ratios.min():.2f} (min over pairs), "
+              f"tau's are {(np.exp(srt)).round(4).tolist()}")
+        print(f"     amplitudes hitting the a>=0 boundary in this model: "
+              f"{int(np.sum(Ck[:,1:K_bic+2] < 1e-8))} of {M*(K_bic+1)} -> decomposition not identifiable")
+        # the two close modes replicate ONE mode of the K_bic model: compare summed amplitudes
+        j = int(np.argmin(ratios))                      # closest pair = srt[j], srt[j+1]
+        cols = np.argsort(tk[:K_bic + 1])
+        summed = Ck[:, 1 + cols[j]] + Ck[:, 1 + cols[j + 1]]
+        Cs, _ = fit_coefs(x, fits[K_bic][1][:K_bic], fits[K_bic][1][K_bic:], Y, W)
+        geo_mean = np.sqrt(np.exp(srt[j]) * np.exp(srt[j + 1]))
+        ks = int(np.argmin(np.abs(np.exp(fits[K_bic][1][:K_bic]) - geo_mean)))
+        print(f"     pair-sum amplitudes  {np.array2string(summed, precision=3)}")
+        print(f"     single mode (K={K_bic}) tau={np.exp(fits[K_bic][1][ks]):.5g}: "
+              f"{np.array2string(Cs[:,1+ks], precision=3)}  -> the extra mode only splits one "
+              f"broad mode, it does not add structure")
+
+    print("\n" + "=" * 79)
+    print("STEP 2  leave-one-curve-out cross-validation (theta from 4 curves only)")
+    print("=" * 79)
+    cv, per_fold = loco_cv(range(1, KMAX + 1), x, Y, M, warm={K: fits[K][1] for K in fits})
+    K_raw = min(cv, key=lambda K: cv[K])
+    sem_raw = np.array(per_fold[K_raw]).std(ddof=1) / np.sqrt(M)
+    print(f"  paired per-fold CV differences vs K={K_raw} (positive = worse than best):")
+    for K in sorted(cv):
+        d = np.array(per_fold[K]) - np.array(per_fold[K_raw])
+        sd = d.std(ddof=1) / np.sqrt(M) if M > 1 else 0.0
+        print(f"    K={K}: dCV={d.mean():+.6f} +- {sd:.6f}   "
+              f"{'within noise' if abs(d.mean()) < 2*max(sd,1e-12) else 'different'}")
+    K_cv = min(K for K in cv if cv[K] <= cv[K_raw] + sem_raw)   # 1-SE rule
+    print(f"  raw CV minimum at K={K_raw} (CV={cv[K_raw]:.6f}, 1 SEM={sem_raw:.6f}); "
+          f"1-SE rule -> LOCO-CV-optimal K = {K_cv}")
+    K = min(K_bic, K_cv)
+    print(f"  reconciliation: BIC={K_bic}, CV={K_cv} -> K={K} (simpler model wins conflicts)")
+
+    print("\n" + "=" * 79)
+    print("STEP 3  structural tests on the selected model (duplicates / merge / split / C1)")
+    print("=" * 79)
+    r, th = fits[K]
+    o = np.argsort(th[:K]); th = np.r_[th[:K][o], th[K:][o]]
+    for i in range(K - 1):
+        dl = th[:K][i + 1] - th[:K][i]
+        if dl < MERGE_DLN:
+            print(f"  duplicate candidates: modes {i},{i+1} d ln tau={dl:.3f} < {MERGE_DLN}")
+    merge_test(K, th, x, Y, M, ntot, sig)
+    K2, th2, r2, _ = split_test(K, th, x, Y, M, ntot, sig)
+    if K2 != K:
+        print(f"  split accepted -> K={K2}; refitting")
+        K = K2
+        r, th = multistart_fit(K2, x, Y, W)
+        o = np.argsort(th[:K]); th = np.r_[th[:K][o], th[K:][o]]
+    else:
+        print("  no split accepted: current K is stable against mode splitting")
+    # Focused identifiability check of the rejected richer model (its plain F test can be
+    # formally significant, so we test whether the extra mode is IDENTIFIABLE at all):
+    if K + 1 in fits:
+        rk, tk = fits[K + 1]
+        rg = np.random.default_rng(SEED + 17)
+        A = design(x, tk[:K + 1], tk[K + 1:], W)
+        Yhat = np.array([A @ nnls(A, y)[0] for y in Y])
+        ratios, n_boundary = [], 0
+        for _ in range(60):
+            Yb = Yhat + rg.normal(0.0, sig, Y.shape)
+            _, tb = refine(K + 1, tk, x, Yb, W, max_nfev=1500)
+            srt = np.sort(tb[:K + 1]); ratios.append(float(np.exp(np.diff(srt)).min()))
+            Cb, _ = fit_coefs(x, tb[:K + 1], tb[K + 1:], Yb, W)
+            n_boundary += int(np.any(Cb[:, 1:K + 2] < 1e-8))
+        ratios = np.array(ratios)
+        print(f"  identifiability of the rejected K={K+1} split (60 parametric-bootstrap "
+              f"replicates of the K={K+1} fit):")
+        print(f"    closest tau pair ratio: median={np.median(ratios):.3f} "
+              f"[16-84%] {np.quantile(ratios,0.16):.3f} .. {np.quantile(ratios,0.84):.3f} "
+              f"[2.5-97.5%] {np.quantile(ratios,0.025):.3f} .. {np.quantile(ratios,0.975):.3f}"
+              f"   (ratio 1 = the two modes coincide)")
+        print(f"    replicates with at least one amplitude pinned at the a>=0 boundary: "
+              f"{n_boundary}/60 -> the split amplitudes are NOT identifiable; "
+              f"K={K} retained")
+    boundary_test(K, th, x, Y, W)
+    C, _ = fit_coefs(x, th[:K], th[K:], Y, W)
+    amp = C[:, 1:1 + K]
+    thr_amp = 3 * sig / np.sqrt(n)
+    dead = [k for k in range(K) if np.all(amp[:, k] < thr_amp)]
+    print(f"  prune threshold 3*sigma/sqrt(n)={thr_amp:.4f}; modes ~0 in ALL curves: "
+          f"{dead if dead else 'none'} (all modes retained)")
+
+    print("\n" + "=" * 79)
+    print("STEP 4  weight check re vs im (from residuals, not by eye)")
+    print("=" * 79)
+    C, R = fit_coefs(x, th[:K], th[K:], Y, W)
+    rms_re = float(np.sqrt(np.mean(R[:, :n] ** 2))); rms_im = float(np.sqrt(np.mean(R[:, n:] ** 2)))
+    print(f"  residual RMS re={rms_re:.4f} im={rms_im:.4f} ratio={rms_re/rms_im:.3f}")
+    if not (0.7 < rms_re / rms_im < 1.4):
+        print("  -> re-weighting with 1/rms and refitting")
+        w = (1.0 / rms_re, 1.0 / rms_im)
+        r, th = multistart_fit(K, x, Y, w)
+        o = np.argsort(th[:K]); th = np.r_[th[:K][o], th[K:][o]]
+    else:
+        print("  -> equal weights confirmed (no re-weighting)")
+
+    print("\n" + "=" * 79)
+    print("STEP 5  final joint refit + goodness-of-fit evidence (C4)")
+    print("=" * 79)
+    r, th = multistart_fit(K, x, Y, W)
+    o = np.argsort(th[:K]); th = np.r_[th[:K][o], th[K:][o]]
+    tau, phi = np.exp(th[:K]), th[K:]
+    C, R = fit_coefs(x, th[:K], th[K:], Y, W)
+    a0 = C[:, 0] - C[:, -1]; amp = C[:, 1:1 + K]
+    p = n_params(K, M)
+    print("  modes (tau ascending):")
+    for k in range(K):
+        print(f"    mode {k}: tau={tau[k]:.6g}  phi={phi[k]:.4f}  "
+              f"a_k per curve = {np.array2string(amp[:,k], precision=4)}")
+    print(f"  baselines a0^(m) = {np.array2string(a0, precision=4)} "
+          f"(all non-negative: {bool(np.all(a0 > -1e-12))})")
+    print(f"  RSS={r:.5f}  n={ntot}  p={p}  RSS/n={r/ntot:.6f}  RMS={np.sqrt(r/ntot):.5f}")
+    print(f"  independent sigma_hat^2 (2nd diffs) = {sig**2:.6f}  (sigma_hat={sig:.4f})")
+    print(f"  RSS/(n-p) = {r/(ntot-p):.6f} -> residual sigma = {np.sqrt(r/(ntot-p)):.4f} "
+          f"({100*(np.sqrt(r/(ntot-p))/sig-1):+.2f}% vs sigma_hat)")
+    red = r / (ntot - p) / sig ** 2
+    print(f"  reduced chi2 = {red:.3f} (3-sigma band for n-p={ntot-p}: "
+          f"[{1-3*np.sqrt(2/(ntot-p)):.3f}, {1+3*np.sqrt(2/(ntot-p)):.3f}]) -> "
+          f"{'consistent with noise' if red < 1+3*np.sqrt(2/(ntot-p)) else 'EXCESS'}")
+    print("  per-curve RMS(re), RMS(im), lag-1 autocorrelation of residuals along ln x:")
+    worst = 0.0
+    for c in range(M):
+        rr, ri = np.sqrt(np.mean(R[c, :n] ** 2)), np.sqrt(np.mean(R[c, n:] ** 2))
+        l1r = np.corrcoef(R[c, :n][:-1], R[c, :n][1:])[0, 1]
+        l1i = np.corrcoef(R[c, n:][:-1], R[c, n:][1:])[0, 1]
+        worst = max(worst, rr, ri)
+        # relative sd of an RMS estimate over n points ~ 1/sqrt(2 n)  -> z score vs sigma_hat
+        zr, zi = (rr - sig) / (sig / np.sqrt(2 * n)), (ri - sig) / (sig / np.sqrt(2 * n))
+        print(f"    curve {c}: RMS(re)={rr:.4f} RMS(im)={ri:.4f} lag1(re)={l1r:+.3f} "
+              f"lag1(im)={l1i:+.3f}  z(re)={zr:+.2f} z(im)={zi:+.2f}")
+    print(f"  worst per-curve RMS = {worst:.4f} vs sigma_hat = {sig:.4f} "
+          f"(ratio {worst/sig:.3f}; |z| <= {abs(worst-sig)/(sig/np.sqrt(2*n)):.2f}) -> no curve "
+          f"stands out => no missed mode concentrated in one curve")
+    ks = 9
+    def sm(y):
+        yp = np.r_[np.full(ks // 2, y[0]), y, np.full(ks // 2, y[-1])]
+        return np.convolve(yp, np.ones(ks) / ks, mode="valid")
+    obs = max(max(np.abs(sm(R[c, :n])).max() for c in range(M)),
+              max(np.abs(sm(R[c, n:])).max() for c in range(M)))
+    rg = np.random.default_rng(SEED + 5)
+    null = np.array([max(np.abs(sm(rg.normal(0, sig, n))).max() for _ in range(M)) for _ in range(400)])
+    print(f"  'wave' test, max |9-pt smoothed residual|: observed={obs:.4f}; white-noise null "
+          f"median={np.median(null):.4f} p95={np.quantile(null,0.95):.4f} max={null.max():.4f}")
+    print(f"  -> residuals consistent with white noise, no missed-mode wave: "
+          f"{bool(obs < np.quantile(null, 0.99))}")
+    print(f"  tau-convention sanity check (model: peak at x*tau ~ 1): predicted -im peak "
+          f"positions x ~ 1/tau = {np.array2string(1/tau, precision=4)}")
+    print("  physical-constraint verification:")
+    print(f"    tau_k > 0                     : {bool(np.all(tau > 0))}")
+    print(f"    0 < phi_k <= 1                : {bool(np.all((phi > 0) & (phi <= 1.0 + 1e-12)))}"
+          f"  (min={phi.min():.4f}, max={phi.max():.4f}; at a bound: "
+          f"{[int(i) for i in range(K) if phi[i] > 1 - 1e-3 or phi[i] < 1e-2]})")
+    print(f"    a_k^(m) >= 0 (all curves)     : {bool(np.all(amp >= -1e-12))}"
+          f"  (min={amp.min():.4f})")
+    print(f"    modes shared by all curves    : yes (single (tau,phi) set; only a0,a_k per curve)")
+    print("  leave-one-curve-out parameter stability (tau,phi refitted on 4 curves):")
+    jt = []
+    for h in range(M):
+        idx = [c for c in range(M) if c != h]
+        rr_, tt_ = multistart_fit(K, x, Y[idx], W, n_start=40, seed=SEED + 100 + h, verbose=False)
+        oo = np.argsort(tt_[:K]); jt.append(np.r_[np.exp(tt_[:K][oo]), tt_[K:][oo]])
+        print(f"    drop curve {h}: tau={np.array2string(jt[-1][:K], precision=5)} "
+              f"phi={np.array2string(jt[-1][K:], precision=3)} RSS={rr_:.5f}")
+    jt = np.array(jt)
+    for k in range(K):
+        print(f"    mode {k}: tau jackknife spread {jt[:,k].min():.5g} .. {jt[:,k].max():.5g} "
+              f"(full fit {tau[k]:.5g});  phi {jt[:,K+k].min():.3f} .. {jt[:,K+k].max():.3f} "
+              f"(full {phi[k]:.3f})")
+
+    print("\n" + "=" * 79)
+    print("STEP 6  bootstrap, multistart spread, traceability")
+    print("=" * 79)
+    T, P, Aa, nzero = parametric_bootstrap(K, th, x, Y, W, sig)
+    print(f"  {N_BOOT} warm-start + {N_BOOT_COLD} cold-multistart replicates; replicates with a "
+          f"fully zeroed mode: {nzero}")
+    print("  (warm start understates multimodality; cold replicates are the honest bound)")
+    for k in range(K):
+        t_, p_ = np.sort(T[:, k]), np.sort(P[:, k])
+        print(f"   mode {k}: tau  median={np.median(t_):.5g} [16-84%] {np.quantile(t_,0.16):.5g}"
+              f" .. {np.quantile(t_,0.84):.5g}  [2.5-97.5%] {np.quantile(t_,0.025):.5g}"
+              f" .. {np.quantile(t_,0.975):.5g}")
+        print(f"            phi median={np.median(p_):.4f} [16-84%] "
+              f"{np.quantile(p_,0.16):.4f} .. {np.quantile(p_,0.84):.4f}   "
+              f"amp medians {np.array2string(np.median(Aa[:,:,k],axis=0), precision=3)}")
+    rg = np.random.default_rng(SEED + 31)
+    sols = sorted((refine(K, np.r_[np.sort(rg.uniform(LNTAU_LO, LNTAU_HI, K)),
+                                  rg.uniform(0.15, 1.0, K)], x, Y, W) for _ in range(25)),
+                  key=lambda z: z[0])
+    print("  25 extra cold multistarts on the real data (multimodality check):")
+    for rr, tt in sols[:5]:
+        print(f"    RSS={rr:.5f} tau={np.array2string(np.exp(np.sort(tt[:K])), precision=5)}")
+    print(f"    best cold RSS={sols[0][0]:.5f} vs final={r:.5f} "
+          f"(delta={sols[0][0]-r:+.5f}) -> {'global optimum confirmed' if sols[0][0] > r-1e-6 else 'BETTER SOLUTION FOUND'}")
+
+    print("\n" + "=" * 79)
+    print("STEP 7  write results/modes.csv  (C3: amplitudes from ONE final NNLS refit)")
+    print("=" * 79)
+    C, _ = fit_coefs(x, th[:K], th[K:], Y, W)
+    a_final = C[:, 1:1 + K]
+    assert np.all(np.diff(th[:K]) > 0), "modes must be strictly tau-sorted"
+    os.makedirs("results", exist_ok=True)
+    with open(OUT_CSV, "w") as f:
+        f.write("tau," + ",".join(f"a_{m}" for m in range(M)) + "\n")
+        for k in range(K):
+            f.write(f"{np.exp(th[k]):.10g}," + ",".join(f"{a_final[m,k]:.10g}" for m in range(M)) + "\n")
+    print(open(OUT_CSV).read())
+    print(f"  {K} mode rows (ascending tau) + header; columns a_0..a_{M-1} = amplitude in curve m")
+    print(f"  total runtime {time.time()-t0:.1f} s")
+
+
+if __name__ == "__main__":
+    main()

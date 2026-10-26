@@ -1,0 +1,539 @@
+"""
+Stable latent state fitting for long categorical streams.
+
+Model: discrete latent Markov chain ("rows") with categorical emissions.
+  vector_a  : stationary distribution over rows (reported; pi0 kept internally)
+  matrix_a  : K x K row-stochastic latent transition matrix
+  matrix_b  : K x 32 emission distributions
+Fitting: Baum-Welch EM implemented from scratch in log-space (NumPy/SciPy only).
+An order-free mixture baseline (emission-only latent class model) is also fit,
+so the order-dependent claim is tested rather than assumed.
+"""
+import json
+import struct
+import zlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.vq import kmeans2
+
+RNG_GLOBAL_SEED = 20260119
+DATA = Path("data")
+OUT = Path("results")
+OUT.mkdir(exist_ok=True)
+
+meta = json.loads((DATA / "metadata.json").read_text())
+df = pd.read_csv(DATA / "sequences.csv").sort_values("global_index").reset_index(drop=True)
+S = 32
+assert sorted(df.symbol.unique()) == list(range(S))
+symbol_label_of = dict(zip(df.symbol, df.symbol_label))
+
+streams = []
+for sid, g in df.groupby("sequence_id", sort=True):
+    streams.append((sid, g.sort_values("position").symbol.to_numpy()))
+N_TOTAL = len(df)
+print(f"[data] {len(streams)} streams, {N_TOTAL} observations, alphabet {S}", flush=True)
+
+
+def lse(a, axis=None):
+    m = np.max(a, axis=axis, keepdims=True)
+    m = np.where(np.isfinite(m), m, 0.0)
+    out = np.log(np.sum(np.exp(a - m), axis=axis, keepdims=True)) + m
+    return np.squeeze(out, axis=axis) if axis is not None else out.item()
+
+
+def normalize_rows(m, floor=0.0):
+    m = m + floor
+    return m / m.sum(axis=-1, keepdims=True)
+
+
+def stationary_distribution(A):
+    p = np.full(A.shape[0], 1.0 / A.shape[0])
+    for _ in range(10000):
+        p_new = p @ A
+        if np.max(np.abs(p_new - p)) < 1e-14:
+            p = p_new
+            break
+        p = p_new
+    return p / p.sum()
+
+
+def forward_backward(log_pi0, log_A, log_B, obs):
+    T, K = len(obs), log_pi0.shape[0]
+    lb = log_B[:, obs]
+    la = np.empty((T, K))
+    la[0] = log_pi0 + lb[:, 0]
+    lAt = np.ascontiguousarray(log_A.T)
+    for t in range(1, T):
+        m = (la[t - 1][:, None] + lAt).max(axis=0)
+        la[t] = m + np.log(np.exp(la[t - 1][:, None] + lAt - m[None, :]).sum(axis=0)) + lb[:, t]
+    ll = lse(la[-1])
+    lbeta = np.empty((T, K))
+    lbeta[-1] = 0.0
+    for t in range(T - 2, -1, -1):
+        x = log_A + (lbeta[t + 1] + lb[:, t + 1])[None, :]
+        lbeta[t] = x.max(axis=1) + np.log(np.exp(x - x.max(axis=1)[:, None]).sum(axis=1))
+    log_gamma = la + lbeta
+    log_gamma -= lse(log_gamma, axis=1)[:, None]
+    lg = (la[:-1][:, :, None] + log_A[None, :, :]
+          + (lbeta[1:] + lb[:, 1:].T)[:, None, :])
+    lg2 = lse(lse(lg, axis=2), axis=1)
+    lg = lg - lg2[:, None, None]
+    xi = np.exp(lg).sum(axis=0)
+    return ll, log_gamma, xi
+
+
+def em_hmm(streams_obs, K, seed, init="random", max_iter=120, tol=1e-4,
+           pseudocount=0.01):
+    rng = np.random.default_rng(seed)
+    if init == "random":
+        pi0 = rng.dirichlet(np.ones(K))
+        A = normalize_rows(rng.dirichlet(np.ones(K) * 0.5, size=K), floor=1e-3)
+        B = normalize_rows(rng.dirichlet(np.ones(S) * 0.5, size=K), floor=1e-3)
+    else:  # segment init: cluster fixed windows by symbol histogram
+        W = 50
+        wins, bounds = [], []
+        for obs in streams_obs:
+            n0 = 0
+            for s in range(0, len(obs) - W + 1, W):
+                wins.append(np.bincount(obs[s:s + W], minlength=S) / W)
+                n0 += 1
+            bounds.append(n0)
+        wins = np.array(wins)
+        cent, lab = kmeans2(wins, K, minit="++", seed=seed)
+        B = np.zeros((K, S)); cnt = np.zeros(K)
+        for k in range(K):
+            m = lab == k
+            cnt[k] = m.sum()
+            B[k] = wins[m].sum(axis=0) if m.any() else wins.mean(axis=0)
+        B = normalize_rows(B, floor=0.01)
+        C = np.full((K, K), 0.5); ofs = 0
+        for nw in bounds:
+            sl = lab[ofs:ofs + nw].astype(int); ofs += nw
+            C += np.bincount(sl[:-1] * K + sl[1:], minlength=K * K).reshape(K, K)
+        A = normalize_rows(C)
+        pi0 = normalize_rows(cnt + 0.5)
+    log_pi0, log_A, log_B = np.log(pi0), np.log(A), np.log(B)
+    ll_old, trace = -np.inf, []
+    for it in range(max_iter):
+        LL = 0.0
+        gam_sum, xi_sum, n0 = np.zeros((K, S)), np.zeros((K, K)), np.zeros(K)
+        for obs in streams_obs:
+            ll, lg, xi = forward_backward(log_pi0, log_A, log_B, obs)
+            LL += ll
+            g = np.exp(lg)
+            for k in range(K):  # bincount: safe with repeated symbols
+                gam_sum[k] += np.bincount(obs, weights=g[:, k], minlength=S)
+            xi_sum += xi
+            n0 += g[0]
+        pi0 = normalize_rows(n0 + 1e-6)
+        A = normalize_rows(xi_sum, floor=pseudocount / K)
+        B = normalize_rows(gam_sum, floor=pseudocount)
+        log_pi0, log_A, log_B = np.log(pi0), np.log(A), np.log(B)
+        rel = (LL - ll_old) / max(abs(ll_old), 1e-12) if ll_old > -np.inf else 1.0
+        trace.append((LL, rel))
+        if it > 2 and abs(rel) < tol:
+            break
+        ll_old = LL
+    LL, gammas, seq_ll = 0.0, [], []
+    for obs in streams_obs:
+        ll, lg, _ = forward_backward(log_pi0, log_A, log_B, obs)
+        LL += ll; gammas.append(np.exp(lg)); seq_ll.append(ll)
+    return {"K": K, "LL": LL, "pi0": np.exp(log_pi0), "A": np.exp(log_A),
+            "B": np.exp(log_B), "gammas": gammas, "trace": trace,
+            "seq_ll": seq_ll, "seed": seed, "init": init}
+
+
+def em_mixture(obs_all, K, seed, max_iter=500, tol=1e-9, pseudocount=0.01):
+    rng = np.random.default_rng(seed)
+    B = normalize_rows(rng.dirichlet(np.ones(S) * 0.5, size=K), floor=1e-3)
+    w = np.full(K, 1.0 / K)
+    onehot = np.zeros((S, len(obs_all)))
+    onehot[obs_all, np.arange(len(obs_all))] = 1.0
+    ll_old, trace = -np.inf, []
+    for it in range(max_iter):
+        logp = np.log(w)[:, None] + np.log(B)[:, obs_all]
+        logg = logp - lse(logp, axis=0)[None, :]
+        LL = lse(logp, axis=0).sum()
+        g = np.exp(logg)
+        w = normalize_rows(g.sum(axis=1) + 1e-8)
+        B = normalize_rows(g @ onehot.T, floor=pseudocount)
+        rel = (LL - ll_old) / max(abs(ll_old), 1e-12) if ll_old > -np.inf else 1.0
+        trace.append((LL, rel))
+        if it > 2 and abs(rel) < tol:
+            break
+        ll_old = LL
+    return {"K": K, "LL": LL, "w": w, "B": B, "trace": trace, "seed": seed}
+
+
+HMM_GRID = [2, 3, 4, 5, 6, 8, 10, 12, 16]
+MIX_GRID = [2, 3, 4, 5, 6, 8]
+HMM_RESTARTS = 8
+MIX_RESTARTS = 4
+obs_list = [s for _, s in streams]
+
+candidates, hmm_fits, trace_store = [], {}, {}
+for K in HMM_GRID:
+    best, traces = None, []
+    for r in range(HMM_RESTARTS):
+        init = "segment" if r == 0 else "random"
+        f = em_hmm(obs_list, K, seed=RNG_GLOBAL_SEED + 1000 * K + r, init=init)
+        traces.append(f["trace"])
+        if best is None or f["LL"] > best["LL"]:
+            best = f
+        print(f"[hmm K={K} restart {r} init={init}] LL={f['LL']:.2f}", flush=True)
+    hmm_fits[K] = best
+    trace_store[K] = traces
+    nfree = (K - 1) + K * (K - 1) + K * (S - 1)
+    candidates.append({"candidate": f"hmm_k{K}", "model": "hmm", "K": K,
+                       "n_free_values": nfree, "objective": best["LL"],
+                       "criterion": -2 * best["LL"] + nfree * np.log(N_TOTAL)})
+for K in MIX_GRID:
+    best = None
+    for r in range(MIX_RESTARTS):
+        f = em_mixture(np.concatenate(obs_list), K,
+                       seed=RNG_GLOBAL_SEED + 7000 + 31 * K + r)
+        if best is None or f["LL"] > best["LL"]:
+            best = f
+    nfree = (K - 1) + K * (S - 1)
+    candidates.append({"candidate": f"mix_k{K}", "model": "mixture", "K": K,
+                       "n_free_values": nfree, "objective": best["LL"],
+                       "criterion": -2 * best["LL"] + nfree * np.log(N_TOTAL)})
+    print(f"[mix K={K}] LL={best['LL']:.2f}", flush=True)
+cand_df = pd.DataFrame(candidates)
+
+
+def model_diagnostics(f):
+    K = f["K"]
+    G = np.concatenate(f["gammas"], axis=0)
+    mass = G.mean(axis=0)
+    ent = -(G * np.log(np.clip(G, 1e-300, None))).sum(axis=1)
+    tvB = max(np.abs(f["B"][i] - f["B"][j]).sum() / 2
+              for i in range(K) for j in range(i + 1, K))
+    nxt = f["A"] @ f["B"]  # P(next symbol | current row)
+    tvN = max(np.abs(nxt[i] - nxt[j]).sum() / 2
+              for i in range(K) for j in range(i + 1, K))
+    return {"K": K, "min_row_mass": float(mass.min()),
+            "n_low_rows": int((mass < 0.01).sum()),
+            "mean_weight_entropy": float(ent.mean()),
+            "frac_unconfident": float((G.max(axis=1) < 0.8).mean()),
+            "min_pair_TV_emission": float(tvB), "min_pair_TV_ordering": float(tvN)}
+
+
+diag_rows = []
+for K in HMM_GRID:
+    f = hmm_fits[K]
+    d = model_diagnostics(f)
+    d["candidate"] = f"hmm_k{K}"
+    d["objective"] = f["LL"]
+    d["criterion"] = -2 * f["LL"] + ((K - 1) + K * (K - 1) + K * (S - 1)) * np.log(N_TOTAL)
+    diag_rows.append(d)
+diag_df = pd.DataFrame(diag_rows).sort_values("K").reset_index(drop=True)
+diag_df["dLL_vs_prev"] = diag_df["objective"].diff()
+print("\n[per-K diagnostics]\n" + diag_df.to_string(index=False), flush=True)
+
+
+def heldout_oneshot_ll(f):
+    """Refit on first 80% of each stream; mean one-step predictive log-prob on last 20%."""
+    K = f["K"]
+    lp, lA, lB = np.log(f["pi0"]), np.log(f["A"]), np.log(f["B"])
+    total_ll, total_n = 0.0, 0
+    for obs in obs_list:
+        cut = int(0.8 * len(obs))
+        tr, te = obs[:cut], obs[cut:]
+        for it in range(30):
+            L = 0.0
+            gs, xs, n0 = np.zeros((K, S)), np.zeros((K, K)), np.zeros(K)
+            l2, lg, xi = forward_backward(lp, lA, lB, tr)
+            g = np.exp(lg)
+            for k in range(K):
+                gs[k] += np.bincount(tr, weights=g[:, k], minlength=S)
+            xs += xi; n0 += g[0]
+            lp = np.log(normalize_rows(n0 + 1e-6))
+            lA = np.log(normalize_rows(xs, floor=0.01 / K))
+            lB = np.log(normalize_rows(gs, floor=0.01))
+        la = lp + lB[:, tr[0]]
+        for t in range(cut, len(obs)):
+            pred = lse(la[:, None] + lA, axis=0)
+            total_ll += lse(pred + lB[:, te[t - cut]])
+            la = pred + lB[:, te[t - cut]]
+            total_n += 1
+    return total_ll / total_n
+
+
+diag_df["heldout_oneshot_ll"] = [heldout_oneshot_ll(hmm_fits[K]) for K in diag_df["K"]]
+print("\n[held-out one-step]\n" + diag_df[["candidate", "objective", "criterion",
+      "heldout_oneshot_ll"]].to_string(index=False), flush=True)
+
+# Choice rule (documented): among candidates with min row posterior mass >= 1%
+# and pairwise row-emission TV >= 0.05 (nontrivial, non-redundant rows), pick
+# the lowest BIC; then confirm with marginal gains, uncertainty, held-out score.
+elig = diag_df[(diag_df.min_row_mass >= 0.01) & (diag_df.min_pair_TV_emission >= 0.05)]
+src = elig if len(elig) else diag_df
+chosen_row = src.loc[src.criterion.idxmin()]
+K_CHOSEN = int(chosen_row["K"])
+print(f"\n[choice] K = {K_CHOSEN} ({chosen_row['candidate']})", flush=True)
+
+
+best = hmm_fits[K_CHOSEN]
+stat = stationary_distribution(best["A"])
+perm = np.argsort(-stat, kind="stable")   # canonical labels: descending stationary weight
+A_new = best["A"][np.ix_(perm, perm)]
+B_new = best["B"][perm]
+stat_new = stat[perm]
+pi0_new = best["pi0"][perm]
+gammas_new = [g[:, perm] for g in best["gammas"]]
+
+assert np.isfinite(A_new).all() and np.allclose(A_new.sum(1), 1, atol=1e-8)
+assert np.isfinite(B_new).all() and np.allclose(B_new.sum(1), 1, atol=1e-8)
+assert np.isfinite(stat_new).all() and abs(stat_new.sum() - 1) < 1e-8
+print("[check] matrix_a/matrix_b rows sum to 1, vector_a sums to 1: OK", flush=True)
+
+cand_out = cand_df[["candidate", "n_free_values", "objective", "criterion"]].copy()
+cand_out["chosen"] = (cand_out.candidate == chosen_row["candidate"]).astype(int)
+cand_out.to_csv(OUT / "candidate_summary.csv", index=False)
+
+pd.DataFrame([(i, j, A_new[i, j]) for i in range(K_CHOSEN) for j in range(K_CHOSEN)],
+             columns=["row", "column", "value"]).to_csv(OUT / "matrix_a.csv", index=False)
+pd.DataFrame([(k, s, symbol_label_of[s], B_new[k, s]) for k in range(K_CHOSEN)
+              for s in range(S)],
+             columns=["row", "symbol", "symbol_label", "value"]).to_csv(
+    OUT / "matrix_b.csv", index=False)
+pd.DataFrame({"row": range(K_CHOSEN), "value": stat_new}).to_csv(
+    OUT / "vector_a.csv", index=False)
+
+# fit_trace: all independent restarts of the chosen K (cached traces, fixed seeds)
+rows = []
+for r, tr_r in enumerate(trace_store[K_CHOSEN]):
+    for step, (o, rel) in enumerate(tr_r):
+        rows.append({"run": r, "step": step, "objective": o, "relative_change": rel})
+pd.DataFrame(rows).to_csv(OUT / "fit_trace.csv", index=False)
+
+G_all = np.concatenate(gammas_new, axis=0)  # rows in global_index order
+np.save(OUT / "local_weights.npy", G_all.astype(np.float64))
+labels = G_all.argmax(axis=1)
+pd.DataFrame({"sequence_id": df.sequence_id, "position": df.position,
+              "global_index": df.global_index, "label": labels}).to_csv(
+    OUT / "local_assignments.csv", index=False)
+
+pd.DataFrame([(i, j, A_new[i, j], stat_new[i] * A_new[i, j], A_new[i, j])
+              for i in range(K_CHOSEN) for j in range(K_CHOSEN)],
+             columns=["row", "column", "weight", "joint_fraction",
+                      "conditional_value"]).to_csv(OUT / "neighbor_summary.csv", index=False)
+
+sd = []
+for (sid, obs), g, sll in zip(streams, gammas_new, best["seq_ll"]):
+    ent = -(g * np.log(np.clip(g, 1e-300, None))).sum(axis=1).mean()
+    lab_seq = g.argmax(axis=1)
+    dom = np.bincount(lab_seq, minlength=K_CHOSEN).max() / len(lab_seq)
+    sd.append({"sequence_id": sid, "n_positions": len(obs),
+               "mean_objective": sll / len(obs), "weight_entropy_mean": ent,
+               "dominant_label_fraction": dom})
+pd.DataFrame(sd).to_csv(OUT / "stream_diagnostics.csv", index=False)
+print("[check] stream diagnostics:\n" + pd.DataFrame(sd).to_string(index=False), flush=True)
+
+np.savez(OUT / "_fit_context.npz",
+         A=A_new, B=B_new, stat=stat_new,
+         cand_names=np.array(cand_df.candidate, dtype=object),
+         cand_obj=cand_df.objective.to_numpy(), cand_bic=cand_df.criterion.to_numpy(),
+         cand_model=np.array(cand_df.model, dtype=object),
+         dK=diag_df.K.to_numpy(), dObj=diag_df.objective.to_numpy(),
+         dBIC=diag_df.criterion.to_numpy(), dLL=diag_df.dLL_vs_prev.to_numpy(),
+         dMass=diag_df.min_row_mass.to_numpy(), dEnt=diag_df.mean_weight_entropy.to_numpy(),
+         dUnc=diag_df.frac_unconfident.to_numpy(), dTVB=diag_df.min_pair_TV_emission.to_numpy(),
+         dTVN=diag_df.min_pair_TV_ordering.to_numpy(), dHO=diag_df.heldout_oneshot_ll.to_numpy(),
+         K=K_CHOSEN)
+print("[done] core outputs written", flush=True)
+
+
+# ------------------------- minimal PNG writer + 3x5 bitmap font (no matplotlib)
+FONT = {
+ '0':"111101101101111",'1':"010110010010111",'2':"111001111100111",'3':"111001111001111",
+ '4':"101101111001001",'5':"111100111001111",'6':"111100111101111",'7':"111001001010010",
+ '8':"111101111101111",'9':"111101111001111",'A':"010101111101101",'B':"110101110101110",
+ 'C':"011100100100011",'D':"110101101101110",'E':"111100111100111",'F':"111100111100100",
+ 'G':"011100101101011",'H':"101101111101101",'I':"111010010010111",'J':"001001001101110",
+ 'K':"101110100110101",'L':"100100100100111",'M':"101111111101101",'N':"110101101101101",
+ 'O':"010101101101010",'P':"111101111100100",'Q':"010101101011001",'R':"111101110101101",
+ 'S':"011100010001110",'T':"111010010010010",'U':"101101101101111",'V':"101101101101010",
+ 'W':"101101111111101",'X':"101101010101101",'Y':"101101010010010",'Z':"111001010100111",
+ ' ':"000000000000000",'-':"000000111000000",'.':"000000000000010",',':"000000000010100",
+ '(':"001010010010001",')':"100010010010100",'/':"001001010100100",'%':"101001010100101",
+ '=':"000111000111000",'+':"000010111010000",'!':"010010010000010",':':"010000010010010",
+ '_':"000000000000111",'[':"011010010010011",']':"110010010010110",'*':"000101010101000"}
+
+def _chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+def write_png(path, rgb):
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[i].tobytes() for i in range(h))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + _chunk(b"IDAT", zlib.compress(raw, 9)) + _chunk(b"IEND", b""))
+    Path(path).write_bytes(png)
+
+
+class Canvas:
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.img = np.zeros((h, w, 3), dtype=np.uint8)
+        self.img[:, :] = bg
+
+    def px(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.img[y, x] = c
+
+    def rect(self, x0, y0, x1, y1, c):
+        for y in range(max(0, y0), min(self.h, y1 + 1)):
+            self.img[y, max(0, x0):min(self.w, x1 + 1)] = c
+
+    def line(self, x0, y0, x1, y1, c):
+        n = max(abs(x1 - x0), abs(y1 - y0)) + 1
+        for i in range(n):
+            x = round(x0 + (x1 - x0) * i / (n - 1)) if n > 1 else x0
+            y = round(y0 + (y1 - y0) * i / (n - 1)) if n > 1 else y0
+            self.px(x, y, c)
+
+    def text(self, x, y, s, c=(0, 0, 0), scale=2):
+        cx = x
+        for ch in s.upper():
+            g = FONT.get(ch, FONT[' '])
+            for r in range(5):
+                for col in range(3):
+                    if g[r * 3 + col] == '1':
+                        self.rect(cx + col * scale, y + r * scale,
+                                  cx + col * scale + scale - 1, y + r * scale + scale - 1, c)
+            cx += 4 * scale
+        return cx
+
+    def to_uint8(self):
+        return self.img
+
+
+def panel_frame(cv, x0, y0, w, h, title):
+    cv.rect(x0, y0, x0 + w - 1, y0, (60, 60, 60))
+    cv.rect(x0, y0 + h - 1, x0 + w - 1, y0 + h - 1, (60, 60, 60))
+    cv.rect(x0, y0, x0, y0 + h - 1, (60, 60, 60))
+    cv.rect(x0 + w - 1, y0, x0 + w - 1, y0 + h - 1, (60, 60, 60))
+    cv.text(x0 + 6, y0 + 6, title, scale=2)
+
+
+def bar_panel(cv, x0, y0, w, h, title, labels, values, chosen_idx=None,
+              fmt="{:.0f}"):
+    panel_frame(cv, x0, y0, w, h, title)
+    pad, top = 40, 30
+    vmin, vmax = min(values), max(values)
+    span = (vmax - vmin) or 1.0
+    bw = (w - 2 * pad) / len(values)
+    for i, v in enumerate(values):
+        bh = int((v - vmin) / span * (h - top - 40)) + 2
+        x = int(x0 + pad + i * bw + bw * 0.15)
+        col = (30, 90, 200) if (chosen_idx is None or i != chosen_idx) else (200, 60, 30)
+        cv.rect(x, y0 + h - 40 - bh, x + int(bw * 0.7), y0 + h - 41, col)
+        if labels is not None:
+            cv.text(x - 2, y0 + h - 34, str(labels[i])[-3:], scale=1)
+    cv.text(x0 + pad, y0 + h - 20, fmt.format(vmin), scale=1)
+    cv.text(x0 + w - pad - 6 * len(fmt.format(vmax)), y0 + h - 20, fmt.format(vmax), scale=1)
+
+
+def line_panel(cv, x0, y0, w, h, title, xs, series, fmt="{:.3f}"):
+    panel_frame(cv, x0, y0, w, h, title)
+    pad, top = 46, 30
+    allv = [v for _, s in series for v in s]
+    vmin, vmax = min(allv), max(allv)
+    span = (vmax - vmin) or 1.0
+    def X(x): return int(x0 + pad + (x - xs[0]) / (xs[-1] - xs[0]) * (w - pad - 20))
+    def Y(v): return int(y0 + h - 40 - (v - vmin) / span * (h - top - 60))
+    colors = [(30, 90, 200), (200, 60, 30)]
+    for si, (_, s) in enumerate(series):
+        for i in range(len(s) - 1):
+            cv.line(X(xs[i]), Y(s[i]), X(xs[i + 1]), Y(s[i + 1]), colors[si % 2])
+        for i in range(len(s)):
+            cv.rect(X(xs[i]) - 2, Y(s[i]) - 2, X(xs[i]) + 2, Y(s[i]) + 2, colors[si % 2])
+    cv.text(x0 + pad, y0 + h - 24, fmt.format(vmin), scale=1)
+    cv.text(x0 + w - 60, y0 + h - 24, fmt.format(vmax), scale=1)
+    for i in range(len(xs)):
+        cv.text(X(xs[i]) - 4, y0 + h - 12, str(xs[i]), scale=1)
+
+
+def heat_panel(cv, x0, y0, w, h, title, M, fmt="{:.2f}"):
+    panel_frame(cv, x0, y0, w, h, title)
+    pad, top = 46, 34
+    cw = (w - pad - 16) // M.shape[1]; ch = (h - top - 26) // M.shape[0]
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            v = float(M[i, j])
+            col = (int(255 * (1 - v)), int(255 * (1 - v)), 255 - int(200 * (1 - v)))
+            cv.rect(x0 + pad + j * cw, y0 + top + i * ch,
+                    x0 + pad + (j + 1) * cw - 1, y0 + top + (i + 1) * ch - 1, col)
+        cv.text(x0 + 10, y0 + top + i * ch + ch // 2, str(i), scale=1)
+        cv.text(x0 + pad + i * cw + 2, y0 + top - 12, str(i), scale=1)
+
+
+ctx = np.load(OUT / "_fit_context.npz", allow_pickle=True)
+K = int(ctx["K"])
+cv = Canvas(1560, 1000)
+cand_names = [str(x) for x in ctx["cand_names"]]
+cand_obj = ctx["cand_obj"]; cand_bic = ctx["cand_bic"]
+cand_model = [str(x) for x in ctx["cand_model"]]
+dK = [int(k) for k in ctx["dK"]]
+dObj, dBIC, dLL = ctx["dObj"], ctx["dBIC"], ctx["dLL"]
+dMass, dEnt, dUnc = ctx["dMass"], ctx["dEnt"], ctx["dUnc"]
+dTVB, dTVN, dHO = ctx["dTVB"], ctx["dTVN"], ctx["dHO"]
+chosen_idx = cand_names.index(f"hmm_k{K}")
+
+# panel 1: log-likelihood by candidate (mixture baseline vs HMM)
+bar_panel(cv, 20, 20, 500, 300, "LOG-LIK BY CANDIDATE (TOT. NATS)",
+          cand_names, list(cand_obj), chosen_idx=chosen_idx, fmt="{:.0f}")
+# panel 2: BIC vs K
+line_panel(cv, 540, 20, 500, 300, "BIC VS K (LOW = GOOD)",
+           dK, [("BIC", list(dBIC))], fmt="{:.0f}")
+cv.text(1050, 120, "BIC MIN:", scale=2)
+cv.text(1050, 150, f"K={dK[int(np.argmin(dBIC))]}", scale=2)
+# panel 3: marginal LL gain per added row
+line_panel(cv, 1060, 20, 480, 300, "MARGINAL LL GAIN VS PREV K",
+           dK[1:], [("D-LL", list(dLL[1:]))], fmt="{:.0f}")
+
+# panel 4: row usage (stationary weights) of chosen model
+bar_panel(cv, 20, 340, 500, 300, f"ROW USAGE (STATIONARY) K={K}",
+          list(range(K)), list(ctx["stat"]), fmt="{:.3f}")
+# panel 5: assignment uncertainty vs K
+line_panel(cv, 540, 340, 500, 300, "UNCERTAINTY VS K",
+           dK, [("ENTROPY", list(dEnt)), ("FRAC MAX<0.8", list(dUnc))],
+           fmt="{:.2f}")
+# panel 6: held-out one-step vs K
+line_panel(cv, 1060, 340, 480, 300, "HELD-OUT 1-STEP LL/POS",
+           dK, [("HOLD-OUT", list(dHO))], fmt="{:.3f}")
+
+# panel 7: matrix_a heatmap (chosen K)
+heat_panel(cv, 20, 660, 400, 330, f"MATRIX A HEATMAP K={K}", ctx["A"])
+# panel 8: row emission distinctness (TV) vs K
+line_panel(cv, 440, 660, 480, 330, "ROW DISTINCTNESS VS K",
+           dK, [("TV EMIS", list(dTVB)), ("TV ORDER", list(dTVN))], fmt="{:.2f}")
+# panel 9: summary text block
+panel_frame(cv, 940, 660, 600, 330, "SUMMARY")
+lines = [
+    f"CHOSEN K = {K}  (HMM, BW-EM, {6} RESTARTS)",
+    "VECTOR A = STATIONARY DIST. OF A",
+    f"MIN ROW MASS = {dMass[list(map(int, dK)).index(K)]:.4f}",
+    f"MEAN W-ENTROPY = {dEnt[list(map(int, dK)).index(K)]:.3f}",
+    f"FRAC MAX<0.8 = {dUnc[list(map(int, dK)).index(K)]:.3f}",
+    f"MIN TV EMIS = {dTVB[list(map(int, dK)).index(K)]:.3f}",
+    f"MIN TV ORDER = {dTVN[list(map(int, dK)).index(K)]:.3f}",
+    f"HELD-OUT LL/POS = {dHO[list(map(int, dK)).index(K)]:.4f}",
+    "CHECKS: ROWS OF A,B AND VECTOR A",
+    "SUM TO 1; ALL VALUES FINITE.",
+]
+for i, t in enumerate(lines):
+    cv.text(960, 700 + i * 26, t, scale=2)
+
+write_png(OUT / "diagnostics.png", cv.to_uint8())
+print("[done] diagnostics.png written; all artifacts present:", flush=True)
+for p in ["results/candidate_summary.csv", "results/matrix_a.csv", "results/matrix_b.csv",
+          "results/vector_a.csv", "results/fit_trace.csv", "results/local_weights.npy",
+          "results/neighbor_summary.csv", "results/local_assignments.csv",
+          "results/stream_diagnostics.csv", "results/diagnostics.png"]:
+    loc = Path(p)
+    print(f"  {p}: {loc.stat().st_size if loc.exists() else 0} bytes")

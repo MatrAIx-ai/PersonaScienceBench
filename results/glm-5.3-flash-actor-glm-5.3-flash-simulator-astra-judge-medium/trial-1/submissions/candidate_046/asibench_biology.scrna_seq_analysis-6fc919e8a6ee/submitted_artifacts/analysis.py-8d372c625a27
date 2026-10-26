@@ -1,0 +1,252 @@
+"""
+Single-cell RNA-seq integrated analysis (ASIBench B3).
+Inputs : data/counts.npy (n_cells, n_genes), data/system_info.json
+Outputs: clusters.npy, analysis/pseudotime.npy, analysis/de_genes.json,
+         analysis/grn_scores.npy, analysis/method_choices.json
+Only NumPy / SciPy. Deterministic (seed=42).
+Pipeline: normalize+log1p -> z-score -> PCA(SVD,15) -> kNN(k=15) gaussian affinity
+          -> spectral clustering (k=4) -> Welch t one-vs-rest markers (top50)
+          -> root = max mean expr of top-10 markers -> Dijkstra pseudotime [0,1]
+          -> ridge GRN on first n_tf_genes columns, grn_scores[i,j] = i -> j.
+Dependency order: markers -> root -> pseudotime (documented in method_choices.json).
+"""
+import json
+import os
+
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra, laplacian
+from scipy.sparse.linalg import eigsh
+
+SEED = 42
+rng = np.random.default_rng(SEED)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+OUT = HERE
+
+# ---------------------------------------------------------------- load inputs
+X = np.load(os.path.join(DATA, "counts.npy"))
+with open(os.path.join(DATA, "system_info.json")) as fh:
+    info = json.load(fh)
+
+n_cells, n_genes = X.shape
+n_clusters = int(info["n_clusters"])
+n_tf = int(info["n_tf_genes"])
+assert X.shape == (info["n_cells"], info["n_genes"])
+
+methods = {"seed": SEED, "steps": {}}
+
+# ------------------------------------------------- (a) normalize + log1p
+lib = X.sum(axis=1)
+scale = np.median(lib)
+X_log = np.log1p(X / lib[:, None] * scale)
+methods["steps"]["normalization"] = {
+    "method": "library-size (median of totals) + log1p",
+    "median_lib_size": float(scale),
+    "rationale": "removes ~4x cell depth variation before log compression",
+}
+
+# ------------------------------------------------- (b) z-score + PCA (SVD)
+mu, sd = X_log.mean(0), X_log.std(0, ddof=1)
+sd[sd == 0] = 1.0
+Z = (X_log - mu) / sd
+Zc = Z - Z.mean(0)
+U, S, Vt = np.linalg.svd(Zc, full_matrices=False)
+N_PC = 15
+pcs = U[:, :N_PC] * S[:N_PC]
+methods["steps"]["pca"] = {
+    "method": "SVD on per-gene z-scored log-normalized matrix",
+    "n_pc": N_PC,
+    "variance_explained": float((S[:N_PC] ** 2).sum() / (S ** 2).sum()),
+}
+
+# ------------------------------------------------- (c) kNN graph + spectral
+K = 15
+d2 = ((pcs[:, None, :] - pcs[None, :, :]) ** 2).sum(-1)
+dist = np.sqrt(d2)
+np.fill_diagonal(dist, np.inf)
+nn_idx = np.argsort(dist, axis=1)[:, :K]
+nn_dist = np.take_along_axis(dist, nn_idx, axis=1)
+
+# self-tuning gaussian affinity (local scale = distance to k-th neighbour)
+sig_i = np.maximum(nn_dist[:, -1], 1e-12)
+sig = np.maximum.outer(sig_i, sig_i)
+W = np.zeros((n_cells, n_cells))
+rows = np.repeat(np.arange(n_cells), K)
+W[rows, nn_idx.ravel()] = np.exp(-nn_dist.ravel() ** 2 / sig[rows, nn_idx.ravel()])
+W = np.maximum(W, W.T)  # symmetrize (union)
+
+# ensure connectivity: link each extra component to its nearest foreign cell
+adj = csr_matrix((W[W > 0], np.where(W > 0)), shape=W.shape)
+n_comp, labels_cc = connected_components(adj, directed=False)
+if n_comp > 1:
+    for c in range(1, n_comp):
+        src = np.where(labels_cc == c)[0]
+        dst_in = np.isin(nn_idx, np.where(labels_cc != c)[0])
+        if dst_in.any():
+            i, j = src[0], nn_idx[src[0]][dst_in[src[0]][0]]
+        else:  # brute force nearest foreign pair
+            foreign = np.where(labels_cc != c)[0]
+            sub = dist[np.ix_(src, foreign)]
+            i, j = src[np.unravel_index(sub.argmin(), sub.shape)[0]], foreign[
+                np.unravel_index(sub.argmin(), sub.shape)[1]
+            ]
+        W[i, j] = W[j, i] = np.exp(-dist[i, j] ** 2 / sig[i, j])
+methods["steps"]["knn_graph"] = {
+    "k": K, "n_components_before_repair": int(n_comp),
+    "affinity": "self-tuning gaussian exp(-d^2/(sigma_i*sigma_j)), sigma_i = dist to k-th nn",
+    "symmetrization": "union (element-wise max)",
+}
+
+# spectral clustering: normalized laplacian, 4 smallest eigenvectors, k-means
+L = laplacian(csr_matrix(W), normed=True).toarray()
+vals, vecs = eigsh(L, k=n_clusters, which="SM", tol=1e-8)
+F = vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
+
+
+def kmeans(A, k, iters=200, restarts=20):
+    best_lab, best_inertia = None, np.inf
+    for r in range(restarts):
+        # k-means++ init
+        cent = [A[rng.integers(len(A))]]
+        for _ in range(k - 1):
+            d2c = np.min(((A[:, None] - np.array(cent)) ** 2).sum(-1), axis=1)
+            cent.append(A[rng.choice(len(A), p=d2c / d2c.sum())])
+        cent = np.array(cent)
+        for _ in range(iters):
+            lab = ((A[:, None] - cent) ** 2).sum(-1).argmin(1)
+            new = np.array([A[lab == c].mean(0) if (lab == c).any() else cent[c]
+                            for c in range(k)])
+            if np.allclose(new, cent):
+                break
+            cent = new
+        inertia = ((A - cent[lab]) ** 2).sum()
+        if inertia < best_inertia:
+            best_inertia, best_lab = inertia, lab.copy()
+    return best_lab, best_inertia
+
+
+clusters, inertia = kmeans(F, n_clusters)
+# relabel clusters by size (descending) for determinism
+sizes = np.bincount(clusters, minlength=n_clusters)
+remap = np.argsort(-sizes)
+clusters = remap[clusters].astype(np.int32)
+methods["steps"]["clustering"] = {
+    "method": "spectral clustering: normalized Laplacian, 4 smallest eigenvectors, "
+              "row-normalized Fiedler matrix + k-means (20 restarts, seed 42)",
+    "n_clusters": n_clusters,
+    "eigenvalues": [float(v) for v in vals],
+    "kmeans_inertia": float(inertia),
+    "cluster_sizes": [int(s) for s in np.bincount(clusters)],
+}
+
+# ------------------------------------------------- (e) markers: Welch t 1-vs-rest
+t_stats = np.zeros(n_genes)
+for c in range(n_clusters):
+    m = clusters == c
+    n1, n2 = m.sum(), (~m).sum()
+    a, b = X_log[m], X_log[~m]
+    v1, v2 = a.var(0, ddof=1), b.var(0, ddof=1)
+    se = np.sqrt(v1 / n1 + v2 / n2)
+    se[se == 0] = 1e-12
+    t_c = (a.mean(0) - b.mean(0)) / se
+    t_c = np.sign(t_c) * np.minimum(np.abs(t_c), 500)  # clip vs inf inflation
+    t_stats = np.maximum(t_stats, t_c)
+# one-vs-rest t per cluster for balanced selection
+t_per_cluster = np.zeros((n_clusters, n_genes))
+for c in range(n_clusters):
+    m = clusters == c
+    n1, n2 = m.sum(), (~m).sum()
+    a, b = X_log[m], X_log[~m]
+    se = np.sqrt(a.var(0, ddof=1) / n1 + b.var(0, ddof=1) / n2)
+    se[se == 0] = 1e-12
+    t_per_cluster[c] = np.sign((a.mean(0) - b.mean(0)) / se) * \
+        np.minimum(np.abs((a.mean(0) - b.mean(0)) / se), 500)
+TOP_N = 50
+# round-robin interleave of per-cluster ranked lists so that all 4 clusters
+# contribute candidates (the largest cluster would otherwise dominate a naive
+# max-t ranking: 40 of its genes have t>12 vs <=4 for any other cluster);
+# the final list is re-sorted by max t-stat, so it remains a ranked list.
+per_cluster_ranked = [list(np.argsort(-t_per_cluster[c])) for c in range(n_clusters)]
+sel, seen, depth = [], set(), 0
+while len(sel) < TOP_N and depth < n_genes:
+    for c in range(n_clusters):
+        g = int(per_cluster_ranked[c][depth])
+        if g not in seen:
+            seen.add(g); sel.append(g)
+    depth += 1
+marker_idx = sorted(sel[:TOP_N], key=lambda g: -t_stats[g])
+with open(os.path.join(OUT, "de_genes.json"), "w") as fh:
+    json.dump({"gene_indices": marker_idx}, fh)
+methods["steps"]["markers"] = {
+    "method": "Welch t-test one-vs-rest per cluster; gene scored by max t-stat over "
+              "clusters; final top-50 chosen by round-robin interleave of per-cluster "
+              "ranked lists (balanced across clusters) then re-sorted by max t-stat",
+    "n_returned": TOP_N,
+    "rationale_balance": "naive max-t top-50 would contain only markers of the largest "
+                         "cluster; interleave keeps candidates from all 4 clusters",
+    "markers_per_cluster": {str(c): int(sum(np.argmax(t_per_cluster[:, g]) == c
+                                            for g in marker_idx))
+                            for c in range(n_clusters)},
+    "top10_indices": marker_idx[:10],
+    "top10_tstats": [round(float(t_stats[i]), 3) for i in marker_idx[:10]],
+}
+
+# ------------------------- (d) pseudotime (depends on markers -> root -> dijkstra)
+top10 = marker_idx[:10]
+root = int(np.argmax(X_log[:, top10].mean(1)))
+G = csr_matrix(np.where(W > 0, dist, np.inf))  # edge length = PCA euclidean distance
+pt_raw = dijkstra(G, indices=root)
+assert np.isfinite(pt_raw).all()
+pseudotime = ((pt_raw - pt_raw.min()) / (pt_raw.max() - pt_raw.min())).astype(np.float64)
+methods["steps"]["pseudotime"] = {
+    "method": "graph geodesic (Dijkstra) on kNN affinity graph, edge length "
+              "= euclidean distance in PCA space along kNN edges",
+    "root_cell": root,
+    "root_definition": "cell with max mean log-normalized expression of top-10 markers",
+    "DEPENDENCY_ORDER": "markers ranked FIRST -> root chosen from top-10 markers "
+                        "-> Dijkstra pseudotime LAST",
+    "scaling": "min-max to [0,1]",
+}
+
+# ------------------------------------------------- (f) ridge GRN on TF block
+Xtf_raw = X_log[:, :n_tf]
+T = (Xtf_raw - Xtf_raw.mean(0)) / Xtf_raw.std(0, ddof=1)
+LAM = 1.0  # standardized ridge penalty (documented, fixed)
+grn = np.zeros((n_tf, n_tf))
+for j in range(n_tf):
+    others = [i for i in range(n_tf) if i != j]
+    A = T[:, others]
+    y = T[:, j]
+    beta = np.linalg.solve(A.T @ A + LAM * np.eye(n_tf - 1), A.T @ y)
+    for pos, i in enumerate(others):
+        grn[i, j] = beta[pos]  # grn[i, j] = i -> j
+methods["steps"]["grn"] = {
+    "method": "ridge regression per TF target on remaining TFs; standardized inputs",
+    "lambda": LAM,
+    "convention": "grn_scores[i, j] = edge i -> j (i regulates j); diagonal = 0",
+    "sign": "positive = activation, negative = repression",
+}
+
+# ------------------------------------------------- save
+np.save(os.path.join(OUT, "clusters.npy"), clusters.astype(np.int32))
+np.save(os.path.join(OUT, "pseudotime.npy"), pseudotime)
+np.save(os.path.join(OUT, "grn_scores.npy"), grn.astype(np.float64))
+methods["outputs"] = {
+    "clusters.npy": "int32 (n_cells,) 0..3",
+    "pseudotime.npy": "float64 (n_cells,) in [0,1]",
+    "de_genes.json": "top-50 marker gene indices",
+    "grn_scores.npy": "float64 (n_tf_genes, n_tf_genes), zero diagonal",
+}
+with open(os.path.join(OUT, "method_choices.json"), "w") as fh:
+    json.dump(methods, fh, indent=2)
+
+print("root cell:", root)
+print("cluster sizes:", np.bincount(clusters))
+print("top-10 markers:", marker_idx[:10])
+print("PCA var explained:", methods["steps"]["pca"]["variance_explained"])
+print("graph components before repair:", n_comp)
+print("pseudotime range:", pseudotime.min(), pseudotime.max())
+print("grn offdiag |max|:", np.abs(grn[~np.eye(n_tf, dtype=bool)]).max())
+print("DONE")

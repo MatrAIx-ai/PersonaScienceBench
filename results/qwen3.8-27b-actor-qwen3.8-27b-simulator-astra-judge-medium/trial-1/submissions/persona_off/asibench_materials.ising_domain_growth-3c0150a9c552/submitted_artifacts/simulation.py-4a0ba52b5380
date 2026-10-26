@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""
+B3: Hidden binary-grid time evolution  (episode: materials.ising_domain_growth)
+=============================================================================
+Model inferred from the inputs (no external description is provided):
+
+* The state is a +/-1 spin on an L x L lattice with periodic (torus)
+  boundaries.  The supplied initial state is an uncorrelated 50/50 random
+  state (white noise: NN agreement ~0.50, flat power spectrum), i.e. the
+  standard starting condition for coarsening (domain growth).
+
+* `control` = 2.0236 is interpreted as the temperature T of the 2D Ising
+  model with J = k_B = 1.  The exact 2D Ising T_c = 2/ln(1+sqrt(2)) =
+  2.26919, so the system is prepared BELOW T_c (T/T_c = 0.892) -> ordered
+  phase -> non-conserved order-parameter coarsening, R(t) ~ t^(1/2) for
+  Glauber dynamics in 2D.
+
+Dynamics: one "step" = one Monte-Carlo sweep = L^2 single-site Glauber
+update attempts in a uniformly random order (the standard Markov process
+whose stationary distribution is the Gibbs measure at temperature T).
+For each site:
+    h_i = sum of the 4 nearest-neighbour spins of site i (periodic)
+    P(i flips) = 1/(1 + exp(2 s_i h_i / T)) = 0.5 (1 - s_i tanh(h_i/T))
+Sites are processed in random chunks of 64 for vectorization; within a
+chunk, neighbours in the same chunk use the chunk-start values (an
+O(64/L^2) approximation to exact sequential dynamics).
+Random numbers: numpy default_rng seeded with `dynamics_seed`.
+
+Observables:
+seriesA [2,n_meas]: row0 = |m(t)| (magnetization magnitude);
+                    row1 = R(t) = integral correlation length of C(r,t)
+seriesB [2,n_meas]: row0 = S(k_min,t) (S at the 4 smallest nonzero k, avg);
+                    row1 = interface density (fraction broken NN bonds)
+stackC  [n_snap,max_r]: circularly averaged radial correlation C(r,t)
+stackD  [n_snap,L]: 1D periodic autocorrelation, lags 0..L-1
+stackE  [n_snap,2,L]: structure factor along x (row0) and y (row1) axes
+metadataA: dynamic-scaling collapse C(r,t) = f(r/R(t)) on stackC
+metadataB: power-law fit R(t) = A t^alpha on a documented window
+
+Only numpy / scipy / matplotlib are used.  Deterministic from dynamics_seed.
+"""
+import json
+import numpy as np
+from scipy import stats
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:  # matplotlib not importable in this interpreter
+    HAS_MPL = False
+
+# ----------------------------------------------------------------------
+# 1. Inputs
+# ----------------------------------------------------------------------
+with open("data/parameters.json") as fh:
+    P = json.load(fh)
+
+L       = int(P["grid_size"])
+T       = float(P["control"])
+n_steps = int(P["n_steps"])
+snap_t  = np.asarray(P["snapshot_times"], dtype=float)
+meas_t  = np.asarray(P["measurement_times"], dtype=float)
+max_r   = int(P["max_r"])
+seed    = int(P["dynamics_seed"])
+n_meas  = len(meas_t)
+n_snap  = len(snap_t)
+
+s0 = np.load("data/initial_state.npy")
+assert s0.shape == (L, L), "initial state shape mismatch"
+assert set(np.unique(s0)).issubset({-1, 1}), "state is not binary +/-1"
+s0 = s0.astype(np.int8)
+
+# ----------------------------------------------------------------------
+# 2. Precomputed geometry
+# ----------------------------------------------------------------------
+# Minimum-image offset set i, j in [-L/2, L/2) (L even): each distinct
+# periodic shift exactly once.  Group offsets by rounded Euclidean distance.
+half = L // 2
+groups = {r: [] for r in range(max_r)}
+for i in range(-half, half):
+    for j in range(-half, half):
+        r = int(round(np.hypot(i, j)))
+        if r < max_r:
+            groups[r].append((i, j))
+for r in range(max_r):
+    assert groups[r], f"no offsets for radial bin r={r}"
+
+k_axis = np.fft.fftfreq(L, d=1.0 / L)          # [0,1,...,49,-50,...,-1]
+kx, ky = np.meshgrid(k_axis, k_axis, indexing="ij")
+k2 = kx * kx + ky * ky
+k2_mask = k2 > 0.0
+
+# ----------------------------------------------------------------------
+# 3. Observable functions
+# ----------------------------------------------------------------------
+def structure_factor(s):
+    F = np.fft.fft2(s.astype(np.float64))
+    return np.abs(F) ** 2
+
+def R_from_radial(cr):
+    """Domain size / integral correlation length from the radial
+    correlation C(r):  R = sum_r C(r) / C(0)  (standard integral
+    correlation length, i.e. the area under C(r) normalized by C(0)).
+    Tracks the growing domain size during coarsening and saturates near
+    L/2 once a single domain spans the torus.
+    """
+    c0 = cr[0]
+    if abs(c0) < 1e-12:
+        return 0.0
+    return float((cr / c0).sum())
+
+def s_kmin(S):
+    """Structure-factor intensity at the 4 smallest non-zero wavevectors."""
+    return float(np.mean([S[1, 0], S[0, 1], S[-1, 0], S[0, -1]]))
+
+def interface_density(s):
+    ah = (s == np.roll(s, 1, axis=1)).mean()
+    av = (s == np.roll(s, 1, axis=0)).mean()
+    return float(1.0 - 0.5 * (ah + av))
+
+def circ_autocorr(s):
+    """A[i,j] = sum_{x,y} s[x,y] s[x+i, y+j] (periodic), via FFT."""
+    F = np.fft.fft2(s.astype(np.float64))
+    return np.fft.ifft2(F * np.conj(F)).real
+
+def radial_from_A(A):
+    c = np.empty(max_r, dtype=np.float64)
+    for r in range(max_r):
+        acc = 0.0
+        for i, j in groups[r]:
+            acc += A[i, j]
+        c[r] = acc / (len(groups[r]) * L * L)
+    return c
+
+def line_from_A(A):
+    d = np.arange(L)
+    return (A[d, 0] + A[0, d]) / (2.0 * L * L)
+
+# ----------------------------------------------------------------------
+# 4. Time evolution (parallel Glauber sweeps)
+# ----------------------------------------------------------------------
+rng = np.random.default_rng(seed)
+s = s0.copy()
+
+meas_idx = {int(t): k for k, t in enumerate(meas_t)}
+snap_idx = {int(t): k for k, t in enumerate(snap_t)}
+
+seriesA = np.empty((2, n_meas), dtype=np.float64)
+seriesB = np.empty((2, n_meas), dtype=np.float64)
+stackC  = np.empty((n_snap, max_r), dtype=np.float64)
+stackD  = np.empty((n_snap, L), dtype=np.float64)
+stackE  = np.empty((n_snap, 2, L), dtype=np.float64)
+snap_states = {}
+R_snap = np.empty(n_snap, dtype=np.float64)
+
+PTAB = np.array([0.5 * (1.0 - np.tanh(h / T))
+                 for h in (-4.0, -2.0, 0.0, 2.0, 4.0)])
+CHUNK = 64
+
+def _sweep(state, rng):
+    """One Monte-Carlo sweep: L^2 sequential Glauber attempts, random
+    order, vectorized in random chunks of CHUNK sites."""
+    idx = rng.permutation(L * L)
+    for c in range(0, L * L, CHUNK):
+        sel = idx[c:c + CHUNK]
+        rows = sel // L
+        cols = sel % L
+        h = (state[(rows - 1) % L, cols] + state[(rows + 1) % L, cols]
+             + state[rows, (cols - 1) % L]
+             + state[rows, (cols + 1) % L]).astype(np.float64)
+        hidx = ((h + 4.0) // 2).astype(np.int8)
+        p = np.where(state[rows, cols] > 0,
+                     PTAB[hidx], 1.0 - PTAB[hidx])
+        fl = rng.random(len(sel)) < p
+        if fl.any():
+            state[rows[fl], cols[fl]] = -state[rows[fl], cols[fl]]
+    return state
+
+for t in range(1, n_steps + 1):
+    s = _sweep(s, rng)
+
+    if t in meas_idx:
+        k = meas_idx[t]
+        A = circ_autocorr(s)
+        seriesA[0, k] = abs(float(s.mean()))
+        seriesA[1, k] = R_from_radial(radial_from_A(A))
+        S = structure_factor(s)
+        seriesB[0, k] = s_kmin(S)
+        seriesB[1, k] = interface_density(s)
+
+    if t in snap_idx:
+        k = snap_idx[t]
+        A = circ_autocorr(s)
+        cr = radial_from_A(A)
+        stackC[k] = cr
+        stackD[k] = line_from_A(A)
+        S = structure_factor(s)
+        stackE[k, 0] = S[:, 0]
+        stackE[k, 1] = S[0, :]
+        R_snap[k] = R_from_radial(cr)
+        snap_states[k] = s.copy()
+
+# ----------------------------------------------------------------------
+# 5. metadataB: power-law fit  R(t) = A * t^alpha
+# ----------------------------------------------------------------------
+# Window selection rule (documented): local log-log slopes between
+# consecutive measurements; reference slope = median of the local slopes
+# over the first half of the (log-spaced) measurement schedule, where the
+# coarsening is active; the window is the longest contiguous run of local
+# slopes within +/-0.10 of the reference.  This isolates the intermediate-
+# time power-law regime between the early-time relaxation from the
+# uncorrelated initial state and the late-time finite-size saturation.
+lt = np.log(meas_t)
+lx = np.log(seriesA[1])
+beta_local = np.diff(lx) / np.diff(lt)
+first_half = slice(0, len(beta_local) // 2)
+beta_ref = float(np.median(beta_local[first_half]))
+good = np.abs(beta_local - beta_ref) <= 0.10
+
+# longest contiguous True run of `good`
+best_len, best_i, best_j = 0, 0, 0
+i = 0
+while i < len(good):
+    if good[i]:
+        j = i
+        while j + 1 < len(good) and good[j + 1]:
+            j += 1
+        if j - i + 1 > best_len:
+            best_len, best_i, best_j = j - i + 1, i, j
+        i = j + 1
+    else:
+        i += 1
+i0, i1 = best_i, best_j + 1        # measurement-index window (inclusive)
+if best_len < 5:                    # fallback: first half of the run
+    i0, i1 = first_half.start, first_half.stop + 1
+
+sel = np.arange(i0, i1 + 1)
+fit_t = meas_t[sel]
+fit_R = seriesA[1, sel]
+fit = stats.linregress(lt[sel], lx[sel])
+alpha = float(fit.slope)
+alpha_se = float(fit.stderr)
+amplitude = float(np.exp(fit.intercept))
+r_squared = float(fit.rvalue ** 2)
+fit_range = [float(fit_t[0]), float(fit_t[-1])]
+
+metadataB = {
+    "exponent": alpha,
+    "exponent_std_error": alpha_se,
+    "amplitude": amplitude,
+    "fit_range": fit_range,
+    "r_squared": r_squared,
+    "notes": [
+        "Fit: log R(t) = log A + alpha * log t (ordinary least squares on "
+        "the log-log data of seriesA row 1, where R(t) is the integral "
+        "correlation length of the radial correlation C(r,t): "
+        "R = sum_r C(r) / C(0) (area under C(r), normalized by C(0)).",
+        f"Window rule: longest contiguous run of local log-log slopes within "
+        f"+/-0.10 of the median local slope over the first half of the "
+        f"schedule (reference slope {beta_ref:.4f}); selected measurement "
+        f"indices [{i0}, {i1}] -> fit_range = {fit_range}.",
+        f"Number of measurements used in the fit: n = {len(fit_t)}.",
+        "Expected asymptotic exponent for 2D Ising Glauber coarsening is 1/2; "
+        "deviations reflect finite-size effects (L = 100) at long times and "
+        "the early-time crossover from the uncorrelated initial state.",
+    ],
+}
+
+# ----------------------------------------------------------------------
+# 6. metadataA: dynamic-scaling collapse  C(r,t) = f(r / R(t))
+# ----------------------------------------------------------------------
+collapse_grid_size = 200
+x_s = np.arange(max_r, dtype=np.float64)[None, :] / R_snap[:, None]
+x_max = float(x_s[:, -1].min())          # overlap of all rescaled curves
+xg = np.linspace(0.0, x_max, collapse_grid_size)
+Y = np.stack([np.interp(xg, x_s[ss], stackC[ss]) for ss in range(n_snap)])
+Y_bar = Y.mean(axis=0)
+num = np.sqrt((Y - Y_bar[None, :]) ** 2).mean()
+den = np.sqrt((Y_bar ** 2).mean())
+rel_rms_spread = float(num / den)
+collapse_quality = float(np.clip(1.0 - rel_rms_spread, 0.0, 1.0))
+
+metadataA = {
+    "collapse_check_applicable": True,
+    "collapse_quality": collapse_quality,
+    "collapse_relative_rms_spread": rel_rms_spread,
+    "collapse_dimension": 2,
+    "collapse_snapshot_times": [float(t) for t in snap_t],
+    "collapse_lengths": [float(r) for r in R_snap],
+    "collapse_x_range": [0.0, x_max],
+    "collapse_grid_size": collapse_grid_size,
+    "notes": [
+        "Dynamic-scaling test C(r,t) = f(r/R(t)) applied to stackC using "
+        "R(t) = integral correlation length of the radial correlation, "
+        "evaluated at the 6 snapshot times (3 of which lie off the "
+        "measurement schedule, so R was computed directly from the state "
+        "at those times).",
+        "Each radial correlation curve was rescaled as x = r/R(t) and "
+        f"linearly resampled onto a common grid of {collapse_grid_size} "
+        f"points over the overlap x in [0, {x_max:.4f}].",
+        "collapse_relative_rms_spread = rms over (curve, x) of "
+        "(C_s(x) - mean_s C_s(x)) divided by the rms of the mean curve; "
+        "collapse_quality = clip(1 - spread, 0, 1).",
+        "collapse_dimension = 2 refers to the 2D radial (circularly "
+        "averaged) correlation; collapse_grid_size would be 0 iff not "
+        "applicable.",
+    ],
+}
+
+# ----------------------------------------------------------------------
+# 7. Save arrays (exact shapes, float64, finite) and JSON metadata
+# ----------------------------------------------------------------------
+def save(name, arr):
+    arr = np.ascontiguousarray(arr, dtype=np.float64)
+    assert np.all(np.isfinite(arr)), f"{name} contains non-finite values"
+    np.save(name, arr)
+    return arr
+
+save("seriesA.npy", seriesA)
+save("seriesB.npy", seriesB)
+save("stackC.npy", stackC)
+save("stackD.npy", stackD)
+save("stackE.npy", stackE)
+
+with open("metadataA.json", "w") as fh:
+    json.dump(metadataA, fh, indent=2)
+with open("metadataB.json", "w") as fh:
+    json.dump(metadataB, fh, indent=2)
+
+# ----------------------------------------------------------------------
+# 8. Diagnostic figure (single multi-panel PNG)
+# ----------------------------------------------------------------------
+
+# Primary path: matplotlib (declared environment package).
+# Fallback: self-contained numpy + stdlib (zlib/struct) PNG
+# renderer, used only when matplotlib is not importable, so the
+# script stays runnable with numpy/scipy alone.
+
+# ---- minimal 5x7 bitmap font (rows = 5-bit masks, MSB leftmost) ----
+_FONT5X7 = {
+"0": (0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110),
+"1": (0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110),
+"2": (0b01110,0b10001,0b00001,0b00110,0b01000,0b10000,0b11111),
+"3": (0b01110,0b10001,0b00001,0b00110,0b00001,0b10001,0b01110),
+"4": (0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010),
+"5": (0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110),
+"6": (0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110),
+"7": (0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000),
+"8": (0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110),
+"9": (0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100),
+"A": (0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+"B": (0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110),
+"C": (0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110),
+"D": (0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100),
+"E": (0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111),
+"F": (0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000),
+"G": (0b01110,0b10001,0b10000,0b10111,0b10001,0b10001,0b01111),
+"H": (0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001),
+"I": (0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110),
+"J": (0b00111,0b00010,0b00010,0b00010,0b00010,0b10010,0b01100),
+"K": (0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001),
+"L": (0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111),
+"M": (0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001),
+"N": (0b10001,0b11001,0b10101,0b10011,0b10001,0b10001,0b10001),
+"O": (0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+"P": (0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000),
+"Q": (0b01110,0b10001,0b10001,0b10001,0b10101,0b10010,0b01101),
+"R": (0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001),
+"S": (0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110),
+"T": (0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100),
+"U": (0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110),
+"V": (0b10001,0b10001,0b10001,0b10001,0b10001,0b01010,0b00100),
+"W": (0b10001,0b10001,0b10001,0b10101,0b10101,0b11011,0b10001),
+"X": (0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001),
+"Y": (0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100),
+"Z": (0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111),
+"a": (0b00000,0b00000,0b01110,0b00001,0b01111,0b10001,0b01111),
+"b": (0b10000,0b10000,0b10110,0b11001,0b10001,0b10001,0b11110),
+"c": (0b00000,0b00000,0b01110,0b10000,0b10000,0b10001,0b01110),
+"d": (0b00001,0b00001,0b01101,0b10011,0b10001,0b10001,0b01111),
+"e": (0b00000,0b00000,0b01110,0b10001,0b11111,0b10000,0b01110),
+"f": (0b00110,0b01001,0b01000,0b11100,0b01000,0b01000,0b01000),
+"g": (0b00000,0b01111,0b10001,0b10001,0b01111,0b00001,0b01110),
+"h": (0b10000,0b10000,0b10110,0b11001,0b10001,0b10001,0b10001),
+"i": (0b00100,0b00000,0b01100,0b00100,0b00100,0b00100,0b01110),
+"j": (0b00010,0b00000,0b00110,0b00010,0b00010,0b10010,0b01100),
+"k": (0b10000,0b10000,0b10010,0b10100,0b11000,0b10100,0b10010),
+"l": (0b01100,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110),
+"m": (0b00000,0b00000,0b11010,0b10101,0b10101,0b10001,0b10001),
+"n": (0b00000,0b00000,0b10110,0b11001,0b10001,0b10001,0b10001),
+"o": (0b00000,0b00000,0b01110,0b10001,0b10001,0b10001,0b01110),
+"p": (0b00000,0b00000,0b11110,0b10001,0b11110,0b10000,0b10000),
+"q": (0b00000,0b00000,0b01101,0b10011,0b01111,0b00001,0b00001),
+"r": (0b00000,0b00000,0b10110,0b11001,0b10000,0b10000,0b10000),
+"s": (0b00000,0b00000,0b01111,0b10000,0b01110,0b00001,0b11110),
+"t": (0b01000,0b01000,0b11100,0b01000,0b01000,0b01001,0b00110),
+"u": (0b00000,0b00000,0b10001,0b10001,0b10001,0b10011,0b01101),
+"v": (0b00000,0b00000,0b10001,0b10001,0b10001,0b01010,0b00100),
+"w": (0b00000,0b00000,0b10001,0b10001,0b10101,0b10101,0b01010),
+"x": (0b00000,0b00000,0b10001,0b01010,0b00100,0b01010,0b10001),
+"y": (0b00000,0b00000,0b10001,0b10001,0b01111,0b00001,0b01110),
+"z": (0b00000,0b00000,0b11111,0b00010,0b00100,0b01000,0b11111),
+"?": (0b01110,0b10001,0b00001,0b00110,0b00001,0b00000,0b00100),
+" ": (0b00000,0b00000,0b00000,0b00000,0b00000,0b00000,0b00000),
+".": (0b00000,0b00000,0b00000,0b00000,0b00000,0b00100,0b00100),
+",": (0b00000,0b00000,0b00000,0b00000,0b00100,0b00100,0b01000),
+":": (0b00000,0b00100,0b00100,0b00000,0b00100,0b00100,0b00000),
+"(": (0b00010,0b00100,0b01000,0b01000,0b01000,0b00100,0b00010),
+")": (0b01000,0b00100,0b00010,0b00010,0b00010,0b00100,0b01000),
+"/": (0b00001,0b00010,0b00010,0b00100,0b01000,0b01000,0b10000),
+"-": (0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000),
+"+": (0b00000,0b00100,0b00100,0b11111,0b00100,0b00100,0b00000),
+"=": (0b00000,0b00000,0b11111,0b00000,0b11111,0b00000,0b00000),
+"^": (0b00100,0b01010,0b10001,0b00000,0b00000,0b00000,0b00000),
+"<": (0b00010,0b00100,0b01000,0b10000,0b01000,0b00100,0b00010),
+">": (0b01000,0b00100,0b00010,0b00001,0b00010,0b00100,0b01000),
+"[": (0b01110,0b01000,0b01000,0b01000,0b01000,0b01000,0b01110),
+"]": (0b01110,0b00010,0b00010,0b00010,0b00010,0b00010,0b01110),
+"*": (0b00000,0b10101,0b01110,0b11111,0b01110,0b10101,0b00000),
+"_": (0b00000,0b00000,0b00000,0b00000,0b00000,0b00000,0b11111),
+"%": (0b11001,0b11010,0b00010,0b00100,0b01000,0b01011,0b10011),
+"$": (0b00100,0b01111,0b10100,0b01110,0b00101,0b11110,0b00100),
+"!": (0b00100,0b00100,0b00100,0b00100,0b00100,0b00000,0b00100),
+"'": (0b00100,0b00100,0b01000,0b00000,0b00000,0b00000,0b00000),
+}
+
+def _png_write(path, rgb):
+    """Write an HxWx3 uint8 array as PNG (Python stdlib only)."""
+    import zlib, struct
+    h, w = rgb.shape[:2]
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    with open(path, "wb") as fh:
+        fh.write(b"\x89PNG\r\n\x1a\n")
+        fh.write(chunk(b"IHDR", ihdr))
+        fh.write(chunk(b"IDAT", zlib.compress(raw, 9)))
+        fh.write(chunk(b"IEND", b""))
+
+def _put_text(cv, x, y, s, color, scale=1):
+    cx = x
+    for ch in s:
+        g = _FONT5X7.get(ch, _FONT5X7["?"])
+        for ry in range(7):
+            bits = g[ry]
+            if not bits:
+                continue
+            for rx in range(5):
+                if bits & (1 << (4 - rx)):
+                    yy = y + ry * scale
+                    xx = cx + rx * scale
+                    cv[yy:yy + scale, xx:xx + scale] = color
+        cx += 6 * scale
+
+def _put_line(cv, x0, y0, x1, y1, color, w=2, dash=None):
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    H, W = cv.shape[:2]
+    for i in range(n + 1):
+        if dash is not None:
+            on, off = dash
+            if (i % (on + off)) >= on:
+                continue
+        x = int(round(x0 + (x1 - x0) * i / n))
+        y = int(round(y0 + (y1 - y0) * i / n))
+        for dx in range(w):
+            for dy in range(w):
+                xx, yy = x + dx, y + dy
+                if 0 <= xx < W and 0 <= yy < H:
+                    cv[yy, xx] = color
+
+def _fmt_num(v):
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 100:
+        return str(int(round(v)))
+    if a >= 1:
+        r = round(v, 1)
+        return str(int(r)) if r == int(r) else f"{r:.1f}"
+    s = f"{round(v, 2):.2f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+def _log_tick_label(v):
+    n = int(round(np.log10(v)))
+    return {0: "1", 1: "10", 2: "100", 3: "1000", 4: "10000",
+            -1: "0.1", -2: "0.01"}.get(n, f"1e{n}")
+
+def _put_text_rot(cv, x, y, s, color, scale=1):
+    tmp = np.zeros((7 * scale, max(1, len(s) * 6 * scale), 3), np.uint8)
+    _put_text(tmp, 0, 0, s, color, scale)
+    rot = np.rot90(tmp, 1)
+    h2, w2 = rot.shape[:2]
+    H, W = cv.shape[:2]
+    y2 = max(0, min(y, H - h2)); x2 = max(0, min(x, W - w2))
+    m = rot.sum(axis=2, keepdims=True) > 0
+    cv[y2:y2 + h2, x2:x2 + w2] = np.where(m, rot, cv[y2:y2 + h2, x2:x2 + w2])
+
+def _frame(cv, x0, y0, x1, y1):
+    _put_line(cv, x0, y0, x1, y0, (0, 0, 0), 2)
+    _put_line(cv, x0, y1, x1, y1, (0, 0, 0), 2)
+    _put_line(cv, x0, y0, x0, y1, (0, 0, 0), 2)
+    _put_line(cv, x1, y0, x1, y1, (0, 0, 0), 2)
+
+def _image_panel(cv, x0, y0, pw, ph, title, data):
+    _put_text(cv, x0 + 8, y0 + 6, title, (0, 0, 0))
+    px0, py0 = x0 + 10, y0 + 24
+    w2, h2 = pw - 20, ph - 58
+    img = np.where(data[..., None] > 0,
+                   np.array([178, 24, 43], np.uint8),
+                   np.array([33, 102, 172], np.uint8))
+    ys = (np.arange(h2) * data.shape[0] // h2)
+    xs = (np.arange(w2) * data.shape[1] // w2)
+    cv[py0:py0 + h2, px0:px0 + w2] = img[ys][:, xs]
+    _frame(cv, px0, py0, px0 + w2, py0 + h2)
+
+def _plot_panel(cv, x0, y0, pw, ph, title, ylab, xlab, curves,
+                xmode="lin", ymode="lin", xlim=None, ylim=None,
+                show_labels=True):
+    _put_text(cv, x0 + 8, y0 + 6, title, (0, 0, 0))
+    px0, py0 = x0 + 58, y0 + 24
+    pw2, ph2 = pw - 70, ph - 58
+    # data ranges (log axes: positive values only)
+    def range_of(arr, mode):
+        if mode == "log":
+            v = arr[arr > 0]
+            if len(v) == 0:
+                return 1e-6, 1.0
+            return float(v.min()), float(v.max())
+        return float(arr.min()), float(arr.max())
+    def pad(lo, hi, mode):
+        if mode == "log":
+            llo, lhi = np.log10(lo), np.log10(hi)
+            span = lhi - llo
+            return 10 ** (llo - 0.05 * span), 10 ** (lhi + 0.05 * span)
+        span = hi - lo
+        if span == 0:
+            span = 1.0
+        return lo - 0.05 * span, hi + 0.05 * span
+    if xlim is None:
+        lo = min(range_of(c[0], xmode)[0] for c in curves)
+        hi = max(range_of(c[0], xmode)[1] for c in curves)
+        xlim = pad(lo, hi, xmode)
+    if ylim is None:
+        lo = min(range_of(c[1], ymode)[0] for c in curves)
+        hi = max(range_of(c[1], ymode)[1] for c in curves)
+        ylim = pad(lo, hi, ymode)
+    def tr(v, lo, hi, mode):
+        if mode == "log":
+            llo, lhi = np.log10(lo), np.log10(hi)
+            return (np.log10(v) - llo) / (lhi - llo)
+        return (v - lo) / (hi - lo)
+    def X(v):
+        return px0 + tr(v, xlim[0], xlim[1], xmode) * pw2
+    def Y(v):
+        return py0 + ph2 - tr(v, ylim[0], ylim[1], ymode) * ph2
+    _frame(cv, px0, py0, px0 + pw2, py0 + ph2)
+    # ticks
+    def ticks(lo, hi, mode):
+        if mode == "log":
+            nlo, nhi = int(np.ceil(np.log10(lo))), int(np.floor(np.log10(hi)))
+            return [10.0 ** n for n in range(nlo, nhi + 1)]
+        n = 5
+        return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+    for v in ticks(*xlim, xmode):
+        if not (xlim[0] <= v <= xlim[1]):
+            continue
+        xx = int(X(v))
+        _put_line(cv, xx, py0 + ph2, xx, py0 + ph2 + 5, (0, 0, 0), 1)
+        lab = _log_tick_label(v) if xmode == "log" else _fmt_num(v)
+        _put_text(cv, xx - 3 * len(lab), py0 + ph2 + 8, lab, (0, 0, 0))
+    for v in ticks(*ylim, ymode):
+        if not (ylim[0] <= v <= ylim[1]):
+            continue
+        yy = int(Y(v))
+        _put_line(cv, px0 - 5, yy, px0, yy, (0, 0, 0), 1)
+        lab = _log_tick_label(v) if ymode == "log" else _fmt_num(v)
+        _put_text(cv, px0 - 8 - 6 * len(lab), yy - 3, lab, (0, 0, 0))
+    _put_text(cv, px0 + pw2 // 2 - 3 * len(xlab), y0 + ph - 14, xlab, (0, 0, 0))
+    _put_text_rot(cv, x0 + 2, py0 + ph2 // 2 - 3 * len(ylab), ylab, (0, 0, 0))
+    # curves
+    for (xs, ys, color, dash, lab) in curves:
+        ok = (xs > 0) if xmode == "log" else np.ones(len(xs), bool)
+        ok &= (ys > 0) if ymode == "log" else np.ones(len(ys), bool)
+        prev = None
+        for i in range(len(xs)):
+            if ok[i]:
+                p = (int(X(xs[i])), int(Y(ys[i])))
+                if prev is not None:
+                    _put_line(cv, prev[0], prev[1], p[0], p[1], color, 2, dash)
+                prev = p
+            else:
+                prev = None
+        if show_labels and prev is not None:
+            cw = cv.shape[1]
+            _put_text(cv, min(prev[0] + 3, cw - 42), max(prev[1] - 9, 0),
+                      lab, color)
+
+def make_figure_fallback():
+    """Self-contained PNG diagnostic figure (numpy + stdlib only)."""
+    W, H = 1760, 2200
+    cv = np.full((H, W, 3), 255, np.uint8)
+    _put_text(cv, 40, 16,
+              f"2D Ising domain growth  L={L}  T={T:.4f} < Tc=2.2692  "
+              f"Glauber  seed={seed}", (0, 0, 0), 2)
+    _put_text(cv, 40, 42,
+              f"fit: R(t) = {amplitude:.3f} t^{alpha:.3f} +/- {alpha_se:.3f}  "
+              f"R2={r_squared:.4f}  t in [{fit_range[0]:.0f}, {fit_range[1]:.0f}]",
+              (0, 0, 0), 2)
+    _put_text(cv, 40, 68,
+              f"collapse C(r,t)=f(r/R(t))  quality={collapse_quality:.3f}  "
+              f"spread={rel_rms_spread:.3f}", (0, 0, 0), 2)
+    PW, PH = 520, 470
+    def P(r, c):
+        return 40 + c * (PW + 55), 100 + r * (PH + 45)
+    colors = [(31, 119, 180), (255, 127, 14), (44, 160, 44),
+              (214, 39, 40), (148, 103, 189), (140, 86, 75)]
+    for ss in range(n_snap):
+        x0, y0 = P(ss // 3, ss % 3)
+        _image_panel(cv, x0, y0, PW, PH,
+                     f"state t={snap_t[ss]:.0f}", snap_states[ss])
+    x0, y0 = P(2, 0)
+    tf = np.linspace(fit_range[0], fit_range[1], 50)
+    _plot_panel(cv, x0, y0, PW, PH, "seriesA: m(t) and R(t)  (log-log)",
+                "value", "t (steps)",
+                [(meas_t, seriesA[0], colors[0], None, "|m|"),
+                 (meas_t, seriesA[1], colors[1], None, "R(t)"),
+                 (tf, amplitude * tf ** alpha, (200, 0, 0), (8, 5), "fit")],
+                xmode="log", ymode="log")
+    x0, y0 = P(2, 1)
+    _plot_panel(cv, x0, y0, PW, PH, "seriesB: S(kmin) and I(t)  (log-log)",
+                "value", "t (steps)",
+                [(meas_t, seriesB[0], colors[0], None, "S(kmin)"),
+                 (meas_t, seriesB[1], colors[1], None, "I(t)")],
+                xmode="log", ymode="log")
+    x0, y0 = P(2, 2)
+    _plot_panel(cv, x0, y0, PW, PH, "stackC: C(r,t)  (log-y)",
+                "C(r,t)", "r",
+                [(np.arange(max_r), stackC[ss], colors[ss], None,
+                  f"t={snap_t[ss]:.0f}") for ss in range(n_snap)],
+                ymode="log")
+    x0, y0 = P(3, 0)
+    _plot_panel(cv, x0, y0, PW, PH, f"collapse C(r,t)=f(r/R(t))  "
+                f"quality={collapse_quality:.3f}", "C(r,t)", "r / R(t)",
+                [(xg, Y[ss], colors[ss], None, f"t={snap_t[ss]:.0f}")
+                 for ss in range(n_snap)]
+                + [(xg, Y_bar, (0, 0, 0), None, "mean")],
+                xlim=(0.0, x_max))
+    x0, y0 = P(3, 1)
+    _plot_panel(cv, x0, y0, PW, PH, "stackD: C1d(d,t)  (log-y)",
+                "C1d(d,t)", "lag d",
+                [(np.arange(L), stackD[ss], colors[ss], None,
+                  f"t={snap_t[ss]:.0f}") for ss in range(n_snap)],
+                ymode="log")
+    x0, y0 = P(3, 2)
+    ks = np.arange(1, L)
+    _plot_panel(cv, x0, y0, PW, PH, "stackE: S(k) along x (y dotted, last t)",
+                "S(k)", "k",
+                [(ks, stackE[ss, 0, 1:], colors[ss], None,
+                  f"t={snap_t[ss]:.0f}") for ss in range(n_snap)]
+                + [(ks, stackE[n_snap - 1, 1, 1:], (120, 120, 120), (2, 4),
+                   "y-axis last t")],
+                ymode="log")
+    _png_write("figure.png", cv)
+
+def make_figure_mpl():
+    """Multi-panel diagnostic figure via matplotlib."""
+    fig = plt.figure(figsize=(17, 20), dpi=140)
+    gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.35)
+
+    # rows 1-2: the six sampled states
+    for ss in range(n_snap):
+        ax = fig.add_subplot(gs[ss // 3, ss % 3])
+        ax.imshow(snap_states[ss], cmap="bwr", vmin=-1.0, vmax=1.0,
+                  interpolation="nearest")
+        ax.set_title(f"state at t = {snap_t[ss]:.0f}")
+        ax.set_xticks([]); ax.set_yticks([])
+
+    # row 3: seriesA + power-law fit
+    ax = fig.add_subplot(gs[2, 0])
+    ax.loglog(meas_t, seriesA[0], lw=1.2, label="|m(t)|")
+    ax.loglog(meas_t, seriesA[1], lw=1.2, label="R(t) (integral corr. length)")
+    tf = np.linspace(fit_range[0], fit_range[1], 50)
+    ax.loglog(tf, amplitude * tf ** alpha, "r--", lw=1.5,
+              label=f"fit: R = {amplitude:.2f} t^{alpha:.3f} "
+                    f"(R$^2$={r_squared:.3f})")
+    ax.set_xlabel("t (steps)"); ax.set_ylabel("value")
+    ax.set_title("seriesA: |m(t)| and R(t)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both")
+
+    # row 3: seriesB
+    ax = fig.add_subplot(gs[2, 1])
+    ax.loglog(meas_t, seriesB[0], lw=1.2, label="S(k_min, t)")
+    ax.loglog(meas_t, seriesB[1], lw=1.2, label="interface density I(t)")
+    ax.set_xlabel("t (steps)"); ax.set_ylabel("value")
+    ax.set_title("seriesB: S(k_min) and interface density")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both")
+
+    # row 3: stackC raw radial correlations
+    ax = fig.add_subplot(gs[2, 2])
+    for ss in range(n_snap):
+        ax.semilogy(np.arange(max_r), stackC[ss], lw=1.2,
+                    label=f"t={snap_t[ss]:.0f}")
+    ax.set_xlabel("r"); ax.set_ylabel("C(r, t)")
+    ax.set_title("stackC: radial correlation C(r,t)")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3, which="both")
+
+    # row 4: the collapse
+    ax = fig.add_subplot(gs[3, 0])
+    for ss in range(n_snap):
+        ax.plot(xg, Y[ss], lw=1.2, label=f"t={snap_t[ss]:.0f}")
+    ax.plot(xg, Y_bar, "k-", lw=1.8, alpha=0.7, label="mean")
+    ax.set_xlabel(r"$r / R(t)$"); ax.set_ylabel(r"$C(r,t)$")
+    ax.set_title(f"collapse C(r,t)=f(r/R(t))  (quality={collapse_quality:.3f})")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3)
+
+    # row 4: stackD 1D autocorrelation
+    ax = fig.add_subplot(gs[3, 1])
+    for ss in range(n_snap):
+        ax.semilogy(np.arange(L), stackD[ss], lw=1.2, label=f"t={snap_t[ss]:.0f}")
+    ax.set_xlabel("lag d"); ax.set_ylabel("$C_{1d}(d,t)$")
+    ax.set_title("stackD: 1D periodic autocorrelation")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3, which="both")
+
+    # row 4: stackE structure factor along the two axes
+    ax = fig.add_subplot(gs[3, 2])
+    ks = np.arange(1, L)
+    for ss in range(n_snap):
+        ax.semilogy(ks, stackE[ss, 0, 1:], lw=1.2, label=f"t={snap_t[ss]:.0f} (x)")
+    ax.semilogy(ks, stackE[n_snap - 1, 1, 1:], ":", color="gray", lw=1.5,
+                label=f"t={snap_t[-1]:.0f} (y)")
+    ax.set_xlabel("k"); ax.set_ylabel("$S(k)$")
+    ax.set_title("stackE: structure factor along x (solid) and y (dotted, last t)")
+    ax.legend(fontsize=7); ax.grid(alpha=0.3, which="both")
+
+    fig.suptitle(
+        f"2D Ising domain growth, L={L}, T={T:.4f} (< Tc=2.2692), Glauber, "
+        f"seed={seed}\n"
+        f"R(t) = {amplitude:.3f} t^{alpha:.3f} +/- {alpha_se:.3f} on "
+        f"t in [{fit_range[0]:.0f}, {fit_range[1]:.0f}], R$^2$={r_squared:.4f};  "
+        f"collapse quality = {collapse_quality:.3f}",
+        fontsize=12,
+    )
+    fig.savefig("figure.png")
+    plt.close(fig)
+
+if HAS_MPL:
+    make_figure_mpl()
+else:
+    make_figure_fallback()
+
+# ----------------------------------------------------------------------
+# 9. Self-verification + summary
+# ----------------------------------------------------------------------
+checks = {
+    "seriesA.npy": (2, n_meas),
+    "seriesB.npy": (2, n_meas),
+    "stackC.npy": (n_snap, max_r),
+    "stackD.npy": (n_snap, L),
+    "stackE.npy": (n_snap, 2, L),
+}
+for name, shape in checks.items():
+    a = np.load(name)
+    assert a.shape == shape, f"{name} shape {a.shape} != {shape}"
+    assert a.dtype == np.float64, f"{name} dtype {a.dtype}"
+    assert np.all(np.isfinite(a)), f"{name} non-finite"
+
+ka = set(json.load(open("metadataA.json")))
+kb = set(json.load(open("metadataB.json")))
+assert ka == {"collapse_check_applicable", "collapse_quality",
+              "collapse_relative_rms_spread", "collapse_dimension",
+              "collapse_snapshot_times", "collapse_lengths",
+              "collapse_x_range", "collapse_grid_size", "notes"}, ka
+assert kb == {"exponent", "exponent_std_error", "amplitude",
+              "fit_range", "r_squared", "notes"}, kb
+
+t10 = int(np.where(meas_t == 10.0)[0][0])
+print("=== B3 run complete ===")
+print(f"L={L}, T={T}, n_steps={n_steps}, seed={seed}")
+print(f"|m|: t=5 {seriesA[0,0]:.4f} -> t=12305 {seriesA[0,-1]:.4f}")
+print(f"R(t): t=5 {seriesA[1,0]:.3f}, t=10 {seriesA[1,t10]:.3f}, "
+      f"t=12305 {seriesA[1,-1]:.3f}")
+print(f"interface density: t=5 {seriesB[1,0]:.4f} -> "
+      f"t=12305 {seriesB[1,-1]:.4f}")
+print(f"S(k_min): t=5 {seriesB[0,0]:.1f} -> t=12305 {seriesB[0,-1]:.1f}")
+print(f"R_snap at snapshot times: {np.round(R_snap, 3)}")
+print(f"fit: alpha={alpha:.4f} +/- {alpha_se:.4f}, A={amplitude:.4f}, "
+      f"R^2={r_squared:.5f}, fit_range={fit_range}, n={len(fit_t)}")
+print(f"local-slope reference {beta_ref:.4f}; window indices [{i0},{i1}]")
+print(f"collapse: x_max={x_max:.4f}, rel_rms_spread={rel_rms_spread:.4f}, "
+      f"quality={collapse_quality:.4f}")
+print("all shape/dtype/finiteness/JSON-key checks passed")

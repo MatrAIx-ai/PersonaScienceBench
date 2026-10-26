@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+Shared-mode recovery from complex response curves.
+
+Model (per curve m):  R_m(x) = a0_m + sum_k a_{k,m} / (1 + (i*x*tau_k)^phi_k)
+  - tau_k, phi_k : SHARED across all 5 curves, unknown K
+  - a0_m, a_{k,m}: curve-specific linear coefficients (a_{k,m} >= 0)
+
+Approved method: joint multi-start MAP + variable projection
+  1) Outer bounded nonlinear params p = [log tau_1, log(tau_k - tau_{k-1}),
+     phi_k]  (strict tau ordering, tau>0 via log, 0<phi<=1 by bounds)
+  2) Inner per-curve variable projection: a0 eliminated analytically, K
+     amplitudes via nnls (nonnegative) -> only 2K nonlinear params remain
+  3) K = 1..6 multi-start scan (40-150 restarts), nested K-seeding, then
+     reweighted by estimated per-observable noise  -> BIC primary, AIC +
+     restart-stability cross-check; Debye (phi=1) constrained cross-check
+  4) Approx. standard errors from local Hessian; residual diagnostics;
+     noiseless self-test for reproducibility
+
+Outputs: analysis.py (this file), results/modes.csv, results/diagnostics.json
+"""
+import json, os, time
+import numpy as np
+import pandas as pd
+from scipy.optimize import nnls, minimize
+
+DATA_CSV = "data/curves.csv"
+OUT_CSV = "results/modes.csv"
+OUT_DIAG = "results/diagnostics.json"
+KMAX = 6
+
+def basis(t, phi):
+    """1/(1 + (i*t)^phi), t = x*tau (real array), phi scalar in (0,1]."""
+    z = (t.astype(complex)) ** phi * np.exp(1j * phi * np.pi / 2)
+    return 1.0 / (1.0 + z)
+
+def tau_phi_from_p(p, K):
+    tau = np.empty(K)
+    tau[0] = np.exp(p[0])
+    for k in range(1, K):
+        tau[k] = tau[k - 1] + np.exp(p[k])      # strict ascending order
+    return tau, p[K:2 * K]
+
+def inner_proj(XM, re, im, tau, phi, w_re, w_im):
+    """Variable projection: for fixed shared (tau,phi) solve the curve-specific
+    linear coefficients -> a0 (free, re-part) + amplitudes (>=0) by nnls."""
+    K = len(tau)
+    b = basis(XM[:, None] * tau[None, :], phi[None, :])     # N x K complex
+    u, v = b.real, b.imag
+    sw_re, sw_im = np.sqrt(w_re), np.sqrt(w_im)
+    # weighted space: a0 column = sw_re*1 (uniform) -> eliminated by centering
+    uamp = u * sw_re
+    vamp = v * sw_im
+    yw_re = re * sw_re
+    yw_im = im * sw_im
+    Aamp = np.vstack([uamp - uamp.mean(axis=0), vamp])
+    yamp = np.concatenate([yw_re - yw_re.mean(), yw_im])
+    a, _ = nnls(Aamp, yamp)                                 # amplitudes >= 0
+    a0 = float((yw_re - uamp @ a).mean() / sw_re)           # physical a0
+    r_re = yw_re - a0 * sw_re - uamp @ a
+    r_im = yw_im - vamp @ a
+    return a0, a, float(r_re @ r_re + r_im @ r_im)
+
+class Fitter:
+    """Holds data + weights; objective = sum of weighted per-curve RSS (chi2)."""
+    def __init__(self, df):
+        self.curves_sorted = sorted(df["curve"].unique())
+        self.XM = df[df["curve"] == self.curves_sorted[0]]["x"].values
+        self.N = self.XM.size
+        self.NC = len(self.curves_sorted)
+        self.NOBS = self.NC * 2 * self.N
+        self.curves = [(df[(df["curve"] == c)].re.values.astype(float),
+                        df[(df["curve"] == c)].im.values.astype(float))
+                       for c in self.curves_sorted]
+        self.rng = np.random.default_rng(2026)
+        self.w_re, self.w_im = 1.0, 1.0
+        self.log_min = np.log(self.XM.min() * 1e-2)
+        self.log_max = np.log(self.XM.max() * 1e2)
+        grid = np.linspace(-3.5, 3.5, 25)
+        peaks = np.array([-1.49, -0.12, 2.46])
+        self.pool_l10 = np.unique(np.round(np.concatenate([grid, peaks]), 3))
+        self.best_cache = {}
+        self.deg_free_per_K = {}
+        for K in range(1, KMAX + 1):
+            self.deg_free_per_K[K] = 2 * K + self.NC * (K + 1)
+
+    # ---- objective and inner solvers ----
+    def objective(self, p, K):
+        tau, phi = tau_phi_from_p(p, K)
+        return sum(inner_proj(self.XM, re, im, tau, phi, self.w_re, self.w_im)[2]
+                   for (re, im) in self.curves)
+
+    def objective_debye(self, p, K):
+        """Same model with phi_k fixed to 1 (Debye); p holds K log-tau only."""
+        tau, _ = tau_phi_from_p(p, K)
+        phi = np.ones(K)
+        return sum(inner_proj(self.XM, re, im, tau, phi, self.w_re, self.w_im)[2]
+                   for (re, im) in self.curves)
+
+    def residual_solution(self, K):
+        sol = self.best_cache[K]
+        tau, phi = tau_phi_from_p(sol["x"], K)
+        out = []
+        for re, im in self.curves:
+            a0, a, _ = inner_proj(self.XM, re, im, tau, phi, self.w_re, self.w_im)
+            b = basis(self.XM[:, None] * tau[None, :], phi[None, :])
+            R = a0 + b @ a
+            out.append(dict(a0=a0, a=a, rre=re - R.real, rim=im - R.imag))
+        return tau, phi, out
+
+    def make_bounds(self, K, debye=False):
+        b = ([(self.log_min, self.log_max)]
+             + [(np.log(1e-4), self.log_max)] * (K - 1))
+        if not debye:
+            b += [(1e-3, 1.0)] * K
+        return b
+
+    def random_start(self, K, debye=False):
+        g = self.rng
+        if g.random() < 0.4:
+            base = np.array([-1.49, -0.12, 2.46])[:min(K, 3)]
+            extra = g.choice(np.linspace(-3.5, 3.5, 25),
+                             size=max(0, K - len(base)), replace=False)
+            l10 = np.sort(np.concatenate([base, extra]) + g.normal(0, 0.08, K))
+        else:
+            l10 = np.sort(g.choice(self.pool_l10, size=K, replace=False)
+                          + g.normal(0, 0.12, K))
+        tau = 10.0 ** l10
+        p = np.empty(K if debye else 2 * K)
+        p[0] = np.log(tau[0])
+        for k in range(1, K):
+            p[k] = np.log(max(tau[k] - tau[k - 1], 1e-4))
+        if not debye:
+            p[K:2 * K] = (np.full(K, 1.0) if g.random() < 0.5
+                          else g.uniform(0.3, 1.0, K))
+        return p
+
+    def seed_from_higher(self, K, debye=False):
+        """Nested seeds: remove each mode of best K+1 solution -> refit K."""
+        if K + 1 not in self.best_cache:
+            return []
+        hi = self.best_cache[K + 1]
+        hi_tau, _ = tau_phi_from_p(hi["x"], K + 1)
+        seeds = []
+        for drop in range(K + 1):
+            keep = [i for i in range(K + 1) if i != drop]
+            tau = np.sort(hi_tau[keep])
+            p = np.empty(K if debye else 2 * K)
+            p[0] = np.log(tau[0])
+            for k in range(1, K):
+                p[k] = np.log(max(tau[k] - tau[k - 1], 1e-4))
+            if not debye:
+                p[K:2 * K] = np.clip(hi["x"][(K + 1):2 * (K + 1)][keep], 1e-3, 1.0)
+            seeds.append(p)
+        return seeds
+
+    def solve_K(self, K, p0, debye=False):
+        obj = self.objective_debye if debye else self.objective
+        bounds = self.make_bounds(K, debye)
+        args = (K,) if debye else (K,)
+        res = minimize(obj, p0, args=(K,) if not debye else (K,),
+                       method="L-BFGS-B", bounds=bounds,
+                       options=dict(maxiter=2000, ftol=1e-13, gtol=1e-7,
+                                    maxls=60))
+        return res
+
+    @staticmethod
+    def _better(a, b):
+        return b if b is not None and (a is None or b.fun < a.fun) else a
+
+    def scan_K(self, K, restarts, debye=False):
+        best, costs = None, []
+        bounds = self.make_bounds(K, debye)
+        for _ in range(restarts):
+            r = self.solve_K(K, self.random_start(K, debye), debye)
+            costs.append(r.fun)
+            best = self._better(best, r)
+        # nested seeds from higher-K best (helps global optimum + fair BIC)
+        for p0 in self.seed_from_higher(K, debye):
+            r = self.solve_K(K, p0, debye)
+            costs.append(r.fun)
+            best = self._better(best, r)
+        sol = dict(fun=best.fun, x=best.x, costs=np.asarray(costs))
+        tau, phi = tau_phi_from_p(best.x, K)
+        sol["tau"], sol["phi"] = tau, phi
+        return sol
+
+    def full_scan(self, restarts, debye=False, descending=False):
+        res = {}
+        order = sorted(restarts, reverse=descending)
+        for K in order:
+            res[K] = self.scan_K(K, restarts[K], debye)
+            tau, phi = res[K]["tau"], res[K]["phi"]
+            c = res[K]["costs"]
+            self.best_cache[K] = res[K]
+            print(f"  K={K} chi2={res[K]['fun']:.5f} "
+                  f"frac1%={np.mean(c <= res[K]['fun']*1.01):.3f} "
+                  f"frac5%={np.mean(c <= res[K]['fun']*1.05):.3f} "
+                  f"log10tau={np.round(np.log10(tau),2)} "
+                  f"phi={np.round(phi,3)}", flush=True)
+        return res
+
+    # ---- model selection helpers ----
+    def chi2(self, K, debye=False):
+        sol = self.best_cache[K]
+        obj = self.objective_debye if debye else self.objective
+        return obj(sol["x"], K)
+
+    def ic(self, K, chi2, p, n):
+        aic = n * np.log(chi2 / n) + 2 * p
+        bic = n * np.log(chi2 / n) + p * np.log(n)
+        return aic, bic
+
+# ------------------------------ main -------------------------------------
+def main():
+    os.makedirs("results", exist_ok=True)
+    df = pd.read_csv(DATA_CSV)
+    ft = Fitter(df)
+    n = ft.NOBS
+    t0 = time.time()
+
+    # ---- pass 1: equal-weight scan (noise not known yet) ----
+    print("[1/5] Equal-weight multi-start scan K=1..6")
+    restarts = {1: 60, 2: 80, 3: 100, 4: 100, 5: 80, 6: 60}
+    scan_eq = ft.full_scan(restarts)
+
+    # ---- noise estimate from a robustly chosen intermediate K ----
+    # pick K by a quick BIC on equal-weight chi2 (avoid overfit argmin)
+    chi_eq = {K: ft.chi2(K) for K in scan_eq}
+    Kc = min(chi_eq, key=lambda k: (np.log(chi_eq[k] / n)
+                                    + ft.deg_free_per_K[k] * np.log(n) / n))
+    tau_c, phi_c, resid_c = ft.residual_solution(Kc)
+    sig_re = float(np.std(np.concatenate([r["rre"] for r in resid_c])))
+    sig_im = float(np.std(np.concatenate([r["rim"] for r in resid_c])))
+    print(f"[2/5] noise from K={Kc} residuals: "
+          f"sigma_re={sig_re:.4f} sigma_im={sig_im:.4f}")
+    ft.w_re, ft.w_im = 1.0 / sig_re ** 2, 1.0 / sig_im ** 2
+
+    # ---- pass 2: reweighted scan (fair chi2 for BIC/AIC) ----
+    print("[3/5] Reweighted scan K=3..6 (plus Debye cross-check K=2..5)")
+    restarts2 = {1: 60, 2: 70, 3: 80, 4: 90, 5: 70, 6: 60}
+    scan2 = ft.full_scan(restarts2, descending=True)
+    # Debye (phi=1) constrained fits for cross-check
+    debye_cache, debye_chi = {}, {}
+    for K in range(2, 6):
+        debye_cache[K] = ft.scan_K(K, 40, debye=True)
+        ft.best_cache[K] = scan2[K]          # restore best (free-phi) cache
+        debye_chi[K] = ft.chi2(K, debye=True)
+
+    # keep better of the two passes (pass2 is weighted + nested-seeded)
+    for K in scan2:
+        if scan_eq[K]["fun"] < scan2[K]["fun"]:
+            ft.best_cache[K] = scan_eq[K]
+        else:
+            ft.best_cache[K] = scan2[K]
+
+    # ---- model comparison ----
+    print(f"[4/5] Model comparison  (n_eff={n})")
+    tab = {}
+    for K in range(1, KMAX + 1):
+        chi2 = ft.chi2(K)
+        p = ft.deg_free_per_K[K]
+        aic, bic = ft.ic(K, chi2, p, n)
+        c = ft.best_cache[K]["costs"]
+        stab = float(np.mean(c <= ft.best_cache[K]["fun"] * 1.01))
+        tab[K] = dict(chi2=chi2, p=p, aic=aic, bic=bic, stab=stab)
+        print(f"   K={K} npar={p:3d} chi2={chi2:8.3f} BIC={bic:8.2f} "
+              f"AIC={aic:8.2f} stab1%={stab:.2f}")
+    # Debye rows
+    for K in range(2, 6):
+        chi2 = debye_chi[K]
+        p = K + ft.NC * (K + 1)
+        aic, bic = ft.ic(K, chi2, p, n)
+        tab[f"K={K} Debye"] = dict(chi2=chi2, p=p, aic=aic, bic=bic,
+                                   stab=np.nan)
+        print(f"   K={K} (Debye) npar={p:3d} chi2={chi2:8.3f} BIC={bic:8.2f} "
+              f"AIC={aic:8.2f}")
+
+    klist = [k for k in tab if isinstance(k, int)]
+    Kbest = min(klist, key=lambda k: tab[k]["bic"])
+    aic_best = min(klist, key=lambda k: tab[k]["aic"])
+    print(f"    -> BIC-selected K={Kbest}; AIC-selected K={aic_best}")
+
+    tau, phi, resid = ft.residual_solution(Kbest)
+    sol = ft.best_cache[Kbest]
+    chi_best = ft.chi2(Kbest)
+
+    # ---- approximate SE from local Hessian ----
+    print("[5/5] Final K=%d parameters" % Kbest)
+    K = Kbest
+    fobj = lambda p: ft.objective(p, K)
+    pbest = sol["x"].copy()
+    H = np.zeros((2 * K, 2 * K))
+    for i in range(2 * K):
+        for j in range(i, 2 * K):
+            ei = np.zeros(2 * K); ej = np.zeros(2 * K)
+            ei[i] = 1e-3 * max(1.0, abs(pbest[i]))
+            ej[j] = 1e-3 * max(1.0, abs(pbest[j]))
+            H[i, j] = H[j, i] = ((fobj(pbest + ei + ej) - fobj(pbest + ei - ej))
+                                 - (fobj(pbest - ei + ej) - fobj(pbest - ei - ej))
+                                 ) / (4 * ei[i] * ej[j])
+    eig = np.linalg.eigvalsh(H)
+    if eig.min() <= 0:
+        H += np.eye(2 * K) * (-eig.min() + 1e-6)
+    invH = np.linalg.inv(H)
+    sigma2 = chi_best / (n - tab[Kbest]["p"])     # goodness-of-fit scale (~1)
+    cov = 2.0 * sigma2 * invH
+
+    def jac_obs(p):
+        t, ph = tau_phi_from_p(p, K)
+        return np.concatenate([np.log10(t), ph])
+    Jnum = np.zeros((2 * K, 2 * K))
+    for i in range(2 * K):
+        ep = np.zeros(2 * K); ep[i] = 1e-4 * max(1.0, abs(pbest[i]))
+        Jnum[:, i] = (jac_obs(pbest + ep) - jac_obs(pbest - ep)) / (2 * ep[i])
+    se_obs = np.sqrt(np.diag(Jnum @ cov @ Jnum.T))
+    log10tau_se, phi_se = se_obs[:K], se_obs[K:]
+
+    mode_tab = []
+    for k in range(K):
+        print(f"   mode {k}: tau={tau[k]:.6g} (log10 {np.log10(tau[k]):.3f}"
+              f" +- {log10tau_se[k]:.3f})  phi={phi[k]:.4f} +- {phi_se[k]:.4f}")
+        mode_tab.append(dict(mode=k, tau=float(tau[k]),
+                             log10tau=float(np.log10(tau[k])),
+                             phi=float(phi[k]),
+                             se_log10tau=float(log10tau_se[k]),
+                             se_phi=float(phi_se[k])))
+    print("   per-curve a0:", np.round([r["a0"] for r in resid], 4))
+    print("   per-curve amplitudes:")
+    print(np.array([r["a"] for r in resid]).round(4))
+
+    # ---- diagnostics ----
+    rre = np.concatenate([r["rre"] for r in resid])
+    rim = np.concatenate([r["rim"] for r in resid])
+    print("Residual diagnostics:")
+    print(f"   re: std={rre.std():.4f} mean={rre.mean():.3e} max|.|={np.abs(rre).max():.4f}")
+    print(f"   im: std={rim.std():.4f} mean={rim.mean():.3e} max|.|={np.abs(rim).max():.4f}")
+    per_curve_re = [float(np.std(r["rre"])) for r in resid]
+    per_curve_im = [float(np.std(r["rim"])) for r in resid]
+    print(f"   per-curve re std: {np.round(per_curve_re,4)}")
+    print(f"   per-curve im std: {np.round(per_curve_im,4)}")
+
+    # ---- write required outputs ----
+    rows = [[float(tau[k])] + [float(r["a"][k]) for r in resid]
+            for k in range(K)]
+    modes_df = pd.DataFrame(rows, columns=["tau"]
+                            + [f"a_{i}" for i in range(ft.NC)])
+    modes_df.to_csv(OUT_CSV, index=False)
+    print("\nWrote", OUT_CSV)
+    print(modes_df.round(5).to_string())
+
+    diag = dict(Kbest=Kbest, aic_best=aic_best, sigma_re=sig_re,
+                sigma_im=sig_im, sigma2=float(sigma2),
+                tab={str(k): {kk: (float(vv) if isinstance(vv, (int, float))
+                          else vv) for kk, vv in v.items()} for k, v in tab.items()},
+                modes=mode_tab,
+                a0=[float(r["a0"]) for r in resid],
+                amplitudes=modes_df.round(6).to_dict("list"),
+                per_curve_re_std=per_curve_re, per_curve_im_std=per_curve_im,
+                best_chi2=float(chi_best),
+                elapsed_s=float(time.time() - t0))
+
+    # ---- self-test: noiseless data from recovered params ----
+    print("\n[6/5] Self-test: refit noise-free data from recovered params")
+    XM = ft.XM
+    A_true = np.array([r["a"] for r in resid])
+    b0_true = np.array([r["a0"] for r in resid])
+    syn = []
+    for i in range(ft.NC):
+        b = basis(XM[:, None] * tau[None, :], phi[None, :])
+        R = b0_true[i] + b @ A_true[i]
+        syn.append((R.real, R.imag))
+    orig = ft.curves
+    ft.curves = syn
+    ft.best_cache = {}
+    best_self = None
+    for _ in range(30):
+        r = ft.solve_K(K, ft.random_start(K))
+        best_self = ft._better(best_self, r)
+    for p0 in ft.seed_from_higher(K):
+        r = ft.solve_K(K, p0)
+        best_self = ft._better(best_self, r)
+    ft.curves = orig
+    tau_s, phi_s = tau_phi_from_p(best_self.x, K)
+    dT = float(np.max(np.abs(np.log10(tau_s) - np.log10(tau))))
+    dP = float(np.max(np.abs(phi_s - phi)))
+    print(f"   refit chi2={best_self.fun:.6e}")
+    print(f"   true  log10tau={np.round(np.log10(tau),4)} phi={np.round(phi,4)}")
+    print(f"   refit log10tau={np.round(np.log10(tau_s),4)} phi={np.round(phi_s,4)}")
+    print(f"   max|dlog10tau|={dT:.2e}  max|dphi|={dP:.2e}")
+    diag["selftest"] = dict(chi2=float(best_self.fun), dlog10tau=dT, dphi=dP,
+                            recovered_log10tau=[float(v) for v in np.log10(tau_s)],
+                            recovered_phi=[float(v) for v in phi_s])
+    json.dump(diag, open(OUT_DIAG, "w"), indent=1)
+    print("Wrote", OUT_DIAG)
+    print("DONE")
+
+if __name__ == "__main__":
+    main()

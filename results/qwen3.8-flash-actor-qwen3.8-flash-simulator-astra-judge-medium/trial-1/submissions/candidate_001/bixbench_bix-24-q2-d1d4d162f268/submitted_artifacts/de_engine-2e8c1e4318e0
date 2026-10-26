@@ -1,0 +1,131 @@
+"""Pure-Python DESeq2-equivalent DE engine (independent implementation, NOT validated against DESeq2).
+Steps: median-of-ratios size factors; NB2 GLM (IRLS, closed-form 2-group); gene-wise dispersion MLE
+(saturated fit); dispersion trend fit disp=a0+a1/mu on quantile bins; empirical-Bayes shrinkage of
+log-dispersion toward trend (sampling var ~ 2/df); Wald test on group log2FC; BH FDR."""
+import numpy as np, pandas as pd
+from scipy.stats import norm
+from scipy.optimize import minimize_scalar
+
+LOG2 = np.log(2.0)
+
+def median_of_ratios(counts):  # counts: genes x samples (kept genes)
+    logc = np.log(counts)
+    logc = np.where(counts > 0, logc, np.nan)
+    complete = ~np.isnan(logc).any(axis=1)
+    gm_log = np.nanmean(logc[complete], axis=1, keepdims=True)
+    ratios = logc[complete] - gm_log
+    return np.exp(np.nanmedian(ratios, axis=0))
+
+def nb_ll(y, mu, a):
+    from scipy.special import gammaln
+    inva = 1.0/a
+    return (gammaln(y+inva)-gammaln(inva)-gammaln(y+1)
+            + inva*np.log(inva/(inva+mu)) + y*np.log(mu/(inva+mu)))
+
+def saturated_mu(yg, a):
+    """NB2 MLE of group mean per gene for fixed alpha (vectorized Newton)."""
+    mu = np.maximum(yg.mean(axis=1), 1e-3)[:, None]
+    a = np.asarray(a)[:, None]
+    for _ in range(300):
+        V = mu*(1.0+a*mu)
+        S = ((yg-mu)/V).sum(1)
+        I = (1.0/V).sum(1)
+        step = np.clip(S/np.maximum(I,1e-300), -0.8*mu[:,0], mu[:,0]+1.0)
+        mu = np.maximum(mu[:,0]+step, 1e-4)[:, None]
+        if np.nanmax(np.abs(step)/np.maximum(mu[:,0],1e-6)) < 1e-10: break
+    return mu
+
+def profile_disp(y1, y2, a_grid, a_start):
+    """for each gene maximize NB loglik over alpha on grid then parabola refine (grid: log spaced)"""
+    n_genes = y1.shape[0]
+    ll = np.zeros((len(a_grid), n_genes))
+    for k,a in enumerate(a_grid):
+        aa=np.full(n_genes,max(a,1e-12)); m1=saturated_mu(y1,aa); m2=saturated_mu(y2,aa)
+        ll[k] = nb_ll(y1,m1,np.maximum(a,1e-12)).sum(1)+nb_ll(y2,m2,np.maximum(a,1e-12)).sum(1)
+    best = np.argmax(ll,axis=0)
+    alpha = a_grid[best]
+    # parabola refine on log-alpha where interior
+    for g in range(n_genes):
+        k = best[g]
+        if 0<k<len(a_grid)-1:
+            x0,x1,x2 = np.log(a_grid[k-1]),np.log(a_grid[k]),np.log(a_grid[k+1])
+            y0,y1_,y2 = ll[k-1,g],ll[k,g],ll[k+1,g]
+            d = (y0-2*y1_+y2)
+            if d<0:
+                off = 0.5*(y0-y2)/d*(x1-x0)
+                alpha[g] = np.exp(np.clip(x1+off, x0-1, x2+1))
+    return np.clip(alpha,1e-4,20)
+
+def de_analysis(counts, groups, col_ctrl, col_trt):
+    cols = np.isin(groups, [col_ctrl, col_trt])
+    groups = groups[cols]
+    y = counts.values.astype(float)[:, cols]
+    x = (groups==col_trt).astype(float)
+    keep = (y>=10).sum(axis=1)>=3
+    yk = y[keep]
+    sf = median_of_ratios(yk)
+    norm_c = yk/sf
+    y1 = norm_c[:, x==0]; y2 = norm_c[:, x==1]
+    n = yk.shape[1]; p = 2; df = n-p
+    mu_hat = norm_c.mean(axis=1)
+    a_grid = np.exp(np.linspace(np.log(1e-4), np.log(10), 60))
+    a_mle = profile_disp(y1, y2, a_grid, None)
+    # trend: fit disp = a0 + a1/mu on quantile bins of mean normalized count
+    order = np.argsort(mu_hat)
+    nbins = 25
+    bins = np.array_split(order, nbins)
+    bx = np.array([mu_hat[b].mean() for b in bins])
+    by = np.array([np.median(a_mle[b]) for b in bins])
+    from scipy.optimize import curve_fit
+    def f(mu,a0,a1): return a0+a1/np.maximum(mu,1e-3)
+    p0 = [0.05, 0.5]
+    try:
+        popt,_ = curve_fit(f, bx, by, p0=p0, maxfev=20000,
+                           bounds=([1e-6,1e-6],[10,100]))
+    except Exception:
+        popt = p0
+    trend = np.clip(f(mu_hat,*popt),1e-4,20)
+    # EB shrinkage of log disp toward trend
+    with np.errstate(all='ignore'):
+        ldiff = np.log(np.maximum(a_mle,1e-4))-np.log(trend)
+        samp_var = 2.0/df
+        prior_var = np.median(ldiff**2) - samp_var
+        prior_var = max(prior_var, 0.05)
+        w_post = (1/samp_var)/(1/samp_var+1/prior_var)
+        a_shrunk = np.exp((1-w_post)*np.log(trend)+w_post*np.log(np.maximum(a_mle,1e-4)))
+    a_shrunk = np.clip(a_shrunk,1e-4,20)
+    b0,b1,se1 = glm2_offset(yk, x, a_shrunk, sf)
+    log2fc = b1/LOG2
+    z = np.where(se1>0, b1/np.maximum(se1,1e-300), 0)
+    pv = 2*norm.sf(np.abs(z))
+    # BH
+    m = pv.size; o = np.argsort(pv); pv_s = pv[o]
+    q = np.minimum.accumulate((pv_s*m/np.arange(1,m+1))[::-1])[::-1]
+    padj = np.empty(m); padj[o] = np.clip(q,0,1)
+    res = pd.DataFrame({"ensembl_id":counts.index[:y.shape[0]][keep],
+                        "baseMean":norm_c.mean(axis=1),
+                        "log2FC_CBDvsCtrl":log2fc,"stat":z,"pvalue":pv,"padj":padj,
+                        "disp_mle":a_mle,"disp_shrunk":a_shrunk})
+    return res, sf, keep, popt, prior_var
+
+def glm2_offset(y, x, a, sf):
+    """NB2 IRLS with log offset log(sf): mu = sf*exp(b0+b1 x)."""
+    off = np.log(sf)[None,:]
+    b0 = np.log(np.maximum(y.mean(axis=1),1e-3)); b1 = np.zeros(y.shape[0])
+    for it in range(80):
+        eta = b0[:,None]+b1[:,None]*x[None,:]+off
+        mu = np.exp(np.clip(eta,-30,30))
+        w = mu/(1.0+a[:,None]*mu)
+        z = (eta-off) + (y-mu)/np.maximum(mu,1e-12)
+        S0,S1,S2 = w.sum(1),(w*x).sum(1),(w*x*x).sum(1)
+        T0,T1 = (w*z).sum(1),(w*x*z).sum(1)
+        det = np.where(np.abs(S0*S2-S1*S1)<1e-300,1e-300,S0*S2-S1*S1)
+        nb0=(S2*T0-S1*T1)/det; nb1=(S0*T1-S1*T0)/det
+        d = np.maximum(np.abs(nb0-b0),np.abs(nb1-b1)); b0,b1=nb0,nb1
+        if np.nanmax(d)<1e-9: break
+    eta = b0[:,None]+b1[:,None]*x[None,:]+off
+    mu = np.exp(np.clip(eta,-30,30))
+    w = mu/(1.0+a[:,None]*mu)
+    S0,S1,S2 = w.sum(1),(w*x).sum(1),(w*x*x).sum(1)
+    det = np.where(np.abs(S0*S2-S1*S1)<1e-300,1e-300,S0*S2-S1*S1)
+    return b0,b1,np.sqrt(S0/det)

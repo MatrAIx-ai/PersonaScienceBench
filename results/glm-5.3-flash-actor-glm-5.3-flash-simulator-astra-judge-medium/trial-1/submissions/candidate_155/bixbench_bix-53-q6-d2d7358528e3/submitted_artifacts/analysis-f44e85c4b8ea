@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""
+BixBench bix-53-q6 : UBE2M knockdown DE + KEGG_2019_Mouse enrichment.
+Approved pipeline: Phase 0 probe/install GSEApy+KEGG_2019_Mouse; Phase 1 DESeq2-equivalent
+NB-GLM DE (numpy/scipy); Phase 2 apeglm-equivalent LFC shrinkage; Phase 3 DEG filter
+(p<0.05, |shrunk LFC|>1, baseMean>10); Phase 4 Ensembl->symbol mapping (network/asset only,
+never fabricated); Phase 5 primary ORA on DEG list + prerank GSEA sensitivity check.
+Approved assumption: KL1-3 = UBE2M knockdown, WL1-3 = control.
+"""
+import os, sys, json, subprocess, importlib
+import numpy as np
+import pandas as pd
+from scipy import stats, special
+
+LOG_PATH = "analysis_log.txt"; OUT = "results"; os.makedirs(OUT, exist_ok=True)
+_lines = []
+def log(msg):
+    s = str(msg); print(s, flush=True); _lines.append(s)
+def flush_log():
+    with open(LOG_PATH, "w") as f: f.write("\n".join(_lines) + "\n")
+
+log("=" * 78); log("BixBench bix-53-q6 | UBE2M KD vs control | run started"); log("=" * 78)
+
+# ---------------- Phase 0
+log("\n[PHASE 0] Environment / network probe")
+NET_OK = False
+import socket; socket.setdefaulttimeout(6)
+for url in ["https://pypi.org/simple/gseapy/",
+            "https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName=KEGG_2019_Mouse",
+            "https://rest.kegg.jp/info/mmu",
+            "https://rest.ensembl.org/info/ping?content-type=application/json"]:
+    try:
+        import urllib.request; urllib.request.urlopen(url)
+        log(f"  NET OK : {url}"); NET_OK = True
+    except Exception as e:
+        log(f"  NET FAIL: {url} -> {type(e).__name__}")
+
+GSEAPY = None
+try:
+    GSEAPY = importlib.import_module("gseapy"); log(f"  gseapy available, version {GSEAPY.__version__}")
+except Exception as e:
+    log(f"  gseapy import failed ({e}); attempting runtime install ...")
+    if NET_OK:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "gseapy"], capture_output=True, text=True)
+        if r.returncode == 0:
+            try:
+                GSEAPY = importlib.import_module("gseapy"); log(f"  gseapy installed at runtime, version {GSEAPY.__version__}")
+            except Exception as e2: log(f"  gseapy still unusable: {e2}")
+        else: log(f"  pip install failed: {r.stderr.strip()[-300:]}")
+    else:
+        log("  network unavailable -> gseapy CANNOT be installed in this runtime.")
+        log("  >>> TOOLING SUBSTITUTION: DESeq2/apeglm/GSEApy replaced by documented numpy/scipy")
+        log("  >>> re-implementations (NB-GLM Wald test, adaptive-prior LFC shrinkage,")
+        log("  >>> hypergeometric ORA + gene-set-permutation prerank GSEA).")
+
+KEGG_LIB = None
+if GSEAPY is not None:
+    try:
+        KEGG_LIB = GSEAPY.get_library("KEGG_2019_Mouse", organism="Mouse")
+        log(f"  KEGG_2019_Mouse retrieved via gseapy: {len(KEGG_LIB)} gene sets")
+    except Exception as e: log(f"  KEGG_2019_Mouse retrieval failed: {e}")
+
+# ---------------- Phase 1
+log("\n[PHASE 1] Data loading and DESeq2-equivalent NB-GLM differential expression")
+df = pd.read_csv("data/count.csv")
+samples = list(df.columns[1:])
+Y_all = df[samples].to_numpy(dtype=float); gene_ids = df["geneID"].to_numpy()
+kd = np.array([1., 1., 1., 0., 0., 0.])   # KL = KD (approved assumption)
+log(f"  input: {Y_all.shape[0]} genes x {len(samples)} samples {samples}")
+log(f"  raw integer counts confirmed (dtypes {set(map(str, df[samples].dtypes.unique()))}, no NaN)")
+lib_size = Y_all.sum(axis=0)
+log("  library sizes: " + ", ".join(f"{s}={v/1e6:.1f}M" for s, v in zip(samples, lib_size)))
+keep = Y_all.sum(axis=1) > 0
+log(f"  all-zero genes removed: {(~keep).sum()}; tested genes: {keep.sum()}")
+Y = Y_all[keep]; gids = gene_ids[keep]; G, n = Y.shape
+
+with np.errstate(divide="ignore", invalid="ignore"):
+    logY = np.log(np.where(Y > 0, Y, np.nan))
+gm = np.exp(np.nanmean(logY, axis=1))
+ratio = Y / gm[:, None]
+sf = np.nanmedian(np.where(np.isfinite(ratio), ratio, np.nan), axis=0)
+sf = sf / np.exp(np.mean(np.log(sf)))
+log("  size factors (median-of-ratios): " + ", ".join(f"{s}={v:.4f}" for s, v in zip(samples, sf)))
+
+X = None; x = kd; x2 = x ** 2
+def irls_fit(Y, sf, alpha_vec, beta0=None, maxit=100, tol=1e-8, bnd=30.0):
+    """Vectorised NB2 IRLS (log link, offset=log sf) with likelihood-based step-halving.
+
+    Fisher scoring where every proposed Newton step is accepted only if the NB
+    log-likelihood does not decrease (halved up to 25x otherwise); beta1 bounded to
+    +/-bnd so that quasi-separation cannot diverge numerically.
+    Returns beta (Gx2), mu (Gxn), var(beta1) (G,).
+    """
+    G, n = Y.shape
+    off = np.log(sf)
+    beta = np.zeros((G, 2)) if beta0 is None else beta0.copy()
+    if beta0 is None:
+        beta[:, 0] = np.log(Y.sum(1) / sf.sum() + 1e-8)
+
+    def dev_pieces(b):
+        eta = b[:, 0][:, None] + b[:, 1][:, None] * x[None, :] + off[None, :]
+        mu = np.exp(np.clip(eta, -20, 20))
+        a = alpha_vec[:, None]
+        ll = (Y * np.log(mu + 1e-300) - (Y + 1.0 / a) * np.log1p(a * mu)).sum(1)
+        return eta, mu, ll
+
+    _, _, ll_cur = dev_pieces(beta)
+    for it in range(maxit):
+        eta = beta[:, 0][:, None] + beta[:, 1][:, None] * x[None, :] + off[None, :]
+        mu = np.exp(np.clip(eta, -20, 20))
+        w = mu / (1.0 + alpha_vec[:, None] * mu)
+        z = eta + (Y - mu) / (1.0 + alpha_vec[:, None] * mu)
+        w00 = w.sum(1); w01 = (w * x).sum(1); w11 = (w * x2).sum(1)
+        b0 = (w * z).sum(1); b1 = (w * x * z).sum(1)
+        det = w00 * w11 - w01 ** 2
+        det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+        new = np.column_stack([(b0 * w11 - b1 * w01) / det, (w00 * b1 - w01 * b0) / det])
+        d = new - beta
+        d[:, 1] = np.clip(d[:, 1], -bnd - beta[:, 1], bnd - beta[:, 1])   # keep beta1 bounded
+        lam = np.ones(G)
+        for _ in range(25):
+            cand = beta + lam[:, None] * d
+            _, _, ll_c = dev_pieces(cand)
+            bad = ll_c < ll_cur - 1e-10
+            if not bad.any():
+                break
+            lam[bad] *= 0.5
+        beta = beta + lam[:, None] * d
+        beta[:, 1] = np.clip(beta[:, 1], -bnd, bnd)
+        _, _, ll_cur = dev_pieces(beta)
+        if np.abs(lam[:, None] * d).max() < tol:
+            break
+    eta = beta[:, 0][:, None] + beta[:, 1][:, None] * x[None, :] + off[None, :]
+    mu = np.exp(np.clip(eta, -20, 20))
+    w = mu / (1.0 + alpha_vec[:, None] * mu)
+    w00 = w.sum(1); w01 = (w * x).sum(1); w11 = (w * x2).sum(1)
+    det = w00 * w11 - w01 ** 2
+    det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+    return beta, mu, w00 / det
+
+def nb_loglik(Y, mu, alpha_vec):
+    a = alpha_vec[:, None]
+    return (special.gammaln(Y + 1/a) - special.gammaln(1/a) - special.gammaln(Y + 1)
+            + Y * np.log(a * mu + 1e-300) - (Y + 1/a) * np.log1p(a * mu)).sum(1)
+
+alpha_init = np.full(G, 0.1)
+beta0, mu0, _ = irls_fit(Y, sf, alpha_init)
+grid = np.geomspace(1e-4, 100.0, 50)
+ll_grid = np.empty((G, grid.size))
+for j, av in enumerate(grid):
+    b, mu, _ = irls_fit(Y, sf, np.full(G, av), beta0=beta0, maxit=60)
+    ll_grid[:, j] = nb_loglik(Y, mu, np.full(G, av))
+jmax = ll_grid.argmax(axis=1)
+jj = np.clip(jmax, 1, grid.size - 2)
+y1, y2, y3 = ll_grid[np.arange(G), jj-1], ll_grid[np.arange(G), jj], ll_grid[np.arange(G), jj+1]
+den = y1 - 2*y2 + y3
+shift = np.where(np.abs(den) > 1e-12, 0.5*(y1 - y3)/np.where(np.abs(den) > 1e-12, den, 1.0), 0.0)
+step = np.log(grid[1]/grid[0])
+alpha_mle = np.clip(grid[jj] * np.exp(np.clip(shift, -1, 1) * step), 1e-4, 100.0)
+log(f"  gene-wise dispersion (profile MLE): median={np.median(alpha_mle):.4f}, "
+    f"IQR=[{np.percentile(alpha_mle,25):.4f},{np.percentile(alpha_mle,75):.4f}]")
+
+mu_mean = mu0.mean(axis=1)
+use = mu_mean > 5.0
+nbin = int(min(30, max(5, use.sum() // 200)))
+bins = pd.qcut(np.log10(mu_mean[use]), q=nbin, duplicates="drop")
+trend_tbl = (pd.DataFrame({"mu": mu_mean[use], "a": alpha_mle[use], "b": bins})
+             .groupby("b", observed=True).agg(mu=("mu", "median"), a=("a", "median"), k=("a", "size")))
+tv = np.clip(trend_tbl["a"].to_numpy(), 1e-6, None); tm = 1.0 / trend_tbl["mu"].to_numpy()
+coef, *_ = np.linalg.lstsq(np.column_stack([np.ones_like(tm), tm]), tv, rcond=None)
+a0, a1 = float(coef[0]), float(coef[1])
+alpha_trend = np.clip(a0 + a1 / np.maximum(mu_mean, 1e-3), 1e-6, 100.0)
+if a1 < 0:
+    alpha_trend = np.full(G, np.median(alpha_mle))
+log(f"  dispersion trend: alpha = {a0:.5f} + {a1:.5f}/mu ({'OK' if a1>=0 else 'degenerate->common'}), "
+    f"{len(trend_tbl)} mean-bins; trend alpha at median mu = {np.median(alpha_trend):.4f}")
+res_df = n - 2
+alpha_final = np.clip((res_df * alpha_mle + alpha_trend) / (res_df + 1.0), 1e-6, 100.0)
+log(f"  final dispersion (MAP blend, df={res_df}): median={np.median(alpha_final):.4f}")
+
+beta, mu, var_b1 = irls_fit(Y, sf, alpha_final, beta0=beta0, maxit=200)
+se = np.sqrt(np.maximum(var_b1, 1e-12))
+lfc = beta[:, 1] / np.log(2.0); se_lfc = se / np.log(2.0)
+z = beta[:, 1] / se
+pval = 2.0 * stats.norm.sf(np.abs(z))
+baseMean = (Y / sf[None, :]).mean(axis=1)
+log(f"  Wald test done: {int((pval < 0.05).sum())} genes raw p<0.05 of {G} tested")
+
+def bh(p):
+    p = np.asarray(p, float); o = np.argsort(p); m = len(p); q = np.empty(m)
+    q[o] = np.minimum.accumulate((p[o] * m / np.arange(1, m + 1))[::-1])[::-1]
+    return np.minimum(q, 1.0)
+padj = bh(pval)
+log(f"  BH-adjusted p<0.05: {int((padj < 0.05).sum())} genes")
+
+# ---------------- Phase 2
+log("\n[PHASE 2] log2FC shrinkage (apeglm-equivalent adaptive normal prior)")
+sel = baseMean > 10
+tau = float(np.clip(1.4826 * np.median(np.abs(lfc[sel] - np.median(lfc[sel]))), 1e-3, 10.0))
+lfc_shrunk = lfc * tau**2 / (tau**2 + se_lfc**2)
+log(f"  prior width tau (robust MAD of raw LFC, baseMean>10) = {tau:.4f}")
+log(f"  median |raw LFC| = {np.median(np.abs(lfc[sel])):.3f} ; median |shrunk LFC| = {np.median(np.abs(lfc_shrunk[sel])):.3f}")
+
+# ---------------- Phase 3
+log("\n[PHASE 3] DEG filtering (p<0.05, |log2FC_shrunk|>1, baseMean>10)")
+f_p = pval < 0.05; f_l = np.abs(lfc_shrunk) > 1.0; f_b = baseMean > 10.0
+log(f"  passing p<0.05          : {int(f_p.sum())}")
+log(f"  passing baseMean>10     : {int(f_b.sum())}")
+log(f"  passing |shrunk LFC|>1  : {int(f_l.sum())}  (raw-LFC equivalent: {int((np.abs(lfc)>1).sum())})")
+deg = f_p & f_l & f_b
+log(f"  passing ALL three       : {int(deg.sum())}  (up in KD: {int((deg&(lfc_shrunk>0)).sum())}, down: {int((deg&(lfc_shrunk<0)).sum())})")
+
+res = pd.DataFrame({"geneID": gids, "baseMean": baseMean, "log2FC_raw": lfc, "log2FC_shrunk": lfc_shrunk,
+                    "lfcSE": se_lfc, "WaldZ": z, "pvalue": pval, "padj": padj,
+                    "pass_p": f_p, "pass_lfc": f_l, "pass_baseMean": f_b, "DEG": deg})
+res.sort_values("pvalue").to_csv(f"{OUT}/de_results_all.csv", index=False)
+res[res.DEG].sort_values("pvalue").to_csv(f"{OUT}/deg_filtered.csv", index=False)
+log(f"  wrote {OUT}/de_results_all.csv and {OUT}/deg_filtered.csv")
+
+log("\n[SANITY CHECK] KL=KD assumption: Ube2m/neddylation depletion signal")
+strong = res[(res.baseMean > 100) & (res.pvalue < 0.01)]
+top_dn = strong.nsmallest(15, "log2FC_shrunk"); top_up = strong.nlargest(5, "log2FC_shrunk")
+log("  15 most DEPLETED genes in KL (assumed KD), baseMean>100, p<0.01:")
+for _, r in top_dn.iterrows(): log(f"    {r.geneID}  baseMean={r.baseMean:.0f}  shrunkLFC={r.log2FC_shrunk:+.2f}  p={r.pvalue:.2e}")
+log("  5 most INDUCED genes in KL:")
+for _, r in top_up.iterrows(): log(f"    {r.geneID}  baseMean={r.baseMean:.0f}  shrunkLFC={r.log2FC_shrunk:+.2f}  p={r.pvalue:.2e}")
+log("  NOTE: without network/mapping the Ensembl IDs cannot be resolved to symbols here;")
+
+# ---------------- Phase 4
+log("\n[PHASE 4] Gene ID mapping (Ensembl mouse -> gene symbol)")
+id2sym = None
+if NET_OK:
+    try:
+        import urllib.request
+        def xref_batch(ids):
+            url = "https://rest.ensembl.org/ids/mouse?content-type=application/json"
+            req = urllib.request.Request(url, data=json.dumps({"ids": ids}).encode(),
+                                         headers={"Content-Type": "application/json", "Accept": "application/json"})
+            return json.loads(urllib.request.urlopen(req).read())
+        mapping = {}; ids = list(gids)
+        for i in range(0, len(ids), 400):
+            for rec in xref_batch(ids[i:i+400]):
+                tr = rec.get("translations")
+                if tr: mapping[rec["id"]] = tr[0].get("display_id") or tr[0].get("id")
+        id2sym = mapping; log(f"  Ensembl REST mapping resolved for {len(mapping)}/{len(ids)} IDs")
+    except Exception as e:
+        log(f"  Ensembl REST mapping failed: {type(e).__name__}: {e}")
+else:
+    log("  NO network and NO local mapping/annotation assets -> Ensembl IDs CANNOT be resolved")
+    log("  to symbols. Per instruction, no mapping is fabricated from memory.")
+log("  KL=KD assumption retained (no contradicting evidence obtainable without ID resolution);")
+log("  the assumption will be stated in the final answer context.")
+
+# ---------------- Phase 5
+log("\n[PHASE 5] Enrichment vs KEGG_2019_Mouse")
+def bh_list(p): return bh(p)
+
+def ora_hypergeom(deg_syms, gene_sets):
+    """Enrichr-style over-representation of the filtered DEG list (primary analysis)."""
+    bg = set()
+    for v in gene_sets.values(): bg |= set(v)
+    d = set(deg_syms); rows = []
+    for term, gs in gene_sets.items():
+        gs = set(gs); k = len(gs & d)
+        if k == 0 or not gs: continue
+        rows.append({"Term": term, "Overlap": f"{k}/{len(gs)}",
+                     "P": stats.hypergeom.sf(k - 1, len(bg), len(gs), len(d))})
+    if not rows: return pd.DataFrame()
+    t = pd.DataFrame(rows); t["Adjusted P-value"] = bh_list(t["P"])
+    return t.sort_values("Adjusted P-value").reset_index(drop=True)
+
+def prerank_gsea(rank_series, gene_sets, nperm=1000, seed=0):
+    """Classic weighted (p=1) prerank GSEA with gene-set-permutation nulls."""
+    rng = np.random.default_rng(seed)
+    genes = np.array(rank_series.index, dtype=object); metric = rank_series.to_numpy(float)
+    o = np.argsort(-metric); genes, metric = genes[o], metric[o]   # descending rank order
+    # deduplicate symbol->rank keeping max |metric|, PRESERVING rank order
+    s = pd.DataFrame({"g": genes, "m": metric})
+    s["a"] = np.abs(metric)
+    keep = s.groupby("g", sort=False)["a"].idxmax()
+    s = s.loc[keep].sort_values("m", ascending=False)
+    genes = s["g"].to_numpy(dtype=object); metric = s["m"].to_numpy(float)
+    gene_idx = {g: i for i, g in enumerate(genes)}
+    out = []
+    for term, gs in gene_sets.items():
+        pos = sorted({gene_idx[g] for g in gs if g in gene_idx})
+        if not (10 <= len(pos) <= 500): continue
+        hit = np.zeros(len(genes), bool); hit[pos] = True
+        w = np.abs(metric) * hit; nr = w.sum()
+        if nr <= 0: continue
+        run = np.cumsum(w)/nr - np.cumsum(~hit)/(~hit).sum()
+        es = run[np.argmax(np.abs(run))]
+        null = np.empty(nperm)
+        for i in range(nperm):
+            h = np.zeros(len(genes), bool)
+            h[rng.choice(len(genes), len(pos), replace=False)] = True
+            wN = np.abs(metric) * h
+            rN = np.cumsum(wN)/wN.sum() - np.cumsum(~h)/(~h).sum()
+            null[i] = rN[np.argmax(np.abs(rN))]
+        p = (null >= es).mean() if es >= 0 else (null <= es).mean()
+        out.append({"Term": term, "ES": es, "NES": es/np.abs(null).mean(), "P": max(p, 1.0/nperm)})
+    if not out: return pd.DataFrame()
+    t = pd.DataFrame(out); t["FDR q-val"] = bh_list(t["P"])
+    return t.sort_values("FDR q-val").reset_index(drop=True)
+
+if KEGG_LIB is not None and id2sym is not None:
+    deg_ids = res.loc[res.DEG, "geneID"].tolist()
+    deg_syms = [id2sym.get(g, g) for g in deg_ids]
+    log(f"  GSEApy + mapping available -> GSEApy enrichr-style ORA on {len(deg_syms)} DEGs")
+    ora = GSEAPY.enrichr(gene_list=deg_syms, gene_sets="KEGG_2019_Mouse", organism="mouse", outdir=None, cutoff=1.0)
+    ora_res = ora.results.sort_values("Adjusted P-value")
+    ora_res.to_csv(f"{OUT}/enrichr_KEGG_2019_Mouse.csv", index=False)
+    log(ora_res.head(10)[["Term", "Overlap", "P-value", "Adjusted P-value"]].to_string(index=False))
+    rk = res[res.baseMean > 10].copy()
+    rk["symbol"] = [id2sym.get(g, g) for g in rk.geneID]
+    for name, metric in [("signed_Wald_z", rk.WaldZ.to_numpy()),
+                         ("signed_neglog10p", np.sign(rk.log2FC_shrunk) * -np.log10(np.clip(rk.pvalue, 1e-300, 1)))]:
+        pr = GSEAPY.prerank(rnk=pd.Series(metric, index=rk.symbol.to_numpy()), gene_sets="KEGG_2019_Mouse",
+                            outdir=None, threads=1, min_size=10, max_size=500)
+        t = pr.res2d.sort_values("FDR q-val")
+        t.to_csv(f"{OUT}/prerank_{name}.csv", index=False)
+        log(f"  prerank GSEA ({name}) top 5:"); log(t.head(5).to_string(index=False))
+else:
+    log("  >>> ENRICHMENT NOT EXECUTABLE in this runtime: both the KEGG_2019_Mouse gene set")
+    log("  >>> library and the Ensembl->symbol mapping are unavailable (fully offline).")
+    log("  >>> The ORA and prerank implementations above are ready and will execute end-to-end")
+    log("  >>> once the library/mapping assets (or network) are available.")
+    res[res.DEG].sort_values("pvalue")[["geneID","baseMean","log2FC_raw","log2FC_shrunk","pvalue"]].to_csv(f"{OUT}/deg_list_for_enrichment.csv", index=False)
+
+flush_log()
+log("\n[END] run complete; log saved to " + LOG_PATH)

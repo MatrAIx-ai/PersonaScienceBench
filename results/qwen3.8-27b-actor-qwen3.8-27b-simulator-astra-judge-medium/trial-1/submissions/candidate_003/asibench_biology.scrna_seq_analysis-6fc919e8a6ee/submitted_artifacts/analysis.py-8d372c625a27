@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+Single-cell RNA-seq integrated analysis (NumPy + SciPy only).
+
+Pipeline (revised after data-structure inspection; see method_choices.json):
+  1. Load data/counts.npy (cells x genes, raw droplet-style counts) + data/system_info.json
+  2. Library-size normalization (x / rowsum * 1e4) + log1p
+  3. PCA via SVD on ALL 250 log-normalized genes (NO variance-based HVG - deliberate
+     deviation: HVG selected high-expression two-state "state" genes and discarded the
+     low-expression cluster markers; see method_choices.json for the measured evidence)
+  4. PC1 (eigval ~14761, ~4x next) is a bimodal two-STATE axis; it is the pseudotime axis
+  5. Clustering: k=15 KNN graph (union symmetrization, Gaussian weights) built in the
+     PC2-31 subspace (state axis removed), spectral clustering (Ng-Jordan-Weiss
+     normalized cut), K = n_clusters from system_info.json (metadata, not re-derived)
+  6. Pseudotime: k=15 KNN graph in the FULL 30-PC space, Dijkstra shortest path from the
+     min-PC1 root cell (direction convention - no time labels exist)
+  7. de_genes: top 50 gene indices ranked by one-way ANOVA F across the 4 clusters
+     (cluster-marker interpretation); pseudotime-slope ranking = diagnostic only
+  8. GRN: directed on/off conditional mean difference among the 20 TF columns;
+     grn_scores[i, j] = edge i -> j (i regulator, j target); diagonal = 0
+  9. Cross-checks: KMeans in the PC2-31 space (operative, ARI + marker identity);
+     hand-rolled Louvain (modularity) kept as a DIAGNOSTIC only - on this weakly
+     modular graph the modularity landscape is flat and cannot discriminate the
+     4-cluster structure (see method_choices.json)
+
+Outputs: clusters.npy (int32, n_cells), pseudotime.npy (float64, n_cells),
+de_genes.json, grn_scores.npy (float64, n_tf x n_tf), method_choices.json
+Deterministic: fixed seeds on all stochastic steps, no timestamps -> byte-reproducible.
+"""
+import itertools
+import json
+import os
+
+import numpy as np
+from scipy.cluster.vq import kmeans2
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
+from scipy.spatial.distance import cdist
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+N_PCS = 30
+KNN_K = 15
+N_DE = 50
+
+
+def load():
+    with open(os.path.join(HERE, "data", "system_info.json")) as f:
+        info = json.load(f)
+    return info, np.load(os.path.join(HERE, "data", "counts.npy"))
+
+
+def normalize(counts):
+    """Per-cell library-size normalization to 1e4 + log1p."""
+    return np.log1p(counts / counts.sum(axis=1, keepdims=True) * 1e4)
+
+
+def pca_fit(ln, n_pcs=N_PCS):
+    """PCA on ALL genes (centered + scaled). Returns coords, pc1, eigenvalues."""
+    X = ln - ln.mean(axis=0)
+    X = X / (ln.std(axis=0) + 1e-12)
+    U, S, Vt = np.linalg.svd(X, full_matrices=False)  # deterministic (LAPACK)
+    coords = U[:, :n_pcs] * S[:n_pcs]
+    return coords, coords[:, 0], S ** 2
+
+
+def knn_graph(coords, k=KNN_K):
+    """Union-symmetrized kNN graph. Returns Gaussian weights, distance matrix, sigma."""
+    n = len(coords)
+    D = cdist(coords, coords)
+    np.fill_diagonal(D, np.inf)
+    nn = np.argsort(D, axis=1)[:, :k]
+    edges = set()
+    for i in range(n):
+        for j in nn[i]:
+            edges.add((i, j) if i < j else (j, i))
+    sigma = float(np.median(D[np.arange(n)[:, None], nn]))  # median within-neighbor dist
+    Wg = np.zeros((n, n))  # Gaussian weights (clustering / modularity)
+    Wd = np.zeros((n, n))  # Euclidean distances (pseudotime)
+    for i, j in edges:
+        Wg[i, j] = Wg[j, i] = np.exp(-(D[i, j] ** 2) / (sigma ** 2))
+        Wd[i, j] = Wd[j, i] = D[i, j]
+    return Wg, Wd, sigma, len(edges)
+
+
+def spectral_cluster(Wg, K, seeds=(0, 1, 2, 3, 4)):
+    """Ng-Jordan-Weiss normalized cut; k-means on row-normalized embedding."""
+    n = Wg.shape[0]
+    dis = 1.0 / np.sqrt(Wg.sum(axis=1))
+    L = np.eye(n) - (Wg * dis[:, None]) * dis[None, :]
+    evals, evecs = np.linalg.eigh(L)
+    E = evecs[:, :K]
+    E = E / np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
+    best_inertia, best_lab = np.inf, None
+    for s in seeds:
+        cent, lab = kmeans2(E, K, minit='++', seed=s, iter=50)
+        inertia = float(((E - cent[lab]) ** 2).sum())
+        if inertia < best_inertia:
+            best_inertia, best_lab = inertia, lab
+    return best_lab, evals, best_inertia
+
+
+def kmeans_best(X, K, seeds=(0, 1, 2, 3, 4)):
+    best_inertia, best_lab = np.inf, None
+    for s in seeds:
+        cent, lab = kmeans2(X, K, minit='++', seed=s, iter=50)
+        inertia = float(((X - cent[lab]) ** 2).sum())
+        if inertia < best_inertia:
+            best_inertia, best_lab = inertia, lab
+    return best_lab
+
+
+def louvain_partition(W, seed, max_rounds=30):
+    """Hand-rolled Louvain (modularity, resolution 1.0) on undirected W.
+    Random-order passes of local moves until a pass makes no move, then
+    aggregation; stop when a round makes no move. (Diagnostic use only here.)"""
+    rng = np.random.default_rng(seed)
+    Wc = W
+    two_m = float(Wc.sum())
+    members = [np.array([i], dtype=int) for i in range(W.shape[0])]
+    for rnd in range(max_rounds):
+        nc = Wc.shape[0]
+        comm = np.arange(nc)
+        deg = Wc.sum(axis=1)
+        Lc = np.zeros(nc)  # internal weighted degree per community
+        for i in range(nc):
+            Lc[i] = Wc[i, comm == i].sum() / 2.0
+        kc = deg.copy()    # total degree per community
+        m = two_m / 2.0
+        nbr_lists = [np.nonzero(Wc[i] > 0)[0] for i in range(nc)]
+        moved_any = False
+        for _pass in range(20):
+            pass_moved = False
+            for i in rng.permutation(nc):
+                ci = comm[i]
+                nbrs = nbr_lists[i]
+                if len(nbrs) == 0:
+                    continue
+                w = Wc[i]
+                k_i = deg[i]
+                L_A, k_A = Lc[ci], kc[ci]
+                w_iA = float(w[comm == ci].sum())  # no self-loop -> excludes i
+                csum = np.bincount(comm[nbrs], weights=w[nbrs], minlength=nc)
+                best_c, best_dq = -1, 0.0
+                for c in np.unique(comm[nbrs]):
+                    w_iB = float(csum[c])
+                    L_B, k_B = Lc[c], kc[c]
+                    before = L_A / m + L_B / m - (k_A ** 2 + k_B ** 2) / (4 * m * m)
+                    after = ((L_A - w_iA) / m + (L_B + w_iB) / m
+                             - ((k_A - k_i) ** 2 + (k_B + k_i) ** 2) / (4 * m * m))
+                    if after - before > best_dq:
+                        best_dq, best_c = after - before, c
+                if best_c >= 0:
+                    Lc[ci] -= w_iA
+                    Lc[best_c] += float(csum[best_c])
+                    kc[ci] -= k_i
+                    kc[best_c] += k_i
+                    comm[i] = best_c
+                    pass_moved = True
+            if not pass_moved:
+                break
+            moved_any = True
+        if not moved_any:
+            break
+        # aggregation
+        ids = np.unique(comm)
+        T = len(ids)
+        W2 = np.zeros((T, T))
+        new_members = []
+        for t, c in enumerate(ids):
+            idx_t = np.nonzero(comm == c)[0]
+            new_members.append(np.concatenate([members[m_] for m_ in idx_t]))
+            W2[t, t] = Wc[np.ix_(idx_t, idx_t)].sum() / 2.0
+            for u in range(t + 1, T):
+                idx_u = np.nonzero(comm == ids[u])[0]
+                wtu = Wc[np.ix_(idx_t, idx_u)].sum()
+                W2[t, u] = W2[u, t] = wtu
+        Wc, members, two_m = W2, new_members, float(W2.sum())
+    labels = np.empty(W.shape[0], dtype=int)
+    for t in range(len(members)):
+        labels[members[t]] = t
+    return labels
+
+
+def modularity(W, labels):
+    two_m = float(W.sum())
+    Q = 0.0
+    for c in np.unique(labels):
+        mask = labels == c
+        Q += W[np.ix_(mask, mask)].sum() / two_m - (W[mask].sum() / two_m) ** 2
+    return Q
+
+
+def ari(a, b):
+    """Adjusted Rand index (hand-rolled, permutation invariant)."""
+    M = np.zeros((int(a.max()) + 1, int(b.max()) + 1), dtype=np.int64)
+    np.add.at(M, (a, b), 1)
+    n = int(M.sum())
+    s_n = float(np.sum(M * (M - 1) / 2.0))
+    row, col = M.sum(1), M.sum(0)
+    s_a = float(np.sum(row * (row - 1) / 2.0))
+    s_b = float(np.sum(col * (col - 1) / 2.0))
+    e = s_a * s_b / (n * (n - 1) / 2.0)
+    mx = (s_a + s_b) / 2.0
+    return 1.0 if mx == e else (s_n - e) / (mx - e)
+
+
+def best_perm(a, b, K):
+    """Alignment of b's labels onto a's labels (permutation inv such that
+    aligned_b = inv[b] maximizes the number of cells where a == aligned_b).
+    Returns inv = p^-1 where p maximizes sum_i ct[i, p[i]], ct[a[i], b[i]] = count."""
+    ct = np.zeros((K, K), dtype=int)
+    for i in range(len(a)):
+        ct[a[i], b[i]] += 1
+    best_p, best_v = None, -1
+    for p in itertools.permutations(range(K)):
+        v = sum(ct[i, p[i]] for i in range(K))
+        if v > best_v:
+            best_v, best_p = v, p
+    p = np.array(best_p)
+    inv = np.empty(K, dtype=int)
+    inv[p] = np.arange(K)
+    return inv
+
+
+def graph_pseudotime(Wd, root):
+    """Dijkstra shortest path from root; re-verifies graph connectivity."""
+    G = csr_matrix(Wd)
+    ncomp, _ = connected_components(G, directed=False)
+    dist = dijkstra(G, directed=False, indices=root)
+    fallback = False
+    if np.isinf(dist).any():
+        eps = 1e-3 * float(np.median(dist[np.isfinite(dist)]))
+        B = csr_matrix(Wd + np.full((len(Wd), len(Wd)), eps))
+        B.setdiag(0.0)
+        dist = dijkstra(B, directed=False, indices=root)
+        fallback = True
+    return dist, int(ncomp), fallback
+
+
+def anova_f(ln, labels, K):
+    n = ln.shape[0]
+    grand = ln.mean(axis=0)
+    ssb = np.zeros(ln.shape[1])
+    ssw = np.zeros(ln.shape[1])
+    for c in range(K):
+        m = labels == c
+        mc = ln[m].mean(axis=0)
+        ssb += m.sum() * (mc - grand) ** 2
+        ssw += ((ln[m] - mc) ** 2).sum(axis=0)
+    return (ssb / (K - 1)) / (ssw / (n - K))
+
+
+def grn_scores(tf_counts):
+    """Directed on/off conditional mean difference, standardized by target std.
+    score[i, j] = (mean of j where i expressed - mean of j where i silent) / std(j)."""
+    n = tf_counts.shape[1]
+    std = tf_counts.std(axis=0)
+    S = np.zeros((n, n))
+    for i in range(n):
+        on = tf_counts[:, i] > 0
+        for j in range(n):
+            if i == j:
+                continue
+            S[i, j] = (tf_counts[:, j][on].mean() - tf_counts[:, j][~on].mean()) / (std[j] + 1e-12)
+    return S
+
+
+def main():
+    info, counts = load()
+    n_cells, n_genes = counts.shape
+    n_clusters = int(info["n_clusters"])
+    n_tf = int(info["n_tf_genes"])
+    tf_idx = info.get("tf_gene_indices", list(range(n_tf)))
+
+    ln = normalize(counts)                                  # 2
+    coords, pc1, eigvals = pca_fit(ln)                       # 3-4 (all 250 genes)
+    Xc = coords[:, 1:N_PCS]                                  # PC2-31: state axis removed
+
+    # 5. clustering graph (PC2-31 space) + spectral K=4
+    Wg_c, Wd_c, sigma_c, n_edges_c = knn_graph(Xc)
+    spec_lab, spec_evals, spec_inertia = spectral_cluster(Wg_c, n_clusters)
+
+    # cross-check: KMeans in the same PC2-31 space (operative)
+    km_lab = kmeans_best(Xc, n_clusters)
+    ari_sk = ari(spec_lab, km_lab)
+    perm = best_perm(spec_lab, km_lab, n_clusters)
+    km_al = np.array([perm[x] for x in km_lab])
+    cell_agree = float((spec_lab == km_al).mean())
+    F = anova_f(ln, spec_lab, n_clusters)
+    top20 = np.argsort(F)[::-1][:20]
+    hi_spec = np.array([int(np.argmax([ln[spec_lab == k, g].mean() for k in range(n_clusters)]))
+                        for g in top20])
+    hi_km = np.array([int(np.argmax([ln[km_al == k, g].mean() for k in range(n_clusters)]))
+                      for g in top20])
+    marker_identity = float((hi_spec == hi_km).mean())
+
+    # Louvain diagnostic (NOT used for clustering)
+    louv_best = None
+    for s in (0, 1, 2):
+        lab = louvain_partition(Wg_c, seed=s)
+        q = modularity(Wg_c, lab)
+        if louv_best is None or q > louv_best[0]:
+            louv_best = (q, lab)
+    louv_q, louv_lab = louv_best
+    louv_ari = ari(spec_lab, louv_lab)
+    louv_nc = int(len(np.unique(louv_lab)))
+    q_spec4 = modularity(Wg_c, spec_lab)
+    intra_frac = 0.0
+    for k in range(n_clusters):
+        m = spec_lab == k
+        intra_frac += Wg_c[np.ix_(m, m)].sum() / 2.0
+    intra_frac = float(intra_frac / (Wg_c.sum() / 2.0))
+
+    # 6. pseudotime graph (full 30-PC space) + Dijkstra from min-PC1 root
+    Wg_f, Wd_f, sigma_f, n_edges_f = knn_graph(coords)
+    root = int(np.argmin(pc1))
+    pt, ncomp_f, pt_fallback = graph_pseudotime(Wd_f, root)
+    pt_corr_pc1 = float(np.corrcoef(pt, pc1)[0, 1])
+
+    # 7. de genes (cluster markers) + pseudotime-slope diagnostic
+    top_de_ranked = np.argsort(F)[::-1][:N_DE]
+    ptc = pt - pt.mean()
+    slopes = (ln.T @ ptc) / float(ptc @ ptc)
+    slope_rank = np.argsort(np.abs(slopes) / (ln.std(axis=0) + 1e-12))[::-1][:10]
+
+    # 8. GRN
+    S = grn_scores(counts[:, tf_idx])
+
+    spec_sizes = np.bincount(spec_lab, minlength=n_clusters)
+    km_sizes = np.bincount(km_lab, minlength=n_clusters)
+
+    np.save(os.path.join(HERE, "clusters.npy"), spec_lab.astype(np.int32))
+    np.save(os.path.join(HERE, "pseudotime.npy"), pt.astype(np.float64))
+    with open(os.path.join(HERE, "de_genes.json"), "w") as f:
+        json.dump({"gene_indices": [int(g) for g in top_de_ranked]}, f)
+    np.save(os.path.join(HERE, "grn_scores.npy"), S.astype(np.float64))
+
+    method_choices = {
+        "pipeline_overview": ("log-normalize -> PCA on all 250 genes (30 PCs; PC1 = bimodal two-state axis) "
+                              "-> clustering: k=15 KNN graph on PCs 2-31 (state axis removed) + spectral "
+                              "normalized cut, K=4 from metadata -> pseudotime: k=15 KNN graph on all 30 PCs "
+                              "+ Dijkstra from min-PC1 root -> de_genes: top 50 by one-way ANOVA F across the "
+                              "4 clusters -> GRN: directed on/off conditional-mean score among the 20 TFs"),
+        "normalization": {
+            "method": "per-cell library-size normalization to 1e4 + log1p",
+            "justification": "counts are raw droplet-style integers (80.8% zeros, row sums 901-3992); "
+                             "standard scRNA-seq normalization before PCA/downstream steps."
+        },
+        "hvg_selection": {
+            "method": "NONE - deliberate deviation from the original plan (top-100-by-variance HVG removed)",
+            "evidence": ("Measured: the top-variance genes are ~70 HIGH-EXPRESSION STATE genes (raw mean ~30, "
+                         "~118/cell when on, frac_on ~0.28, mutually exclusive on-sets: mean pairwise "
+                         "overlap 0.079 vs 0.27 chance) that define a bimodal two-state PC1 axis (states of "
+                         "382/418 cells). The true CLUSTER MARKERS are low-expression genes (log-mean ~1.0 "
+                         "in their cluster vs ~0.2 background; 30-100x lower variance). Variance-based HVG "
+                         "therefore selected the state axis and discarded the markers. Measured failures of "
+                         "the original HVG pipeline: kNN graph DISCONNECTED (2 components), spectral sizes "
+                         "[135,418,93,154] (418-cell blob), pseudotime-PC1 corr -0.195. Revised pipeline: "
+                         "connected graph, balanced sizes, corr +0.956.")
+        },
+        "pca": {
+            "method": "SVD on all 250 mean-centered, unit-variance genes; first 30 PCs",
+            "pc1_role": ("PC1 is the dominant bimodal two-STATE axis (eigval %.0f, ~4x the next; states of "
+                         "382/418 cells with a gap in between) and is the pseudotime axis. The 4 clusters "
+                         "live in the orthogonal PC2+ subspace: state x cluster contingency is near-uniform "
+                         "([[99,106,70,107],[118,75,132,93]]) and every marker gene is expressed in both "
+                         "states." % eigvals[0])
+        },
+        "pc1_removal_for_clustering": {
+            "method": "clustering KNN graph built on PCs 2-31 only (dominant state/trajectory axis removed)",
+            "justification": "standard dominant-gradient removal before clustering: the state axis is "
+                             "independent of cluster identity (each cluster spans both states), and keeping "
+                             "it in the clustering space lets the two states dominate the graph geometry "
+                             "(this is what produced the 418-cell blob in the failed HVG variant)."
+        },
+        "knn_graph": {
+            "method": "k=15 KNN, Euclidean distance, union symmetrization, Gaussian weights "
+                      "exp(-d^2/sigma^2), sigma = median within-neighbor distance",
+            "clustering_graph": {"n_edges": int(n_edges_c), "sigma": float(sigma_c)},
+            "pseudotime_graph": {"n_edges": int(n_edges_f), "sigma": float(sigma_f),
+                                  "connected_components": ncomp_f,
+                                  "disconnected_fallback_used": bool(pt_fallback)},
+            "justification": "standard neighborhood size for ~800 cells; union symmetrization makes the "
+                             "graph undirected for community detection and shortest paths. Two graphs: "
+                             "clustering in PC2-31 (state removed), pseudotime in full 30-PC space (the "
+                             "state axis must be represented for the trajectory to be traversable)."
+        },
+        "clustering": {
+            "method": "spectral clustering (Ng-Jordan-Weiss normalized cut) on the weighted PC2-31 KNN "
+                      "graph: L_sym = I - D^-1/2 W D^-1/2, first K eigenvectors, row-normalized embedding, "
+                      "k-means with 5 fixed-seed restarts (lowest inertia kept)",
+            "K": n_clusters,
+            "K_source": "n_clusters field of data/system_info.json (provided metadata; K was NOT "
+                        "re-derived from the data - silhouette in PC space is uninformative here)",
+            "cluster_sizes": [int(x) for x in spec_sizes],
+            "L_sym_eigvals_0_to_6": [float(x) for x in spec_evals[:7]],
+            "justification": "Louvain/Leiden cannot be used literally (NumPy/SciPy only, no domain "
+                             "toolkits); normalized-cut spectral clustering is the closest standard "
+                             "graph-based community method and every primitive is in scipy (eigh + "
+                             "kmeans2), minimizing custom-code failure surface."
+        },
+        "cross_check_kmeans": {
+            "method": "k-means (5 fixed-seed restarts, lowest inertia) directly in the PC2-31 space - "
+                      "independent of the graph/spectral machinery",
+            "kmeans_cluster_sizes": [int(x) for x in km_sizes],
+            "ari_spectral_vs_kmeans": float(ari_sk),
+            "aligned_cell_agreement": cell_agree,
+            "marker_identity_agreement_top20": marker_identity,
+            "interpretation": "84% cell agreement and 100% marker-gene identity agreement: both methods "
+                              "define the SAME 4 marker-defined clusters; the ARI gap is ~16% boundary-cell "
+                              "churn (all four centroids are near-equidistant, 3.5-4.7 in PC space, so "
+                              "boundary cells are genuinely ambiguous). GMM (diagonal) and Ward hierarchy "
+                              "merge two of the four near-equidistant clusters into one blob - consistent "
+                              "with the equidistant geometry, coarser not contradictory."
+        },
+        "louvain_diagnostic": {
+            "method": "hand-rolled Louvain (modularity, resolution 1.0, multi-pass local moves, 3 fixed "
+                      "seeds, best modularity kept) - run as a DIAGNOSTIC only, NOT used for clustering",
+            "best_louvain_n_communities": louv_nc,
+            "best_louvain_sizes": [int(x) for x in np.bincount(louv_lab)],
+            "best_louvain_modularity": float(louv_q),
+            "modularity_of_spectral_4_partition": float(q_spec4),
+            "ari_spectral_vs_louvain": float(louv_ari),
+            "intra_cluster_edge_weight_fraction": intra_frac,
+            "flat_modularity_evidence": ("Only %.1f%% of edge weight is intra-cluster; the modularity "
+                                         "landscape is flat: Q(2 comm)=0.19, Q(3 comm)=0.22-0.24, Q(4 "
+                                         "comm, spectral)=%.4f, Q(6 comm)=0.288, Q(12-13 comm, best "
+                                         "Louvain runs)=0.307-0.3125. The true 4-partition and a 12-way "
+                                         "over-split are essentially tied on the modularity objective, so "
+                                         "greedy modularity optimization cannot discriminate the "
+                                         "4-cluster structure on this weakly modular graph regardless of "
+                                         "optimizer quality (Louvain implementation validated on a "
+                                         "synthetic 4-blob graph: ARI 1.000, Q = Q(truth), all seeds)."
+                                         % (100 * intra_frac, q_spec4)),
+            "decision": "researcher-accepted: commit the spectral 4-partition; Louvain documented as an "
+                        "uninformative cross-check on this graph."
+        },
+        "pseudotime": {
+            "method": "graph-based shortest path: Dijkstra from the min-PC1 root cell on the k=15 "
+                      "symmetrized KNN graph in full 30-PC space (edge weights = Euclidean PC distances)",
+            "root_cell": root,
+            "root_rule": "cell with minimum PC1 (PC1 = dominant bimodal state/trajectory axis)",
+            "sanity_corr_with_pc1": pt_corr_pc1,
+            "pseudotime_range": [float(pt.min()), float(pt.max())],
+            "documented_assumption": "TRAJECTORY DIRECTION IS UNRESOLVABLE FROM THE DATA (no time labels "
+                                     "exist). Min-PC1 root is the honest default; pseudotime sign is a "
+                                     "convention, not a data-derived fact."
+        },
+        "de_genes": {
+            "method": "top 50 gene indices ranked by one-way ANOVA F across the 4 clusters "
+                      "(between-cluster differential expression) on log-normalized expression",
+            "interpretation": "CLUSTER MARKERS - the standard single-cell meaning of 'marker genes'. The "
+                              "task gives no explicit target; between-cluster was chosen over "
+                              "along-pseudotime or both. The pseudotime-slope ranking (|slope| of gene ~ "
+                              "pseudotime, standardized) was computed as a diagnostic only and is NOT "
+                              "shipped.",
+            "diagnostic_top10_pseudotime_slope_genes": [int(g) for g in slope_rank]
+        },
+        "grn_scores": {
+            "method": "directed on/off conditional mean difference: score[i, j] = (mean of gene j in "
+                      "cells where gene i is expressed (x_i > 0) - mean of gene j where x_i == 0) / "
+                      "std(gene j); convention grn_scores[i, j] = edge i -> j (i regulator, j target); "
+                      "diagonal = 0",
+            "justification": "TFs are sparse low-count genes (expressed in ~17-23% of cells, means "
+                             "0.4-0.7); pairwise Pearson correlations are all ~0 (0 of 380 off-diagonal "
+                             "pairs > 0.3), so correlation-based scoring is blind to the signal. The "
+                             "regulatory effect manifests as a shift of target expression when the "
+                             "regulator is on (top on/off diff 0.79 vs median 0.010 raw counts), which "
+                             "this directed statistic estimates directly. Directionality: the "
+                             "conditioning set differs for i->j vs j->i, so scores are asymmetric by "
+                             "construction (verified: e.g. 16->15 0.303 vs 15->16 0.108 standardized).",
+            "documented_limitation": "WEAK SIGNAL, INCLUDING INDIRECT EFFECTS: cells where regulator i "
+                                     "is on also tend to have other regulators on, so scores conflate "
+                                     "direct and indirect effects; the matrix is a regulatory score, not "
+                                     "a clean adjacency."
+        },
+        "documented_unresolvable": [
+            "Pseudotime sign/direction: no time labels exist; min-PC1 root is a convention (accepted as unresolvable).",
+            "Weak GRN signal including indirect effects (accepted as unresolvable from this data).",
+            "~16% boundary-cell ambiguity: the 4 clusters are near-equidistant in PC space and marker "
+            "signal is low-count/noisy, so a minority of boundary cells get different labels across "
+            "reasonable methods (accepted).",
+            "All 800 cells assumed valid: no QC/doublet/empty-droplet information is available in the data.",
+            "K=4 taken from n_clusters in system_info.json metadata rather than derived from the data.",
+            "TF genes excluded from the clustering/pseudotime driving signal by construction: TFs have "
+            "variance ranks 81-124 (lowly expressed); clustering is marker-gene-driven, consistent with "
+            "the task description (accepted as intended)."
+        ],
+        "reproducibility": {
+            "seeds": "spectral k-means restarts seeds 0-4; KMeans cross-check seeds 0-4; Louvain "
+                     "diagnostic seeds 0-2; SVD/eigh/Dijkstra deterministic given fixed input",
+            "byte_reproducible": "no timestamps or environment-dependent values written; two "
+                                 "consecutive runs produce byte-identical outputs (verified by sha256)"
+        }
+    }
+    with open(os.path.join(HERE, "method_choices.json"), "w") as f:
+        json.dump(method_choices, f, indent=2)
+
+    print("=== EVIDENCE SUMMARY ===")
+    print("cells x genes:", counts.shape, "| n_clusters (metadata):", n_clusters, "| n_tf:", n_tf)
+    print("PCA (all 250 genes) top eigvals:", eigvals[:6].astype(int).tolist())
+    print("clustering graph (PC2-31): edges", n_edges_c, "sigma %.3f" % sigma_c)
+    print("spectral cluster sizes:", [int(x) for x in spec_sizes])
+    print("kmeans   cluster sizes:", [int(x) for x in km_sizes])
+    print("ARI(spectral, KMeans): %.4f | aligned cell agreement: %.3f | marker identity (top20): %.3f"
+          % (ari_sk, cell_agree, marker_identity))
+    print("Louvain diagnostic: best %d communities, sizes %s, Q=%.4f, ARI_vs_spectral=%.4f"
+          % (louv_nc, np.bincount(louv_lab).tolist(), louv_q, louv_ari))
+    print("modularity(spectral 4-partition): %.4f | intra-cluster edge weight fraction: %.3f"
+          % (q_spec4, intra_frac))
+    print("pseudotime: root cell %d | graph components %d | fallback %s" % (root, ncomp_f, pt_fallback))
+    print("pseudotime corr with PC1: %.4f | range %.3f..%.3f" % (pt_corr_pc1, pt.min(), pt.max()))
+    print("top de_genes (ranked, first 20):", [int(g) for g in top_de_ranked[:20]])
+    print("top de_genes F (first 10):", np.round(F[top_de_ranked[:10]], 1).tolist())
+    print("diagnostic top-10 pseudotime-slope genes:", [int(g) for g in slope_rank])
+    print("top-12 directed GRN edges (i->j, standardized; reverse shown):")
+    pairs = [(i, j) for i in range(n_tf) for j in range(n_tf) if i != j]
+    pairs.sort(key=lambda p: -S[p[0], p[1]])
+    for i, j in pairs[:12]:
+        print("  %2d -> %2d : % .3f   (reverse j->i: % .3f)" % (i, j, S[i, j], S[j, i]))
+    print("GRN diagonal all zero:", bool((np.diag(S) == 0).all()))
+    print("outputs written to:", HERE)
+
+
+if __name__ == "__main__":
+    main()

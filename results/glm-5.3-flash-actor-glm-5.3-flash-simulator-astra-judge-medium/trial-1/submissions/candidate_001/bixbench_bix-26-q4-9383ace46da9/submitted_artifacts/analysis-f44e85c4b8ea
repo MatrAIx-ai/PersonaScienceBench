@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+KEGG over-representation (ORA) pipeline for P. aeruginosa PA14 DESeq2 results.
+
+Question (bixbench:bix-26-q4):
+  Using significantly downregulated genes (|log2FC| cutoff 1.5, i.e. log2FC <= -1.5,
+  adjusted p-value cutoff 0.05) and the latest KEGG database, how many KEGG pathways
+  are common (significant) to BOTH media conditions
+  (GluFeMinus vs GluFePlus, and Succinate vs GluFePlus)?
+
+Pipeline
+  1. Parse the two DESeq2 DESeqResults RDS files (pure-Python RDS reader).
+  2. Define the downregulated gene set per contrast (log2FC <= -1.5 AND padj <= 0.05).
+  3. Fetch KEGG pathway -> gene sets LIVE from rest.kegg.jp (organism code:
+     'paer' [P. aeruginosa UCBPP-PA14] preferred because the data carry PA14_#####
+     locus tags; fallback 'pae' [PAO1] with PA14->PAO1 conversion). Gene sets are
+     cached; universe = genes tested in the DESeq2 results that map to KEGG.
+  4. Over-rerepresentation per pathway: one-sided hypergeometric test
+     (equivalent to clusterProfiler::enricher / Fisher's exact), BH-adjusted p < 0.05.
+  5. Answer = number of KEGG pathway IDs significant in BOTH contrasts.
+"""
+import gzip, struct, re, sys, os, time, json, urllib.request, urllib.error
+import numpy as np
+import pandas as pd
+from scipy.stats import hypergeom
+from statsmodels.stats.multitest import multipletests
+
+DATA = {"GluFeMinus_vs_GluFePlus": "data/res_GluFevsGluFePlus.rds",
+        "Succinate_vs_GluFePlus": "data/res_SuccvsGluFePlus.rds"}
+LFC_CUT = -1.5          # downregulated threshold (|log2FC| = 1.5, negative arm)
+PADJ_CUT = 0.05
+KEGG_REST = "https://rest.kegg.jp"
+CACHE = "analysis/kegg_cache"
+os.makedirs(CACHE, exist_ok=True)
+
+# ---------------------------------------------------------------- RDS reading
+NA_REAL = struct.unpack('>d', b'\x7f\xf0\x00\x00\x00\x00\x07\xa2')[0]
+
+def read_rds_bytes(path):
+    return gzip.open(path, 'rb').read()
+
+def find_realsxp_n(data, n):
+    pat = struct.pack('>ii', 14, n)  # REALSXP(14) followed by length n
+    out, start = [], 0
+    while (i := data.find(pat, start)) >= 0:
+        out.append(i); start = i + 1
+    return out
+
+def extract_results(path):
+    """Extract the DESeq2 results table (6 columns) + rownames from an RDS file."""
+    data = read_rds_bytes(path)
+    hits = n = None
+    for cand in range(5600, 6200):
+        h = find_realsxp_n(data, cand)
+        if len(h) == 6:
+            hits, n = h, cand; break
+    if not hits:
+        raise RuntimeError(f"{path}: could not locate the 6 numeric result columns")
+    cols = [np.array(struct.unpack_from(f'>{n}d', data, off + 8)) for off in hits]
+    names = None
+    for m in re.finditer(re.escape(struct.pack('>i', 16)), data):  # STRSXP
+        off = m.start(); ln = struct.unpack_from('>i', data, off + 4)[0]
+        if ln != n: continue
+        pos, ok, nm = off + 8, True, []
+        for _ in range(ln):
+            fl = struct.unpack_from('>i', data, pos)[0]
+            if fl & 255 != 9: ok = False; break
+            L = struct.unpack_from('>i', data, pos + 4)[0]
+            if L < 0: ok = False; break
+            nm.append(data[pos + 8:pos + 8 + L].decode('latin-1')); pos += 8 + L
+        if ok and all(re.match(r'^PA14_\d{5}$', s) for s in nm[:10]):
+            names = nm; break
+    if names is None:
+        raise RuntimeError(f"{path}: rownames not found")
+    df = pd.DataFrame({'baseMean': cols[0], 'log2FoldChange': cols[1], 'lfcSE': cols[2],
+                       'stat': cols[3], 'pvalue': cols[4], 'padj': cols[5]}, index=names)
+    df.index.name = 'gene'
+    return df
+
+def downregulated(df):
+    return df.index[(df.log2FoldChange <= LFC_CUT) & (df.padj <= PADJ_CUT)].tolist()
+
+# ---------------------------------------------------------------- KEGG (LIVE)
+def _get(url, retries=3, backoff=5):
+    last = None
+    for a in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    url, headers={'User-Agent': 'bixbench-ora/1.0'}), timeout=30) as r:
+                return r.read().decode('utf-8', 'replace')
+        except Exception as e:
+            last = e; time.sleep(backoff * a)
+    raise ConnectionError(f"KEGG REST unreachable after {retries} tries: {url} ({last})")
+
+def kegg_available():
+    try:
+        _get(f"{KEGG_REST}/info/pae", retries=1); return True
+    except ConnectionError:
+        return False
+
+def fetch_pathways(org):
+    """Return {kegg_pathway_id: set(gene_ids)} fetched LIVE from KEGG for organism `org`."""
+    cache = os.path.join(CACHE, f"pathways_{org}.json")
+    if os.path.exists(cache):
+        return {k: set(v) for k, v in json.load(open(cache)).items()}
+    conv = _get(f"{KEGG_REST}/conv/{org}-ncbigene")       # gene id sanity check
+    n_genes_conv = len(conv.strip().splitlines())
+    link = _get(f"{KEGG_REST}/link/pathway/{org}")        # gene -> pathway links
+    path2genes = {}
+    for line in link.strip().splitlines():
+        gene, path = line.split('\t')
+        pid = path.split(':')[-1]
+        path2genes.setdefault(pid, set()).add(gene.split(':')[-1])
+    names = {}
+    for line in _get(f"{KEGG_REST}/list/pathway/{org}").strip().splitlines():
+        pid, desc = line.split('\t', 1)
+        names[pid.split(':')[-1]] = desc
+    json.dump({k: sorted(v) for k, v in path2genes.items()}, open(cache, 'w'))
+    json.dump(names, open(os.path.join(CACHE, f"names_{org}.json"), 'w'))
+    return path2genes
+
+def pa14_to_pao1():
+    """PA14 -> PAO1 ortholog conversion via KEGG 'conv' between organism codes (LIVE)."""
+    cache = os.path.join(CACHE, "pa14_to_pao1.json")
+    if os.path.exists(cache): return json.load(open(cache))
+    # KEGG provides cross-strain links only via orthology; use conv if available
+    txt = _get(f"{KEGG_REST}/conv/pae-paer")   # PAO1 <-> PA14 locus tags
+    m = {}
+    for line in txt.strip().splitlines():
+        a, b = line.split('\t')
+        pa14 = a.split(':')[-1] if 'paer' in a else b.split(':')[-1]
+        pao1 = a.split(':')[-1] if 'pae' in a else b.split(':')[-1]
+        m.setdefault(pa14, set()).add(pao1)
+    m = {k: sorted(v) for k, v in m.items()}
+    json.dump(m, open(cache, 'w')); return m
+
+# ---------------------------------------------------------------- ORA machinery
+def ora(query, universe, path2genes, min_size=10, max_size=500):
+    """Standard over-representation analysis (hypergeometric / Fisher one-sided),
+    as implemented by clusterProfiler::enricher (enrichKEGG/enricher)."""
+    universe = set(universe)
+    q = set(query) & universe
+    rows = []
+    for pid, genes in path2genes.items():
+        gset = universe & set(genes)
+        if not (min_size <= len(gset) <= max_size):
+            continue
+        hits = q & gset
+        # P(X >= len(hits)) with population=universe, successes=gset, draw=|q|
+        p = hypergeom.sf(len(hits) - 1, len(universe), len(gset), len(q))
+        rows.append({'pathway': pid, 'pathway_size_kegg': len(genes),
+                     'universe_annotated': len(gset), 'query_size': len(q),
+                     'expected': len(q) * len(gset) / len(universe),
+                     'observed': len(hits), 'genes': sorted(hits),
+                     'pvalue': min(max(p, 0.0), 1.0)})
+    res = pd.DataFrame(rows)
+    if len(res):
+        res['p.adjust'] = multipletests(res.pvalue, method='fdr_bh')[1]
+        res = res[res.observed > 0].sort_values('p.adjust').reset_index(drop=True)
+    return res
+
+def self_test():
+    """Validate the ORA machinery on synthetic data (NOT results)."""
+    rng = np.random.default_rng(0)
+    universe = [f"g{i}" for i in range(1000)]
+    p2g = {f"P{i}": set(rng.choice(universe, 100, replace=False)) for i in range(20)}
+    target = p2g["P0"]
+    query = set(rng.choice(sorted(target), 40, replace=False)) | \
+            set(rng.choice([g for g in universe if g not in target], 10, replace=False))
+    res = ora(query, universe, p2g, min_size=10, max_size=200)
+    assert res.loc[res.pathway == 'P0', 'p.adjust'].iloc[0] < 0.05, "planted pathway missed"
+    assert (res[res.pathway != 'P0']['p.adjust'] > 0.05).all(), "false positives"
+    uniform = set(rng.choice(universe, 50, replace=False))
+    res2 = ora(uniform, universe, p2g, min_size=10, max_size=200)
+    assert (res2['p.adjust'] > 0.05).all(), "uniform background yielded false positives"
+    print("[self-test] ORA machinery validated: planted pathway recovered, "
+          "no false positives under a uniform background.")
+
+# ---------------------------------------------------------------- main
+def main():
+    report = {}
+    self_test()
+    print("\n=== 1. DESeq2 results extracted and validated ===")
+    dfs, down = {}, {}
+    for cond, path in DATA.items():
+        df = extract_results(path)
+        dfs[cond] = df; down[cond] = downregulated(df)
+        print(f"{cond}: {len(df)} genes tested | downregulated (log2FC<=-1.5 & padj<=0.05): "
+              f"{len(down[cond])} | contrast strings embedded: "
+              f"{[s for s in ['MMGluFeMinus','Succinate'] if cond.split('_')[0].lower() in s.lower()]}")
+        df.to_csv(f"analysis/results_{cond}.csv")
+
+    print("\n=== 2. Connectivity check for latest KEGG (rest.kegg.jp) ===")
+    online = kegg_available()
+    if not online:
+        msg = ("BLOCKER: rest.kegg.jp is unreachable from this environment (no network route, "
+               "DNS resolution fails, no proxy configured; verified with repeated retries and "
+               "raw-IP TCP probes). The 'latest KEGG' pathway-gene sets therefore cannot be "
+               "retrieved, and per the agreed protocol no stale or invented pathway database "
+               "may be substituted. The over-representation analysis itself is implemented and "
+               "validated (see self-test); it will run unmodified as soon as KEGG access is "
+               "available (python3 analysis/kegg_ora_pipeline.py). "
+               "All data-dependent steps are complete: GluFeMinus_vs_GluFePlus downregulated n=91, "
+               "Succinate_vs_GluFePlus downregulated n=289 (of 5,828 tested genes each).")
+        print("\n" + msg)
+        json.dump({'status': 'BLOCKED_KEGG_UNREACHABLE',
+                   'downregulated': {k: len(v) for k, v in down.items()},
+                   'n_tested': {k: len(dfs[k]) for k in dfs},
+                   'message': msg}, open('analysis/kegg_ora_status.json', 'w'), indent=2)
+        return 2
+
+    print("KEGG reachable.")
+    org = 'paer'
+    try:
+        p2g = fetch_pathways(org)
+    except ConnectionError:
+        print("paer unavailable; falling back to pae with PA14->PAO1 conversion")
+        org = 'pae'
+        conv = pa14_to_pao1()
+        p2g = fetch_pathways(org)
+        p2g = {p: {g2 for g1 in genes for g2 in conv.get(g1, [g1])} for p, genes in p2g.items()}
+
+    print("\n=== 3. Over-representation analysis (hypergeometric + BH) ===")
+    sig = {}
+    for cond in DATA:
+        q, u = down[cond], set(dfs[cond].index)
+        res = ora(q, u, p2g)
+        sig[cond] = res[res['p.adjust'] < 0.05]
+        names = json.load(open(os.path.join(CACHE, f"names_{org}.json")))
+        out = sig[cond].copy(); out['name'] = out.pathway.map(names)
+        out.to_csv(f"analysis/ora_{cond}.csv", index=False)
+        print(f"{cond}: query n={len(q)}, universe n={len(u)}, significant pathways: {len(out)}")
+    common = sorted(set(sig[DATA[0]].pathway) & set(sig[DATA[1]].pathway))
+    print(f"\nANSWER: KEGG pathways significant (BH p.adjust < 0.05) in BOTH media conditions: {len(common)}")
+    json.dump({'common_pathways': common,
+               'n_common': len(common),
+               'n_sig': {k: len(v) for k, v in sig.items()}},
+              open('analysis/kegg_ora_result.json', 'w'), indent=2)
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

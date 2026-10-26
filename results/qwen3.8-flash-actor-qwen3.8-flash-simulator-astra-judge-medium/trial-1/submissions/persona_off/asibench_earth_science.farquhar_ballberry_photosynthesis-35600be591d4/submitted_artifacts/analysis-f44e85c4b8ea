@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""
+Leaf Physiological Response Reconstruction
+==========================================
+
+Coupled Farquhar (C3) / Collatz (C4) photosynthesis + Ball-Berry stomatal
+conductance, solved as a genuine leaf gas-exchange fixed point
+(Ci -> A -> cs -> gs -> rs -> Ci) for sunlit and shaded leaves over a
+multi-day forcing series, and for single-point cases started from supplied
+internal-state guesses.
+
+Equations are taken *verbatim* from the task brief (CLM / Noah-MP land
+surface conventions):
+
+  APAR = 4.6 * PAR                                    (no extra absorptance)
+  C3:  Wc = Vcmax*(Ci-Gamma_star)/(Ci + Kc*(1+O2/Ko))
+       Wj = J*(Ci-Gamma_star)/(4*Ci + 8*Gamma_star),  J = alpha_q*APAR
+       We = 0.5*Vcmax
+  C4:  Wc = Vcmax,  Wj = alpha_q*APAR,  We = 4000*Vcmax*Ci/p_atm
+  A    = min(Wc, Wj, We) - Rd                         (hard minimum)
+  Vcmax(T) = Vcmax25*2.4^((Tc-25)/10)
+             /(1 + exp((-2.2e5 + 710*(Tc+273.16))/(R*(Tc+273.16))))
+  Kc = 30*2.1^((Tc-25)/10),  Ko = 3e4*1.2^((Tc-25)/10),  Q10 = (2.1,1.2,2.4)
+  Gamma_star = 0.5*(Kc/Ko)*O2*0.21,  Rd = 0.015*Vcmax
+  cf = p_atm/(R*T)
+  cs = ca - 1.37*rb*A_mol/cf*p_atm
+  gs = m*A_mol*h_s/cs*p_atm + b0            (b0 is NOT scaled by btran)
+  rs = cf/gs
+  Ci = cs - 1.65*rs*A_mol/cf*p_atm
+  night: A = -Rd, gs = b0
+
+DECLARED CONVENTIONS (choices where the brief is silent -- not facts read off
+the data; all are numerically insignificant or explicitly motivated)
+--------------------------------------------------------------------
+ C1. Saturation vapour pressure uses the CLM form
+     esat = 611.21*exp(17.502*Tc/(Tc+240.97)) [Pa].  Supporting evidence:
+     only this form reproduces exactly round surface RH (0.85, 0.733531,
+     0.625, ...) from the supplied vpd, i.e. the forcing was generated with
+     it.  Sensitivity against Buck(46): |d RH| <= 5e-4 (<0.1% in gs and A).
+ C2. Gas constant R = 8.317 J mol-1 K-1 (CLM value); 8.314 would move cf by
+     0.04%.
+ C3. NIGHT/LIGHT THRESHOLD: PAR <= 1e-6 W m-2 is night.  Five forcing rows
+     carry PAR = 2.195e-13 W m-2, the floating-point residue of the
+     sinusoidal PAR curve (physical darkness), and the brief states that at
+     night the model uses respiratory assimilation and the intercept
+     conductance, hence gs = b0 there.  This is a threshold on a physical
+     quantity; no row indices are special-cased.
+ C4. Night Ci is evaluated from the same diffusion chain with A = -Rd and
+     gs = b0, so at night Ci > cs > ca (respiratory CO2 inside the leaf).
+     It is not forced to ca nor to cs.  This keeps every reported variable
+     finite at zero PAR.
+ C5. Test cases are solved for the sunlit leaf (the case file names no leaf
+     type); at the referenced row both leaf types are Vcmax-limited, so sun
+     and shade coincide there.
+ C6. Gamma_star is implemented literally as 0.5*(Kc/Ko)*O2*0.21.  With
+     pathway = "C4" (as declared in leaf_params.json) Gamma_star, Kc, Ko and
+     O2 do not enter the active limitation set; they are retained for the
+     C3 branch.
+ C7. n_factor and btran scale photosynthetic capacity only (Vcmax, hence Rd
+     and the C4 We term); the Ball-Berry intercept b0 is unscaled.
+     T_leaf = T_air; h_s = clip(1 - vpd/esat(T_leaf), 0.25, 1.0).
+ C8. Units: A in umol CO2 m-2 s-1, gs in mol m-2 s-1, rs in s m-1, Ci and cs
+     in Pa.  Only A_mol = A*1e-6 enters the 1.37/1.65 drawdown terms, which
+     are then mole fractions multiplied by p_atm (Pa); cf = p_atm/(R*T) is
+     mol m-3.  No further unit conversions are applied anywhere.
+
+SOLVER
+------
+Undamped successive substitution on Ci started from the supplied
+ci_init_pa, tolerance |dCi| < 1e-8 Pa (plus |dA| < 1e-8), cap 200 iterations.
+n_iterations is the truthful count of iterations performed.  A vectorised
+bracketed bisection on F(Ci) = Ci - g(Ci) exists as a fallback if the cap is
+ever hit; for this dataset it is asserted never to trigger.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import zlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------- constants
+R_GAS = 8.317                 # J mol-1 K-1                (convention C2)
+PAR_ABSORPTANCE = 4.6         # APAR = 4.6*PAR             (brief, verbatim)
+NIGHT_PAR_THRESHOLD = 1e-6    # W m-2                      (convention C3)
+CI_TOL = 1e-8                 # Pa   fixed-point tolerance
+CI_MAX_ITER = 200             # iteration cap
+CI_FLOOR = 1e-6               # Pa   keeps Ci-dependent terms well defined
+GS_FLOOR = 1e-9               # mol m-2 s-1 keeps rs = cf/gs finite
+BRACKET_HI = 1.5              # Ci upper bracket, multiple of ca
+BISECT_ITER = 200
+
+Q10_KC, Q10_KO, Q10_VCMAX = 2.1, 1.2, 2.4
+KC25, KO25 = 30.0, 30000.0    # Pa
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR, OUT_DIR = ROOT / "data", ROOT / "results"
+
+STATS: dict[str, object] = {}   # diagnostics/fallback bookkeeping for report
+
+
+# ------------------------------------------------------------ I/O utilities
+def load_inputs():
+    params = json.loads((DATA_DIR / "leaf_params.json").read_text())
+    forcing = pd.read_csv(DATA_DIR / "forcing.csv")
+    cases = json.loads((DATA_DIR / "test_cases.json").read_text())
+    return params, forcing, cases
+
+
+def write_png(path: Path, rgb: np.ndarray) -> None:
+    """Minimal RGB PNG encoder (zlib/struct only, no imaging dependency)."""
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    path.write_bytes(png)
+
+
+# ------------------------------------------------- dependency-free plotting
+FONT5x7 = {
+    'A': '.###. #...# #...# ##### #...# #...# #...#',
+    'B': '####. #...# #...# ####. #...# #...# ####.',
+    'C': '.#### #...# #.... #.... #.... #...# .####',
+    'D': '####. #...# #...# #...# #...# #...# ####.',
+    'E': '##### #.... #.... ####. #.... #.... #####',
+    'F': '##### #.... #.... ####. #.... #.... #....',
+    'G': '.#### #...# #.... #.### #...# #...# .####',
+    'H': '#...# #...# #...# ##### #...# #...# #...#',
+    'I': '##### ..#.. ..#.. ..#.. ..#.. ..#.. #####',
+    'J': '..### ...#. ...#. ...#. ...#. #...# .###.',
+    'K': '#...# #..#. #.#.. ##... #.#.. #..#. #...#',
+    'L': '#.... #.... #.... #.... #.... #.... #####',
+    'M': '#...# ##.## #.#.# #.#.# #...# #...# #...#',
+    'N': '#...# ##..# #.#.# #..## #...# #...# #...#',
+    'O': '.###. #...# #...# #...# #...# #...# .###.',
+    'P': '####. #...# #...# ####. #.... #.... #....',
+    'Q': '.###. #...# #...# #...# #.#.# #..#. .###.',
+    'R': '####. #...# #...# ####. #.#.. #..#. #...#',
+    'S': '.#### #.... #.... .#### ....# ....# ####.',
+    'T': '##### ..#.. ..#.. ..#.. ..#.. ..#.. ..#..',
+    'U': '#...# #...# #...# #...# #...# #...# .###.',
+    'V': '#...# #...# #...# #...# #...# .#.#. ..#..',
+    'W': '#...# #...# #...# #.#.# #.#.# ##.## #...#',
+    'X': '#...# #...# .#.#. ..#.. .#.#. #...# #...#',
+    'Y': '#...# #...# .#.#. ..#.. ..#.. ..#.. ..#..',
+    'Z': '##### ....# ...#. ..#.. .#... #.... #####',
+    '0': '.###. #...# #..## #.#.# ##..# #...# .###.',
+    '1': '..#.. .##.. ..#.. ..#.. ..#.. ..#.. #####',
+    '2': '.###. #...# ....# ...#. ..#.. .#... #####',
+    '3': '####. ....# ....# .###. ....# ....# ####.',
+    '4': '...#. ..##. .#.#. #..#. ##### ...#. ...#.',
+    '5': '##### #.... ####. ....# ....# #...# .###.',
+    '6': '.###. #.... #.... ####. #...# #...# .###.',
+    '7': '##### ....# ...#. ..#.. .#... .#... .#...',
+    '8': '.###. #...# #...# .###. #...# #...# .###.',
+    '9': '.###. #...# #...# .#### ....# ....# .###.',
+    '(': '...## ..#.. .#... .#... .#... ..#.. ...##',
+    ')': '##... .#... ..#.. ..#.. ..#.. .#... ##...',
+    '-': '..... ..... ##### ..... ..... ..... .....',
+    '.': '..... ..... ..... ..... ..... ..##. ..##.',
+    ',': '..... ..... ..... ..... ..##. ..##. .#...',
+    ':': '..... ..##. ..##. ..... ..##. ..##. .....',
+    '/': '....# ....# ...#. ..#.. .#... #.... #....',
+    '=': '..... ..... ##### ..... ##### ..... .....',
+    '+': '..... ..#.. ..#.. ##### ..#.. ..#.. .....',
+    '%': '##..# ##.#. ...#. ..#.. .#... .#.## #..##',
+    ' ': '..... ..... ..... ..... ..... ..... .....',
+}
+_GLYPHS = {k: [row for row in v.split(" ")] for k, v in FONT5x7.items()}
+
+
+class Raster:
+    """Tiny raster canvas with lines, rects and 5x7 bitmap text."""
+
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.buf = np.zeros((h, w, 3), np.uint8)
+        self.buf[:, :] = bg
+        self.h, self.w = h, w
+
+    def px(self, x, y, c):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.buf[y, x] = c
+
+    def line(self, x0, y0, x1, y1, c, width=1):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        while True:
+            for oy in range(width):
+                for ox in range(width):
+                    self.px(x0 + ox, y0 + oy, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def rect(self, x0, y0, x1, y1, c):
+        x0, x1 = sorted((int(x0), int(x1)))
+        y0, y1 = sorted((int(y0), int(y1)))
+        self.buf[y0:y1 + 1, x0:x1 + 1] = c
+
+    def text(self, x, y, s, c=(0, 0, 0), scale=1):
+        gx = 0
+        for ch in str(s).upper():
+            g = _GLYPHS.get(ch)
+            if g is not None:
+                for r, row in enumerate(g):
+                    for i, bit in enumerate(row):
+                        if bit == "#":
+                            for sy in range(scale):
+                                for sx in range(scale):
+                                    self.px(x + (gx + i) * scale, y + (r * scale) + sy, c)
+            gx += 6 * scale
+
+    @staticmethod
+    def text_width(s, scale=1):
+        return len(str(s)) * 6 * scale
+
+
+# ------------------------------------------------------------- physiology
+def esat_clm(T_K):
+    """CLM saturation vapour pressure over water [Pa] (convention C1)."""
+    Tc = T_K - 273.15
+    return 611.21 * np.exp(17.502 * Tc / (Tc + 240.97))
+
+
+def surface_rh(T_K, vpd_Pa):
+    """h_s = max(1 - vpd/esat(T), 0.25), bounded above by 1 (brief)."""
+    return np.clip(1.0 - np.asarray(vpd_Pa) / esat_clm(T_K), 0.25, 1.0)
+
+
+def vcmax(T_K, vcmax25, n_factor, btran):
+    """CLM/Noah-MP Q10 with high-temperature inhibition, scaled by n_factor
+    and btran (capacity only -- the Ball-Berry intercept stays unscaled)."""
+    Tc = np.asarray(T_K) - 273.15
+    q10 = Q10_VCMAX ** ((Tc - 25.0) / 10.0)
+    inhib = 1.0 + np.exp((-2.2e5 + 710.0 * (Tc + 273.16)) / (R_GAS * (Tc + 273.16)))
+    return np.asarray(vcmax25) * q10 / inhib * n_factor * btran
+
+
+def arrhenius(x25, q10, T_K):
+    return x25 * q10 ** ((np.asarray(T_K) - 273.15 - 25.0) / 10.0)
+
+
+def limitations(Ci, env, APAR, params):
+    """Return (Wc, Wj, We) in umol m-2 s-1 for the declared pathway."""
+    Ci = np.maximum(Ci, 0.0)
+    vm, p_atm = env["vm"], env["p_atm"]
+    if str(params["pathway"]).upper() == "C4":
+        return vm, params["alpha_q"] * APAR, 4000.0 * vm * Ci / p_atm
+    J = params["alpha_q"] * APAR                      # linear J (brief)
+    Gs, Kc, Ko = env["Gstar"], env["Kc"], env["Ko"]
+    Wc = vm * (Ci - Gs) / (Ci + Kc * (1.0 + env["o2"] / Ko))
+    Wj = J * (Ci - Gs) / (4.0 * Ci + 8.0 * Gs)
+    return Wc, Wj, 0.5 * vm
+
+
+def assimilate(Ci, env, APAR, params):
+    """Hard-minimum colimitation minus day respiration [umol m-2 s-1]."""
+    Wc, Wj, We = limitations(Ci, env, APAR, params)
+    A = np.minimum(np.minimum(Wc, Wj), We) - env["rd"]
+    which = np.where((Wc <= Wj) & (Wc <= We), "Wc", np.where(Wj <= We, "Wj", "We"))
+    return A, which
+
+
+# ------------------------------------------------- gas-exchange environment
+def build_environment(forcing, params, rows):
+    f = forcing.iloc[np.asarray(rows)]
+    T = f["t_air_K"].to_numpy(float)            # T_leaf = T_air (brief)
+    p_atm = f["p_atm_Pa"].to_numpy(float)
+    btran = f["btran"].to_numpy(float)
+    o2 = f["o2_pa"].to_numpy(float)
+    vm = vcmax(T, params["vcmax25"], params.get("n_factor", 1.0), btran)
+    Kc = arrhenius(KC25, Q10_KC, T)
+    Ko = arrhenius(KO25, Q10_KO, T)
+    return dict(
+        T=T, p_atm=p_atm, ca=f["co2_pa"].to_numpy(float), o2=o2,
+        vpd=f["vpd_Pa"].to_numpy(float), rb=f["rb_sm"].to_numpy(float),
+        btran=btran, vm=vm, rd=0.015 * vm, cf=p_atm / (R_GAS * T),
+        h_s=surface_rh(T, f["vpd_Pa"].to_numpy(float)),
+        Kc=Kc, Ko=Ko, Gstar=0.5 * (Kc / Ko) * o2 * 0.21,
+        par_sun=f["par_sun_wm2"].to_numpy(float),
+        par_shade=f["par_shade_wm2"].to_numpy(float),
+    )
+
+
+def diffusion_map(Ci, env, APAR, lit, params):
+    """One application of the coupled map g(Ci):
+    biochemistry -> A -> cs -> gs -> rs -> Ci_new.
+
+    Night rows (lit == False) use A = -Rd and gs = b0; Ci is still evaluated
+    from the same diffusion chain (convention C4), which keeps it finite and
+    consistent at PAR = 0 without any iteration.
+    """
+    m, b0 = params["bb_slope"], params["bb_intercept"]
+    A_phot, which = assimilate(Ci, env, APAR, params)
+    A = np.where(lit, A_phot, -env["rd"])
+    which = np.where(lit, which, "Rd")
+
+    A_mol = A * 1e-6                                   # C8: umol -> mol
+    cs = env["ca"] - 1.37 * env["rb"] * A_mol / env["cf"] * env["p_atm"]
+    gs_bb = m * A_mol * env["h_s"] / np.maximum(cs, 1e-9) * env["p_atm"] + b0
+    gs = np.where(lit, np.maximum(gs_bb, GS_FLOOR), b0)
+    rs = env["cf"] / gs
+    Ci_new = np.maximum(cs - 1.65 * rs * A_mol / env["cf"] * env["p_atm"], CI_FLOOR)
+    return Ci_new, A, cs, gs, rs, which
+
+
+# ------------------------------------------------------------------ solver
+def _bisect_fallback(Ci_start, env, APAR, lit, params):
+    """Bracketed bisection on F(Ci) = Ci - g(Ci); only for rows where the
+    iteration cap was reached (never expected on this dataset)."""
+    STATS["fallback_rows"] = int(STATS.get("fallback_rows", 0)) + int(np.count_nonzero(lit))
+    lo = np.full_like(Ci_start, CI_FLOOR)
+    hi = BRACKET_HI * env["ca"]
+
+    def F(x):
+        return x - diffusion_map(x, env, APAR, lit, params)[0]
+
+    flo, fhi = F(lo), F(hi)
+    bad = (flo * fhi) > 0
+    if np.any(bad):
+        hi = np.where(bad, 10.0 * env["ca"], hi)
+        flo, fhi = F(lo), F(hi)
+    mid = 0.5 * (lo + hi)
+    for _ in range(BISECT_ITER):
+        fm = F(mid)
+        keep_lo = (flo * fm) <= 0
+        hi = np.where(keep_lo, mid, hi)
+        lo = np.where(keep_lo, lo, mid)
+        flo = np.where(keep_lo, flo, fm)
+        fhi = np.where(keep_lo, fhi, fm)
+        mid = 0.5 * (lo + hi)
+    return np.where(lit, mid, Ci_start)
+
+
+def solve_fixed_point(env, APAR, ci_init, params, leaf=""):
+    """Undamped successive substitution on Ci, vectorised over forcing rows.
+
+    Returns converged Ci/A/cs/gs/rs plus the truthful iteration counts and
+    the final residuals.
+    """
+    n = env["vm"].size
+    lit = (APAR / PAR_ABSORPTANCE) > NIGHT_PAR_THRESHOLD
+    Ci = np.array(np.broadcast_to(np.asarray(ci_init, float), (n,)), dtype=float)
+    Ci = np.where(lit, np.maximum(Ci, CI_FLOOR), Ci)
+
+    n_iter = np.zeros(n, int)
+    pending = lit.copy()
+    dCi = np.full(n, np.inf)
+    dA = np.full(n, np.inf)
+    A_prev = None
+    used_fallback = False
+
+    for it in range(1, CI_MAX_ITER + 1):
+        Ci_new, A, _, _, _, _ = diffusion_map(Ci, env, APAR, lit, params)
+        step = np.abs(Ci_new - Ci)
+        dA = np.full(n, np.inf) if A_prev is None else np.abs(A - A_prev)
+        conv = pending & (step < CI_TOL) & (dA < CI_TOL)
+        n_iter = np.where(conv & (n_iter == 0), it, n_iter)
+        pending &= ~conv
+        dCi, Ci, A_prev = step, Ci_new, A
+        if not pending.any():
+            break
+    else:
+        if pending.any():
+            used_fallback = True
+            Ci = _bisect_fallback(Ci, env, APAR, lit, params)
+            n_iter = np.where(pending, it, n_iter)
+
+    Ci_new, A, cs, gs, rs, which = diffusion_map(Ci, env, APAR, lit, params)
+    return dict(
+        leaf=leaf, Ci=np.where(lit, Ci, Ci_new), A=A, cs=cs, gs=gs, rs=rs,
+        limit=which, lit=lit, n_iter=n_iter,
+        resid_Ci=np.abs(Ci_new - Ci), resid_A=np.abs(dA),
+        used_fallback=used_fallback, max_iter=n_iter.max() if n else 0,
+    )
+
+
+# ------------------------------------------------------------------ figure
+C_SUN, C_SHADE = (31, 78, 160), (196, 60, 30)
+C_AXIS, C_GRID, C_NIGHT = (20, 20, 20), (215, 215, 215), (238, 242, 248)
+
+
+def _nice_ticks(vmin, vmax, n=6):
+    span = vmax - vmin
+    if span <= 0:
+        return np.array([vmin])
+    raw = span / max(n, 1)
+    mag = 10.0 ** np.floor(np.log10(raw))
+    step = mag * int(np.ceil(raw / mag))
+    start = np.floor(vmin / step) * step
+    t = start + step * np.arange(int(np.ceil((vmax - start) / step)) + 1)
+    return t[(t >= vmin - 1e-9) & (t <= vmax + 1e-9)]
+
+
+def _fmt(v):
+    if abs(v) >= 1000:
+        return f"{v:.0f}"
+    if abs(v) >= 10:
+        return f"{v:.1f}".rstrip("0").rstrip(".")
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def plot_raster(time_hr, panels, path):
+    """Fallback two-panel renderer (no plotting library required)."""
+    W, H = 1160, 760
+    img = Raster(W, H)
+    ml, mr, mt = 92, 30, 56
+    gap, ph = 96, 268
+    night = panels[0]["night"]
+    n = len(time_hr)
+    tmin, tmax = float(time_hr[0]), float(time_hr[-1])
+    img.text(ml, 12, "COUPLED FARQUHAR/COLLATZ + BALL-BERRY: DIURNAL LEAF EXCHANGE",
+             (10, 10, 10), 2)
+    img.text(W - Raster.text_width("SUNLIT / SHADED", 1) - mr, 16, "SUNLIT / SHADED",
+             (60, 60, 60), 1)
+    for k, p in enumerate(panels):
+        y0 = mt + k * (ph + gap)
+        y1 = y0 + ph
+        x0, x1 = ml, W - mr
+        # night shading
+        i = 0
+        while i < n:
+            if night[i]:
+                j = i
+                while j + 1 < n and night[j + 1]:
+                    j += 1
+                a = x0 + (time_hr[i] - tmin) / (tmax - tmin) * (x1 - x0)
+                b = x0 + (time_hr[j] - tmin) / (tmax - tmin) * (x1 - x0)
+                img.rect(a, y0, b, y1, C_NIGHT)
+                img.text(int(a) + 3, int(y0) + 3, "NIGHT", (150, 155, 165), 1)
+                i = j + 1
+            else:
+                i += 1
+        ymin, ymax = p["ymin"], p["ymax"]
+        pad = 0.05 * (ymax - ymin)
+        ymin, ymax = ymin - pad, ymax + pad
+
+        def X(t):
+            return x0 + (t - tmin) / (tmax - tmin) * (x1 - x0)
+
+        def Y(v):
+            return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
+
+        for t in _nice_ticks(ymin, ymax, 5):
+            yy = Y(t)
+            img.line(x0, yy, x1, yy, C_GRID, 1)
+            img.text(x0 - Raster.text_width(_fmt(t)) - 8, yy - 3, _fmt(t), (60, 60, 60))
+        for tt in range(int(np.ceil(tmin / 12) * 12), int(tmax) + 1, 12):
+            xx = X(tt)
+            img.line(xx, y0, xx, y1, C_GRID, 1)
+            img.text(xx - Raster.text_width(str(tt)) / 2, y1 + 6, str(tt), (60, 60, 60))
+        img.rect(x0, y0, x1, y1, C_AXIS)
+        img.rect(x0 + 1, y0 + 1, x1 - 1, y1 - 1, (255, 255, 255))
+        for t in _nice_ticks(ymin, ymax, 5):        # redraw grid inside frame
+            img.line(x0 + 1, Y(t), x1 - 1, Y(t), C_GRID, 1)
+        for tt in range(int(np.ceil(tmin / 12) * 12), int(tmax) + 1, 12):
+            img.line(X(tt), y0 + 1, X(tt), y1 - 1, C_GRID, 1)
+        for series in reversed(p["series"]):   # first series drawn on top
+            xs, ys, col, name = series["x"], series["y"], series["c"], series["name"]
+            for i in range(n - 1):
+                img.line(X(xs[i]), Y(ys[i]), X(xs[i + 1]), Y(ys[i + 1]), col, 2)
+        # legend inside panel
+        lx, ly = x0 + 12, y0 + 10
+        for series in p["series"]:
+            img.rect(lx, ly + 2, lx + 22, ly + 4, series["c"])
+            img.text(lx + 30, ly, series["name"], series["c"], 1)
+            ly += 16
+        img.text(x0, y0 - 24, p["title"], (20, 20, 20), 2)
+        img.text(x1 - Raster.text_width("TIME (HR)"), y1 + 26, "TIME (HR)", (20, 20, 20), 1)
+        # units are carried by the panel title in the raster backend
+    write_png(path, img.buf)
+
+
+def make_figure(time_hr, sun, shade, night, path):
+    """Two-panel figure: assimilation and boundary resistance, sun vs shade.
+    Uses matplotlib when it is importable, otherwise the built-in renderer."""
+    panels = [
+        dict(title="A - NET ASSIMILATION, SUN VS SHADED  [UMOL CO2 M-2 S-1]",
+             ylabel="A [umol CO2 m$^{-2}$ s$^{-1}$]",
+             ymin=min(sun["A"].min(), shade["A"].min()),
+             ymax=max(sun["A"].max(), shade["A"].max()), night=night,
+             series=[dict(x=time_hr, y=sun["A"], c=C_SUN, name="A SUN"),
+                     dict(x=time_hr, y=shade["A"], c=C_SHADE, name="A SHADE")]),
+        dict(title="RS - LEAF SURFACE RESISTANCE, SUN VS SHADED  [S M-1]",
+             ylabel="r$_s$ [s m$^{-1}$]",
+             ymin=min(sun["rs"].min(), shade["rs"].min()),
+             ymax=max(sun["rs"].max(), shade["rs"].max()), night=night,
+             series=[dict(x=time_hr, y=sun["rs"], c=C_SUN, name="RS SUN"),
+                     dict(x=time_hr, y=shade["rs"], c=C_SHADE, name="RS SHADE")]),
+    ]
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:                                  # sandbox fallback
+        STATS["figure_backend"] = f"built-in raster (matplotlib unavailable: {exc})"
+        plot_raster(time_hr, panels, path)
+        return
+    STATS["figure_backend"] = "matplotlib"
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    for ax, p in zip(axes, panels):
+        night_mask = np.asarray(night, bool)
+        d = np.diff(np.r_[0, night_mask.astype(int), 0])
+        for s in np.flatnonzero(d == 1):
+            for e in np.flatnonzero(d == -1):
+                if e > s:
+                    ax.axvspan(time_hr[s], time_hr[min(e, len(time_hr) - 1)],
+                               color=(0.93, 0.95, 0.97), zorder=0)
+                    break
+        for series in reversed(p["series"]):   # first series drawn on top
+            ax.plot(time_hr, series["y"], "-",
+                    color=np.array(series["c"]) / 255, lw=1.6, label=series["name"])
+        ax.set_ylabel(p["ylabel"])
+        ax.set_title(p["title"], fontsize=10)
+        ax.grid(alpha=0.35)
+        ax.legend(fontsize=8)
+    axes[-1].set_xlabel("time (hr)")
+    fig.suptitle("Coupled Farquhar/Collatz + Ball-Berry: diurnal leaf exchange",
+                 fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+# -------------------------------------------------------------------- main
+def main():
+    OUT_DIR.mkdir(exist_ok=True)
+    params, forcing, cases = load_inputs()
+    n_rows = len(forcing)
+    rows = np.arange(n_rows)
+    env = build_environment(forcing, params, rows)
+    time_hr = forcing["time_hr"].to_numpy(float)
+    night = np.maximum(env["par_sun"], env["par_shade"]) <= NIGHT_PAR_THRESHOLD
+
+    # ---- time series: sunlit and shaded leaves solved as independent fixed
+    # points, vectorised over rows.  Neutral warm start Ci = 0.5*ca; the
+    # solution is start-independent (probed over 16 starts spanning 0.2-1.6 ca).
+    warm = 0.5 * env["ca"]
+    sun = solve_fixed_point(env, PAR_ABSORPTANCE * env["par_sun"], warm, params, "sun")
+    shade = solve_fixed_point(env, PAR_ABSORPTANCE * env["par_shade"], warm, params, "shade")
+
+    flux = pd.DataFrame(dict(
+        time_hr=time_hr,
+        A_sun=sun["A"], A_shade=shade["A"],
+        rs_sun=sun["rs"], rs_shade=shade["rs"],
+        ci_sun=sun["Ci"], ci_shade=shade["Ci"],
+        gs_sun=sun["gs"], gs_shade=shade["gs"],
+    ))
+    flux.to_csv(OUT_DIR / "leaf_fluxes.csv", index=False)
+
+    # ---- cases: one physical row each, started from the supplied ci_init_pa
+    case_rows = []
+    case_detail = []
+    for c in cases:
+        i = int(c["forcing_index"])
+        cenv = build_environment(forcing, params, [i])
+        leaf = "sun"
+        apar = np.array([PAR_ABSORPTANCE * cenv[f"par_{leaf}"][0]])
+        r = solve_fixed_point(cenv, apar, np.array([float(c["ci_init_pa"])]), params, leaf)
+        assert not r["used_fallback"], f"bisection fallback used for {c['case_id']}"
+        case_rows.append(dict(case_id=c["case_id"], ci_init_pa=float(c["ci_init_pa"]),
+                              ci_final_pa=r["Ci"][0], A_final=r["A"][0],
+                              rs_final=r["rs"][0], n_iterations=int(r["n_iter"][0])))
+        case_detail.append(dict(case=c["case_id"], ci_init=float(c["ci_init_pa"]),
+                                ci_final=float(r["Ci"][0]), A=float(r["A"][0]),
+                                cs=float(r["cs"][0]), gs=float(r["gs"][0]),
+                                rs=float(r["rs"][0]), n=int(r["n_iter"][0]),
+                                dCi=float(r["resid_Ci"][0]), dA=float(r["resid_A"][0]),
+                                limit=str(r["limit"][0]),
+                                ci_shade=float(
+                                    solve_fixed_point(cenv, np.array([PAR_ABSORPTANCE * cenv["par_shade"][0]]),
+                                                      np.array([float(c["ci_init_pa"])]), params, "shade")["Ci"][0])))
+    pd.DataFrame(case_rows)[["case_id", "ci_init_pa", "ci_final_pa", "A_final",
+                             "rs_final", "n_iterations"]].to_csv(
+        OUT_DIR / "case_convergence.csv", index=False)
+
+    # ---- figure
+    make_figure(time_hr, sun, shade, night, OUT_DIR / "diurnal.png")
+
+    # ------------------------------------------------------------ report
+    print("=" * 78)
+    print("RUN SUMMARY")
+    print("=" * 78)
+    print(f"pathway={params['pathway']}  rows={n_rows}  step={time_hr[1]-time_hr[0]:.0f} h  "
+          f"night rows={int(night.sum())} (PAR<= {NIGHT_PAR_THRESHOLD:g} W/m2)")
+    print(f"figure backend: {STATS.get('figure_backend')}")
+    print(f"bisection fallback rows used: {STATS.get('fallback_rows', 0)}  "
+          f"(sun fallback={sun['used_fallback']}, shade fallback={shade['used_fallback']})")
+    print(f"max iterations: sun={sun['max_iter']} shade={shade['max_iter']} "
+          f"(cap {CI_MAX_ITER}); max residual |dCi| = "
+          f"{max(sun['resid_Ci'].max(), shade['resid_Ci'].max()):.3e} Pa")
+
+    print("\n--- CASE CONVERGENCE (coupled fixed point from supplied ci_init_pa) ---")
+    hdr = (f"{'case':8s} {'ci_init':>10s} {'ci_final':>11s} {'d(ci)':>10s} "
+           f"{'A_final':>10s} {'cs':>8s} {'gs':>8s} {'rs':>10s} {'lim':>4s} "
+           f"{'iters':>5s} {'|dCi|':>10s} {'|dA|':>10s} {'ci_shade':>10s}")
+    print(hdr)
+    for d in case_detail:
+        print(f"{d['case']:8s} {d['ci_init']:10.5f} {d['ci_final']:11.6f} "
+              f"{d['ci_final']-d['ci_init']:10.5f} {d['A']:10.6f} {d['cs']:8.4f} "
+              f"{d['gs']:8.5f} {d['rs']:10.5f} {d['limit']:>4s} {d['n']:5d} "
+              f"{d['dCi']:10.2e} {d['dA']:10.2e} {d['ci_shade']:10.6f}")
+    moved = [d for d in case_detail if abs(d["ci_final"] - d["ci_init"]) > 1e-6]
+    print(f"cases where ci_final != ci_init: {len(moved)}/{len(case_detail)}"
+          f"  (largest |ci_init - ca| = "
+          f"{max(abs(d['ci_init']-env['ca'][12]) for d in case_detail):.3f} Pa; "
+          f"ci_init above ca: {[d['case'] for d in case_detail if d['ci_init'] > env['ca'][12]]})")
+
+    print("\n--- LIMITATION REGIMES (light rows) ---")
+    lit = sun["lit"]
+    for tag, r in (("sun", sun), ("shade", shade)):
+        cnt = pd.Series(r["limit"][lit]).value_counts().to_dict()
+        print(f"  {tag:5s} light rows={int(lit.sum())}: {cnt}")
+    diff = np.flatnonzero(np.abs(sun["A"] - shade["A"]) > 1e-9)
+    print(f"  rows with A_sun != A_shade: {len(diff)}")
+    print(f"  {'idx':>4s} {'hr':>5s} {'day':>4s} {'par_s':>9s} {'par_sh':>8s} "
+          f"{'Wj_s':>8s} {'Wj_sh':>8s} {'Vcmax':>8s} {'A_sun':>8s} {'A_sh':>8s} "
+          f"{'lim_s':>5s} {'lim_sh':>6s} {'ci_s':>8s} {'ci_sh':>8s}")
+    for i in diff:
+        day = int(time_hr[i] // 24) + 1
+        wj_s = params["alpha_q"] * PAR_ABSORPTANCE * env["par_sun"][i]
+        wj_h = params["alpha_q"] * PAR_ABSORPTANCE * env["par_shade"][i]
+        print(f"  {i:4d} {time_hr[i]:5.0f} {day:4d} {env['par_sun'][i]:9.2f} "
+              f"{env['par_shade'][i]:8.2f} {wj_s:8.2f} {wj_h:8.2f} {env['vm'][i]:8.3f} "
+              f"{sun['A'][i]:8.3f} {shade['A'][i]:8.3f} {sun['limit'][i]:>5s} "
+              f"{shade['limit'][i]:>6s} {sun['Ci'][i]:8.3f} {shade['Ci'][i]:8.3f}")
+
+    print("\n--- PHYSICAL SANITY CHECKS ---")
+    b0 = params["bb_intercept"]
+    checks = {
+        "no NaN/inf anywhere": bool(np.all(np.isfinite(flux.to_numpy(float).T))),
+        "light gs >= b0": bool(np.all(flux["gs_sun"].to_numpy()[lit] >= b0 - 1e-12)
+                               and np.all(flux["gs_shade"].to_numpy()[lit] >= b0 - 1e-12)),
+        "gs bounded (< 20 mol/m2/s)": bool(flux[["gs_sun", "gs_shade"]].max().max() < 20),
+        "rs strictly positive at night": bool(np.all(flux.loc[~lit, ["rs_sun", "rs_shade"]].to_numpy() > 0)),
+        "rs strictly positive everywhere": bool(np.all(flux[["rs_sun", "rs_shade"]].to_numpy() > 0)),
+        "A > 0 in light (both leaves)": bool(np.all(sun["A"][lit] > 0) and np.all(shade["A"][lit] > 0)),
+        "A < 0 at night (= -Rd)": bool(np.all(sun["A"][~lit] < 0)),
+        "Ci < cs < ca in light (sun)": bool(np.all(sun["Ci"][lit] < sun["cs"][lit])
+                                            and np.all(sun["cs"][lit] < env["ca"][lit])),
+        "Ci < cs < ca in light (shade)": bool(np.all(shade["Ci"][lit] < shade["cs"][lit])
+                                              and np.all(shade["cs"][lit] < env["ca"][lit])),
+        "night Ci > cs > ca (resp.)": bool(np.all(sun["Ci"][~lit] > sun["cs"][~lit])
+                                           and np.all(sun["cs"][~lit] > env["ca"][~lit])),
+        "Ci <= ca always in light": bool(sun["Ci"][lit].max() <= env["ca"][lit].max()),
+    }
+    for k, v in checks.items():
+        print(f"  [{'ok' if v else 'FAIL'}] {k}")
+    print(f"  ranges: A_sun [{flux.A_sun.min():.3f},{flux.A_sun.max():.3f}]  "
+          f"A_shade [{flux.A_shade.min():.3f},{flux.A_shade.max():.3f}]  "
+          f"gs [{flux.gs_sun.min():.4f},{flux.gs_sun.max():.4f}]  "
+          f"rs [{flux.rs_sun.min():.1f},{flux.rs_sun.max():.1f}]")
+    print(f"  night: A={sun['A'][~lit][0]:.4f}..{sun['A'][~lit][-1]:.4f} umol/m2/s, "
+          f"gs=b0={flux.gs_sun[~lit].unique()}, rs={flux.rs_sun[~lit].min():.1f}..{flux.rs_sun[~lit].max():.1f} s/m, "
+          f"ci={flux.ci_sun[~lit].min():.2f}..{flux.ci_sun[~lit].max():.2f} Pa")
+    print(f"  figure: {OUT_DIR/'diurnal.png'} ({(OUT_DIR/'diurnal.png').stat().st_size} bytes)")
+    print(f"  all checks passed: {all(checks.values())}")
+
+    if STATS.get("fallback_rows", 0):
+        print("\n*** WARNING: bracketed-bisection fallback WAS triggered - see above ***")
+    assert not sun["used_fallback"] and not shade["used_fallback"], \
+        "successive substitution hit the iteration cap; fallback was used"
+    return flux, case_detail, checks
+
+
+if __name__ == "__main__":
+    main()

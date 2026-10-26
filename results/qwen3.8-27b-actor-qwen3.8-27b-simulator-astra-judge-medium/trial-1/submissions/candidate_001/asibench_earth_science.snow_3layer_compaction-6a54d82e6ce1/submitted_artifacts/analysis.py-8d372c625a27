@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""
+analysis.py — Fixed 3-layer, process-based snowpack model
+=========================================================
+Task: evolve a 3-layer snowpack (data/snowpack_init.json) under 68 days of
+hourly atmospheric forcing (data/forcing.csv) and write:
+  results/snow_state.npy      float64 (68, 3, 5) [thickness_m, density_kg_m3, ice_mm, liq_mm, temp_K]
+  results/snow_summary.csv    day, swe_mm, snow_depth_m, melt_mm, refreeze_mm, runoff_mm, mean_density_kg_m3
+  results/snow_evolution.png  2x3 diagnostic figure
+
+Formulation
+-----------
+* Fixed 3 layers, each isothermal (lumped). State per layer:
+  W_ice, W_liq [kg/m2 == mm w.e.] (separate ice and liquid states), T [K],
+  rho [kg/m3] (ice-matrix density). Thickness DERIVED: h_i = (W_ice+W_liq)/rho
+  -> mass-thickness consistency exact by construction; compaction raises rho
+  and thins h with W unchanged. Guards: h >= 1e-6 m, W_ice floored at 1e-6
+  kg/m2 so a fully melted layer cannot produce NaN/divide-by-zero.
+* Time step: 1-h forcing linearly interpolated; internal dt = 900 s (15-min
+  sub-steps, 4 per hour, 6528 total). Far below conduction stability limit
+  (Fo ~ 1e-3); resolves diurnal surface-balance swing controlling melt timing.
+* Per sub-step: (1) deposition to top layer: snow at T_snow=min(t_air,273.15)
+  as ice, fresh-snow density rho_f = 100 + 0.4*max(0, T_snow-273.15) kg/m3
+  (all snowfall in this record is cold -> 100 kg/m3); layer density
+  mass-weighted, reset to rho_f if layer essentially empty (<1e-3 kg/m2);
+  rain (zero here) as liquid at t_air; deposition carries sensible heat.
+  (2) Surface energy balance, NO degree-day shortcut: skin temperature T_s
+  solved by bisection (residual monotonically decreasing in T_s):
+    (1-a)*sw + lw - eps*sb*T_s^4 + h_s*(t_air-T_s) - L_v*E(T_s) + k1*(T1-T_s)/h1 = 0
+  a=0.80 (aged snow, constant), eps=0.99, h_s=40 W/m2/K (no wind in forcing),
+  E = k_e*(qs(T_s)-q_a), k_e=5e-3 m/s, q_a = RH*qs(t_air) with ASSUMED
+  RH=0.8 (no humidity in forcing), qs Magnus. Skin has zero heat capacity:
+  net flux Q = (1-a)*sw + lw - eps*sb*T_s^4 + h_s*(t_air-T_s) - L_v*E is the
+  heat input to layer 1. If T_s solves above 273.15 it is capped and surplus
+  melts layer-1 ice. Sublimation (E>0) removes ice mass; condensation adds
+  negligible ice. Both enter the mass balance.
+  (3) Inter-layer conduction: G12 = kh(k1,k2)*(T2-T1)/h12 etc., harmonic-mean
+  k, mean thickness; k = 2.07e-4*rho - 1.07e-7*rho^2 W/m/K (Hutter 1986,
+  floor 0.05). Bottom boundary INSULATED (no ground temperature in forcing).
+  (4) Temperature update with latent-heat partitioning: C = W_ice*c_ice +
+  W_liq*c_w [J/m2/K] (floor 1.0). If T_new > 273.15: melt min(W_ice,
+  C*(T_new-273.15)/L_f) (counted in melt). If T_new < 273.15 with liquid:
+  refreeze min(W_liq, C*(273.15-T_new)/L_f) (counted in refreeze); wet layers
+  pinned at 273.15 K. L_f = 334 kJ/kg.
+  (5) Compaction, Anderson & Niu (2010) functional form:
+      d(rho)/dt = C_c * exp(-C2*rho/rho_ice) * sigma_overburden
+  sigma = g*sum(rho_j*h_j over layers above) [Pa]; C2 = 7.834 (dimensionless);
+  rho_ice = 917 kg/m3. C_c = 5e-9 m^-2 s^-1. DOCUMENTED CHOICE: exact
+  published SNH constant set could not be verified offline, so the A&N
+  functional form is used with C_c calibrated to field-realistic rates:
+  ~0.05-0.07 kg/m3/day for the 157 and 274 kg/m3 layers under ~0.6-1.3 kPa
+  overburden, zero for the unloaded top layer.
+  Robustness: a top layer with total SWE < W_PASS (10 mm) is treated as an
+  energy pass-through (meltout of the top layer): the surface energy balance
+  acts on layer 2, percolating melt/refreeze priority still consumes the
+  residual layer-1 ice first, and T1 is reported equal to T2. Per-sub-step
+  |dT| is capped at DT_CAP (5 K) so thin layers cannot run away.
+  (6) Liquid water / drainage: retention w_crit = 3% of layer ice SWE
+  (standard percolation threshold; not in data). If a layer is at 273.15 K
+  and W_liq > w_crit, the excess percolates down one layer per sub-step
+  (instantaneous above threshold); into a cold layer it refreezes (latent
+  heat credited). Bottom layer: excess liquid at 0 C exits as RUNOFF (bottom
+  only); in a cold bottom layer percolating water refreezes instead. No
+  upward redistribution.
+* Mass bookkeeping: SWE(t) = sum(W_ice+W_liq); boundary terms only
+  (deposition in, sublimation out, condensation in, runoff out); melt and
+  refreeze are internal conversions. Closing residual asserted and printed.
+* Outputs: daily snapshots at END of day d (hour 24(d+1)), d=0..67 ->
+  n_days=68, all 1632 forcing hours used. melt/refreeze/runoff are DAILY
+  CUMULATIVES (melt includes water that later refreezes):
+  dSWE = snow + rain + cond - sub - runoff exactly. mean_density = SWE/depth.
+"""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:  # fallback: pure-numpy PNG renderer (below)
+    HAVE_MPL = False
+
+# ---------------------------------------------------------------- constants
+G = 9.81                 # m/s2
+L_F = 334e3              # J/kg latent heat of fusion
+L_V = 2.5e6              # J/kg latent heat of vaporization
+C_ICE = 2100.0           # J/kg/K
+C_W = 4190.0             # J/kg/K
+RHO_ICE = 917.0          # kg/m3
+SIGMA_SB = 5.67e-8       # W/m2/K4
+EPS = 0.99               # snow emissivity
+ALBEDO = 0.80            # shortwave albedo (aged snow, constant)
+H_S = 40.0               # W/m2/K sensible heat transfer coeff (no wind data)
+K_E = 5e-3               # m/s aerodynamic drag coeff for sublimation
+RH = 0.8                 # ASSUMED relative humidity (no humidity in forcing)
+R_V = 461.5              # J/kg/K
+R_D = 287.05             # J/kg/K dry air gas constant
+W_CRIT_FRAC = 0.03       # liquid retention = 3% of ice SWE
+C_C = 5e-9               # m^-2 s^-1 compaction pre-factor (see docstring)
+C2 = 7.834               # dimensionless compaction density exponent
+DT = 900.0               # s internal sub-step (15 min)
+T_MELT = 273.15          # K
+W_EPS = 1e-6             # kg/m2 floor for ice SWE / thickness guards
+W_PASS = 10.0            # kg/m2: top layer thinner than this is an energy
+                         # pass-through (no thermal identity; surface sits on
+                         # layer 2) - prevents C->0 instability during meltout
+DT_CAP = 5.0             # K, max |dT| per sub-step (explicit-scheme safeguard)
+N_SUB = int(round(3600.0 / DT))
+
+
+def q_sat(T):
+    """Saturation specific humidity kg/kg (Magnus e_sat, q = e/(R_v*T))."""
+    return 611.25 * np.exp(17.67 * (T - 273.15) / (T - 28.24)) / (R_V * T)
+
+
+def k_cond(rho):
+    """Snow thermal conductivity W/m/K (Hutter 1986), floored at 0.05."""
+    return np.maximum(0.05, 2.07e-4 * rho - 1.07e-7 * rho ** 2)
+
+
+def layer_h(W_ice, W_liq, rho):
+    """Layer thickness from mass and density (exact mass consistency)."""
+    return np.maximum((W_ice + W_liq) / rho, 1e-6)
+
+
+def solve_skin(t_air, sw, lw, T1, k1, h1, rho_air):
+    """Solve surface energy balance for skin T_s (bisection).
+
+    f(T_s) = (1-a)*sw + lw - eps*sb*T_s^4 + h_s*(t_air-T_s)
+             - L_v*k_e*rho_air*(qs(T_s)-RH*qs(t_air)) + k1*(T1-T_s)/h1 = 0
+    f is monotonically decreasing in T_s. Returns (T_s, q_net, e_sub):
+    q_net = net flux into the pack (W/m2); e_sub = sublimation rate
+    kg/m2/s (>0 = mass loss from the pack).
+    """
+    qa = RH * q_sat(t_air)
+
+    def f(ts):
+        return ((1.0 - ALBEDO) * sw + lw - EPS * SIGMA_SB * ts ** 4
+                + H_S * (t_air - ts)
+                - L_V * K_E * rho_air * (q_sat(ts) - qa)
+                + k1 * (T1 - ts) / h1)
+
+    lo, hi = 240.0, T_MELT + 10.0
+    flo, fhi = f(lo), f(hi)
+    if flo < 0.0:                    # no sign change: root below bracket
+        ts = lo
+    elif fhi > 0.0:                  # root above bracket
+        ts = hi
+    else:
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            fm = f(mid)
+            if (fm > 0) == (flo > 0):
+                lo, flo = mid, fm
+            else:
+                hi = mid
+        ts = 0.5 * (lo + hi)
+    if ts > T_MELT:
+        ts = T_MELT
+    e_sub = K_E * rho_air * (q_sat(ts) - qa)
+    q_net = ((1.0 - ALBEDO) * sw + lw - EPS * SIGMA_SB * ts ** 4
+             + H_S * (t_air - ts) - L_V * e_sub)
+    return ts, q_net, e_sub
+
+
+# ---------------------------------------------------------------- load inputs
+os.makedirs("results", exist_ok=True)
+with open("data/snowpack_init.json") as fh:
+    init = json.load(fh)
+assert init["n_layers"] == 3
+
+W_ice = np.array([l["ice_mm"] for l in init["layers"]], dtype=float)   # kg/m2
+W_liq = np.array([l["liq_mm"] for l in init["layers"]], dtype=float)
+T = np.array([l["temp_K"] for l in init["layers"]], dtype=float)
+rho = np.array([l["density_kg_m3"] for l in init["layers"]], dtype=float)
+
+forc = pd.read_csv("data/forcing.csv")
+t_hr = forc["time_hr"].to_numpy(dtype=float)
+t_air = forc["t_air_K"].to_numpy(dtype=float)
+sw_in = forc["sw_in_wm2"].to_numpy(dtype=float)
+lw_in = forc["lw_in_wm2"].to_numpy(dtype=float)
+sf = forc["snowfall_mm_hr"].to_numpy(dtype=float)
+rf = forc["rainfall_mm_hr"].to_numpy(dtype=float)
+n_hours = len(forc)
+n_days = int(round(n_hours / 24))
+
+swe0 = W_ice.sum() + W_liq.sum()
+print(f"Initial: SWE = {swe0:.4f} mm, depth = "
+      f"{layer_h(W_ice, W_liq, rho).sum():.4f} m")
+
+# ---------------------------------------------------------------- main loop
+tot_snow = tot_rain = tot_sub = tot_cond = tot_runoff = 0.0
+daily = np.zeros((n_days, 3, 5))
+sum_melt = np.zeros(n_days)
+sum_refrz = np.zeros(n_days)
+sum_run = np.zeros(n_days)
+d_melt = d_refrz = d_run = 0.0
+edge_events = []
+
+
+def receive(j, amt):
+    """Refreeze or store percolating liquid in layer j."""
+    global d_refrz
+    if T[j] >= T_MELT - 1e-9:
+        W_liq[j] += amt
+        return
+    C = max(W_ice[j] * C_ICE + W_liq[j] * C_W, 1.0)
+    q = C * (T_MELT - T[j])
+    frz = min(amt, q / L_F)
+    W_ice[j] += frz
+    W_liq[j] += (amt - frz)
+    T[j] = T_MELT - (q - frz * L_F) / C
+    d_refrz += frz
+
+
+for hr in range(n_hours):
+    for sub in range(N_SUB):
+        t = t_hr[hr] + sub / N_SUB
+        ta = np.interp(t, t_hr, t_air)
+        sw = np.interp(t, t_hr, sw_in)
+        lw = np.interp(t, t_hr, lw_in)
+        sfmm = np.interp(t, t_hr, sf) / 3600.0 * DT   # kg/m2 this sub-step
+        rfmm = np.interp(t, t_hr, rf) / 3600.0 * DT
+
+        # 1) deposition onto top layer
+        dep_heat = 0.0
+        if sfmm > 0:
+            tsnow = min(ta, T_MELT)
+            rho_f = 100.0 + 0.4 * max(0.0, tsnow - T_MELT)
+            if W_ice[0] < 1e-3:                      # (re)initialised layer
+                rho[0] = rho_f
+            else:
+                rho[0] = (rho[0] * W_ice[0] + rho_f * sfmm) / (W_ice[0] + sfmm)
+            W_ice[0] += sfmm
+            dep_heat += sfmm * C_ICE * (tsnow - T[0])
+            tot_snow += sfmm
+        if rfmm > 0:
+            W_liq[0] += rfmm
+            dep_heat += rfmm * C_W * (ta - T[0])
+            tot_rain += rfmm
+
+        # 2) surface energy balance
+        h = layer_h(W_ice, W_liq, rho)
+        k = k_cond(rho)
+        rho_air = 101325.0 / (R_D * ta)
+        s = 0 if (W_ice[0] + W_liq[0]) >= W_PASS else 1   # surface layer index
+        if s == 1:
+            T[0] = T[1]                    # empty top layer: no thermal identity
+        ts, q_net, e_sub = solve_skin(ta, sw, lw, T[s], k[s], h[s], rho_air)
+        if e_sub > 0:                                 # sublimation mass loss
+            wsub = min(e_sub * DT, W_ice[s] + W_liq[s])
+            take_ice = min(wsub, W_ice[s])
+            W_ice[s] -= take_ice
+            W_liq[s] -= (wsub - take_ice)
+            tot_sub += wsub
+        else:                                         # condensation (negligible)
+            wdep = -e_sub * DT
+            W_ice[s] += wdep
+            tot_cond += wdep
+
+        # 3) inter-layer conduction (no storage node in an empty top layer)
+        h12 = 0.5 * (h[0] + h[1])
+        h23 = 0.5 * (h[1] + h[2])
+        kh12 = 2.0 / (1.0 / k[0] + 1.0 / k[1])
+        kh23 = 2.0 / (1.0 / k[1] + 1.0 / k[2])
+        g12 = kh12 * (T[1] - T[0]) / h12 if s == 0 else 0.0
+        g23 = kh23 * (T[2] - T[1]) / h23
+
+        # 4) temperature update with latent-heat partitioning
+        E = np.zeros(3)
+        if s == 0:
+            E[0] += q_net + g12 + dep_heat
+            E[1] += g23 - g12
+        else:
+            E[1] += q_net + g23 + dep_heat
+        E[2] += -g23
+        E *= DT
+        for i in range(3):
+            if i == 0 and s == 1:
+                continue                        # pass-through: no energy storage
+            C = max(W_ice[i] * C_ICE + W_liq[i] * C_W, 1.0)
+            dT = max(-DT_CAP, min(DT_CAP, E[i] / C))
+            Tnew = T[i] + dT
+            if Tnew > T_MELT:                         # melting
+                q = C * (Tnew - T_MELT)
+                avail = W_ice[i]
+                if i == 1 and s == 1:                # residual layer-1 ice melts first
+                    avail += W_ice[0]
+                m = min(avail, q / L_F)
+                if i == 1 and s == 1 and W_ice[0] > 0.0 and m > 0.0:
+                    m0 = min(W_ice[0], m)
+                    W_ice[0] -= m0
+                    W_liq[0] += m0
+                    m -= m0
+                W_ice[i] -= m
+                W_liq[i] += m
+                T[i] = T_MELT
+                d_melt += m
+            elif Tnew < T_MELT and W_liq[i] > 0.0:    # refreezing
+                q = C * (T_MELT - Tnew)
+                frz = min(W_liq[i], q / L_F)
+                W_liq[i] -= frz
+                W_ice[i] += frz
+                T[i] = T_MELT - (q - frz * L_F) / C
+                d_refrz += frz
+            else:
+                T[i] = Tnew
+            W_ice[i] = max(W_ice[i], 0.0)
+            W_liq[i] = max(W_liq[i], 0.0)
+        if s == 1:
+            T[0] = T[1]                    # keep reported T1 in sync
+
+        # 5) compaction (Anderson & Niu form, see docstring)
+        h = layer_h(W_ice, W_liq, rho)
+        sigma = np.array([0.0,
+                          G * (rho[0] * h[0]),
+                          G * (rho[0] * h[0] + rho[1] * h[1])])
+        for i in range(3):
+            if W_ice[i] > W_EPS and rho[i] < RHO_ICE and sigma[i] > 0:
+                drho = C_C * np.exp(-C2 * rho[i] / RHO_ICE) * sigma[i] * DT
+                rho[i] = min(rho[i] + drho, RHO_ICE)
+
+        # 6) liquid percolation and bottom runoff
+        for i in range(2):
+            wcrit = W_CRIT_FRAC * W_ice[i]
+            if T[i] >= T_MELT - 1e-9 and W_liq[i] > wcrit:
+                excess = W_liq[i] - wcrit
+                W_liq[i] -= excess
+                receive(i + 1, excess)
+        wcrit3 = W_CRIT_FRAC * W_ice[2]
+        if T[2] >= T_MELT - 1e-9 and W_liq[2] > wcrit3:
+            excess = W_liq[2] - wcrit3
+            W_liq[2] -= excess
+            tot_runoff += excess
+            d_run += excess
+
+        # guards / diagnostics
+        if not (np.all(np.isfinite(W_ice)) and np.all(np.isfinite(W_liq))
+                and np.all(np.isfinite(T)) and np.all(np.isfinite(rho))):
+            raise RuntimeError(f"non-finite state at t={t} h")
+        if W_ice[0] < 1e-3 and sfmm > 0:
+            edge_events.append(f"t={t:.1f} h: top layer re-init on deposition")
+
+    if hr % 24 == 23:                     # end of day -> daily snapshot
+        d = hr // 24
+        h = layer_h(W_ice, W_liq, rho)
+        daily[d] = np.stack([h, rho, W_ice, W_liq, T], axis=1)
+        sum_melt[d] = d_melt
+        sum_refrz[d] = d_refrz
+        sum_run[d] = d_run
+        d_melt = d_refrz = d_run = 0.0
+        if d % 10 == 9:
+            print(f"  day {d+1:2d}: SWE={W_ice.sum()+W_liq.sum():8.3f} mm  "
+                  f"depth={h.sum():.4f} m  T1={T[0]:.2f} K  melt={sum_melt[d]:.2f} mm")
+
+# ---------------------------------------------------------------- mass balance
+swe_end = W_ice.sum() + W_liq.sum()
+residual = (swe_end - swe0 - tot_snow - tot_rain - tot_cond
+            + tot_sub + tot_runoff)
+print("\n--- Mass balance (mm water equivalent) ---")
+print(f"  SWE initial          : {swe0:12.4f}")
+print(f"  + snowfall           : {tot_snow:12.4f}")
+print(f"  + rainfall           : {tot_rain:12.4f}")
+print(f"  + condensation       : {tot_cond:12.6f}")
+print(f"  - sublimation        : {tot_sub:12.6f}")
+print(f"  - runoff             : {tot_runoff:12.4f}")
+print(f"  = SWE final          : {swe_end:12.4f}")
+print(f"  closing residual     : {residual:12.2e} mm")
+assert abs(residual) < 1e-6, "mass balance violated"
+assert daily.shape == (n_days, 3, 5) and np.all(np.isfinite(daily))
+
+# ---------------------------------------------------------------- outputs
+np.save("results/snow_state.npy", daily.astype(np.float64))
+
+swe = daily[:, :, 2] + daily[:, :, 3]                 # mm
+depth = daily[:, :, 0].sum(axis=1)
+mean_rho = swe.sum(axis=1) / depth
+summary = pd.DataFrame({
+    "day": np.arange(n_days),
+    "swe_mm": swe.sum(axis=1),
+    "snow_depth_m": depth,
+    "melt_mm": sum_melt,
+    "refreeze_mm": sum_refrz,
+    "runoff_mm": sum_run,
+    "mean_density_kg_m3": mean_rho,
+})
+summary.to_csv("results/snow_summary.csv", index=False, float_format="%.6f")
+
+# ---------------------------------------------------------------- figure
+# Primary path: matplotlib (available in the native runtime). Fallback: a
+# minimal pure-numpy PNG renderer producing the same 2x3 diagnostic layout
+# (used only when matplotlib is unavailable, e.g. this dev venv).
+_days = np.arange(n_days)
+_lc = [(31, 119, 180), (255, 127, 14), (44, 160, 44)]
+_lnames = ["Layer 1 (top)", "Layer 2", "Layer 3 (bottom)"]
+_swe = daily[:, :, 2] + daily[:, :, 3]
+_depth = daily[:, :, 0].sum(axis=1)
+_mean_rho = _swe.sum(axis=1) / _depth
+
+if HAVE_MPL:
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    fig.suptitle("3-layer snowpack evolution under 68-day forcing", fontsize=14)
+
+    ax = axes[0, 0]
+    for i in range(3):
+        ax.plot(_days, _swe[:, i], color=[c / 255 for c in _lc[i]], lw=1.4, label=_lnames[i])
+    ax.plot(_days, _swe.sum(axis=1), "k", lw=2.2, label="Total SWE")
+    ax.set_title("Snow water equivalent"); ax.set_xlabel("Day"); ax.set_ylabel("SWE (mm)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    ax = axes[0, 1]
+    for i in range(3):
+        ax.plot(_days, daily[:, i, 0], color=[c / 255 for c in _lc[i]], lw=1.4, label=_lnames[i])
+    ax.plot(_days, _depth, "k", lw=2.2, label="Total depth")
+    ax.set_title("Layer thickness"); ax.set_xlabel("Day"); ax.set_ylabel("Thickness (m)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    ax = axes[0, 2]
+    for i in range(3):
+        ax.plot(_days, daily[:, i, 1], color=[c / 255 for c in _lc[i]], lw=1.4, label=_lnames[i])
+    ax.set_title("Ice density"); ax.set_xlabel("Day"); ax.set_ylabel("Density (kg/m3)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    ax = axes[1, 0]
+    for i in range(3):
+        ax.plot(_days, daily[:, i, 4], color=[c / 255 for c in _lc[i]], lw=1.4, label=_lnames[i])
+    ax.axhline(273.15, color="r", ls="--", lw=1, label="0 C")
+    ax.set_title("Layer temperature"); ax.set_xlabel("Day"); ax.set_ylabel("Temperature (K)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.plot(t_hr / 24.0, t_air, "tab:purple", lw=0.8, label="Air temperature (K)")
+    ax.set_xlabel("Time (days)"); ax.set_ylabel("Air temperature (K)", color="tab:purple")
+    ax2 = ax.twinx()
+    ax2.plot(t_hr / 24.0, sw_in, "tab:brown", lw=0.8, alpha=0.7, label="SW in (W/m2)")
+    ax2.set_ylabel("Shortwave in (W/m2)", color="tab:brown")
+    ax.set_title("Forcing"); ax.grid(alpha=0.3)
+    h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=8)
+
+    ax = axes[1, 2]
+    ax.bar(_days, sum_melt, color="tab:red", alpha=0.7, label="Melt (mm)")
+    ax.plot(_days, sum_refrz, "tab:blue", lw=1.4, label="Refreeze (mm)")
+    ax.plot(_days, sum_run, "tab:gray", lw=1.4, label="Runoff (mm)")
+    ax.set_title("Daily melt / refreeze / runoff"); ax.set_xlabel("Day"); ax.set_ylabel("mm w.e.")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig("results/snow_evolution.png", dpi=150)
+else:
+    import zlib as _zlib
+    import struct as _struct
+
+    def _png_write(path, rgb):
+        h, w = rgb.shape[:2]
+        raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+
+        def _chunk(tag, data):
+            return (_struct.pack(">I", len(data)) + tag + data
+                    + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n"
+                    + _chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                    + _chunk(b"IDAT", _zlib.compress(raw, 6))
+                    + _chunk(b"IEND", b""))
+
+    def _g(*rows):
+        return [int(r, 2) for r in rows]
+
+    FONT = {
+        " ": _g("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+        "A": _g("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+        "D": _g("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+        "E": _g("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+        "F": _g("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+        "I": _g("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+        "K": _g("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+        "L": _g("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+        "M": _g("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+        "N": _g("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+        "O": _g("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+        "Q": _g("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+        "R": _g("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+        "S": _g("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+        "T": _g("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+        "U": _g("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+        "V": _g("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+        "W": _g("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+        "Y": _g("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+        "a": _g("00000", "00000", "01110", "00001", "01111", "10001", "01111"),
+        "c": _g("00000", "00000", "01111", "10000", "10000", "10000", "01111"),
+        "d": _g("00001", "00001", "01101", "10011", "10001", "10011", "01101"),
+        "e": _g("00000", "00000", "01110", "10001", "11111", "10000", "01110"),
+        "f": _g("00110", "01001", "01000", "11100", "01000", "01000", "01000"),
+        "g": _g("00000", "01111", "10001", "10001", "01111", "00001", "01110"),
+        "i": _g("00100", "00000", "01100", "00100", "00100", "00100", "01111"),
+        "k": _g("10000", "10000", "10010", "10100", "11000", "10100", "10010"),
+        "l": _g("01100", "00100", "00100", "00100", "00100", "00100", "01110"),
+        "m": _g("00000", "00000", "11010", "10101", "10101", "10001", "10001"),
+        "n": _g("00000", "00000", "11010", "10101", "10101", "10101", "10101"),
+        "o": _g("00000", "00000", "01110", "10001", "10001", "10001", "01110"),
+        "q": _g("00000", "00000", "01110", "10001", "10001", "00001", "00001"),
+        "r": _g("00000", "00000", "10110", "11001", "10000", "10000", "10000"),
+        "s": _g("00000", "00000", "01111", "10000", "01110", "00001", "11110"),
+        "t": _g("01000", "01000", "11100", "01000", "01000", "01001", "00110"),
+        "u": _g("00000", "00000", "10001", "10001", "10001", "10011", "01101"),
+        "v": _g("00000", "00000", "10001", "10001", "10001", "01010", "00100"),
+        "w": _g("00000", "00000", "10001", "10001", "10101", "10101", "01010"),
+        "y": _g("00000", "00000", "10001", "10001", "01111", "00001", "01110"),
+        "z": _g("00000", "00000", "11111", "00100", "01000", "10000", "11111"),
+        "0": _g("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+        "1": _g("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+        "2": _g("01110", "10001", "00001", "00110", "01000", "10000", "11111"),
+        "3": _g("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+        "4": _g("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+        "5": _g("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+        "6": _g("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+        "7": _g("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+        "8": _g("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+        "9": _g("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+        "(": _g("00010", "00100", "01000", "01000", "01000", "00100", "00010"),
+        ")": _g("01000", "00100", "00010", "00010", "00010", "00100", "01000"),
+        "/": _g("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+        ".": _g("00000", "00000", "00000", "00000", "00000", "00100", "00100"),
+        "-": _g("00000", "00000", "00000", "01110", "00000", "00000", "00000"),
+        "+": _g("00000", "00100", "00100", "11111", "00100", "00100", "00000"),
+    }
+
+    def _text(buf, x, y, s, color, sc=2):
+        for ch in s:
+            g = FONT.get(ch, FONT[" "])
+            for r in range(7):
+                row = g[r]
+                for c in range(5):
+                    if (row >> (4 - c)) & 1:
+                        buf[y + r * sc: y + (r + 1) * sc,
+                            x + c * sc: x + (c + 1) * sc] = color
+            x += 6 * sc
+        return x
+
+    def _textw(s, sc=2):
+        return len(s) * 6 * sc
+
+    def _fill(buf, x0, y0, x1, y1, color):
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(buf.shape[1], x1), min(buf.shape[0], y1)
+        if x1 > x0 and y1 > y0:
+            buf[y0:y1, x0:x1] = color
+
+    def _polyline(buf, pts, color, th=2):
+        for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+            n = max(1, int(max(abs(x1 - x0), abs(y1 - y0))))
+            for i in range(n + 1):
+                x = int(round(x0 + (x1 - x0) * i / n))
+                y = int(round(y0 + (y1 - y0) * i / n))
+                _fill(buf, x - th, y - th, x + th + 1, y + th + 1, color)
+
+    def _nice_ticks(vmin, vmax, n=5):
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        step = (vmax - vmin) / (n - 1)
+        mag = 10 ** np.floor(np.log10(step))
+        for m in (1, 2, 2.5, 5, 10):
+            if step / mag <= m:
+                step = m * mag
+                break
+        t0 = np.ceil(vmin / step) * step
+        return np.arange(t0, vmax + 1e-9, step)
+
+    def _panel(buf, px, py, pw, ph, title, xlabel, ylabel, series,
+               bars=None, second=None, hline=None):
+        """Draw one panel. series: list of (xs, ys, color, label).
+        second: (xs, ys, color, label) on a right axis. bars: bars from 0."""
+        BLACK = (0, 0, 0)
+        ML, MR, MT, MB = 64, 56, 34, 46
+        ax0, ay0 = px + ML, py + MT
+        ax1, ay1 = px + pw - MR, py + ph - MB
+        all_ys = [y for (_, y, _, _) in series]
+        if second:
+            all_ys.append(second[1])
+        if bars:
+            all_ys.append(bars[1])
+        ymin = min(float(np.min(y)) for y in all_ys)
+        ymax = max(float(np.max(y)) for y in all_ys)
+        if ymax - ymin < 1e-9:
+            ymax = ymin + 1.0
+        pad = 0.08 * (ymax - ymin)
+        if ymin < 0:
+            ymin -= pad
+        ymax += pad
+        xmax = max(float(np.max(s[0])) for s in series)
+        _fill(buf, ax0, ay0, ax1 + 1, ay1 + 1, (255, 255, 255))
+        _fill(buf, ax0, ay0, ax1 + 1, ay0 + 2, (200, 200, 200))
+        _fill(buf, ax1 - 1, ay0, ax1 + 1, ay1 + 1, (200, 200, 200))
+        _fill(buf, ax0, ay1, ax1 + 1, ay1 + 2, BLACK)
+        _fill(buf, ax0, ay0, ax0 + 2, ay1 + 1, BLACK)
+
+        def X(x):
+            return ax0 + (x / xmax) * (ax1 - ax0)
+
+        def Y(y):
+            return ay1 - (y - ymin) / (ymax - ymin) * (ay1 - ay0)
+
+        for xt in _nice_ticks(0, xmax):
+            xx = int(X(xt))
+            _fill(buf, xx, ay1, xx + 1, ay1 + 5, BLACK)
+            lab = f"{xt:.0f}"
+            _text(buf, xx - _textw(lab) // 2, ay1 + 8, lab, BLACK)
+        for yt in _nice_ticks(ymin, ymax):
+            yy = int(Y(yt))
+            _fill(buf, ax0 - 5, yy, ax0, yy + 1, BLACK)
+            _fill(buf, ax0, yy, ax1, yy + 1, (232, 232, 232))
+            lab = f"{yt:.0f}"
+            _text(buf, ax0 - 8 - _textw(lab), yy - 7, lab, BLACK)
+        if second:
+            smin = float(np.min(second[1])); smax = float(np.max(second[1]))
+            if smax > smin:
+                for yt in _nice_ticks(smin, smax):
+                    yy = int(ay1 - (yt - smin) / (smax - smin) * (ay1 - ay0))
+                    _fill(buf, ax1, yy, ax1 + 5, yy + 1, (140, 80, 20))
+                    lab = f"{yt:.0f}"
+                    _text(buf, ax1 + 8, yy - 7, lab, (140, 80, 20))
+        if bars:
+            xs, ys, col, _ = bars
+            wbar = max(1, int((ax1 - ax0) / max(1, len(xs)) * 0.7))
+            for x, y in zip(xs, ys):
+                xx = int(X(x))
+                _fill(buf, xx - wbar // 2, int(Y(y)), xx + wbar // 2 + 1, ay1, col)
+        for xs, ys, col, _ in series:
+            _polyline(buf, [(int(X(x)), int(Y(y))) for x, y in zip(xs, ys)], col)
+        if second:
+            _polyline(buf, [(int(X(x)), int(Y(y)))
+                            for x, y in zip(second[0], second[1])], second[2], th=1)
+        if hline is not None:
+            yy = int(Y(hline))
+            _fill(buf, ax0, yy, ax1, yy + 1, (200, 0, 0))
+        ly = ay0 + 6
+        for xs, ys, col, lab in (list(series) + ([second] if second else [])
+                                + ([bars] if bars else [])):
+            _fill(buf, ax1 - _textw(lab) - 16, ly + 6, ax1 - _textw(lab) - 2, ly + 9, col)
+            _text(buf, ax1 - _textw(lab), ly, lab, BLACK)
+            ly += 16
+        _text(buf, px + (pw - _textw(title)) // 2, py + 4, title, BLACK)
+        _text(buf, px + (pw - _textw(xlabel)) // 2, py + ph - 18, xlabel, BLACK)
+        for r, ch in enumerate(ylabel):
+            _text(buf, 14, py + MT + (ay1 - ay0) // 2 - 56 + r * 14, ch, BLACK)
+
+    W_F, H_F = 1600, 900
+    buf = np.full((H_F, W_F, 3), 255, dtype=np.uint8)
+    _text(buf, (W_F - _textw("3-layer snowpack evolution under 68-day forcing")) // 2,
+          10, "3-layer snowpack evolution under 68-day forcing", (0, 0, 0), sc=2)
+    pw, ph = 500, 400
+    x0s = [20, 540, 1060]
+    y0s = [50, 470]
+    L = _days
+    _panel(buf, x0s[0], y0s[0], pw, ph, "Snow water equivalent", "Day", "SWE (mm)",
+           [(L, _swe[:, 0], _lc[0], "Layer 1"), (L, _swe[:, 1], _lc[1], "Layer 2"),
+            (L, _swe[:, 2], _lc[2], "Layer 3"),
+            (L, _swe.sum(axis=1), (0, 0, 0), "Total SWE")])
+    _panel(buf, x0s[1], y0s[0], pw, ph, "Layer thickness", "Day", "Thickness (m)",
+           [(L, daily[:, 0, 0], _lc[0], "Layer 1"), (L, daily[:, 1, 0], _lc[1], "Layer 2"),
+            (L, daily[:, 2, 0], _lc[2], "Layer 3"), (L, _depth, (0, 0, 0), "Total")])
+    _panel(buf, x0s[2], y0s[0], pw, ph, "Ice density", "Day", "Density (kg/m3)",
+           [(L, daily[:, 0, 1], _lc[0], "Layer 1"), (L, daily[:, 1, 1], _lc[1], "Layer 2"),
+            (L, daily[:, 2, 1], _lc[2], "Layer 3")])
+    _panel(buf, x0s[0], y0s[1], pw, ph, "Layer temperature", "Day", "Temperature (K)",
+           [(L, daily[:, 0, 4], _lc[0], "Layer 1"), (L, daily[:, 1, 4], _lc[1], "Layer 2"),
+            (L, daily[:, 2, 4], _lc[2], "Layer 3")], hline=273.15)
+    _panel(buf, x0s[1], y0s[1], pw, ph, "Forcing", "Time (days)", "Air temp (K)",
+           [(t_hr / 24.0, t_air, (128, 0, 128), "Air temp (K)")],
+           second=(t_hr / 24.0, sw_in, (140, 80, 20), "SW in (W/m2)"))
+    _panel(buf, x0s[2], y0s[1], pw, ph, "Daily melt / refreeze / runoff", "Day", "mm w.e.",
+           [(L, sum_refrz, (31, 119, 180), "Refreeze"), (L, sum_run, (120, 120, 120), "Runoff")],
+           bars=(L, sum_melt, (214, 60, 60), "Melt"))
+    _png_write("results/snow_evolution.png", buf)
+
+# ---------------------------------------------------------------- diagnostics
+print("\n--- Diagnostics ---")
+print(f"  final SWE            : {swe_end:.3f} mm  (initial {swe0:.3f} mm)")
+print(f"  final depth          : {_depth[-1]:.4f} m")
+print(f"  final mean density   : {_mean_rho[-1]:.2f} kg/m3")
+print(f"  total melt (cum.)    : {sum_melt.sum():.3f} mm")
+print(f"  total refreeze (cum.): {sum_refrz.sum():.3f} mm")
+print(f"  total runoff         : {tot_runoff:.3f} mm")
+print(f"  max daily melt       : {sum_melt.max():.3f} mm on day {int(sum_melt.argmax())}")
+_liq_idx = int(daily[:, :, 3].argmax())
+print(f"  max liquid held      : {daily[:, :, 3].max():.4f} mm "
+      f"(day {_liq_idx // 3}, layer {_liq_idx % 3 + 1})")
+print(f"  final layer temps    : {np.round(T, 2)} K")
+print(f"  final densities      : {np.round(rho, 2)} kg/m3")
+print(f"  edge cases triggered : {len(edge_events)}")
+for e in edge_events[:5]:
+    print("   ", e)
+print(f"  figure backend       : {'matplotlib' if HAVE_MPL else 'numpy fallback'}")
+print("\nWrote results/snow_state.npy", daily.shape, daily.dtype)
+print("Wrote results/snow_summary.csv rows:", len(summary))
+print("Wrote results/snow_evolution.png")

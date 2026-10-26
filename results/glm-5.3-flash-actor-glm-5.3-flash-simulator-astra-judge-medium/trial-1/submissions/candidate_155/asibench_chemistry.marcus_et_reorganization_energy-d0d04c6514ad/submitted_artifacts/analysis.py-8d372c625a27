@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+Solution-phase electron-transfer response calculation.
+
+Pipeline
+--------
+1. Read metadata, reorder every frame-specific array to ascending site_id
+   (site-major Cartesian blocks: [x,y,z] per site).
+2. Rigidly align frame B onto frame A (forward) and frame A onto frame B
+   (backward) with a mass-weighted Kabsch superposition (proper rotation,
+   det = +1, no reflection).
+3. Mass-weighted Hessian diagonalisation per frame; retain the 15 resolved
+   (positive-eigenvalue) modes, ordered by ascending eigenvalue.
+4. Reorganisation energies:
+     lambda_4pt_*  = 1/2 d^T H d           (four-point harmonic estimator,
+                                            evaluated on the reference-frame
+                                            potential surface)
+     lambda_nm_*   = 1/2 sum_k eps_k c_k^2 (resolved-mode decomposition)
+     lambda_inner_effective = mean(forward, backward)
+     lambda_outer  = Marcus two-sphere nonequilibrium solvent term
+     lambda_total  = inner_effective + outer
+5. Marcus / Golden-Rule rates on the preserved driving-force grid
+   (rows kept in file order) and the self-exchange rate (Delta G = 0).
+6. Diagnostics + a six-panel overview.png.  matplotlib is not importable in
+   this environment, so the figure is rendered with a self-contained numpy
+   rasteriser and written as a valid 8-bit RGB PNG (zlib/struct only).
+
+Conventions (fixed by the output contract and researcher sign-off)
+------------------------------------------------------------------
+* forward  compares frame B in frame A : align B -> A, displacement
+  d_f = sqrt(m) * (B_aligned - A), expressed in frame A; evaluated on the
+  frame-A surface (H_A).
+* backward compares frame A in frame B : align A -> B, displacement
+  d_b = sqrt(m) * (A_aligned - B), expressed in frame B; evaluated on the
+  frame-B surface (H_B).
+* Cross-frame overlaps / transported profiles are magnitude-based.
+* dominant_mode_* = zero-based index of the retained mode with the largest
+  lambda contribution.
+* inverted-region scan: grid sorted by ascending axis_eV, scanned from the
+  most negative end; a point is inverted when axis_eV < -lambda_total;
+  first_inverted_* = first such point encountered in that scan.
+"""
+
+import csv
+import json
+import os
+import math
+import struct
+import zlib
+
+import numpy as np
+
+DATA = "data"
+OUT = "results"
+
+HBAR_EV_S = 6.582119569e-16          # hbar [eV s]
+KB_EV_K = 8.617333262e-5             # Boltzmann [eV/K]
+COULOMB_EV_A = 14.399645             # e^2/(4 pi eps0) [eV A]
+EIG_TOL = 1e-8                       # resolved-mode eigenvalue threshold
+
+
+def read_csv_rows(path):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def load_inputs():
+    site_rows = read_csv_rows(f"{DATA}/site_table.csv")
+    site_ids = [int(r["site_id"]) for r in site_rows]
+    masses = {int(r["site_id"]): float(r["mass_amu"]) for r in site_rows}
+    labels = {int(r["site_id"]): r["label_code"] for r in site_rows}
+
+    order_rows = read_csv_rows(f"{DATA}/frame_site_order.csv")
+    raw_to_site = {}
+    for r in order_rows:
+        raw_to_site.setdefault(r["frame_id"], {})[int(r["row_index"])] = (
+            int(r["site_id"]), r["label_code"])
+
+    for fid, mapping in raw_to_site.items():
+        for idx, (sid, lab) in mapping.items():
+            assert labels[sid] == lab, (fid, idx, sid, lab)
+
+    coords, hess, site_perm = {}, {}, {}
+    for fid in ("frame_a", "frame_b"):
+        c_raw = np.load(f"{DATA}/{fid}_coords.npy")
+        h_raw = np.load(f"{DATA}/{fid}_hessian.npy")
+        mapping = raw_to_site[fid]
+        perm = [mapping[idx][0] for idx in sorted(mapping)]
+        p = [s * 3 + c for s in perm for c in range(3)]
+        coords[fid] = c_raw[np.argsort(perm)]
+        hess[fid] = h_raw[np.ix_(p, p)]
+        site_perm[fid] = perm
+        assert np.allclose(hess[fid], hess[fid].T, atol=1e-10)
+
+    manifest = json.load(open(f"{DATA}/system_manifest.json"))
+    medium = json.load(open(f"{DATA}/medium_response.json"))
+    grid = [(int(r["grid_id"]), float(r["axis_eV"]))
+            for r in read_csv_rows(f"{DATA}/driving_force_grid.csv")]
+    return (site_ids, masses, labels, coords, hess, site_perm,
+            manifest, medium, grid)
+
+
+def kabsch(P, Q, w):
+    """Rotation+translation (det=+1) minimising sum_i w_i |P_i R + t - Q_i|^2."""
+    w = np.asarray(w, float)
+    Pc = (P * w[:, None]).sum(0) / w.sum()
+    Qc = (Q * w[:, None]).sum(0) / w.sum()
+    A = (P - Pc).T @ ((Q - Qc) * w[:, None])
+    U, _, Vt = np.linalg.svd(A)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    t = Qc - Pc @ R
+    fitted = P @ R + t
+    rmsd = math.sqrt(((fitted - Q) ** 2).sum(1).mean())
+    return R, t, rmsd
+
+
+# --------------------------------------------------------------------------
+# PNG rasteriser (matplotlib-free fallback)
+# --------------------------------------------------------------------------
+_FONT = {  # 5x7 glyphs, MSB = leftmost column
+    "0": (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
+    "1": (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "2": (0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F),
+    "3": (0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+    "4": (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02),
+    "5": (0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+    "6": (0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+    "7": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    "8": (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+    "9": (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+    "A": (0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "B": (0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    "C": (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    "D": (0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    "E": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+    "F": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    "G": (0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F),
+    "H": (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "I": (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "K": (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+    "L": (0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    "M": (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11),
+    "N": (0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11),
+    "O": (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "P": (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    "R": (0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    "S": (0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+    "T": (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "U": (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "V": (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    "W": (0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A),
+    "X": (0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    "Y": (0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04),
+    "Z": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    " ": (0, 0, 0, 0, 0, 0, 0),
+    "-": (0, 0, 0, 0x1F, 0, 0, 0),
+    "+": (0, 0x04, 0x04, 0x1F, 0x04, 0x04, 0),
+    ".": (0, 0, 0, 0, 0, 0x0C, 0x0C),
+    ",": (0, 0, 0, 0, 0x0C, 0x04, 0x08),
+    ":": (0, 0x0C, 0x0C, 0, 0x0C, 0x0C, 0),
+    "/": (0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10),
+    "(": (0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
+    ")": (0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08),
+    "|": (0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "^": (0x04, 0x0A, 0x11, 0, 0, 0, 0),
+    "_": (0, 0, 0, 0, 0, 0, 0x1F),
+    "=": (0, 0, 0x1F, 0, 0x1F, 0, 0),
+}
+
+
+class Canvas:
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.buf = np.empty((h, w, 3), np.uint8)
+        self.buf[:] = bg
+
+    def px(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.buf[y, x] = c
+
+    def line(self, x0, y0, x1, y1, c=(0, 0, 0), th=1):
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for i in range(n + 1):
+            x = x0 + (x1 - x0) * i / max(n, 1)
+            y = y0 + (y1 - y0) * i / max(n, 1)
+            for dx in range(th):
+                for dy in range(th):
+                    self.px(int(x) + dx, int(y) + dy, c)
+
+    def rect(self, x0, y0, x1, y1, c=(0, 0, 0)):
+        self.line(x0, y0, x1, y0, c)
+        self.line(x0, y1, x1, y1, c)
+        self.line(x0, y0, x0, y1, c)
+        self.line(x1, y0, x1, y1, c)
+
+    def fill_rect(self, x0, y0, x1, y1, c):
+        x0, x1 = sorted((int(x0), int(x1)))
+        y0, y1 = sorted((int(y0), int(y1)))
+        self.buf[max(y0, 0):min(y1 + 1, self.h),
+                 max(x0, 0):min(x1 + 1, self.w)] = c
+
+    def disc(self, x, y, r, c):
+        for yy in range(int(y - r), int(y + r) + 1):
+            for xx in range(int(x - r), int(x + r) + 1):
+                if (xx - x) ** 2 + (yy - y) ** 2 <= r * r:
+                    self.px(xx, yy, c)
+
+    def text(self, x, y, s, c=(0, 0, 0), sc=2):
+        cx = x
+        for ch in s.upper():
+            g = _FONT.get(ch, _FONT[" "])
+            for ry, row in enumerate(g):
+                for rx in range(5):
+                    if row & (1 << (4 - rx)):
+                        self.fill_rect(cx + rx * sc, y + ry * sc,
+                                       cx + rx * sc + sc - 1,
+                                       y + ry * sc + sc - 1, c)
+            cx += 6 * sc
+
+    def save(self, path):
+        raw = b"".join(b"\x00" + self.buf[i].tobytes() for i in range(self.h))
+
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h,
+                                            8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw, 9))
+               + chunk(b"IEND", b""))
+        with open(path, "wb") as fh:
+            fh.write(png)
+
+
+def fmt_num(v, nd=2):
+    if v != 0 and (abs(v) >= 1e4 or abs(v) < 1e-2):
+        m, e = f"{v:.2e}".split("e")
+        return f"{m}E{int(e):+d}"
+    return f"{v:.{nd}f}"
+
+
+class Panel:
+    """Axes with linear mapping of data space into a pixel box."""
+
+    def __init__(self, cv, x0, y0, x1, y1, title):
+        self.cv = cv
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        cv.text(x0 + 4, y0 + 2, title, sc=2)
+        self.ax0, self.ay0 = x0 + 50, y0 + 26
+        self.ax1, self.ay1 = x1 - 10, y1 - 30
+        self.ylo = None
+
+    def set_range(self, lo, hi, pad=0.05):
+        if hi - lo < 1e-12:
+            hi = lo + 1.0
+        p = (hi - lo) * pad
+        self.xlo, self.xhi = lo - p, hi + p
+
+    def set_yrange(self, lo, hi, pad=0.05):
+        if hi - lo < 1e-12:
+            hi = lo + 1.0
+        p = (hi - lo) * pad
+        self.ylo, self.yhi = lo - p, hi + p
+
+    def mx(self, x):
+        f = (x - self.xlo) / (self.xhi - self.xlo)
+        return self.ax0 + f * (self.ax1 - self.ax0)
+
+    def my(self, y):
+        f = (y - self.ylo) / (self.yhi - self.ylo)
+        return self.ay1 - f * (self.ay1 - self.ay0)
+
+    def axes(self, xticks, yticks):
+        cv = self.cv
+        cv.line(self.ax0, self.ay0, self.ax0, self.ay1)
+        cv.line(self.ax0, self.ay1, self.ax1, self.ay1)
+        for t in xticks:
+            x = self.mx(t)
+            cv.line(x, self.ay1, x, self.ay1 + 4)
+            cv.text(int(x) - 12, self.ay1 + 8, fmt_num(t), sc=1)
+        for t in yticks:
+            y = self.my(t)
+            cv.line(self.ax0 - 4, y, self.ax0, y)
+            cv.text(self.ax0 - 50, int(y) - 3, fmt_num(t), sc=1)
+
+
+def draw_overview(path, info):
+    cv = Canvas(1500, 1000)
+    cv.text(20, 4, "ET REORGANISATION ENERGY OVERVIEW - CASE "
+            + info["case_id"], sc=2)
+    ca = info["ca"]
+    b_al = info["b_al"]
+    lo = np.minimum(ca.min(0), b_al.min(0)) - 0.5
+    hi = np.maximum(ca.max(0), b_al.max(0)) + 0.5
+
+    # panel 1: structures
+    p = Panel(cv, 20, 30, 500, 490, "P1: FRAME A VS ALIGNED B (XY)")
+    p.set_range(lo[0], hi[0]); p.set_yrange(lo[1], hi[1])
+    p.axes([round(lo[0] + k * (hi[0] - lo[0]) / 2, 1) for k in range(3)],
+           [round(lo[1] + k * (hi[1] - lo[1]) / 2, 1) for k in range(3)])
+    for i, (a, b) in enumerate(zip(ca, b_al)):
+        r = 9 if i == info["fe_site"] else 6
+        p.cv.disc(p.mx(a[0]), p.my(a[1]), r, (200, 30, 30))
+        p.cv.disc(p.mx(b[0]) + 3, p.my(b[1]) + 3, r, (30, 30, 200))
+    cv.text(40, 452, "RED=FRAME A  BLUE=FRAME B ALIGNED  BIG=FE", sc=1)
+
+    # panel 2: frequencies
+    p = Panel(cv, 520, 30, 1000, 490, "P2: RETAINED-MODE FREQUENCIES (CM-1)")
+    fa, fb = info["freq_a"], info["freq_b"]
+    fmax = max(fa.max(), fb.max())
+    p.set_range(-0.5, 15.5); p.set_yrange(0, fmax * 1.05)
+    p.axes([0, 7, 14], [0, round(fmax, -2)])
+    bw = (p.ax1 - p.ax0) / 15.0
+    for k in range(15):
+        x = p.ax0 + k * bw
+        p.cv.fill_rect(x + 2, p.my(fa[k]), x + bw * 0.45, p.ay1, (200, 60, 60))
+        p.cv.fill_rect(x + bw * 0.5, p.my(fb[k]), x + bw - 2, p.ay1, (60, 60, 200))
+    cv.text(545, 452, "RED=FRAME A  BLUE=FRAME B  MODES BY ASCENDING EPS", sc=1)
+
+    # panels 3/4: overlap heatmaps
+    for idx, (tag, mat) in enumerate((("FWD |V_A^T V_B|", info["S_fwd"]),
+                                      ("BWD |V_B^T V_A|", info["S_fwd"].T))):
+        y0 = 30 if idx == 0 else 300
+        p = Panel(cv, 1020, y0, 1480, y0 + 245,
+                  "P%d: MODE OVERLAP %s" % (3 + idx, tag))
+        cw = (p.ax1 - p.ax0) / 15.0
+        ch = (p.ay1 - p.ay0) / 15.0
+        for i in range(15):
+            for j in range(15):
+                v = float(min(max(mat[i, j], 0.0), 1.0))
+                col = (int(255 * (1 - v)), int(255 * (1 - 0.6 * v)),
+                       int(255 * (1 - 0.2 * v)))
+                p.cv.fill_rect(p.ax0 + j * cw, p.ay0 + i * ch,
+                               p.ax0 + (j + 1) * cw - 1,
+                               p.ay0 + (i + 1) * ch - 1, col)
+        cv.text(1040, y0 + 215, "DARK=1.0 WHITE=0.0 MAX=%.3f" % mat.max(), sc=1)
+
+    # panel 5: lambda contribution per mode
+    p = Panel(cv, 20, 520, 740, 980,
+              "P5: LAMBDA CONTRIBUTION PER MODE (LOG10 EV)")
+    la = np.log10(np.maximum(info["lam_k_fwd"], 1e-300))
+    lb = np.log10(np.maximum(info["lam_k_bwd"], 1e-300))
+    lo5 = math.floor(min(la.min(), lb.min())) - 1
+    hi5 = math.ceil(max(la.max(), lb.max())) + 1
+    p.set_range(-0.5, 15.5); p.set_yrange(lo5, hi5)
+    p.axes([0, 7, 14], [lo5 + 1, (lo5 + hi5) // 2, hi5 - 1])
+    bw = (p.ax1 - p.ax0) / 15.0
+    ybase = p.my(lo5 + 0.2)
+    for k in range(15):
+        x = p.ax0 + k * bw
+        p.cv.fill_rect(x + 1, p.my(la[k]), x + bw * 0.45, ybase, (200, 60, 60))
+        p.cv.fill_rect(x + bw * 0.5, p.my(lb[k]), x + bw - 1, ybase, (60, 60, 200))
+    cv.text(40, 940, "RED=FORWARD BLUE=BACKWARD DOMINANT FWD=%d BWD=%d"
+            % (info["dom_fwd"], info["dom_bwd"]), sc=1)
+
+    # panel 6: rate curve
+    p = Panel(cv, 760, 520, 1480, 980, "P6: LOG10 K_ET VS DRIVING FORCE")
+    ax = info["axis"]; lg = info["log10k"]
+    p.set_range(ax.min(), ax.max()); p.set_yrange(lg.min(), lg.max())
+    p.axes([round(ax.min(), 1), 0.0, round(ax.max(), 1)],
+           [lg.min(), (lg.min() + lg.max()) / 2, lg.max()])
+    order = np.argsort(ax)
+    pts = [(p.mx(ax[i]), p.my(lg[i])) for i in order]
+    for (xa, ya), (xb, yb) in zip(pts[:-1], pts[1:]):
+        cv.line(xa, ya, xb, yb, (0, 90, 200), th=2)
+    for x, y in pts:
+        cv.disc(x, y, 2, (0, 90, 200))
+    pk = info["peak_i"]
+    cv.disc(p.mx(ax[pk]), p.my(lg[pk]), 5, (220, 40, 40))
+    cv.text(p.mx(ax[pk]) - 30, p.my(lg[pk]) - 26, "PEAK", sc=1, c=(220, 40, 40))
+    if not info["inv"]:
+        note = "NO INVERTED REGION IN GRID (AXIS > -LAMBDA_TOTAL=%.1f EV)" \
+               % info["lam_tot"]
+    else:
+        note = "INVERTED REGION FIRST AT AXIS=%.3f EV" % info["first_inv_axis"]
+    cv.text(780, 940, note, sc=1)
+    cv.save(path)
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    (site_ids, masses, labels, coords, hess, site_perm,
+     manifest, medium, grid) = load_inputs()
+    n_sites = len(site_ids)
+    assert site_ids == list(range(n_sites))
+    n_dof = 3 * n_sites
+    m_vec = np.array([masses[s] for s in site_ids])
+    M = np.repeat(m_vec, 3)
+    sqrtM = np.sqrt(M)
+    fe_site = int(np.argmax(m_vec))
+
+    # ---- alignment -------------------------------------------------------
+    ca, cb = coords["frame_a"], coords["frame_b"]
+    Ha, Hb = hess["frame_a"], hess["frame_b"]
+    R_f, t_f, rmsd_f = kabsch(cb, ca, m_vec)     # forward : B -> A
+    R_b, t_b, rmsd_b = kabsch(ca, cb, m_vec)     # backward: A -> B
+    b_al = cb @ R_f + t_f                        # B expressed in frame A
+    a_al = ca @ R_b + t_b                        # A expressed in frame B
+    print("[align] forward  rmsd = %.6f A (det R = %+d)"
+          % (rmsd_f, int(np.sign(np.linalg.det(R_f)))))
+    print("[align] backward rmsd = %.6f A (det R = %+d)"
+          % (rmsd_b, int(np.sign(np.linalg.det(R_b)))))
+    chk = np.linalg.norm((cb @ R_f + t_f) @ R_b + t_b - cb)
+    print("[align] inverse-transform residual = %.3e (expect ~0)" % chk)
+
+    # ---- displacements (mass-weighted, signed, source minus target) ------
+    d_f = sqrtM * (b_al - ca).reshape(-1)        # in frame A
+    d_b = sqrtM * (a_al - cb).reshape(-1)        # in frame B
+    aligned_disp = np.stack([d_f, d_b])
+    def rot_vec21(v, R):
+        return np.einsum('sj,ji->si', v.reshape(n_sites, 3), R).reshape(-1)
+    rel = np.linalg.norm(d_b + rot_vec21(d_f, R_f.T))
+    print("[disp] ||d_b + R_f^T d_f|| = %.3e ; ||d_f||=%.4f ||d_b||=%.4f"
+          % (rel, np.linalg.norm(d_f), np.linalg.norm(d_b)))
+
+    # ---- mass-weighted diagonalisation -----------------------------------
+    basis, eps_all, freqs = {}, {}, {}
+    for fid, H in (("frame_a", Ha), ("frame_b", Hb)):
+        Hmw = H / np.sqrt(np.outer(M, M))
+        w, v = np.linalg.eigh(Hmw)
+        sel = w > EIG_TOL
+        assert int(sel.sum()) == manifest["resolved_rank"]
+        w, v = w[sel], v[:, sel]                     # ascending eigenvalue
+        basis[fid], eps_all[fid] = v, w
+        freqs[fid] = np.sqrt(w) * manifest["freq_scale_factor"]
+        print("[%s] %d retained modes, freq %.1f..%.1f cm-1"
+              % (fid, len(w), freqs[fid].min(), freqs[fid].max()))
+    Va, Vb = basis["frame_a"], basis["frame_b"]
+    eps_a, eps_b = eps_all["frame_a"], eps_all["frame_b"]
+    vib_basis = np.stack([Va, Vb])                   # each in its own frame
+
+    # ---- mode projections -------------------------------------------------
+    c_f = Va.T @ d_f                                  # signed, frame A
+    c_b = Vb.T @ d_b                                  # signed, frame B
+    proj_f = Va @ c_f
+    proj_b = Vb @ c_b
+    projected = np.stack([proj_f, proj_b])
+    lam_k_f = 0.5 * eps_a * c_f ** 2
+    lam_k_b = 0.5 * eps_b * c_b ** 2
+    lam_nm_f, lam_nm_b = float(lam_k_f.sum()), float(lam_k_b.sum())
+    # four-point estimator on plain Cartesian coordinates (identical to
+    # 1/2 d_mw^T H_mw d_mw); d_f/d_b are mass-weighted, hence unscale first
+    lam_4pt_f = float(0.5 * (d_f / sqrtM) @ Ha @ (d_f / sqrtM))
+    lam_4pt_b = float(0.5 * (d_b / sqrtM) @ Hb @ (d_b / sqrtM))
+    print("[lambda] 4pt fwd %.6f | nm fwd %.6f eV" % (lam_4pt_f, lam_nm_f))
+    print("[lambda] 4pt bwd %.6f | nm bwd %.6f eV" % (lam_4pt_b, lam_nm_b))
+
+    mode_projection = np.stack([
+        np.stack([c_f, eps_a, lam_k_f], axis=1),
+        np.stack([c_b, eps_b, lam_k_b], axis=1)])
+    dom_f = int(np.argmax(lam_k_f))
+    dom_b = int(np.argmax(lam_k_b))
+
+    # ---- cross-frame overlaps (shared frame, magnitude-based) -------------
+    def rot_basis(V, R):
+        # rotate the Cartesian index of every site block: x' = x R
+        return np.einsum('sjk,ji->sik',
+                         V.reshape(n_sites, 3, -1), R).reshape(n_dof, -1)
+    Vb_inA = rot_basis(Vb, R_f)
+    Va_inB = rot_basis(Va, R_b)
+    S_AB = np.abs(Va.T @ Vb_inA)                      # rows A, cols B
+    mode_overlap = np.stack([S_AB, S_AB.T])
+    print("[overlap] max |Va.Vb| = %.4f, mean = %.4f"
+          % (S_AB.max(), S_AB.mean()))
+
+    # transported profiles: [dir, k, (direct |v_src.d|, via-overlap |S^T c|)]
+    t_f0 = np.abs(Vb_inA.T @ d_f)
+    t_f1 = np.abs(S_AB.T @ c_f)
+    t_b0 = np.abs(Va_inB.T @ d_b)
+    t_b1 = np.abs(S_AB @ c_b)
+    transported = np.stack([np.stack([t_f0, t_f1], axis=1),
+                            np.stack([t_b0, t_b1], axis=1)])
+
+    # ---- medium response / lambda summary --------------------------------
+    r_d, r_a, span = medium["shell_0_A"], medium["shell_1_A"], medium["span_A"]
+    dielec = 1.0 / medium["eps_fast"] - 1.0 / medium["eps_slow"]
+    lam_outer = COULOMB_EV_A * (0.5 / r_d + 0.5 / r_a - 1.0 / span) * dielec
+    lam_inner_eff = 0.5 * (lam_4pt_f + lam_4pt_b)
+    lam_total = lam_inner_eff + lam_outer
+    T = medium["temp_K"]
+    kT = KB_EV_K * T
+    V_cpl = medium["coupling_eV"]
+
+    def marcus_log10k(dg, lam):
+        pref = (2 * math.pi / HBAR_EV_S) * V_cpl ** 2 \
+            / math.sqrt(4 * math.pi * lam * kT)
+        return math.log10(pref) - (dg + lam) ** 2 / (4 * lam * kT) / math.log(10)
+
+    log10_self = marcus_log10k(0.0, lam_total)
+    k_self = 10.0 ** log10_self if log10_self > -308 else 0.0
+    print("[medium] lambda_outer = %.6f eV ; lambda_total = %.6f eV"
+          % (lam_outer, lam_total))
+    print("[rate]   log10 k_self_exchange = %.3f" % log10_self)
+
+    # ---- rate curve (rows preserved in file order) ------------------------
+    grid_ids = np.array([g for g, _ in grid])
+    axis = np.array([a for _, a in grid])
+    log10k = np.array([marcus_log10k(dg, lam_total) for dg in axis])
+    k_et = np.array([10.0 ** x if x > -308 else 0.0 for x in log10k])
+    peak_i = int(np.argmax(log10k))
+
+    srt = np.argsort(axis)                    # scan ascending from most negative
+    inv_mask = axis[srt] < -lam_total
+    inv_detected = bool(inv_mask.any())
+    first_inv_i = int(srt[np.argmax(inv_mask)]) if inv_detected else None
+    first_inv_axis = float(axis[first_inv_i]) if inv_detected else None
+    print("[rate]   peak at grid_id %d, axis %.4f eV, log10 k = %.2f"
+          % (grid_ids[peak_i], axis[peak_i], log10k[peak_i]))
+    print("[rate]   inverted region detected: %s" % inv_detected)
+
+    # ---- diagnostics ------------------------------------------------------
+    diag = {
+        "alignment_rmsd_forward_A": rmsd_f,
+        "alignment_rmsd_backward_A": rmsd_b,
+        "closure_error_forward_eV": abs(lam_4pt_f - lam_nm_f),
+        "closure_error_backward_eV": abs(lam_4pt_b - lam_nm_b),
+        "effective_inner_consistency_eV":
+            abs(lam_inner_eff - 0.5 * (lam_nm_f + lam_nm_b)),
+        "rigid_norm_forward": float(np.linalg.norm(d_f - proj_f)),
+        "rigid_norm_backward": float(np.linalg.norm(d_b - proj_b)),
+        "projected_norm_forward": float(np.linalg.norm(proj_f)),
+        "projected_norm_backward": float(np.linalg.norm(proj_b)),
+        "dominant_mode_forward": dom_f,
+        "dominant_mode_backward": dom_b,
+        "rate_peak_grid_id": int(grid_ids[peak_i]),
+        "rate_peak_axis_eV": float(axis[peak_i]),
+        "rate_peak_s_inv": float(10.0 ** log10k[peak_i])
+        if log10k[peak_i] > -308 else 0.0,
+        "inverted_region_detected": inv_detected,
+        "first_inverted_grid_id": (int(grid_ids[first_inv_i])
+                                   if inv_detected else None),
+        "first_inverted_axis_eV": first_inv_axis,
+    }
+
+    # ---- write outputs ----------------------------------------------------
+    np.save(f"{OUT}/aligned_displacement_mw.npy", aligned_disp)
+    np.save(f"{OUT}/vibrational_basis_mw.npy", vib_basis)
+    np.save(f"{OUT}/mode_overlap.npy", mode_overlap)
+    np.save(f"{OUT}/projected_displacement_mw.npy", projected)
+    np.save(f"{OUT}/transported_mode_projection.npy", transported)
+    np.save(f"{OUT}/mode_projection.npy", mode_projection)
+
+    with open(f"{OUT}/lambda_summary.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["lambda_4pt_forward_eV", "lambda_4pt_backward_eV",
+                    "lambda_nm_forward_eV", "lambda_nm_backward_eV",
+                    "lambda_inner_effective_eV", "lambda_outer_eV",
+                    "lambda_total_eV", "k_self_exchange_s_inv"])
+        w.writerow(["%.17g" % lam_4pt_f, "%.17g" % lam_4pt_b,
+                    "%.17g" % lam_nm_f, "%.17g" % lam_nm_b,
+                    "%.17g" % lam_inner_eff, "%.17g" % lam_outer,
+                    "%.17g" % lam_total, "%.17g" % k_self])
+
+    with open(f"{OUT}/rate_curve.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["grid_id", "axis_eV", "k_et_s_inv", "log10_k_et_s_inv"])
+        for i in range(len(grid)):
+            w.writerow([int(grid_ids[i]), repr(float(axis[i])),
+                        "%.17g" % k_et[i], "%.17g" % log10k[i]])
+
+    with open(f"{OUT}/diagnostics.json", "w") as fh:
+        json.dump(diag, fh, indent=2)
+
+    info = dict(case_id=manifest["case_id"], ca=ca, b_al=b_al,
+                freq_a=freqs["frame_a"], freq_b=freqs["frame_b"],
+                S_fwd=S_AB, lam_k_fwd=lam_k_f, lam_k_bwd=lam_k_b,
+                dom_fwd=dom_f, dom_bwd=dom_b, axis=axis, log10k=log10k,
+                peak_i=peak_i, inv=inv_detected,
+                first_inv_axis=first_inv_axis or 0.0,
+                lam_tot=lam_total, fe_site=fe_site)
+    draw_overview(f"{OUT}/overview.png", info)
+
+    # ---- consistency self-checks ------------------------------------------
+    assert abs(lam_nm_f - mode_projection[0][:, 2].sum()) < 1e-9
+    assert abs(lam_nm_b - mode_projection[1][:, 2].sum()) < 1e-9
+    assert abs(np.linalg.norm(d_f) ** 2
+               - (np.linalg.norm(proj_f) ** 2
+                  + np.linalg.norm(d_f - proj_f) ** 2)) < 1e-8
+    print("[check] all internal consistency assertions passed")
+
+    print("\n=== lambda_summary ===")
+    for nm, vv in (("lambda_4pt_forward_eV", lam_4pt_f),
+                   ("lambda_4pt_backward_eV", lam_4pt_b),
+                   ("lambda_nm_forward_eV", lam_nm_f),
+                   ("lambda_nm_backward_eV", lam_nm_b),
+                   ("lambda_inner_effective_eV", lam_inner_eff),
+                   ("lambda_outer_eV", lam_outer),
+                   ("lambda_total_eV", lam_total),
+                   ("k_self_exchange_s_inv(log10)", log10_self)):
+        print("  %-28s = %.6f" % (nm, vv))
+    print("\n=== diagnostics ===")
+    for k2, v2 in diag.items():
+        print("  %s = %s" % (k2, v2))
+
+
+if __name__ == "__main__":
+    main()

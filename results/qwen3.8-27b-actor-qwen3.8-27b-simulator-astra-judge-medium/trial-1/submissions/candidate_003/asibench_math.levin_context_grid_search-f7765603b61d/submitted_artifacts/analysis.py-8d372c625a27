@@ -1,0 +1,575 @@
+"""analysis.py — learned action-selection policy for deterministic grid-search levels.
+
+Self-contained (stdlib only).  Public interface:
+
+    policy = make_policy(training_data, config=None)
+    scores = policy.action_probs(level, state, legal_actions)  # dict[action, float >= 0]
+
+Design (approved plan):
+  * make_policy replays the solved training trajectories and learns two small
+    empirical tables: first-action counts per legal-mask, and forced-turn counts
+    per (previous_action, legal-mask).  Trajectories obey "go straight while
+    legal" with ~coin-flip turn direction, so the policy is a structural model:
+      - straight continuation gets dominant mass (0.95, discounted at deep depth);
+      - decision points (start / forced turn) get a flat profile
+        [0.35, 0.30, 0.20, 0.15] over candidates ordered by the learned
+        empirical distribution (fallback: uniform);
+      - reverse is down-weighted (never chosen in training) but kept > 0.
+  * Goal-aware layers, used only when the information is actually available:
+      L0: exact BFS distance-to-goal  (needs level['grid'] + level['goal'] + position)
+      L1: greedy Manhattan blend      (needs level['goal'] + position)
+      L2: goal tile 'G' visible in neighbors -> take it
+  * All observation parsing is defensive: any unparseable field degrades to a
+    safe fallback (uniform over legal actions) and never raises.
+"""
+
+from __future__ import annotations
+
+import collections
+import math
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ACTIONS = ("U", "D", "L", "R")
+DIR_DELTA = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+ACTION_REVERSE = {"U": "D", "D": "U", "L": "R", "R": "L"}
+
+# neighbor values that mean "wall / out of bounds / unknown"
+WALL_MARKS = {"", "#", "x", "X", "wall", "WALL", "none", "None", "null", "0"}
+# neighbor values that mean "the goal tile"
+GOAL_MARKS = {"G", "goal"}
+
+# Tuned on the 260 training levels with a best-first search simulation (budget 95).
+DEFAULT_CONFIG = {
+    "straight_prob": 0.95,            # mass for continuing straight (researcher spec: 0.95)
+    "straight_deep_discount": 0.90,   # multiplier on straight_prob when depth is deep
+    "depth_threshold_frac": 0.5,      # "deep" means depth > frac * max_depth
+    "decision_shape": (0.35, 0.30, 0.20, 0.15),  # relative weights at decision points
+    "reverse_share": 0.30,            # share of residual mass reserved for the reverse move
+    "goal_worse_mult": 0.01,          # L1 multiplier for actions that worsen Manhattan dist
+    "bfs_tau": 0.25,                  # L0 temperature: score ~ exp(-dist/tau) (steep -> greedy)
+}
+
+
+
+# ---------------------------------------------------------------------------
+# Defensive parsing helpers (never raise)
+# ---------------------------------------------------------------------------
+
+def _try_int(value):
+    """Best-effort int extraction; None if not an integer."""
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            s = value.strip()
+            if s.lstrip("-").isdigit():
+                return int(s)
+    except Exception:
+        pass
+    return None
+
+
+def _coord_pair(value):
+    """Return (r, c) if value looks like a 2-element numeric pair, else None."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        r = _try_int(value[0])
+        c = _try_int(value[1])
+        if r is not None and c is not None:
+            return (r, c)
+    return None
+
+
+def parse_cell(state):
+    """Return (tile_char, position) from state['cell'] / position fields.
+
+    Either element may be None.  Accepts: a single-char string, a [r, c] pair,
+    or a dict with char/pos sub-fields; also top-level pos/row/col fields.
+    """
+    tile = None
+    pos = None
+    cell = state.get("cell")
+    if isinstance(cell, dict):
+        for key in ("pos", "position", "coord", "coords", "location"):
+            pos = _coord_pair(cell.get(key))
+            if pos is not None:
+                break
+        if pos is None:
+            r = _try_int(cell.get("row", cell.get("r")))
+            c = _try_int(cell.get("col", cell.get("c")))
+            if r is not None and c is not None:
+                pos = (r, c)
+        for key in ("char", "type", "tile", "label", "ch", "value"):
+            v = cell.get(key)
+            if isinstance(v, str) and len(v) == 1:
+                tile = v
+                break
+    elif isinstance(cell, (list, tuple)):
+        pos = _coord_pair(cell)
+        if pos is None and len(cell) == 1:
+            v = cell[0]
+            if isinstance(v, str) and len(v) == 1:
+                tile = v
+    elif isinstance(cell, str) and len(cell) == 1:
+        tile = cell
+    if pos is None:
+        for key in ("pos", "position", "coord", "location"):
+            pos = _coord_pair(state.get(key))
+            if pos is not None:
+                break
+    if pos is None:
+        r = _try_int(state.get("row", state.get("r")))
+        c = _try_int(state.get("col", state.get("c")))
+        if r is not None and c is not None:
+            pos = (r, c)
+    return tile, pos
+
+
+_DIR_SYNONYMS = {
+    "u": "U", "up": "U", "n": "U", "0": "U",
+    "d": "D", "down": "D", "s": "D", "1": "D",
+    "l": "L", "left": "L", "w": "L", "2": "L",
+    "r": "R", "right": "R", "e": "R", "3": "R",
+}
+_OFFSET_TO_DIR = {(-1, 0): "U", (1, 0): "D", (0, -1): "L", (0, 1): "R"}
+
+
+def _tile_value(value):
+    """Map a raw neighbor value to a tile char; walls/out-of-bounds -> None."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return None if value in WALL_MARKS else value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _tile_value(value[0])
+    return None
+
+
+def parse_neighbors(state):
+    """Return {direction: tile_char_or_None} from state['neighbors'].
+
+    Accepts: dict keyed by direction (or by (dr, dc) offset), a 4-element list
+    in U,D,L,R order, a list of (dir, tile) pairs, or an odd-sized square
+    window (list of strings) centered on the current cell.  {} if unparseable.
+    """
+    out = {}
+    nb = state.get("neighbors")
+    if isinstance(nb, dict):
+        for key, value in nb.items():
+            d = _DIR_SYNONYMS.get(key.strip().lower()) if isinstance(key, str) else None
+            if d is None and isinstance(key, (list, tuple)) and len(key) == 2:
+                d = _OFFSET_TO_DIR.get((key[0], key[1]))
+            if d is not None:
+                out[d] = _tile_value(value)
+    elif isinstance(nb, (list, tuple)):
+        if len(nb) == 4:
+            is_pairs = all(isinstance(x, (list, tuple)) and len(x) >= 2 for x in nb)
+            if is_pairs:
+                for x in nb:
+                    d = _DIR_SYNONYMS.get(x[0].strip().lower()) if isinstance(x[0], str) else None
+                    if d is None and isinstance(x[0], (list, tuple)) and len(x[0]) == 2:
+                        d = _OFFSET_TO_DIR.get((x[0][0], x[0][1]))
+                    if d is not None:
+                        out[d] = _tile_value(x[1])
+            else:
+                for d, v in zip(ACTIONS, nb):
+                    out[d] = _tile_value(v)
+        else:
+            rows = [row for row in nb if isinstance(row, (list, tuple))]
+            if rows and all(isinstance(x, str) and len(x) > 0 for row in rows for x in row):
+                h, w = len(rows), len(rows[0])
+                if h >= 3 and w >= 3 and h % 2 == 1 and w % 2 == 1:
+                    cr, cc = h // 2, w // 2
+                    for d, (dr, dc) in DIR_DELTA.items():
+                        r, c = cr + dr, cc + dc
+                        if 0 <= r < h and 0 <= c < w:
+                            out[d] = None if rows[r][c] in WALL_MARKS else rows[r][c]
+    return out
+
+
+def parse_action_seq(value):
+    """Normalize a history-like field to a list of 'UDLR' actions, or None.
+
+    Accepts a string ("UUDLR"), a list of action strings, or a list of state
+    dicts from which an 'action' field can be extracted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        acts = [ch for ch in value.upper() if ch in ACTIONS]
+        return acts or None
+    if isinstance(value, (list, tuple)):
+        acts = []
+        for item in value:
+            if isinstance(item, str) and item.upper() in ACTIONS:
+                acts.append(item.upper())
+            elif isinstance(item, dict):
+                found = None
+                for key in ("action", "a", "move"):
+                    v = item.get(key)
+                    if isinstance(v, str) and v.upper() in ACTIONS:
+                        found = v.upper()
+                        break
+                if found is None:
+                    return None  # states without an extractable action -> not usable
+                acts.append(found)
+            else:
+                return None
+        return acts or None
+    return None
+
+
+def parse_legal_actions(legal_actions, state):
+    """Resolve the legal action set.  Primary source: legal_actions argument."""
+    if isinstance(legal_actions, (list, tuple, str)):
+        seq = legal_actions if isinstance(legal_actions, str) else list(legal_actions)
+        seen, out = set(), []
+        for a in seq:
+            if isinstance(a, str) and a.upper() in ACTIONS and a.upper() not in seen:
+                seen.add(a.upper())
+                out.append(a.upper())
+        if out:
+            return out
+    # fallbacks: legal_mask as letter string / 4-bool list / bitmask
+    mask = state.get("legal_mask")
+    if isinstance(mask, str):
+        out = [a for a in ACTIONS if a in mask.upper()]
+        if out:
+            return out
+    if isinstance(mask, (list, tuple)) and len(mask) == 4:
+        out = [a for a, ok in zip(ACTIONS, mask) if ok in (True, 1, "1", "true", "yes")]
+        if out:
+            return out
+    if isinstance(mask, int) and not isinstance(mask, bool):
+        out = [a for a, bit in zip(ACTIONS, (1, 2, 4, 8)) if mask & bit]
+        if out:
+            return out
+    # fallback: open neighbors
+    nb = parse_neighbors(state)
+    out = [a for a in ACTIONS if nb.get(a) is not None]
+    if out:
+        return out
+    return list(ACTIONS)  # last resort: everything (scores stay safe)
+
+
+def parse_goal(level):
+    """Return (r, c) goal position from level metadata, or None."""
+    if not isinstance(level, dict):
+        return None
+    g = level.get("goal", level.get("target"))
+    pos = _coord_pair(g)
+    if pos is not None:
+        return pos
+    if isinstance(g, dict):
+        r = _try_int(g.get("row", g.get("r")))
+        c = _try_int(g.get("col", g.get("c")))
+        if r is not None and c is not None:
+            return (r, c)
+    return None
+
+
+def parse_start(level):
+    """Return (r, c) start position from level metadata, or None."""
+    if not isinstance(level, dict):
+        return None
+    s = level.get("start", level.get("start_pos"))
+    pos = _coord_pair(s)
+    if pos is not None:
+        return pos
+    if isinstance(s, dict):
+        r = _try_int(s.get("row", s.get("r")))
+        c = _try_int(s.get("col", s.get("c")))
+        if r is not None and c is not None:
+            return (r, c)
+    return None
+
+
+def parse_grid(level):
+    """Return the grid as a list of equal-length strings, or None if absent/malformed."""
+    if not isinstance(level, dict):
+        return None
+    g = level.get("grid")
+    if isinstance(g, (list, tuple)) and g and all(isinstance(row, str) for row in g):
+        w = len(g[0])
+        if w > 0 and all(len(row) == w for row in g):
+            return list(g)
+    return None
+
+
+def position_from_history(start, history, depth=None):
+    """Reconstruct the current position as start + replay(history).
+
+    Only trusted when the history is complete (len == depth), otherwise None.
+    """
+    if start is None or not history:
+        return None
+    if depth is not None and len(history) != depth:
+        return None
+    r, c = start
+    for a in history:
+        r += DIR_DELTA[a][0]
+        c += DIR_DELTA[a][1]
+    return (r, c)
+
+
+# ---------------------------------------------------------------------------
+# Learning from training trajectories
+# ---------------------------------------------------------------------------
+
+def _grid_legal(grid, r, c):
+    """Legal actions on a concrete grid (training replay only)."""
+    h = len(grid)
+    w = len(grid[0])
+    out = []
+    for a in ACTIONS:
+        nr, nc = r + DIR_DELTA[a][0], c + DIR_DELTA[a][1]
+        if 0 <= nr < h and 0 <= nc < w and grid[nr][nc] != "#":
+            out.append(a)
+    return out
+
+
+def learn_tables(training_data):
+    """Replay all solved training levels; build empirical action tables.
+
+    Returns (tab_start, tab_turn, straight_ratio, n_valid_levels):
+      tab_start: {legal_mask: Counter(action)}             for the first action
+      tab_turn:  {(prev_action, legal_mask): Counter(action)}  for forced turns
+      straight_ratio: fraction of non-first steps that continued straight
+    Any malformed input degrades gracefully to empty tables.
+    """
+    tab_start = collections.defaultdict(collections.Counter)
+    tab_turn = collections.defaultdict(collections.Counter)
+    straight = 0
+    nonfirst = 0
+    n_valid = 0
+    levels = None
+    if isinstance(training_data, dict):
+        levels = training_data.get("levels")
+    elif isinstance(training_data, list):
+        levels = training_data
+    if not isinstance(levels, list):
+        return tab_start, tab_turn, 1.0, 0
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        grid = parse_grid(lvl)
+        start = parse_start(lvl)
+        sol = lvl.get("solution")
+        if grid is None or start is None or not isinstance(sol, (list, tuple)):
+            continue
+        acts = [a.upper() for a in sol if isinstance(a, str) and a.upper() in ACTIONS]
+        if not acts:
+            continue
+        r, c = start
+        if not (0 <= r < len(grid) and 0 <= c < len(grid[0]) and grid[r][c] != "#"):
+            continue
+        valid = True
+        for t, a in enumerate(acts):
+            la = _grid_legal(grid, r, c)
+            if a not in la:  # trajectory not consistent with grid -> skip level
+                valid = False
+                break
+            mask = "".join(x for x in ACTIONS if x in la)
+            if t == 0:
+                tab_start[mask][a] += 1
+            else:
+                nonfirst += 1
+                if a == acts[t - 1]:
+                    straight += 1
+                else:
+                    tab_turn[(acts[t - 1], mask)][a] += 1
+            r += DIR_DELTA[a][0]
+            c += DIR_DELTA[a][1]
+        if valid:
+            n_valid += 1
+    ratio = (straight / nonfirst) if nonfirst else 1.0
+    return tab_start, tab_turn, ratio, n_valid
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+class Policy:
+    """Action-selection model.  See module docstring for the layer design."""
+
+    def __init__(self, tab_start, tab_turn, straight_ratio, n_valid_levels, config):
+        self.tab_start = tab_start
+        self.tab_turn = tab_turn
+        self.straight_ratio = straight_ratio
+        self.n_valid_levels = n_valid_levels
+        self.cfg = config
+        self._bfs_cache = {}   # (level_id, goal) -> (grid_str, {pos: dist})
+        self.last_layer = None  # set on each call: 'L0' | 'L1' | 'L2' | 'L3'
+
+    # -- public interface ---------------------------------------------------
+
+    def action_probs(self, level, state, legal_actions):
+        """Return {action: nonnegative score} for the legal actions.
+
+        Never raises: any parse failure degrades to a uniform distribution.
+        """
+        try:
+            level = level if isinstance(level, dict) else {}
+            state = state if isinstance(state, dict) else {}
+            legal = parse_legal_actions(legal_actions, state)
+            if not legal:
+                return {}
+            scores = self._score(level, state, legal)
+            total = sum(max(0.0, float(v)) for v in scores.values())
+            if total <= 0.0:
+                return {a: 1.0 / len(legal) for a in legal}
+            return {a: max(0.0, float(scores.get(a, 0.0))) / total for a in legal}
+        except Exception:
+            try:
+                seq = legal_actions if isinstance(legal_actions, (list, tuple, str)) else []
+                acts = [a for a in seq if isinstance(a, str) and a.upper() in ACTIONS]
+                if acts:
+                    return {a: 1.0 / len(acts) for a in acts}
+            except Exception:
+                pass
+            return {}
+
+    # -- scoring layers -----------------------------------------------------
+
+    def _score(self, level, state, legal):
+        _tile, pos = parse_cell(state)
+        neighbors = parse_neighbors(state)
+
+        # previous action: explicit field, else last of history
+        prev = state.get("previous_action")
+        if not (isinstance(prev, str) and prev.upper() in ACTIONS):
+            hist = parse_action_seq(state.get("history")) or parse_action_seq(state.get("history_tail"))
+            prev = hist[-1] if hist else None
+        else:
+            prev = prev.upper()
+
+        depth = _try_int(state.get("depth"))
+        max_depth = _try_int(level.get("max_depth"))
+        if max_depth is None:
+            max_depth = _try_int(state.get("max_depth"))
+
+        goal = parse_goal(level)
+        start = parse_start(level)
+        if pos is None:
+            pos = position_from_history(start, parse_action_seq(state.get("history")), depth)
+
+        # L2: goal tile visible among neighbors -> take it
+        if neighbors:
+            goal_dirs = [a for a in legal if neighbors.get(a) in GOAL_MARKS]
+            if goal_dirs:
+                self.last_layer = "L2"
+                return {a: (1.0 if a == goal_dirs[0] else 1e-4) for a in legal}
+
+        # L0: exact BFS distance-to-goal (needs grid + goal + position)
+        grid = parse_grid(level)
+        if grid is not None and goal is not None and pos is not None:
+            dist = self._bfs_distances(level, grid, goal)
+            if pos in dist:
+                self.last_layer = "L0"
+                raw = {}
+                tau = float(self.cfg.get("bfs_tau", 1.0))
+                for a in legal:
+                    nr, nc = pos[0] + DIR_DELTA[a][0], pos[1] + DIR_DELTA[a][1]
+                    d = dist.get((nr, nc))
+                    if d is None:
+                        raw[a] = 1e-6  # successor unreachable from goal
+                    else:
+                        # exponential in exact distance: makes the search follow
+                        # steepest-descent shortest paths instead of BFS crawling
+                        raw[a] = math.exp(-d / tau) if d > 0 else 1.0
+                return raw
+
+        # L3 core structural model, optionally blended with L1 (Manhattan)
+        base = self._core_scores(legal, prev, depth, max_depth)
+        if goal is not None and pos is not None:
+            self.last_layer = "L1"
+            d0 = abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+            blended = {}
+            for a in legal:
+                nr, nc = pos[0] + DIR_DELTA[a][0], pos[1] + DIR_DELTA[a][1]
+                d1 = abs(nr - goal[0]) + abs(nc - goal[1])
+                blended[a] = base[a] * (1.0 if d1 < d0 else self.cfg["goal_worse_mult"])
+            return blended
+        self.last_layer = "L3"
+        return base
+
+    def _core_scores(self, legal, prev, depth, max_depth):
+        """Structural model: straight-dominant, flat decision profile."""
+        mask = "".join(a for a in ACTIONS if a in legal)
+        if prev is not None and prev in legal:
+            straight_p = self.cfg["straight_prob"]
+            deep = (depth is not None and max_depth is not None
+                    and depth > self.cfg["depth_threshold_frac"] * max_depth)
+            if deep:
+                straight_p *= self.cfg["straight_deep_discount"]
+            others = [a for a in legal if a != prev]
+            fwd = [a for a in others if a != ACTION_REVERSE[prev]]
+            rev = [a for a in others if a == ACTION_REVERSE[prev]]
+            rem = max(0.0, 1.0 - straight_p)
+            mf = rem * (1.0 - self.cfg["reverse_share"]) / len(fwd) if fwd else 0.0
+            mr = rem * self.cfg["reverse_share"] / len(rev) if rev else 0.0
+            sc = {prev: straight_p}
+            for a in fwd:
+                sc[a] = mf
+            for a in rev:
+                sc[a] = mr
+            for a in legal:
+                sc.setdefault(a, 0.0)
+            return sc
+        # decision point: order candidates by learned empirical counts,
+        # then apply the flat profile (fallback order: action_order)
+        if prev is None:
+            counts = self.tab_start.get(mask)
+        else:
+            counts = self.tab_turn.get((prev, mask))
+        if counts:
+            order = sorted(legal, key=lambda a: (-counts.get(a, 0), ACTIONS.index(a)))
+        else:
+            order = list(legal)
+        shape = self.cfg["decision_shape"]
+        ws, w = [], 1.0
+        for i in range(len(order)):
+            w = shape[i] if i < len(shape) else w * 0.4
+            ws.append(w)
+        return {a: w for a, w in zip(order, ws)}
+
+    def _bfs_distances(self, level, grid, goal):
+        """BFS distance from goal over non-wall cells; cached per level id + grid."""
+        key = (level.get("id"), goal)
+        grid_str = "".join(grid)
+        entry = self._bfs_cache.get(key)
+        if entry is not None and entry[0] == grid_str:
+            return entry[1]
+        dist = {goal: 0}
+        frontier = [goal]
+        h, w = len(grid), len(grid[0])
+        i = 0
+        while i < len(frontier):
+            r, c = frontier[i]
+            i += 1
+            d0 = dist[(r, c)]
+            for a in ACTIONS:
+                nr, nc = r + DIR_DELTA[a][0], c + DIR_DELTA[a][1]
+                if 0 <= nr < h and 0 <= nc < w and grid[nr][nc] != "#" and (nr, nc) not in dist:
+                    dist[(nr, nc)] = d0 + 1
+                    frontier.append((nr, nc))
+        self._bfs_cache[key] = (grid_str, dist)
+        return dist
+
+
+def make_policy(training_data, config=None):
+    """Build the policy from the training data dict (see module docstring)."""
+    cfg = dict(DEFAULT_CONFIG)
+    if isinstance(config, dict):
+        for k, v in config.items():
+            if k in DEFAULT_CONFIG:
+                cfg[k] = v
+    tab_start, tab_turn, straight_ratio, n_valid = learn_tables(training_data)
+    return Policy(tab_start, tab_turn, straight_ratio, n_valid, cfg)

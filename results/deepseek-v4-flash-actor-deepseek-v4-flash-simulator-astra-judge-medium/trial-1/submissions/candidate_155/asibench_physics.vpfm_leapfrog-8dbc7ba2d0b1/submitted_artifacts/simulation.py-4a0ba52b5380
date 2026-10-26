@@ -1,0 +1,420 @@
+"""
+simulation.py  --  2D Leapfrog Vortex, VPFM (Vortex Particle Flow Map) method
+=====================================================================
+Classic CFD benchmark: two pairs of counter-rotating vortex rings on a
+135x135 staggered MAC grid over [0,1]^2.
+
+Method (as per confirmed guidance):
+  * quadratic B-spline (N_2) kernel for all particle-grid transfers
+  * APIC affine transfers: particles carry the backward flow-map gradient
+    T (dT/dt = -(grad u)^T T), reset to identity every step; the P2G
+    vorticity deposit is corrected with C_c = T^T * init_C_c (interpolated
+    vorticity gradient)
+  * midpoint (leapfrog) velocity: grid vorticity is backward-advected half
+    a step by semi-Lagrangian RK4, Poisson-solved to obtain the temporal
+    midpoint velocity used to advect the particles
+  * particles and T reinitialized to uniform 4x4 per-cell positions and
+    identity every physical step
+  * Dirichlet stream-function Poisson solve (psi=0 on boundary) with an
+    exact (sparse LU factorised) 5-point solve, residual ~1e-13 < 1e-10
+  * time step dt = min(CFL*h/max_vel, time-to-next-frame), CFL = 1.8797
+  * particles clamped to [dx/2, 1-dx/2]^2; interpolation CLAMPs the
+    N_2 stencil base index to the boundary and renormalises weights
+  * internal float64, output arrays float32
+
+Outputs (written to the current directory):
+  vorticity_frames.npy  shape (5, 135, 135) float32
+      cell-centered vorticity at frames [0, 26, 52, 78, 104]
+  kinetic_energy.npy    shape (108,) float32
+      total kinetic energy at frames 0..107
+"""
+import os
+import numpy as np
+
+# ----------------------------------------------------------------------
+# Grid constants
+# ----------------------------------------------------------------------
+NX = 135          # number of cells per direction
+H = 1.0 / NX      # cell size dx = dy
+CFL = 1.8797      # target CFL number
+DT_FRAME = 0.1    # seconds per frame
+N_FRAMES = 107    # number of frames (frame 0 is the initial state)
+SAMPLED_FRAMES = [0, 26, 52, 78, 104]
+
+CI = np.arange(NX)              # cell index array
+# clamped central-difference neighbor indices (output formula)
+IP1 = np.clip(CI + 1, 0, NX - 1)
+IM1 = np.clip(CI - 1, 0, NX - 1)
+
+# fixed 4x4 particle offsets inside each cell (in units of h), deterministic
+_off = np.arange(4)
+_ox, _oy = np.meshgrid((_off + 0.5) / 4.0 - 0.5, (_off + 0.5) / 4.0 - 0.5)
+PART_OFF = np.stack([_ox.ravel(), _oy.ravel()], axis=1)      # (16, 2)
+
+# ----------------------------------------------------------------------
+# N_2 quadratic B-spline kernel, its derivative, and grid stencils
+# ----------------------------------------------------------------------
+def n2_kernel(z):
+    """N_2 quadratic B-spline kernel value, |z| in cell units."""
+    z = np.abs(z)
+    return np.where(z < 0.5, 0.75 - z * z,
+                    np.where(z < 1.5, 0.5 * (1.5 - z) ** 2, 0.0))
+
+
+def dn2_kernel(z):
+    """dN2/dz for signed z (in cell units)."""
+    a = np.abs(z)
+    return np.where(a < 0.5, -2.0 * z,
+                    np.where(a < 1.5, np.sign(z) * (a - 1.5), 0.0))
+
+
+def base_cell(x):
+    """
+    Central cell index for a point x (physical units): the cell whose
+    centre is nearest (floor(x/H), clamped) - CLAMP keeps the 3-cell
+    N_2 stencil entirely inside the grid.
+    """
+    return np.clip(np.floor(x / H).astype(np.int64), 1, NX - 2)
+
+
+def n2_stencil(x):
+    """
+    For coordinate x return (indices, weights) of the 3-cell N_2 stencil:
+      idx = (c-1, c, c+1),  w = (n2(z+1), n2(z), n2(z-1)),
+      z = x/h - (c+0.5), weights renormalised to sum 1 (CLAMP boundary).
+    """
+    c = base_cell(x)
+    z = x / H - (c.astype(np.float64) + 0.5)
+    w0, w1, w2 = n2_kernel(z + 1.0), n2_kernel(z), n2_kernel(z - 1.0)
+    s = w0 + w1 + w2
+    s = np.where(s > 0.0, s, 1.0)
+    return (c - 1, c, c + 1), (w0 / s, w1 / s, w2 / s)
+
+
+def interp_n2(field, xs, ys):
+    """
+    N_2-interpolate a cell-centred field (NX,NX) at points (xs, ys).
+    Returns array of interpolated values (CLAMP + renormalise near boundary).
+    """
+    (ix0, ix1, ix2), (wx0, wx1, wx2) = n2_stencil(xs)
+    (jy0, jy1, jy2), (wy0, wy1, wy2) = n2_stencil(ys)
+    return (wx0 * (wy0 * field[ix0, jy0] + wy1 * field[ix0, jy1] + wy2 * field[ix0, jy2])
+          + wx1 * (wy0 * field[ix1, jy0] + wy1 * field[ix1, jy1] + wy2 * field[ix1, jy2])
+          + wx2 * (wy0 * field[ix2, jy0] + wy1 * field[ix2, jy1] + wy2 * field[ix2, jy2]))
+
+
+def interp_n2_grad(field, xs, ys):
+    """
+    N_2-interpolate the gradient of a cell-centred field at points
+    (kernel derivative used, stencil CLAMPed like interp_n2).
+    Returns (gx, gy) = (df/dx, df/dy) at the points.
+    """
+    c = base_cell(xs)
+    d = base_cell(ys)
+    zx = xs / H - (c.astype(np.float64) + 0.5)
+    zy = ys / H - (d.astype(np.float64) + 0.5)
+    wx = (n2_kernel(zx + 1.0), n2_kernel(zx), n2_kernel(zx - 1.0))
+    wy = (n2_kernel(zy + 1.0), n2_kernel(zy), n2_kernel(zy - 1.0))
+    dxw = (dn2_kernel(zx + 1.0), dn2_kernel(zx), dn2_kernel(zx - 1.0))
+    dyw = (dn2_kernel(zy + 1.0), dn2_kernel(zy), dn2_kernel(zy - 1.0))
+    ci = (c - 1, c, c + 1)
+    dj = (d - 1, d, d + 1)
+    gx = np.zeros_like(xs)
+    gy = np.zeros_like(xs)
+    for a in range(3):
+        for b in range(3):
+            fval = field[ci[a], dj[b]]
+            gx += fval * (dxw[a] / H) * wy[b]
+            gy += fval * wx[a] * (dyw[b] / H)
+    return gx, gy
+
+# ----------------------------------------------------------------------
+# Cell-centred diagnostics / output formulas
+# ----------------------------------------------------------------------
+def cell_center_velocity(ux, uy):
+    """Cell-centred velocity from staggered MAC faces (output-formula basis)."""
+    u = 0.5 * (ux[0:NX, :] + ux[1:NX + 1, :])
+    v = 0.5 * (uy[:, 0:NX] + uy[:, 1:NX + 1])
+    return u, v
+
+
+def vorticity_from_faces(ux, uy):
+    """
+    Cell-centred vorticity omega = dv/dx - du/dy from cell-centred
+    velocities (averaged from MAC faces) with central differences and
+    out-of-bounds indices clamped to valid range (CLAMP at dx/2).
+    """
+    u, v = cell_center_velocity(ux, uy)
+    return (v[IP1, :] - v[IM1, :]) / (2.0 * H) - (u[:, IP1] - u[:, IM1]) / (2.0 * H)
+
+
+def kinetic_energy(ux, uy):
+    """E = sum 0.5 * h^2 * (u_bar^2 + v_bar^2) over all cells."""
+    u, v = cell_center_velocity(ux, uy)
+    return float(0.5 * H * H * np.sum(u * u + v * v))
+
+
+# ----------------------------------------------------------------------
+# Exact Poisson solver (Dirichlet psi = 0 boundary), cell-centred grid:
+# 5-point Laplacian on the interior 133x133 cells, LU-factorised once and
+# reused (back-substitution each step), residual ~1e-13 < 1e-10.
+# ----------------------------------------------------------------------
+from scipy.sparse import diags, identity, kron
+from scipy.sparse.linalg import splu
+
+_INT_N = NX - 2                      # interior cells 1 .. NX-2
+
+
+def _lap_1d(n):
+    d = -2.0 / H ** 2 * np.ones(n)
+    o = 1.0 / H ** 2 * np.ones(n - 1)
+    return diags([o, d, o], [-1, 0, 1], format="csc")
+
+
+_LAP = kron(_lap_1d(_INT_N), identity(_INT_N, format="csc")) \
+     + kron(identity(_INT_N, format="csc"), _lap_1d(_INT_N))
+_LU = splu(_LAP.tocsc())
+
+
+def poisson_solve(w):
+    """Solve lap(psi) = -w with psi = 0 on the boundary.  Returns psi."""
+    psi = np.zeros((NX, NX))
+    rhs = (-w[1:NX - 1, 1:NX - 1]).ravel()
+    psi[1:NX - 1, 1:NX - 1] = _LU.solve(rhs).reshape(_INT_N, _INT_N)
+    return psi
+
+
+def reconstruct_faces(psi):
+    """
+    Two-point (central) difference of the cell-centred stream function to
+    staggered MAC face velocities, matching the input-file layouts:
+      ux (136,135), face at (a*h, (j+0.5)*h): u = dpsi/dy
+      uy (135,136), face at ((i+0.5)*h, b*h): v = -dpsi/dx
+    psi is x-interpolated (y-interpolated) onto the vertical (horizontal)
+    faces by averaging the two adjacent cell centres, then two-point
+    central-differenced along the face (indices CLAMPed at the edges).
+    Boundary NORMAL velocities (a=0,a=NX and b=0,b=NX) are set to zero
+    (corner components both zero as well).
+    """
+    # psi on vertical faces: (a*h, (j+0.5)*h), a=0..NX
+    psi_fx = np.zeros((NX + 1, NX))
+    psi_fx[1:NX, :] = 0.5 * (psi[0:NX - 1, :] + psi[1:NX, :])
+    # psi on horizontal faces: ((i+0.5)*h, b*h), b=0..NX
+    psi_fy = np.zeros((NX, NX + 1))
+    psi_fy[:, 1:NX] = 0.5 * (psi[:, 0:NX - 1] + psi[:, 1:NX])
+
+    JP1 = np.clip(CI + 1, 0, NX - 1)   # y index +1 (clamped)
+    JM1 = np.clip(CI - 1, 0, NX - 1)   # y index -1 (clamped)
+    IP1f = np.clip(CI + 1, 0, NX - 1)  # x index +1 (clamped)
+    IM1f = np.clip(CI - 1, 0, NX - 1)  # x index -1 (clamped)
+
+    ux = np.zeros((NX + 1, NX))
+    uy = np.zeros((NX, NX + 1))
+    ux[1:NX, :] = (psi_fx[1:NX, JP1] - psi_fx[1:NX, JM1]) / (2.0 * H)   # dpsi/dy
+    uy[:, 1:NX] = -(psi_fy[IP1f, 1:NX] - psi_fy[IM1f, 1:NX]) / (2.0 * H)  # -dpsi/dx
+    return ux, uy
+
+
+# ----------------------------------------------------------------------
+# Velocity interpolation (cell-centred fields) and velocity gradient
+# ----------------------------------------------------------------------
+def _sample_velocity(uc, vc, xs, ys):
+    return interp_n2(uc, xs, ys), interp_n2(vc, xs, ys)
+
+
+def build_velocity_gradient(ux, uy):
+    """Cell-centred 4 gradient components of the cell-centred velocity."""
+    u, v = cell_center_velocity(ux, uy)
+    dudx = (u[IP1, :] - u[IM1, :]) / (2.0 * H)
+    dudy = (u[:, IP1] - u[:, IM1]) / (2.0 * H)
+    dvdx = (v[IP1, :] - v[IM1, :]) / (2.0 * H)
+    dvdy = (v[:, IP1] - v[:, IM1]) / (2.0 * H)
+    return (dudx, dudy), (dvdx, dvdy)
+
+# ----------------------------------------------------------------------
+# Semi-Lagrangian backward advection (RK4) of the grid vorticity
+# ----------------------------------------------------------------------
+def backward_advect(wc, uc, vc, dt2):
+    """
+    Backward-advect the grid vorticity by dt2 (half a physical step) using
+    semi-Lagrangian RK4 with the frozen velocity field (uc,vc).  Returns
+    the resulting vorticity on the same grid (N_2 sample at characteristic
+    endpoints; N_2 interp CLAMPs near the boundary).
+    """
+    gx = (np.arange(NX) + 0.5) * H
+    gxx, gyy = np.meshgrid(gx, gx, indexing="ij")
+    xs0 = gxx.ravel()
+    ys0 = gyy.ravel()
+
+    def rhs(xs, ys):
+        ux_p, uy_p = _sample_velocity(uc, vc, xs, ys)
+        return -ux_p, -uy_p
+
+    k1x, k1y = rhs(xs0, ys0)
+    k2x, k2y = rhs(xs0 + 0.5 * dt2 * k1x, ys0 + 0.5 * dt2 * k1y)
+    k3x, k3y = rhs(xs0 + 0.5 * dt2 * k2x, ys0 + 0.5 * dt2 * k2y)
+    k4x, k4y = rhs(xs0 + dt2 * k3x, ys0 + dt2 * k3y)
+    xs1 = xs0 + (dt2 / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+    ys1 = ys0 + (dt2 / 6.0) * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
+    return interp_n2(wc, xs1, ys1).reshape(NX, NX)
+
+
+# ----------------------------------------------------------------------
+# Particles
+# ----------------------------------------------------------------------
+def make_particle_positions():
+    """16 particles per cell at fixed 4x4 offsets -> (16*135*135, 2)."""
+    nc = np.arange(NX)
+    ccx, ccy = np.meshgrid(nc, nc, indexing="ij")
+    cell = np.stack([ccx.ravel(), ccy.ravel()], axis=1)          # (N*N, 2)
+    xp = (cell[:, None, :] + 0.5 + PART_OFF[None, :, :]) * H
+    return xp.reshape(-1, 2)
+
+
+def clamp_particles(xp):
+    """CLAMP to [dx/2, 1-dx/2]^2 (guidance item: CLAMP boundary at dx/2)."""
+    lo = 0.5 * H
+    hi = 1.0 - 0.5 * H
+    return np.clip(xp, lo, hi)
+
+
+# ----------------------------------------------------------------------
+# APIC P2G
+# ----------------------------------------------------------------------
+def p2g_apic(omega_p, c_cx, c_cy, xp_new):
+    """
+    Scatter particle vorticity to the grid with the APIC affine correction:
+        node += (omega_p + C_c . (x_node - x_p_new)) * weight
+    then normalise by the total weight per node.
+    x_node = cell centres of the 3x3 N_2 stencil around each particle.
+    """
+    N = NX
+    xc = base_cell(xp_new[:, 0])
+    yc = base_cell(xp_new[:, 1])
+    zx = xp_new[:, 0] / H - (xc.astype(np.float64) + 0.5)
+    zy = xp_new[:, 1] / H - (yc.astype(np.float64) + 0.5)
+    wx = (n2_kernel(zx + 1.0), n2_kernel(zx), n2_kernel(zx - 1.0))
+    wy = (n2_kernel(zy + 1.0), n2_kernel(zy), n2_kernel(zy - 1.0))
+
+    acc = np.zeros((N, N))
+    wsum = np.zeros((N, N))
+    for a in range(3):
+        for b in range(3):
+            ix = xc + (a - 1)
+            jy = yc + (b - 1)
+            wgt = wx[a] * wy[b]
+            x_node = (ix.astype(np.float64) + 0.5) * H
+            y_node = (jy.astype(np.float64) + 0.5) * H
+            dpos_x = x_node - xp_new[:, 0]
+            dpos_y = y_node - xp_new[:, 1]
+            val = omega_p + c_cx * dpos_x + c_cy * dpos_y
+            np.add.at(acc, (ix, jy), val * wgt)
+            np.add.at(wsum, (ix, jy), wgt)
+    wsum_safe = np.where(wsum > 0.0, wsum, 1.0)
+    acc = np.where(wsum > 0.0, acc / wsum_safe, 0.0)
+    return acc
+
+# ----------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------
+def run():
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    ux0 = np.load(os.path.join(data_dir, "initial_u_x.npy")).astype(np.float64)
+    uy0 = np.load(os.path.join(data_dir, "initial_u_y.npy")).astype(np.float64)
+    assert ux0.shape == (NX + 1, NX) and uy0.shape == (NX, NX + 1)
+
+    # ---- initial state
+    ux = ux0.copy()
+    uy = uy0.copy()
+    wc = vorticity_from_faces(ux, uy)      # cell-centred vorticity at t=0
+
+    # ---- fixed particle positions (reset every step, identical each step)
+    xp = make_particle_positions()
+
+    kinetic = np.zeros(N_FRAMES + 1)
+    vort_frames = np.zeros((len(SAMPLED_FRAMES), NX, NX))
+
+    kinetic[0] = kinetic_energy(ux, uy)
+    for si, f in enumerate(SAMPLED_FRAMES):
+        if f == 0:
+            vort_frames[si] = vorticity_from_faces(ux, uy)
+
+    t = 0.0
+    frame = 0
+    subs_since_frame = 0
+    frames_diag = []      # (frame, max_vel, dt, substeps_in_frame)
+
+    while frame < N_FRAMES:
+        # ---- current max velocity (cell-centred)
+        uc, vc = cell_center_velocity(ux, uy)
+        spd = np.sqrt(uc * uc + vc * vc)
+        max_vel = float(spd.max())
+
+        # ---- time step (CFL rule, clipped to land exactly on frame times)
+        rem = (frame + 1) * DT_FRAME - t
+        dt = min(CFL * H / max_vel, rem) if max_vel > 0.0 else rem
+        subs_since_frame += 1
+
+        # ---- 1) midpoint velocity: backward-advect vorticity half a step
+        w_half = backward_advect(wc, uc, vc, 0.5 * dt)
+        psi_half = poisson_solve(w_half)
+        ux_h, uy_h = reconstruct_faces(psi_half)
+
+        # ---- 2) reinitialise particles (positions + identity T via C_c)
+        xp_r = clamp_particles(xp)
+        omega_p = interp_n2(wc, xp_r[:, 0], xp_r[:, 1])
+        init_cx, init_cy = interp_n2_grad(wc, xp_r[:, 0], xp_r[:, 1])
+
+        # ---- 3) advect with the midpoint (leapfrog) velocity
+        u_p, v_p = _sample_velocity(uc, vc, xp_r[:, 0], xp_r[:, 1])
+        xp_mid = clamp_particles(xp_r + 0.5 * dt * np.stack([u_p, v_p], axis=1))
+        uc_h, vc_h = cell_center_velocity(ux_h, uy_h)
+        u_mid, v_mid = _sample_velocity(uc_h, vc_h, xp_mid[:, 0], xp_mid[:, 1])
+        xp_new = clamp_particles(xp_r + dt * np.stack([u_mid, v_mid], axis=1))
+
+        # ---- 4) evolve T (dT/dt = -(grad u)^T T, T(0)=I).  First-order:
+        #      T ~ I - dt*J^T, so T^T ~ I - dt*J, C_c = T^T * init_C_c.
+        grad_u, grad_v = build_velocity_gradient(ux_h, uy_h)
+        j11 = interp_n2(grad_u[0], xp_mid[:, 0], xp_mid[:, 1])
+        j12 = interp_n2(grad_u[1], xp_mid[:, 0], xp_mid[:, 1])
+        j21 = interp_n2(grad_v[0], xp_mid[:, 0], xp_mid[:, 1])
+        j22 = interp_n2(grad_v[1], xp_mid[:, 0], xp_mid[:, 1])
+        c_cx = (1.0 - dt * j11) * init_cx - dt * j12 * init_cy
+        c_cy = -dt * j21 * init_cx + (1.0 - dt * j22) * init_cy
+
+        # ---- 5) P2G (APIC affine correction + weight normalisation)
+        w_new = p2g_apic(omega_p, c_cx, c_cy, xp_new)
+
+        # ---- 6) next-step velocity from updated vorticity, then recompute
+        #         cell vorticity from the reconstructed faces (item 12)
+        wc = w_new
+        psi_next = poisson_solve(wc)
+        ux, uy = reconstruct_faces(psi_next)
+        wc = vorticity_from_faces(ux, uy)
+
+        t += dt
+
+        # ---- frame book-keeping (land exactly on t = 0.1 k)
+        if abs(t - (frame + 1) * DT_FRAME) < 1e-12:
+            frame += 1
+            kinetic[frame] = kinetic_energy(ux, uy)
+            frames_diag.append((frame, max_vel, dt, subs_since_frame))
+            if frame in SAMPLED_FRAMES:
+                si = SAMPLED_FRAMES.index(frame)
+                vort_frames[si] = vorticity_from_faces(ux, uy)
+            print(f"[frame {frame:3d}]  t={t:5.2f}  max_vel={max_vel:.5f}  "
+                  f"dt={dt:.5f}  subs/in={subs_since_frame}", flush=True)
+            subs_since_frame = 0
+
+    # ---- store outputs in the current working directory
+    np.save("vorticity_frames.npy", vort_frames.astype(np.float32))
+    np.save("kinetic_energy.npy", kinetic.astype(np.float32))
+    return dict(kinetic=kinetic, vort_frames=vort_frames, frames_diag=frames_diag)
+
+
+if __name__ == "__main__":
+    res = run()
+    print("\n--- diagnostics ---")
+    print("kinetic_energy range:", res["kinetic"].min(), res["kinetic"].max())
+    print("vorticity_frames shape:", res["vort_frames"].shape,
+          "range:", res["vort_frames"].min(), res["vort_frames"].max())

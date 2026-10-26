@@ -1,0 +1,754 @@
+"""
+simulate.py -- Stochastic De Young-Keizer IP3R channel simulation coupled to a
+Li-Rinzel two-compartment calcium balance.
+
+Public receptor contract (data/system_info.json):
+  * subunit state s = 4k + 2j + i  (i: IP3 bound, j: activating Ca, k: inhibitory Ca)
+  * 8 subunit states, 3 independent subunits per channel
+  * channel conducts iff ALL three subunits are in state s = 3 (i=1, j=1, k=0)
+  * flip_i: (a1,d1) if k=0 else (a3,d3);  flip_j: (a5,d5);  flip_k: (a4,d4) if i=0 else (a2,d2)
+  * binding rate = a * [ligand];  unbinding rate = a * Kd  (reverse = forward * Kd)
+
+Calcium balance (Li-Rinzel convention, c1-scaled lumenal terms -- justified in the
+run report by the example-trace fixed-point comparison):
+  dc/dt = c1 * (v1 * f_open + v2) * (Ca_lumen - c) - Vmax * c^2 / (Km^2 + c^2)
+  dCa_lumen/dt = -(1/c1) * dc/dt           (conserves c + c1*Ca_lumen = c0)
+
+Hybrid scheme (per 1 ms step, operator splitting):
+  1. RK4 integration of (c, Ca_lumen) with the channel flux frozen at the current
+     number of open channels.
+  2. Each subunit flip type (i, j, k) is advanced EXACTLY over the frozen-rate step
+     using the closed-form two-state CTMC transition probability
+         P(s -> 1) = pi1 + (s - pi1) * exp(-(q01 + q10) * dt),  pi1 = q01/(q01+q10).
+     This is exact per flip type (no Poisson double-flip error, important because
+     a1*[IP3] reaches ~260 s^-1); the split error across flip types is negligible
+     at dt = 1 ms (max cross-type flip probability per step ~1.4%).
+"""
+
+import json
+import math
+import os
+import time
+import zlib
+import struct
+
+import numpy as np
+from scipy.signal import find_peaks
+
+# ----------------------------------------------------------------------------
+# Configuration (read from the public inputs; no command-line arguments)
+# ----------------------------------------------------------------------------
+with open("data/system_info.json") as _fh:
+    SYS = json.load(_fh)
+with open("data/scan_spec.json") as _fh:
+    SPEC = json.load(_fh)
+
+_BI = SYS["receptor_kinetics"]["binding_interactions"]
+_A = {r["idx"]: float(r["forward_rate"]) for r in _BI}
+_KD = {r["idx"]: float(r["equilibrium_kd"]) for r in _BI}
+A1, A2, A3, A4, A5 = _A[1], _A[2], _A[3], _A[4], _A[5]
+D1, D2, D3, D4, D5 = (_A[m] * _KD[m] for m in (1, 2, 3, 4, 5))
+
+_C = SYS["compartment"]
+C1 = float(_C["volume_ratio_lumen_to_cyt"])          # V_lumen / V_cytosol
+C0 = float(_C["total_free_ca_micromolar"])           # total free Ca (cyt-normalized)
+
+_F = SYS["channel_flux_and_pump"]
+V1 = float(_F["max_channel_flux_rate_per_second"])   # 6.0 s^-1
+V2 = float(_F["lumen_leak_rate_per_second"])         # 0.11 s^-1
+VMAX = float(_F["reuptake_vmax_micromolar_per_second"])  # 0.9 uM/s
+KM = float(_F["reuptake_km_micromolar"])             # 0.1 uM
+
+CA_INIT = float(SYS["initial_conditions_hint"]["ca_cyt_initial_micromolar"])
+
+IP3_LEVELS = [float(x) for x in SPEC["ip3_levels_micromolar"]]
+CHANNEL_COUNTS = [int(n) for n in SPEC["channel_counts"]]
+N_REP = int(SPEC["n_replicates"])
+T_OBS = float(SPEC["T_obs_seconds"])
+DT_OUT = float(SPEC["dt_out_seconds"])
+N_SAMPLES = int(round(T_OBS / DT_OUT))
+
+DT_INT = 1.0e-3          # hybrid integration step (s)
+SEED_BASE = 987654321    # reproducible stochastic runs
+CR_IP3_IDX_USED = 0      # lowest ligand level for the CV-of-ISI statistic
+
+OPEN_STATE = 3           # s = 4k + 2j + i = 3  <=>  i=1, j=1, k=0
+
+
+# ----------------------------------------------------------------------------
+# 8-state subunit generator (used for exact stationary initialization and for
+# the mean-field diagnostic curve)
+# ----------------------------------------------------------------------------
+def qmat(ip3, c):
+    """Generator Q of the 8-state subunit CTMC (rows = source states)."""
+    Q = np.zeros((8, 8))
+    for s in range(8):
+        i, j, k = s & 1, (s >> 1) & 1, s >> 2
+        if k == 0:
+            Q[s, s ^ 1] += A1 * ip3 if i == 0 else D1
+        else:
+            Q[s, s ^ 1] += A3 * ip3 if i == 0 else D3
+        Q[s, s ^ 2] += A5 * c if j == 0 else D5
+        if i == 0:
+            Q[s, s ^ 4] += A4 * c if k == 0 else D4
+        else:
+            Q[s, s ^ 4] += A2 * c if k == 0 else D2
+        Q[s, s] = -Q[s].sum()
+    return Q
+
+
+def stat8(ip3, c):
+    """Exact stationary distribution of the 8-state subunit CTMC."""
+    Q = qmat(ip3, c)
+    M = Q.T.copy()
+    M[-1, :] = 1.0
+    b = np.zeros(8)
+    b[-1] = 1.0
+    return np.linalg.solve(M, b)
+
+
+# ----------------------------------------------------------------------------
+# Hybrid stochastic kernel: one vectorized batch = (n_ip3 levels x n_replicates)
+# trajectories sharing the same channel count N.
+# ----------------------------------------------------------------------------
+def run_group(ip3_levels, N, n_rep, T_obs, seed):
+    """Simulate len(ip3_levels)*n_rep trajectories of N-channel cells.
+
+    Returns (traces [B, n_samples] cytosolic uM,
+             p_open  [B] time-averaged open fraction,
+             cons_err[B] worst relative conservation drift per trajectory).
+    """
+    B = len(ip3_levels) * n_rep
+    ip3 = np.repeat(np.asarray(ip3_levels, dtype=np.float64), n_rep)
+    NS = 3 * N
+    rng = np.random.default_rng(seed)
+
+    n_samples = int(round(T_obs / DT_OUT))
+    steps = int(round(T_obs / DT_INT))
+    every = steps // n_samples
+    assert every * n_samples == steps, "T_obs/dt_out grid mismatch"
+
+    # --- initial conditions ---------------------------------------------------
+    c = np.full(B, CA_INIT)
+    lum = (C0 - c) / C1
+    # subunits sampled from their exact stationary distribution at (IP3, c_init)
+    P = np.stack([stat8(p, CA_INIT) for p in ip3])          # (B, 8)
+    cum = np.cumsum(P, axis=1)
+    u0 = rng.random((B, NS))
+    s0 = (u0[:, :, None] >= cum[:, None, :]).sum(axis=2).clip(0, 7).astype(np.int8)
+    i_s = (s0 & 1).astype(np.int8)
+    j_s = ((s0 >> 1) & 1).astype(np.int8)
+    k_s = (s0 >> 2).astype(np.int8)
+
+    def open_fraction(i_s, j_s, k_s):
+        # channel conducts iff ALL THREE of its subunits are in state s = 3
+        op = (i_s == 1) & (j_s == 1) & (k_s == 0)
+        return op.reshape(B, N, 3).all(axis=2).sum(axis=1) / float(N)
+
+    f_open = open_fraction(i_s, j_s, k_s)
+
+    # i-flip tables do not depend on c -> precompute once
+    Ri0 = A1 * ip3 + D1
+    Ri1 = A3 * ip3 + D3
+    EI = np.exp(-DT_INT * np.stack([Ri0, Ri1], axis=1))      # (B, 2)
+    PI = np.stack([A1 * ip3 / Ri0, A3 * ip3 / Ri1], axis=1)  # (B, 2)
+    row = np.arange(B)[:, None]
+
+    out = np.empty((B, n_samples), dtype=np.float64)
+    fsum = np.zeros(B)
+    M0 = c + C1 * lum
+    cons_err = np.zeros(B)
+    rec = 0
+
+    dt2, dt6 = DT_INT / 2.0, DT_INT / 6.0
+    km2 = KM * KM
+
+    for step in range(steps):
+        if step % every == 0:
+            out[:, rec] = c
+            rec += 1
+            M = c + C1 * lum
+            cons_err = np.maximum(cons_err, np.abs(M - M0) / M0)
+
+        # --- 1. RK4 for (c, lumen) with frozen channel flux -------------------
+        f = f_open
+        vf = C1 * (V1 * f + V2)
+
+        def J(cc, ll):
+            return vf * (ll - cc) - VMAX * cc * cc / (km2 + cc * cc)
+
+        q1 = J(c, lum)
+        q2 = J(c + dt2 * q1, lum - dt2 * q1 / C1)
+        q3 = J(c + dt2 * q2, lum - dt2 * q2 / C1)
+        q4 = J(c + DT_INT * q3, lum - DT_INT * q3 / C1)
+        dq = dt6 * (q1 + 2.0 * (q2 + q3) + q4)
+        c = np.maximum(c + dq, 0.0)
+        lum = np.maximum(lum - dq / C1, 0.0)
+
+        # --- 2. exact two-state update per flip type --------------------------
+        # flip i (uses current k)
+        Eg = EI[row, k_s]
+        Pg = PI[row, k_s]
+        i_s = (rng.random((B, NS)) < (Pg + (i_s - Pg) * Eg)).astype(np.int8)
+
+        # flip j (depends on c)
+        Rj = A5 * c + D5
+        Pj = A5 * c / Rj
+        Ej = np.exp(-Rj * DT_INT)
+        j_s = (rng.random((B, NS)) <
+               (Pj[:, None] + (j_s - Pj[:, None]) * Ej[:, None])).astype(np.int8)
+
+        # flip k (uses updated i)
+        Rk0 = A4 * c + D4
+        Rk1 = A2 * c + D2
+        Pk = np.stack([A4 * c / Rk0, A2 * c / Rk1], axis=1)
+        Ek = np.exp(-DT_INT * np.stack([Rk0, Rk1], axis=1))
+        Eg2 = Ek[row, i_s]
+        Pg2 = Pk[row, i_s]
+        k_s = (rng.random((B, NS)) < (Pg2 + (k_s - Pg2) * Eg2)).astype(np.int8)
+
+        # --- 3. open fraction (all three subunits in state 3) -----------------
+        f_open = open_fraction(i_s, j_s, k_s)
+        fsum += f_open
+
+    p_open = fsum / steps
+    return out, p_open, cons_err
+
+
+# ----------------------------------------------------------------------------
+# Statistics: peak-to-peak period, CV of ISI
+# ----------------------------------------------------------------------------
+def isis_of_trace(x, dt_out):
+    """Inter-spike intervals (s) of one trace via peak-to-peak spacing."""
+    rng = float(x.max() - x.min())
+    if rng <= 1e-12:
+        return np.empty(0)
+    pk, _ = find_peaks(x, prominence=0.3 * rng, distance=30)  # 3 s min spacing
+    return np.diff(pk) * dt_out
+
+
+def acf_period(x, dt_out):
+    """Fallback period: first local maximum of the autocorrelation for lags in
+    [5, 60] s. Flagged as a fallback by the caller."""
+    y = x - x.mean()
+    n = y.size
+    ac = np.correlate(y, y, "full")[n - 1:]
+    if ac[0] <= 0:
+        return None
+    ac = ac / ac[0]
+    lo = int(round(5.0 / dt_out))
+    hi = min(int(round(60.0 / dt_out)), n - 1)
+    seg = ac[lo:hi]
+    for m in range(1, seg.size - 1):
+        if seg[m] >= seg[m - 1] and seg[m] > seg[m + 1] and seg[m] > 0.05:
+            return (lo + m) * dt_out
+    m = int(np.argmax(seg))
+    return (lo + m) * dt_out if seg[m] > 0.05 else None
+
+
+def period_stat(traces, dt_out):
+    """Mean peak-to-peak period (s) pooled across replicates. Returns
+    (value or None, used_fallback)."""
+    pools = [isis_of_trace(traces[r], dt_out) for r in range(traces.shape[0])]
+    isi = np.concatenate(pools) if pools else np.empty(0)
+    if isi.size >= 1:
+        return float(isi.mean()), False
+    vals = [acf_period(traces[r], dt_out) for r in range(traces.shape[0])]
+    vals = [v for v in vals if v is not None]
+    if vals:
+        return float(np.mean(vals)), True
+    return None, True
+
+
+def cv_stat(traces, dt_out):
+    """Coefficient of variation of ISIs pooled across replicates (None if
+    fewer than two intervals are available)."""
+    pools = [isis_of_trace(traces[r], dt_out) for r in range(traces.shape[0])]
+    isi = np.concatenate(pools) if pools else np.empty(0)
+    if isi.size >= 2 and isi.mean() > 0:
+        return float(isi.std(ddof=1) / isi.mean())
+    return None
+
+
+def meanfield_run(ip3, T_obs, dt_out):
+    """Deterministic mean-field reference: dynamic 8-state occupancies coupled
+    to the Ca balance (Li-Rinzel analogue). Returns (c_trace, mean open frac)."""
+    dt = 1.0e-3
+    n = int(round(T_obs / dt))
+    ns = int(round(T_obs / dt_out))
+    every = n // ns
+    x = stat8(ip3, CA_INIT)
+    c = CA_INIT
+    out = np.empty(ns)
+    rec = 0
+    km2 = KM * KM
+    for step in range(n):
+        if step % every == 0 and rec < ns:
+            out[rec] = c
+            rec += 1
+
+        def F(xx, cc):
+            dx = qmat(ip3, max(cc, 1e-12)).T @ xx
+            ll = (C0 - cc) / C1
+            J = C1 * (V1 * xx[3] ** 3 + V2) * (ll - cc) - VMAX * cc * cc / (km2 + cc * cc)
+            return dx, J
+
+        k1x, k1c = F(x, c)
+        k2x, k2c = F(x + dt / 2 * k1x, c + dt / 2 * k1c)
+        k3x, k3c = F(x + dt / 2 * k2x, c + dt / 2 * k2c)
+        k4x, k4c = F(x + dt * k3x, c + dt * k3c)
+        x = x + dt / 6 * (k1x + 2 * k2x + 2 * k3x + k4x)
+        c = c + dt / 6 * (k1c + 2 * k2c + 2 * k3c + k4c)
+        x = np.maximum(x, 0)
+        x = x / x.sum()
+        c = max(c, 0.0)
+    return out, float(x[3] ** 3)
+
+
+# ----------------------------------------------------------------------------
+# Figure: try matplotlib (Agg) first; fall back to a pure-NumPy PNG renderer
+# (real axes, ticks, labels, legends) if matplotlib is unavailable.
+# ----------------------------------------------------------------------------
+def build_panels(traces, ip3_levels, channel_counts, period, cv, p_open,
+                 rep_ip3_idx, rep_N_idx, mf_open):
+    """Panel specifications shared by both renderers."""
+    t = np.arange(N_SAMPLES) * DT_OUT
+    key = f"ip3{rep_ip3_idx}_N{rep_N_idx}"
+    mf_c, _ = meanfield_run(ip3_levels[rep_ip3_idx], T_OBS, DT_OUT)
+
+    panels = [
+        {
+            "title": f"Representative trace: IP3={ip3_levels[rep_ip3_idx]:g} uM, "
+                     f"N={channel_counts[rep_N_idx]}",
+            "xlabel": "time (s)",
+            "ylabel": "Ca_cyt (uM)",
+            "series": [
+                (t, traces[key][0], "k-", "stochastic"),
+                (t, mf_c, "r--", "mean-field"),
+            ],
+        },
+        {
+            "title": "Period vs IP3 (largest N=%d)" % channel_counts[-1],
+            "xlabel": "IP3 (uM)",
+            "ylabel": "period (s)",
+            "series": [(ip3_levels, _clean(period), "bo-", "peak-to-peak mean")],
+        },
+        {
+            "title": "CV of ISI vs N (IP3=%g uM)" % ip3_levels[CR_IP3_IDX_USED],
+            "xlabel": "N (channels, log scale)",
+            "ylabel": "CV of ISI",
+            "logx": True,
+            "xticks": channel_counts,
+            "series": [(channel_counts, _clean(cv), "bo-", "CV of ISI")],
+        },
+        {
+            "title": "Open probability vs IP3 (largest N=%d)" % channel_counts[-1],
+            "xlabel": "IP3 (uM)",
+            "ylabel": "p_open",
+            "series": [
+                (ip3_levels, p_open, "bo-", "simulated (time-avg)"),
+                (ip3_levels, mf_open, "rs--", "mean-field p3^3"),
+            ],
+        },
+    ]
+    return panels
+
+
+def _clean(vals):
+    return [v if v is not None else np.nan for v in vals]
+
+
+def render_panels_mpl(panels, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    for ax, p in zip(axes.ravel(), panels):
+        for xv, yv, style, label in p["series"]:
+            xv = np.asarray(xv, dtype=float)
+            yv = np.asarray(yv, dtype=float)
+            ok = np.isfinite(yv) & np.isfinite(xv)
+            if ok.sum() == 0:
+                continue
+            ax.plot(xv[ok], yv[ok], style, label=label, markersize=4, linewidth=1.4)
+        ax.set_title(p["title"], fontsize=10)
+        ax.set_xlabel(p["xlabel"])
+        ax.set_ylabel(p["ylabel"])
+        if p.get("logx"):
+            ax.set_xscale("log")
+            ax.set_xticks(p["xticks"])
+            ax.xaxis.set_major_formatter(ScalarFormatter())
+        ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+# ----------------------- pure-NumPy PNG fallback ----------------------------
+_FONT = {
+    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    "C": (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
+    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
+    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    "G": (".###.", "#...#", "#....", "#..##", "#...#", "#...#", ".###."),
+    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "I": (".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
+    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
+    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
+    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
+    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
+    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
+    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
+    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
+    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
+    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+    "0": (".###.", "#..##", "#.#.#", "##..#", "#...#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    "3": (".###.", "#...#", "....#", "..##.", "....#", "#...#", ".###."),
+    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    "6": ("..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."),
+    "7": ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
+    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    "9": (".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."),
+    " ": (".....",) * 7,
+    ".": (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
+    ",": (".....", ".....", ".....", ".....", "..##.", "..##.", ".##.."),
+    "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
+    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
+    "(": ("..##.", ".#...", "#....", "#....", "#....", ".#...", "..##."),
+    ")": (".##..", "...#.", "....#", "....#", "....#", "...#.", ".##.."),
+    "[": (".###.", ".#...", ".#...", ".#...", ".#...", ".#...", ".###."),
+    "]": (".###.", "...#.", "...#.", "...#.", "...#.", "...#.", ".###."),
+    "/": ("....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."),
+    "^": ("..#..", ".#.#.", "#...#", ".....", ".....", ".....", "....."),
+    ":": (".....", "..##.", "..##.", ".....", "..##.", "..##.", "....."),
+    "=": (".....", ".....", "#####", ".....", "#####", ".....", "....."),
+    "~": (".....", ".....", ".#..#", "#.#.#", "#..#.", ".....", "....."),
+    "%": ("#...#", "#..#.", "..#..", ".#...", ".#...", "#..#.", "#...#"),
+    "*": (".....", "#.#.#", ".###.", "#####", ".###.", "#.#.#", "....."),
+}
+
+_COLOR = {"k": (10, 10, 10), "b": (0, 0, 190), "r": (210, 0, 0), "g": (0, 130, 0)}
+
+
+def _fill_rect(img, x, y, w, h, color):
+    H, W, _ = img.shape
+    xa, xb = max(0, int(x)), min(W, int(x + w))
+    ya, yb = max(0, int(y)), min(H, int(y + h))
+    if xa < xb and ya < yb:
+        img[ya:yb, xa:xb] = color
+
+
+def _line(img, x0, y0, x1, y1, color):
+    x0, y0, x1, y1 = int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    H, W, _ = img.shape
+    while True:
+        if 0 <= x0 < W and 0 <= y0 < H:
+            img[y0, x0] = color
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _char_bmp(ch):
+    return _FONT.get(ch.upper(), _FONT[" "])
+
+
+def _text_w(s, scale=2):
+    return len(s) * 6 * scale if s else 0
+
+
+def _draw_text(img, x, y, s, scale=2, color=(10, 10, 10), align="left"):
+    if s is None:
+        return
+    s = str(s)
+    w = _text_w(s, scale)
+    if align == "center":
+        x -= w // 2
+    elif align == "right":
+        x -= w
+    cx = int(x)
+    for ch in s:
+        g = _char_bmp(ch)
+        for r in range(7):
+            for cc in range(5):
+                if g[r][cc] == "#":
+                    _fill_rect(img, cx + cc * scale, y + r * scale, scale, scale, color)
+        cx += 6 * scale
+
+
+def _draw_text_rot(img, x, y_bottom, s, scale=2, color=(10, 10, 10)):
+    """Vertical text, reading bottom-to-top (rotated 90 deg CCW)."""
+    ycur = int(y_bottom)
+    for ch in str(s):
+        g = _char_bmp(ch)
+        for r in range(5):
+            for cc in range(7):
+                if g[6 - cc][r] == "#":
+                    _fill_rect(img, x + r * scale, ycur - (cc + 1) * scale,
+                               scale, scale, color)
+        ycur -= 8 * scale
+
+
+def _nice_ticks(lo, hi, n=5):
+    if hi <= lo:
+        hi = lo + 1.0
+    raw = (hi - lo) / max(n, 1)
+    mag = 10.0 ** math.floor(math.log10(raw))
+    step = mag
+    for mlt in (1, 2, 2.5, 5, 10):
+        if mlt * mag >= raw:
+            step = mlt * mag
+            break
+    t0 = math.ceil(lo / step) * step
+    ticks = []
+    t = t0
+    while t <= hi + 1e-9:
+        ticks.append(t)
+        t += step
+    return ticks
+
+
+def _draw_panel(img, x0, y0, w, h, p):
+    black = (10, 10, 10)
+    scale = 2
+    allx, ally = [], []
+    for xv, yv, _, _ in p["series"]:
+        xv = np.asarray(xv, dtype=float)
+        yv = np.asarray(yv, dtype=float)
+        ok = np.isfinite(yv) & np.isfinite(xv)
+        allx.append(xv[ok])
+        ally.append(yv[ok])
+    if sum(a.size for a in allx) == 0:
+        allx = [np.array([0.0, 1.0])]
+        ally = [np.array([0.0, 1.0])]
+    X = np.concatenate(allx)
+    Y = np.concatenate(ally)
+    if p.get("logx"):
+        X = np.log10(np.maximum(X, 1e-12))
+    xlo, xhi = float(X.min()), float(X.max())
+    ylo, yhi = float(Y.min()), float(Y.max())
+    if xhi <= xlo:
+        xhi = xlo + 1.0
+    if yhi <= ylo:
+        yhi = ylo + 1.0
+    pad_x, pad_y = 0.04 * (xhi - xlo), 0.06 * (yhi - ylo)
+    xlo, xhi, ylo, yhi = xlo - pad_x, xhi + pad_x, ylo - pad_y, yhi + pad_y
+
+    def tx(v):
+        if p.get("logx"):
+            v = math.log10(max(v, 1e-12))
+        return x0 + (v - xlo) / (xhi - xlo) * (w - 1)
+
+    def ty(v):
+        return y0 + h - 1 - (v - ylo) / (yhi - ylo) * (h - 1)
+
+    _line(img, x0, y0, x0 + w - 1, y0, black)
+    _line(img, x0, y0 + h - 1, x0 + w - 1, y0 + h - 1, black)
+    _line(img, x0, y0, x0, y0 + h - 1, black)
+    _line(img, x0 + w - 1, y0, x0 + w - 1, y0 + h - 1, black)
+
+    xt = p["xticks"] if p.get("logx") else _nice_ticks(xlo, xhi, 6)
+    for tv in xt:
+        xx = tx(tv)
+        if x0 <= xx <= x0 + w - 1:
+            _line(img, xx, y0 + h - 1, xx, y0 + h - 1 + 5, black)
+            lbl = str(tv) if p.get("logx") else ("%g" % tv)
+            _draw_text(img, xx, y0 + h - 1 + 8, lbl, scale, black, align="center")
+    for tv in _nice_ticks(ylo, yhi, 5):
+        yy = ty(tv)
+        if y0 <= yy <= y0 + h - 1:
+            _line(img, x0 - 5, yy, x0, yy, black)
+            _draw_text(img, x0 - 8, yy - 7 * scale // 2, "%g" % tv, scale, black,
+                       align="right")
+
+    for xv, yv, style, _lbl in p["series"]:
+        xv = np.asarray(xv, dtype=float)
+        yv = np.asarray(yv, dtype=float)
+        ok = np.isfinite(yv) & np.isfinite(xv)
+        xv, yv = xv[ok], yv[ok]
+        if xv.size == 0:
+            continue
+        color = _COLOR.get(style[0], _COLOR["k"])
+        dashed = "--" in style
+        markers = style.endswith("o")
+        pxs = np.clip(np.array([tx(v) for v in xv]), x0, x0 + w - 1)
+        pys = np.clip(np.array([ty(v) for v in yv]), y0, y0 + h - 1)
+        for m in range(pxs.size - 1):
+            if dashed and m % 2 == 1:
+                continue
+            _line(img, pxs[m], pys[m], pxs[m + 1], pys[m + 1], color)
+        if markers:
+            for m in range(pxs.size):
+                _fill_rect(img, pxs[m] - 2, pys[m] - 2, 5, 5, color)
+
+    _draw_text(img, x0 + w // 2, y0 - 9 * scale - 4, p["title"], scale, black,
+               align="center")
+    _draw_text(img, x0 + w // 2, y0 + h - 1 + 9 * scale, p["xlabel"], scale, black,
+               align="center")
+    _draw_text_rot(img, x0 - 9 * scale - 14, y0 + h - 1, p["ylabel"], scale, black)
+
+    labeled = [s for s in p["series"] if s[3]]
+    if len(labeled) > 1:
+        labels = [s[3] for s in labeled]
+        lw = max(_text_w(l, scale) for l in labels) + 70
+        lh = 10 * scale * len(labels) + 4
+        lx = x0 + w - 8 - lw
+        ly = y0 + 8
+        _fill_rect(img, lx, ly, lw, lh, (255, 255, 255))
+        for bx, by, ex, ey in ((lx, ly, lx + lw, ly), (lx, ly + lh - 1, lx + lw,
+                                                    ly + lh - 1),
+                               (lx, ly, lx, ly + lh - 1),
+                               (lx + lw - 1, ly, lx + lw - 1, ly + lh - 1)):
+            _line(img, bx, by, ex, ey, (180, 180, 180))
+        for m, (xv, yv, style, lbl) in enumerate(labeled):
+            yy = ly + 5 * scale + m * 10 * scale
+            color = _COLOR.get(style[0], _COLOR["k"])
+            dashed = "--" in style
+            for q in range(18):
+                if not (dashed and q % 2 == 1):
+                    _line(img, lx + 6 + q * 2, yy + 3 * scale,
+                          lx + 7 + q * 2, yy + 3 * scale, color)
+            _draw_text(img, lx + 50, yy, lbl, scale, black)
+
+
+def render_panels_fallback(panels, path, W=1400, H=1000):
+    img = np.full((H, W, 3), 255, np.uint8)
+    left, right, top, bottom = 130, 40, 70, 100
+    hgap, vgap = 70, 110
+    pw = (W - left - right - hgap) // 2
+    ph = (H - top - bottom - vgap) // 2
+    for pi, p in enumerate(panels):
+        r, cc = divmod(pi, 2)
+        x0 = left + cc * (pw + hgap)
+        y0 = top + r * (ph + vgap)
+        _draw_panel(img, x0, y0, pw, ph, p)
+    _draw_text(img, W // 2, 10,
+               "IP3R (De Young-Keizer) stochastic channel simulations",
+               3, (10, 10, 10), align="center")
+    write_png(path, img)
+
+
+def write_png(path, img):
+    """Minimal PNG encoder for the uint8 RGB fallback figure."""
+    h, w, _ = img.shape
+    raw = b"".join(b"\x00" + img[m].tobytes() for m in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    with open(path, "wb") as fh:
+        fh.write(sig + chunk(b"IHDR", ihdr) +
+                 chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def make_figure(panels, path):
+    try:
+        render_panels_mpl(panels, path)
+        return "matplotlib"
+    except Exception as exc:
+        print(f"[figure] matplotlib unavailable ({exc!r}); using NumPy PNG fallback")
+        render_panels_fallback(panels, path)
+        return "numpy-fallback"
+
+
+# ----------------------------------------------------------------------------
+# Main driver
+# ----------------------------------------------------------------------------
+def main():
+    t_wall = time.time()
+    n_ip3, n_N = len(IP3_LEVELS), len(CHANNEL_COUNTS)
+    traces = {}
+    p_open_by_N = {}
+    cons_all = []
+    for ji, N in enumerate(CHANNEL_COUNTS):
+        t0 = time.time()
+        pfile = f"_partial_group{ji}.npz"
+        if os.path.exists(pfile):                      # checkpoint/resume
+            _d = np.load(pfile)
+            tr, po, ce = _d["tr"], _d["po"], _d["ce"]
+            print(f"[run] N={N}: restored from checkpoint", flush=True)
+        else:
+            tr, po, ce = run_group(IP3_LEVELS, N, N_REP, T_OBS, SEED_BASE + 101 * ji)
+            np.savez(pfile, tr=tr, po=po, ce=ce)
+        for ii in range(n_ip3):
+            traces[f"ip3{ii}_N{ji}"] = np.ascontiguousarray(
+                tr[ii * N_REP:(ii + 1) * N_REP], dtype=np.float64)
+        p_open_by_N[ji] = po.reshape(n_ip3, N_REP)
+        cons_all.append(ce)
+        print(f"[run] N={N}: {time.time()-t0:.1f} s; cons drift {ce.max():.3e}; "
+              f"p_open [{po.min():.4f}, {po.max():.4f}]", flush=True)
+
+    for ji in range(n_N):                              # clean checkpoints
+        try:
+            os.remove(f"_partial_group{ji}.npz")
+        except OSError:
+            pass
+
+    np.savez("ca_traces.npz", **traces)
+
+    jbig = n_N - 1
+    period, fallback_used = [], []
+    for ii in range(n_ip3):
+        p, fb = period_stat(traces[f"ip3{ii}_N{jbig}"], DT_OUT)
+        period.append(p)
+        fallback_used.append(fb)
+    cv = [cv_stat(traces[f"ip3{CR_IP3_IDX_USED}_N{ji}"], DT_OUT) for ji in range(n_N)]
+    p_open = [float(p_open_by_N[jbig][ii].mean()) for ii in range(n_ip3)]
+    cons_max = float(max(ce.max() for ce in cons_all))
+
+    mf_open = [meanfield_run(p, T_OBS, DT_OUT)[1] for p in IP3_LEVELS]
+
+    summary = {
+        "ip3_levels": IP3_LEVELS,
+        "channel_counts": CHANNEL_COUNTS,
+        "period_vs_ip3": period,
+        "cv_isi_vs_N": cv,
+        "p_open_vs_ip3": p_open,
+        "conservation_error_max": cons_max,
+        "cr_ip3_idx_used": CR_IP3_IDX_USED,
+    }
+    with open("summary_stats.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    panels = build_panels(traces, IP3_LEVELS, CHANNEL_COUNTS, period, cv, p_open,
+                          rep_ip3_idx=2, rep_N_idx=jbig, mf_open=mf_open)
+    renderer = make_figure(panels, "calcium_summary.png")
+
+    print("\n=== summary_stats.json ===")
+    print(json.dumps(summary, indent=2))
+    print("period fallback (autocorrelation) used at ip3 indices:",
+          [i for i, f in enumerate(fallback_used) if f])
+    print(f"figure renderer: {renderer}")
+    print(f"total wall time: {time.time()-t_wall:.1f} s")
+
+
+if __name__ == "__main__":
+    main()

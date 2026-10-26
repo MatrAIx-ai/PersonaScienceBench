@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+B3 Cellular Signaling Dynamics from Channel-Level Kinetic Data
+==============================================================
+Stochastic channel-state simulation of the public
+De Young-Keizer / Li-Rinzel IP3 receptor model (8-state subunits,
+s = 4k + 2j + i), coupled to a cytosolic calcium balance.
+
+Public model contract:  data/system_info.json
+Scan specification:     data/scan_spec.json
+Outputs:
+    simulate.py, ca_traces.npz, summary_stats.json, calcium_summary.png
+
+Numerical scheme
+----------------
+* Each channel has 3 independent 8-state subunits.  At every integration
+  step the subunit transition generator Q(IP3, Ca) (8x8) is built from the
+  public transition-rate semantics and the exact one-step transition
+  matrix P = expm(Q * dt) is computed.  The next subunit state is drawn
+  from the row distribution Categorical(P[s, :]) (matrix-exponential
+  sampling of the CTMC -- exact for piecewise-constant rates).
+* The calcium ODE
+      dCa/dt = v1*(n_open/N)*(Ca_lumen-Ca) + v2*(Ca_lumen-Ca)
+               - Vmax*Ca^2/(Km^2 + Ca^2),   Ca_lumen = (c0-Ca)/c1
+  is advanced with Heun (RK2) on the same grid (dt = 5 ms).
+  J = v1*(open_fraction)*(Ca_lumen-Ca) is the Li-Rinzel whole-cell
+  mean-field-consistent flux (open_fraction = n_open/N).
+* Initial condition: ca_cyt(0)=0.1 uM (public hint); ca_lumen follows from
+  the c0/c1 conservation.  Subunits are drawn from the stationary
+  distribution of their 8-state chain at (IP3, ca_cyt=0.1).
+
+Summary statistics (from simulated traces, peak-to-peak robust)
+-----------------------------------------------------------------
+* period_vs_ip3      : median peak-to-peak ISI at the largest channel
+                       count (scipy find_peaks, prominence 0.15). NaN
+                       where fewer than 2 spikes are observed.
+* cv_isi_vs_N        : CV = std(ISI)/mean(ISI) at the lowest IP3 level
+                       (cr_ip3_idx_used = 0), pooled over replicates.
+* p_open_vs_ip3      : time-averaged open fraction at the largest channel
+                       count (continuous-time average).
+* conservation_error_max : worst relative drift of total calcium content
+                       Ca_cyt + c1*Ca_lumen (exactly c0 by the public
+                       constraint, so the drift is floating-point only).
+
+The figure uses matplotlib when available; otherwise a self-contained
+pure-numpy+zlib PNG renderer is used (valid PNG either way).
+"""
+import json
+import math
+import zlib
+import struct
+import numpy as np
+from scipy.linalg import expm
+from scipy.signal import find_peaks
+
+# ----------------------------------------------------------------------
+# 1. Load the public contract
+# ----------------------------------------------------------------------
+with open("data/system_info.json") as fh:
+    SYS = json.load(fh)
+with open("data/scan_spec.json") as fh:
+    SCAN = json.load(fh)
+
+RK = SYS["receptor_kinetics"]
+CM = SYS["compartment"]
+FX = SYS["channel_flux_and_pump"]
+OB = SYS["observation"]
+IH = SYS["initial_conditions_hint"]
+
+_BI = {b["idx"]: b for b in RK["binding_interactions"]}
+A1, D1 = _BI[1]["forward_rate"], _BI[1]["equilibrium_kd"]
+A2, D2 = _BI[2]["forward_rate"], _BI[2]["equilibrium_kd"]
+A3, D3 = _BI[3]["forward_rate"], _BI[3]["equilibrium_kd"]
+A4, D4 = _BI[4]["forward_rate"], _BI[4]["equilibrium_kd"]
+A5, D5 = _BI[5]["forward_rate"], _BI[5]["equilibrium_kd"]
+
+C0 = float(CM["total_free_ca_micromolar"])
+C1 = float(CM["volume_ratio_lumen_to_cyt"])
+V1 = float(FX["max_channel_flux_rate_per_second"])
+V2 = float(FX["lumen_leak_rate_per_second"])
+V3 = float(FX["reuptake_vmax_micromolar_per_second"])
+K3 = float(FX["reuptake_km_micromolar"])
+T_OBS = float(OB["T_obs_seconds"])
+DT_OUT = float(OB["dt_out_seconds"])
+N_REPS = int(OB["n_replicates"])
+CA0 = float(IH["ca_cyt_initial_micromolar"])
+
+IP3_LEVELS = [float(x) for x in SCAN["ip3_levels_micromolar"]]
+CHANNEL_COUNTS = [int(x) for x in SCAN["channel_counts"]]
+N_SAMPLES = int(round(T_OBS / DT_OUT))          # 1200
+N_IP3 = len(IP3_LEVELS)
+N_N = len(CHANNEL_COUNTS)
+
+# Numerical parameters (validated by distributional convergence tests;
+# the channel CTMC is exact for any dt via the matrix exponential).
+DT_INT = 0.005          # integration step (s); DT_OUT/DT_INT = 20
+BASE_SEED = 12345       # deterministic master seed
+
+
+def make_Q(ip3, ca):
+    """8x8 generator (off-diagonal rates in 1/s; row sums 0).
+
+    State s = 4*k + 2*j + i, i: IP3 bound, j: activating Ca bound,
+    k: inhibitory Ca bound.
+      flip_i : (a1,d1) when k=0 ; (a3,d3) when k=1 ;  bind a*[IP3], unbind a*d
+      flip_j : (a5,d5)
+      flip_k : (a4,d4) when i=0 ; (a2,d2) when i=1 ;  bind a*[Ca],  unbind a*d
+    """
+    Q = np.zeros((8, 8))
+    for k in (0, 1):
+        for j in (0, 1):
+            for i in (0, 1):
+                s = 4 * k + 2 * j + i
+                a = A1 if k == 0 else A3
+                d = D1 if k == 0 else D3
+                t = 4 * k + 2 * j + (1 - i)
+                Q[s, t] += a * ip3 if i == 0 else a * d
+                t = 4 * k + 2 * (1 - j) + i
+                Q[s, t] += A5 * ca if j == 0 else A5 * D5
+                a = A4 if i == 0 else A2
+                d = D4 if i == 0 else D2
+                t = 4 * (1 - k) + 2 * j + i
+                Q[s, t] += a * ca if k == 0 else a * d
+    for s in range(8):
+        Q[s, s] = -Q[s].sum()
+    return Q
+
+
+def subunit_stationary(ip3, ca):
+    """Stationary distribution of a single subunit at fixed (IP3, Ca)."""
+    w, v = np.linalg.eig(make_Q(ip3, ca).T)
+    p = v[:, np.argmin(np.abs(w))].real
+    return p / p.sum()
+
+
+def simulate_grid_point(ip3, n_ch, dt=DT_INT, n_reps=N_REPS, master_seed=BASE_SEED):
+    """Simulate one (IP3, channel count) grid point.
+
+    Returns:
+        traces   : (n_reps, n_samples) float64 cytosolic Ca (uM),
+                   trace[k] aligned to t = k*dt_out seconds.
+        popen    : (n_reps,) continuous-time averaged open fraction.
+        cons_max : (n_reps,) max relative drift of total Ca content.
+    """
+    n_steps = int(round(T_OBS / dt))
+    n_out = N_SAMPLES
+    steps_per_out = int(round(DT_OUT / dt))
+    m = 3 * n_ch
+    traces = np.zeros((n_reps, n_out), dtype=np.float64)
+    popen = np.zeros(n_reps, dtype=np.float64)
+    cons_max = np.zeros(n_reps, dtype=np.float64)
+
+    pi0 = subunit_stationary(ip3, CA0)   # subunit initial distribution
+
+    for rep in range(n_reps):
+        rng = np.random.default_rng(master_seed + 1000 * IP3_LEVELS.index(ip3)
+                                    + 100 * CHANNEL_COUNTS.index(n_ch) + rep)
+        states = rng.choice(8, size=m, p=pi0).astype(np.int32)
+        cur_ca = CA0
+        open_acc = 0.0
+        out_cursor = 0
+        max_drift = 0.0
+
+        for step in range(n_steps):
+            # record at the start of each output block (t = out_cursor*dt_out)
+            if out_cursor < n_out and step % steps_per_out == 0:
+                traces[rep, out_cursor] = cur_ca
+                out_cursor += 1
+
+            # exact CTMC step for all subunits (matrix-exponential sampling)
+            Q = make_Q(ip3, cur_ca)
+            P = expm(Q * dt)
+            u = rng.random(m)
+            acc = np.cumsum(P[states, :], axis=1)
+            states = np.argmax(acc >= u[:, None], axis=1).astype(np.int32)
+
+            # open fraction and calcium balance
+            n_open = np.mean((states == 3).reshape(-1, 3).all(axis=1))
+            open_acc += n_open
+
+            ca_lum = (C0 - cur_ca) / C1
+            drift = abs((cur_ca + C1 * ca_lum) - C0) / C0
+            if drift > max_drift:
+                max_drift = drift
+
+            f1 = (V1 * n_open * (ca_lum - cur_ca)
+                  + V2 * (ca_lum - cur_ca)
+                  - V3 * cur_ca * cur_ca / (K3 * K3 + cur_ca * cur_ca))
+            ca_h = cur_ca + dt * f1
+            ca_lum_h = (C0 - ca_h) / C1
+            f2 = (V1 * n_open * (ca_lum_h - ca_h)
+                  + V2 * (ca_lum_h - ca_h)
+                  - V3 * ca_h * ca_h / (K3 * K3 + ca_h * ca_h))
+            cur_ca = cur_ca + 0.5 * dt * (f1 + f2)
+
+        popen[rep] = open_acc / n_steps
+        cons_max[rep] = max_drift
+
+    return traces, popen, cons_max
+
+
+# ----------------------------------------------------------------------
+# 2. Run the full (IP3 x channel-count) grid
+# ----------------------------------------------------------------------
+print("Simulating %d grid points (ip3 x N), %d replicates each ..."
+      % (N_IP3 * N_N, N_REPS), flush=True)
+CA_TRACES = {}          # key "ip3{i}_N{j}" -> (reps, samples)
+P_OPEN = np.zeros((N_IP3, N_N))      # time-averaged open fraction
+CONS_ERR = np.zeros((N_IP3, N_N))    # worst per-point relative drift
+for i, ip3 in enumerate(IP3_LEVELS):
+    for j, nc in enumerate(CHANNEL_COUNTS):
+        key = "ip3%d_N%d" % (i, j)
+        tr, po, cm = simulate_grid_point(ip3, nc)
+        CA_TRACES[key] = tr
+        P_OPEN[i, j] = po.mean()
+        CONS_ERR[i, j] = cm.max()
+        print("  %s  done (Ca span [%.3f, %.3f], p_open %.5f)"
+              % (key, tr.min(), tr.max(), po.mean()), flush=True)
+
+np.savez_compressed("ca_traces.npz", **CA_TRACES)
+
+# ----------------------------------------------------------------------
+# 3. Summary statistics (peak-to-peak, robust for relaxation oscillations)
+# ----------------------------------------------------------------------
+N_IDX_MAX = int(np.argmax(CHANNEL_COUNTS))          # largest channel count
+CR_IP3_IDX = 0                                       # lowest-IP3 scan level
+PROMINENCE = 0.15   # uM; spikes rise ~1 uM here, plateau ripple < 0.15
+
+
+def peak_times(trace):
+    pks, _ = find_peaks(trace, prominence=PROMINENCE)
+    return pks * DT_OUT
+
+
+def isis_from_traces(tr):
+    """Pooled peak-to-peak ISIs (s) from all replicates of a trace set."""
+    isis = []
+    for r in range(tr.shape[0]):
+        tt = peak_times(tr[r])
+        if tt.size >= 2:
+            isis.extend(np.diff(tt).tolist())
+    return isis
+
+period_vs_ip3 = []
+for i, ip3 in enumerate(IP3_LEVELS):
+    isis = isis_from_traces(CA_TRACES["ip3%d_N%d" % (i, N_IDX_MAX)])
+    if len(isis) >= 1:
+        period_vs_ip3.append(float(np.median(isis)))
+    else:
+        period_vs_ip3.append(float("nan"))   # fewer than 2 spikes
+
+cv_isi_vs_N = []
+for j, nc in enumerate(CHANNEL_COUNTS):
+    isis = isis_from_traces(CA_TRACES["ip3%d_N%d" % (CR_IP3_IDX, j)])
+    if len(isis) >= 2:
+        cv_isi_vs_N.append(float(np.std(isis) / np.mean(isis)))
+    else:
+        cv_isi_vs_N.append(float("nan"))
+
+p_open_vs_ip3 = [float(P_OPEN[i, N_IDX_MAX]) for i in range(N_IP3)]
+conservation_error_max = float(CONS_ERR.max())
+
+summary = {
+    "ip3_levels": IP3_LEVELS,
+    "channel_counts": CHANNEL_COUNTS,
+    "period_vs_ip3": period_vs_ip3,
+    "cv_isi_vs_N": cv_isi_vs_N,
+    "p_open_vs_ip3": p_open_vs_ip3,
+    "conservation_error_max": conservation_error_max,
+    "cr_ip3_idx_used": CR_IP3_IDX,
+}
+with open("summary_stats.json", "w") as fh:
+    json.dump(summary, fh, indent=2)
+print("summary_stats.json written.", flush=True)
+
+# ----------------------------------------------------------------------
+# 4. Multi-panel diagnostic figure
+# ----------------------------------------------------------------------
+def _make_figure_with_matplotlib():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    r = IP3_LEVELS.index(0.2434)
+    c = CHANNEL_COUNTS.index(20)
+    tr = CA_TRACES["ip3%d_N%d" % (r, c)]
+    t = np.arange(N_SAMPLES) * DT_OUT
+    axes[0, 0].plot(t, tr[0], lw=0.8, color="tab:blue")
+    axes[0, 0].set_title("Representative cytosolic Ca trace  (IP3=%.4f uM, N=%d)"
+                         % (IP3_LEVELS[r], CHANNEL_COUNTS[c]))
+    axes[0, 0].set_xlabel("time (s)"); axes[0, 0].set_ylabel("Ca_cyt (uM)")
+
+    axes[0, 1].plot(IP3_LEVELS, period_vs_ip3, "o-", color="tab:green")
+    axes[0, 1].set_title("Fundamental period vs IP3  (N = %d)"
+                         % CHANNEL_COUNTS[N_IDX_MAX])
+    axes[0, 1].set_xlabel("IP3 (uM)"); axes[0, 1].set_ylabel("period (s)")
+
+    axes[1, 0].plot(CHANNEL_COUNTS, cv_isi_vs_N, "s-", color="tab:red")
+    axes[1, 0].set_title("ISI CV vs N  (lowest IP3 level, idx %d)"
+                         % CR_IP3_IDX)
+    axes[1, 0].set_xlabel("channel count N"); axes[1, 0].set_ylabel("CV of ISI")
+    axes[1, 0].set_xscale("log")
+
+    axes[1, 1].plot(IP3_LEVELS, p_open_vs_ip3, "^-", color="tab:purple")
+    axes[1, 1].set_title("Time-averaged open fraction vs IP3  (N = %d)"
+                         % CHANNEL_COUNTS[N_IDX_MAX])
+    axes[1, 1].set_xlabel("IP3 (uM)"); axes[1, 1].set_ylabel("P_open")
+
+    fig.tight_layout()
+    fig.savefig("calcium_summary.png", dpi=110)
+    plt.close(fig)
+
+
+def _write_png(path, img):
+    """Pure-numpy+zlib PNG encoder (RGB rows, filter 0). img is HxWx3."""
+    h, w = img.shape[:2]
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(h))
+
+    def chunk(tag, data):
+        c = tag + data
+        return (struct.pack(">I", len(data)) + c
+                + struct.pack(">I", zlib.crc32(c) & 0xffffffff))
+
+    with open(path, "wb") as fh:
+        fh.write(b"\x89PNG\r\n\x1a\n")
+        fh.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        fh.write(chunk(b"IDAT", zlib.compress(raw, 6)))
+        fh.write(chunk(b"IEND", b""))
+
+
+# --- minimal 5x7 bitmap font (each row = 5 bits, MSB = leftmost pixel) ---
+_F5x7 = {
+    " ": (0, 0, 0, 0, 0, 0, 0),
+    "0": (14, 17, 19, 21, 25, 17, 14),
+    "1": (4, 12, 4, 4, 4, 4, 14),
+    "2": (14, 17, 1, 2, 4, 8, 31),
+    "3": (31, 2, 4, 2, 1, 17, 14),
+    "4": (2, 6, 10, 18, 31, 2, 2),
+    "5": (31, 16, 30, 1, 1, 17, 14),
+    "6": (6, 8, 16, 30, 17, 17, 14),
+    "7": (31, 1, 2, 4, 8, 8, 8),
+    "8": (14, 17, 17, 14, 17, 17, 14),
+    "9": (14, 17, 17, 15, 1, 2, 12),
+    "A": (14, 17, 17, 31, 17, 17, 17),
+    "C": (14, 17, 16, 16, 16, 17, 14),
+    "I": (14, 4, 4, 4, 4, 4, 14),
+    "M": (17, 27, 21, 21, 17, 17, 17),
+    "N": (17, 25, 21, 19, 17, 17, 17),
+    "O": (14, 17, 17, 17, 17, 17, 14),
+    "P": (30, 17, 17, 30, 16, 16, 16),
+    "S": (15, 16, 16, 14, 1, 1, 30),
+    "T": (31, 4, 4, 4, 4, 4, 4),
+    "U": (17, 17, 17, 17, 17, 17, 14),
+    "V": (17, 17, 17, 17, 17, 10, 4),
+    "a": (0, 0, 14, 1, 15, 17, 15),
+    "b": (16, 16, 30, 17, 17, 17, 30),
+    "c": (0, 0, 14, 16, 16, 16, 14),
+    "e": (0, 0, 14, 17, 31, 16, 14),
+    "g": (0, 0, 15, 17, 15, 1, 14),
+    "h": (16, 16, 30, 17, 17, 17, 17),
+    "i": (4, 0, 12, 4, 4, 4, 14),
+    "l": (12, 4, 4, 4, 4, 4, 14),
+    "m": (0, 0, 26, 21, 21, 21, 21),
+    "n": (0, 0, 30, 17, 17, 17, 17),
+    "o": (0, 0, 14, 17, 17, 17, 14),
+    "p": (0, 0, 30, 17, 30, 16, 16),
+    "r": (0, 0, 22, 25, 16, 16, 16),
+    "s": (0, 0, 15, 16, 14, 1, 30),
+    "t": (8, 8, 28, 8, 8, 9, 6),
+    "u": (0, 0, 17, 17, 17, 19, 13),
+    "v": (0, 0, 17, 17, 17, 10, 4),
+    "y": (0, 0, 17, 17, 15, 1, 14),
+    ".": (0, 0, 0, 0, 0, 6, 6),
+    "-": (0, 0, 0, 31, 0, 0, 0),
+    "_": (0, 0, 0, 0, 0, 0, 31),
+    "(": (2, 4, 8, 8, 8, 4, 2),
+    ")": (8, 4, 2, 2, 2, 4, 8),
+    ":": (0, 6, 6, 0, 6, 6, 0),
+    "=": (0, 0, 31, 0, 31, 0, 0),
+}
+
+
+def _text_width(scale):
+    return (5 + 1) * scale
+
+
+def _draw_text(canvas, x, y, text, color, scale=2):
+    """Draw 5x7 bitmap text with top-left at (x, y)."""
+    for ch in text:
+        glyph = _F5x7.get(ch, _F5x7[" "])
+        for r, bits in enumerate(glyph):
+            for cbit in range(5):
+                if bits & (0b10000 >> cbit):
+                    for sy in range(scale):
+                        for sx in range(scale):
+                            yy = y + r * scale + sy
+                            xx = x + cbit * scale + sx
+                            if 0 <= yy < canvas.shape[0] and 0 <= xx < canvas.shape[1]:
+                                canvas[yy, xx] = color
+        x += (5 + 1) * scale
+
+
+def _plot_xy(canvas, x0, x1, y0, y1, xs, ys, color, pad=1):
+    """Map finite data (xs, ys) into the pixel region and draw samples."""
+    xmin, xmax = float(np.nanmin(xs)), float(np.nanmax(xs))
+    fin = ys[~np.isnan(ys)]
+    if fin.size == 0:
+        return
+    ymin, ymax = float(fin.min()), float(fin.max())
+    if xmax == xmin:
+        xmax = xmin + 1.0
+    if ymax == ymin:
+        ymax = ymin + 1.0
+
+    def px(v):
+        return int(round(x0 + (v - xmin) / (xmax - xmin) * (x1 - x0)))
+
+    def py(v):
+        return int(round(y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)))
+
+    for xv, yv in zip(xs, ys):
+        if np.isnan(yv):
+            continue
+        xx, yy = px(xv), py(yv)
+        for dy in range(-pad, pad + 1):
+            for dx in range(-pad, pad + 1):
+                cx, cy = xx + dx, yy + dy
+                if x0 <= cx <= x1 and y0 <= cy <= y1:
+                    canvas[cy, cx] = color
+
+
+def _nice_ticks(vmin, vmax, n=4):
+    span = vmax - vmin
+    if span <= 0:
+        return [float(vmin)]
+    step = 10 ** math.floor(math.log10(span / n))
+    for m in (1.0, 2.0, 5.0, 10.0):
+        if span / (step * m) <= n:
+            step *= m
+            break
+    out = []
+    v = math.ceil(vmin / step) * step
+    while v <= vmax + 1e-9:
+        out.append(v)
+        v += step
+    return out
+
+
+def _fmt(v):
+    if v == int(v):
+        return "%.0f" % v
+    if abs(v) >= 100:
+        return "%.0f" % v
+    if abs(v) >= 10:
+        return "%.1f" % v
+    return "%.2f" % v
+
+
+def _make_figure_pure_numpy():
+    """Self-contained 4-panel diagnostic PNG (no external image library)."""
+    W, H = 1300, 1000
+    img = np.full((H, W, 3), 245, dtype=np.uint8)
+    black = np.array([20, 20, 20])
+    gridc = np.array([202, 202, 202])
+    blue = np.array([31, 119, 180])
+    green = np.array([44, 160, 44])
+    red = np.array([214, 39, 40])
+    purple = np.array([148, 103, 189])
+
+    def panel(x0, x1, y0, y1, title, xlab, ylab, xs, ys, color, xlog=False):
+        img[y0, x0:x1 + 1] = black
+        img[y1, x0:x1 + 1] = black
+        img[y0:y1 + 1, x0] = black
+        img[y0:y1 + 1, x1] = black
+
+        if xlog:
+            xv = np.log10(np.array(xs, dtype=float))
+            xmin, xmax = float(xv.min()), float(xv.max())
+        else:
+            xv = np.asarray(xs, dtype=float)
+            xmin, xmax = float(xv.min()), float(xv.max())
+        fin = ys[~np.isnan(ys)]
+        ymin, ymax = float(fin.min()), float(fin.max())
+
+        for t in _nice_ticks(xmin, xmax):
+            if not (xmin <= t <= xmax):
+                continue
+            xx = int(round(x0 + (t - xmin) / (xmax - xmin) * (x1 - x0)))
+            img[y0:y1 + 1, xx] = gridc
+            img[y1 + 1:y1 + 4, xx] = black
+            lab = "%.0f" % (10 ** t) if xlog else _fmt(t)
+            _draw_text(img, max(0, xx - 6), y1 + 6, lab, black, 1)
+        for t in _nice_ticks(ymin, ymax, 3):
+            if not (ymin <= t <= ymax):
+                continue
+            yy = int(round(y1 - (t - ymin) / (ymax - ymin) * (y1 - y0)))
+            img[yy, x0:x1 + 1] = gridc
+            img[yy, x0 - 3:x0] = black
+            lab = _fmt(t)
+            _draw_text(img, max(0, x0 - 5 - 8 * len(lab)), yy - 3, lab, black, 1)
+
+        _draw_text(img, x0 + 4, y0 - 16, title, black, 2)
+        if len(xlab):
+            _draw_text(img, x0 + 8, y1 + 30, xlab, black, 2)
+        if len(ylab):
+            _draw_text(img, 6, max(8, y0 - 60), ylab, black, 2)
+        _plot_xy(img, x0 + 2, x1 - 2, y0 + 2, y1 - 2,
+                 (10 ** xv) if xlog else xv, ys, color, pad=1)
+
+    rep_i, rep_j = IP3_LEVELS.index(0.2434), CHANNEL_COUNTS.index(20)
+    tr = CA_TRACES["ip3%d_N%d" % (rep_i, rep_j)][0]
+    tvec = np.arange(N_SAMPLES) * DT_OUT
+    panel(90, 630, 80, 470,
+          "Ca trace  (IP3=%.4f uM, N=%d)" % (IP3_LEVELS[rep_i], CHANNEL_COUNTS[rep_j]),
+          "time (s)", "Ca (uM)", tvec, tr, blue)
+    panel(690, 1260, 80, 470, "Period vs IP3", "IP3 (uM)", "period (s)",
+          IP3_LEVELS, np.array(period_vs_ip3), green)
+    panel(90, 630, 540, 930, "CV vs N", "N", "CV",
+          np.array(CHANNEL_COUNTS), np.array(cv_isi_vs_N), red, xlog=True)
+    panel(690, 1260, 540, 930, "P_open vs IP3", "IP3 (uM)", "P_open",
+          IP3_LEVELS, np.array(p_open_vs_ip3), purple)
+
+    _write_png("calcium_summary.png", img)
+
+
+# ----------------------------------------------------------------------
+# 5. Render the figure (matplotlib preferred, pure-numpy fallback)
+# ----------------------------------------------------------------------
+try:
+    _make_figure_with_matplotlib()
+    print("calcium_summary.png written (matplotlib).", flush=True)
+except Exception as exc:   # noqa: BLE001 - environment fallback
+    print("matplotlib unavailable -> pure-numpy PNG renderer (%s)."
+          % type(exc).__name__, flush=True)
+    try:
+        _make_figure_pure_numpy()
+        print("calcium_summary.png written (pure-numpy+zlib).", flush=True)
+    except Exception as exc2:   # noqa: BLE001
+        print("pure-numpy renderer also failed: %s" % exc2, flush=True)
+        raise
+
+print("period_vs_ip3 =", [None if np.isnan(v) else round(v, 2) for v in period_vs_ip3])
+print("cv_isi_vs_N   =", [None if np.isnan(v) else round(v, 3) for v in cv_isi_vs_N])
+print("p_open_vs_ip3 =", [round(v, 5) for v in p_open_vs_ip3])
+print("conservation_error_max = %.3e" % conservation_error_max)

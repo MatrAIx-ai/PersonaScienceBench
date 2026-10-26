@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+BCG-CORONA (TASK008): interaction between BCG vaccination status and prior medical
+history on COVID-19 severity -- ordinal (cumulative-logit / proportional-odds)
+regression controlling for patient-interaction frequency.
+
+Primary specification (approved with researcher):
+  DV : 4-level ordinal built from AE (the only outcome source; DM carries no endpoint)
+       0 = no infection-related AE
+       1 = mild      (max AESEV = 1 among infection-related AEs)
+       2 = moderate  (max AESEV = 2)
+       3 = severe    (max AESEV >= 3 OR AESER = 'Yes')
+       infection-related AE := AECAT == 'RTI' OR AEPT matches COVID|CORONA|SARS
+  Model: cumulative logit / proportional odds (statsmodels OrderedModel, logit link)
+       Severity ~ BCG + priorMH + BCG:priorMH + patients_seen (3 dummies) + expect_interact
+  Inference on interaction: OR = exp(beta), 95% Wald CI, Wald p, LR test vs nested
+  no-interaction model, simple effects of BCG within priorMH = 0 / 1.
+
+Sign convention (verified on simulated data, beta recovered 0.999 for true 1.0):
+  OrderedModel fits P(Y > j) = expit(x'beta - alpha_j)  =>  exp(beta) = odds ratio of
+  being in a MORE severe category.
+
+Outputs: console report, results/*.csv, results/report.md
+"""
+import os, re, warnings
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.special import expit
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.api import Logit, MNLogit
+from statsmodels.miscmodels.ordinal_model import OrderedModel
+
+warnings.filterwarnings("ignore")
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 60)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+Dp = lambda *p: os.path.join(ROOT, "data", *p)
+Rp = lambda *p: os.path.join(ROOT, "results", *p)
+os.makedirs(Rp(), exist_ok=True)
+LOG = []
+def say(*a):
+    s = " ".join(str(x) for x in a)
+    print(s); LOG.append(s)
+Z = stats.norm.ppf(0.975)
+
+# ---------------------------------------------------------------- 1. LOAD
+dm = pd.read_csv(Dp("TASK008_BCG-CORONA_DM.csv"), dtype=str)
+ae = pd.read_csv(Dp("TASK008_BCG-CORONA_AE.csv"), dtype=str, keep_default_na=False, na_values=[""])
+mh = pd.read_csv(Dp("TASK008_BCG-CORONA_MH.csv"), dtype=str, keep_default_na=False, na_values=[""])
+# TASK008_BCG-CORONA_MH.xlsx verified cell-for-cell identical to MH.csv -> CSV only.
+
+say("== 1. INPUT ==")
+say(f"DM {dm.shape} subjects={dm.USUBJID.nunique()} missing_cells={int(dm.isna().sum().sum())}")
+say(f"AE {ae.shape} subjects={ae.USUBJID.nunique()}   MH {mh.shape} subjects={mh.USUBJID.nunique()}")
+ae_real = ae[ae.AEPT.notna()].copy()      # 143 fully-empty rows = subjects with no AE recorded
+say(f"AE real records={len(ae_real)}; empty placeholder rows={int(ae.AEPT.isna().sum())}; "
+    f"subjects with >=1 AE={ae_real.USUBJID.nunique()}")
+say("AESEV counts:", ae_real.AESEV.value_counts(dropna=False).sort_index().to_dict())
+
+# ---------------------------------------------------------------- 2. PRIOR MEDICAL HISTORY
+med = mh[mh.MHSCAT == "MEDICAL HISTORY"].copy()
+med["pos"] = med.MHORRES.eq("2")          # code 1 = absent, 2 = present (no codebook shipped)
+STRICT = {"Hypertension", "Diabetes Mellitus", "Asthma", "Chronic Obstructive Pulmonary Disease",
+          "Other lung disease", "Cardiovascular disease", "Cerebrovascular disease",
+          "Kidney disease", "Liver disease", "Cancer", "Organ or bone marrow transplantation",
+          "Primary immunodeficiency", "Neutropenia or lymphopenia", "Tuberculosis",
+          "chronic sinusitis"}
+mh_broad = med.groupby("USUBJID").pos.any()
+mh_strict = med[med.MHTERM.isin(STRICT)].groupby("USUBJID").pos.any()
+say(f"\npriorMH broad prevalence={mh_broad.mean():.3f} ({int(mh_broad.sum())}/{len(mh_broad)}); "
+    f"strict (no allergy/hay-fever)={mh_strict.reindex(mh_broad.index).fillna(False).mean():.3f}")
+
+# ---------------------------------------------------------------- 3. OUTCOME
+INF_PT = re.compile(r"COVID|CORONA|SARS", re.I)
+pool = ae_real[ae_real.AECAT.eq("RTI") | ae_real.AEPT.str.contains(INF_PT, na=False)].copy()
+pool["sev"] = pd.to_numeric(pool.AESEV, errors="coerce")
+pool["hs"] = pd.to_numeric(pool.AEHS, errors="coerce")
+c19 = ae_real[ae_real.AEPT.str.contains(INF_PT, na=False)].copy()
+c19["sev"] = pd.to_numeric(c19.AESEV, errors="coerce")
+c19["hs"] = pd.to_numeric(c19.AEHS, errors="coerce")
+say("\n== 2. OUTCOME CONSTRUCTION ==")
+say(f"infection-related AE records={len(pool)} subjects={pool.USUBJID.nunique()}; "
+    f"AECAT mix={pool.AECAT.value_counts(dropna=False).to_dict()}; ISR records in pool="
+    f"{int(pool.AECAT.eq('ISR').sum())}")
+say(f"COVID/CORONA/SARS-coded AE records={len(c19)} subjects={c19.USUBJID.nunique()}")
+say("pool rows with AESEV missing:", int(pool.sev.isna().sum()),
+    "| of those AESER=Yes:", int(pool[pool.sev.isna()].AESER.eq('Yes').sum()))
+
+def agg(df):
+    return df.groupby("USUBJID").agg(maxsev=("sev", "max"), maxhs=("hs", "max"),
+                                     anyser=("AESER", lambda s: s.eq("Yes").any()))
+
+def severity(r, ser_any=False):
+    if pd.isna(r["maxsev"]) and pd.isna(r["maxhs"]):
+        return 0
+    s, ser = r["maxsev"], r["anyser"]
+    if ser_any and ser and pd.isna(s):
+        return 3
+    if pd.notna(s) and s >= 3: return 3
+    if ser: return 3
+    if pd.notna(s) and s == 2: return 2
+    return 1
+
+base = dm.set_index("USUBJID").copy()
+base["bcg"] = base.TRTGRP.eq("BCG").astype(int)
+base["prior_mh"] = base.index.map(mh_broad).fillna(False).astype(int)
+base["prior_mh_strict"] = base.index.map(mh_strict.reindex(mh_broad.index).fillna(False)).astype(int)
+base["sex"] = pd.to_numeric(base.SEX, errors="coerce")
+base["age_ord"] = base.Age.map({"10-19": 1, "20-29": 2, "30-39": 3, "40-49": 4,
+                                "50-59": 5, "60-69": 6, "70-79": 7})
+a_inf, a_c19 = agg(pool), agg(c19)
+base = base.join(a_inf.add_prefix("inf_"), how="left").join(a_c19.add_prefix("c19_"), how="left")
+inf = a_inf.reindex(base.index); c19a = a_c19.reindex(base.index)
+base["Y4"] = [severity(r) for _, r in inf.iterrows()]
+base["Y4_sevfix"] = [severity(r, ser_any=True) for _, r in inf.iterrows()]
+base["Y3"] = base.Y4.clip(upper=2)
+base["Y_c19"] = [severity(r) for _, r in c19a.iterrows()]
+base["Y3_c19"] = base.Y_c19.clip(upper=2)
+hs = inf.maxhs
+base["Y_aeHS"] = np.where(hs.isna(), 0, np.where(hs <= 2, 1, np.where(hs <= 4, 2, 3)))
+say("\nDV distributions:")
+for c in ["Y4", "Y3", "Y4_sevfix", "Y3_c19", "Y_c19", "Y_aeHS"]:
+    say(f"  {c:10s}", base[c].value_counts().sort_index().to_dict())
+say(f"  subjects reclassified by AESEV-missing/AESER sensitivity: {int((base.Y4 != base.Y4_sevfix).sum())}")
+base.to_csv(Rp("subject_level_analytic_table.csv"))
+
+cnt = base.groupby(["bcg", "prior_mh"]).Y4.value_counts().unstack(fill_value=0)
+pct = (base.groupby(["bcg", "prior_mh"]).Y4.value_counts(normalize=True).mul(100).round(1)
+       .unstack(fill_value=0))
+lbl = [f"{'BCG' if b else 'Placebo'} / priorMH={'yes' if m else 'no'}" for b, m in cnt.index]
+cnt.index = lbl; pct.index = lbl
+cnt.to_csv(Rp("crosstab_2x4_counts.csv")); pct.to_csv(Rp("crosstab_2x4_proportions.csv"))
+say("\n== 3. EXPLORATORY: 2x4 cross-tab of severity within BCG x priorMH ==")
+say("counts:\n" + cnt.to_string()); say("within-cell %:\n" + pct.to_string())
+
+# ---------------------------------------------------------------- 4. DESIGN
+def design(d, mhvar="prior_mh", freq="patients_seen", expect=True, extra=()):
+    X = pd.DataFrame(index=d.index)
+    X["BCG"] = d.bcg.astype(float)
+    X["priorMH"] = d[mhvar].astype(float)
+    X["BCGxMH"] = d.bcg * d[mhvar]
+    if freq == "patients_seen":
+        X["patients_seen_51_100"] = d.patients_seen.eq("51-100").astype(float)
+        X["patients_seen_gt100"] = d.patients_seen.eq(">100").astype(float)
+    elif freq == "work_hours":
+        X["work_hours_41_80"] = d.work_hours.eq("41-80").astype(float)
+        X["work_hours_gt80"] = d.work_hours.eq(">80").astype(float)
+    if expect:
+        X["expect_interact_Yes"] = d.expect_interact.eq("Yes").astype(float)
+    for e in extra:
+        X[e] = d[e].astype(float)
+    return X
+
+def fit_po(y, X):
+    m = OrderedModel(np.asarray(y), X, distr="logit")
+    res, ok = None, False
+    for meth in ("newton", "bfgs", "nm"):
+        try:
+            r = m.fit(method=meth, maxiter=2000, disp=0)
+            conv = bool(r.mle_retvals.get("converged", True)) if isinstance(r.mle_retvals, dict) else True
+            if conv and np.all(np.isfinite(r.params)) and np.all(np.isfinite(r.bse)):
+                res, ok = r, True; break
+        except Exception as e:
+            last = str(e)
+    if res is None:
+        raise RuntimeError("OrderedModel failed to converge / non-finite SE")
+    res.fit_method_ok = ok
+    return res
+
+def or_table(res, names):
+    rows = []
+    for nm in names:
+        b, se = float(res.params[nm]), float(res.bse[nm])
+        rows.append(dict(term=nm, beta=b, se=se, OR=np.exp(b), OR_lo95=np.exp(b - Z * se),
+                         OR_hi95=np.exp(b + Z * se), p_wald=float(res.pvalues[nm])))
+    return pd.DataFrame(rows)
+
+def contrast(res, coefs, label):
+    V = res.cov_params()
+    b = float(sum(res.params[c] for c in coefs))
+    v = float(sum(V.loc[i, j] for i in coefs for j in coefs))
+    se = np.sqrt(v); zz = b / se
+    return dict(contrast=label, beta=b, se=se, OR=np.exp(b), OR_lo95=np.exp(b - Z * se),
+                OR_hi95=np.exp(b + Z * se), p_wald=float(2 * stats.norm.sf(abs(zz))))
+
+def fit_and_report(y, X, X_red, label, bag):
+    full, red = fit_po(y, X), fit_po(y, X_red)
+    lr = 2 * (full.llf - red.llf); dfd = X.shape[1] - X_red.shape[1]
+    lrp = float(stats.chi2.sf(lr, dfd))
+    tab = or_table(full, list(X.columns)); tab.insert(0, "spec", label)
+    sf = pd.DataFrame([
+        contrast(full, ["BCG"], "simple effect BCG | priorMH=no"),
+        contrast(full, ["BCG", "BCGxMH"], "simple effect BCG | priorMH=yes"),
+        contrast(full, ["priorMH"], "simple effect priorMH | Placebo"),
+        contrast(full, ["priorMH", "BCGxMH"], "simple effect priorMH | BCG"),
+        contrast(full, ["BCGxMH"], "INTERACTION BCG x priorMH")])
+    sf.insert(0, "spec", label)
+    sf["lr_chi2_interaction"] = lr; sf["lr_df"] = dfd; sf["lr_p"] = lrp
+    sf["llf_full"] = full.llf; sf["llf_reduced"] = red.llf; sf["n"] = int(full.nobs)
+    sf["n_categories"] = int(len(set(np.asarray(y))))
+    sf["max_or_se"] = float(max(full.bse[c] for c in X.columns))
+    bag["models"].append(tab); bag["simple"].append(sf)
+    say(f"\n--- {label}")
+    say(f"    n={int(full.nobs)}  levels={sorted(set(np.asarray(y)))}  llf={full.llf:.3f}  "
+        f"max SE over covariates={sf['max_or_se'].iloc[0]:.3f}")
+    say(tab.drop(columns="spec").round(4).to_string(index=False))
+    say(f"    LR test interaction: chi2={lr:.3f} df={dfd} p={lrp:.4g}")
+    say(sf.drop(columns=["spec", "llf_full", "llf_reduced", "n_categories"]).round(4).to_string(index=False))
+    return full
+
+bag = {"models": [], "simple": []}
+say("\n== 4. ORDINAL (PROPORTIONAL-ODDS) MODELS ==")
+Xp = design(base); Xp_red = design(base).drop(columns="BCGxMH")
+full_p = fit_and_report(base.Y4, Xp, Xp_red,
+    "PRIMARY  Y4(none/mild/moderate/severe) ~ BCG + priorMH + BCGxMH + patients_seen + expect_interact", bag)
+
+specs = [
+    ("S1  3-level DV (none / mild / moderate+severe)", "Y3", dict(), dict()),
+    ("S2  DV = AEHS clinical scale (0 / 1-2 / 3-4 / 5-7)", "Y_aeHS", dict(), dict()),
+    ("S3  DV = strict COVID-only AE, 3 levels", "Y3_c19", dict(), dict()),
+    ("S4  DV = strict COVID-only AE, 4 levels", "Y_c19", dict(), dict()),
+    ("S5  priorMH = clinically significant only", "Y4", dict(mhvar="prior_mh_strict"), dict(mhvar="prior_mh_strict")),
+    ("S6  frequency = work_hours instead of patients_seen", "Y4", dict(freq="work_hours"), dict(freq="work_hours")),
+    ("S7  + sex + age covariates", "Y4", dict(extra=("sex", "age_ord")), dict(extra=("sex", "age_ord"))),
+    ("S8  AESEV-missing & serious -> severe", "Y4_sevfix", dict(), dict()),
+    ("S9  NO frequency adjustment (raw BCG x MH interaction)", "Y4", dict(freq="none", expect=False), dict(freq="none", expect=False)),
+]
+for lab, ycol, kw, kwr in specs:
+    Xs = design(base, **kw)
+    Xs = Xs[[c for c in Xs.columns if Xs[c].nunique(dropna=True) > 1]]
+    Xr = Xs.drop(columns=[c for c in ["BCGxMH"] if c in Xs.columns])
+    fit_and_report(base[ycol], Xs, Xr, lab, bag)
+
+ALL_M = pd.concat(bag["models"], ignore_index=True)
+ALL_S = pd.concat(bag["simple"], ignore_index=True)
+ALL_M.to_csv(Rp("ordinal_model_ORs_all_specs.csv"), index=False)
+ALL_S.to_csv(Rp("interaction_inference_all_specs.csv"), index=False)
+
+# ---------------------------------------------------------------- 5. PO DIAGNOSTICS
+say("\n== 5. PROPORTIONAL-ODDS DIAGNOSTICS (primary specification, Y4) ==")
+y = base.Y4.values.astype(int); Xd = Xp.values.astype(float); cols = list(Xp.columns)
+K = int(y.max()) + 1; T = K - 1
+
+brant = []
+for j in range(T):
+    r = Logit((base.Y4 > j).astype(float), sm.add_constant(Xd)).fit(disp=0)
+    for k, c in enumerate(["const"] + cols):
+        pv, bv, zv = r.params.values, r.bse.values, r.pvalues.values
+        brant.append(dict(threshold=f"Y>{j}", term=c, beta=float(pv[k]),
+                          se=float(bv[k]), p=float(zv[k])))
+BRANT = pd.DataFrame(brant); BRANT.to_csv(Rp("po_brant_threshold_specific_logits.csv"), index=False)
+say("threshold-specific binary-logit coefficients (constant down a column => PO plausible):")
+say(BRANT[BRANT.term != "const"].pivot(index="term", columns="threshold", values="beta").round(3).to_string())
+say("... and |beta|/se per threshold:")
+say(BRANT[BRANT.term != "const"].assign(z=lambda d: d.beta / d.se)
+    .pivot(index="term", columns="threshold", values="z").round(2).to_string())
+
+def cat_prob(LP, a, yv, T):
+    P = np.clip(expit(LP - a[None, :]), 1e-12, 1 - 1e-12)
+    Pc = np.column_stack([1 - P[:, 0]] + [P[:, j - 1] - P[:, j] for j in range(1, T)] + [P[:, -1]])
+    return np.clip(Pc[np.arange(len(yv)), yv], 1e-300, None)
+
+def nll_po(pr, X, yv, T):
+    return -np.log(cat_prob(np.repeat((X @ pr[T:])[:, None], T, axis=1), pr[:T], yv, T)).sum()
+
+def _grad(f, x, h=1e-5):
+    g = np.zeros_like(x, dtype=float)
+    for i in range(len(x)):
+        xp = x.copy(); xm = x.copy(); xp[i] += h; xm[i] -= h
+        g[i] = (f(xp) - f(xm)) / (2 * h)
+    return g
+
+def hessian_fd(f, x, h=1e-4):
+    """Observed information (-2 log L Hessian) by central differences of the numeric gradient."""
+    n = len(x); H = np.zeros((n, n))
+    for j in range(n):
+        xp = x.copy(); xm = x.copy(); xp[j] += h; xm[j] -= h
+        H[:, j] = (_grad(f, xp, h) - _grad(f, xm, h)) / (2 * h)
+    return (H + H.T) / 2
+
+def fit_gologit(yv, X, cols, np_cols, free_cuts=None):
+    """Generalised (partially proportional) cumulative logit.
+
+    Every term keeps one proportional slope bp; terms listed in np_cols additionally get
+    free_cuts cut-point-specific DEVIATIONS added to their slope at the FIRST free_cuts
+    cumulative logits (the last cut is the reference).  The proportional-odds model is
+    therefore properly NESTED (all deviations = 0) and each non-proportional term costs
+    free_cuts extra df.  Default free_cuts = T-1, i.e. non-proportionality is tested only at
+    the identifiable cuts, which matters here because the top cut of Y4 holds 24 events.
+    """
+    X = np.asarray(X, float); yv = np.asarray(yv, int)
+    n, p = X.shape; T = int(yv.max())
+    n_idx = [i for i, c in enumerate(cols) if c in np_cols]
+    nb = len(n_idx)
+    fc = (T - 1) if free_cuts is None else int(min(free_cuts, T - 1))
+    def unpack(pr):
+        a = pr[:T]; bp = pr[T:T + p]
+        bn = np.zeros((nb, T))
+        if nb and fc:
+            bn[:, :fc] = pr[T + p:].reshape(nb, fc)          # bn[variable, cut]
+        return a, bp, bn
+    def nll(pr):
+        a, bp, bn = unpack(pr)
+        LP = np.repeat((X @ bp)[:, None], T, axis=1)
+        for t in range(fc):
+            LP[:, t] = LP[:, t] + X[:, n_idx] @ bn[:, t]
+        return -np.log(cat_prob(LP, a, yv, T)).sum()
+    p0 = np.r_[np.linspace(-1.5, 1.5, T), np.zeros(p), np.zeros(nb * fc)]
+    r1 = minimize(nll, p0, method="L-BFGS-B", options=dict(maxiter=60000, maxfun=60000, ftol=1e-16, gtol=1e-14))
+    r2 = minimize(nll, r1.x, method="BFGS", options=dict(maxiter=20000, gtol=1e-12))
+    r = r2 if r2.fun <= r1.fun else r1
+    for _ in range(3):                                        # full-memory BFGS polish (for SEs)
+        r3 = minimize(nll, r.x, method="BFGS", options=dict(maxiter=20000, gtol=1e-13))
+        if r3.fun <= r.fun + 1e-9 and hasattr(r3, "hess_inv"):
+            r = r3
+        if float(np.max(np.abs(_grad(nll, r.x)))) < 1e-5:
+            break
+    gnorm = float(np.max(np.abs(_grad(nll, r.x))))
+    a, bp, bn = unpack(r.x)
+    H = hessian_fd(nll, r.x)
+    Hi = np.linalg.pinv(H)
+    se = np.sqrt(np.clip(np.diag(Hi), 0, None))
+    return dict(nll=float(r.fun), npar=len(r.x), gnorm=gnorm, ok=(gnorm < 1e-3), a=a, bp=bp, bn=bn,
+                Hi=Hi, se=se, T=T, fc=fc, p=p, cols=list(cols), n_idx=n_idx,
+                n_idx_names=[cols[i] for i in n_idx])
+
+def golo_term_slopes(g):
+    """Cut-specific slopes = common slope + deviation, with delta-method SEs."""
+    T, fc, p, cols, Hi = g["T"], g["fc"], g["p"], g["cols"], g["Hi"]
+    rows = []
+    for m, c in enumerate(g["n_idx_names"]):
+        i0 = T + cols.index(c)
+        for t in range(T):
+            idx = [i0] if t >= fc else [i0, T + p + m * fc + t]
+            sgn = [1.0] if t >= fc else [1.0, 1.0]
+            b = g["bp"][cols.index(c)] + (0.0 if t >= fc else g["bn"][m, t])
+            v = sum(si * sj * Hi[i, j] for i, si in zip(idx, sgn) for j, sj in zip(idx, sgn))
+            se = float(np.sqrt(max(v, 0)))
+            rows.append(dict(term=c, threshold=f"Y>{t}", slope=b, se=se,
+                             p=float(2 * stats.norm.sf(abs(b / se)) if se > 0 else 1.0)))
+    return pd.DataFrame(rows)
+
+def golo_joint_dev_test(g, term):
+    """Wald test that all cut-specific deviations of `term` are 0 => that term is proportional."""
+    T, fc, p = g["T"], g["fc"], g["p"]
+    if term not in g["n_idx_names"] or fc == 0:
+        return float("nan"), 0, float("nan")
+    m = g["n_idx_names"].index(term)
+    ix = [T + p + m * fc + t for t in range(fc)]
+    b = np.array([g["bn"][m, t] for t in range(fc)])
+    V = g["Hi"][np.ix_(ix, ix)]
+    w = float(b @ np.linalg.solve(V, b))
+    return w, fc, float(stats.chi2.sf(w, fc))
+
+po_fit = minimize(nll_po, np.r_[np.linspace(-1.5, 1.5, T), np.zeros(len(cols))],
+                  args=(Xd, y, T), method="BFGS", options=dict(maxiter=5000, gtol=1e-9))
+po_nll = float(po_fit.fun)
+po_gnorm = float(np.max(np.abs(_grad(lambda q: nll_po(q, Xd, y, T), po_fit.x))))
+say(f"\ncontrol check - manual cumulative-logit MLE nll={po_nll:.4f} vs statsmodels -llf={-full_p.llf:.4f} "
+    f"(match: {abs(po_nll + full_p.llf) < 0.05})")
+rows = []
+for npc in [["BCG"], ["priorMH"], ["BCGxMH"], ["BCG", "priorMH", "BCGxMH"],
+            ["patients_seen_51_100", "patients_seen_gt100", "expect_interact_Yes"], list(cols)]:
+    g = fit_gologit(y, Xd, cols, npc)
+    lr = 2 * (po_nll - g["nll"]); dfd = g["npar"] - len(po_fit.x)
+    rows.append(dict(non_proportional_terms="ALL_TERMS" if npc is cols else ",".join(npc),
+                     lr_chi2=lr, df=dfd, p=float(stats.chi2.sf(max(lr, 0), dfd)),
+                     nll_po=po_nll, nll_generalised=g["nll"], max_abs_gradient=g["gnorm"], converged=g["ok"]))
+POT = pd.DataFrame(rows); POT.to_csv(Rp("po_lr_tests.csv"), index=False)
+say("\nLR tests: proportional odds vs partially non-proportional (generalised) cumulative logit")
+say(POT.round(4).to_string(index=False))
+say("(each non-proportional term costs T-1 = 2 extra df; LR ~ 0 with df>0 means PO is not rejected)")
+
+mn = MNLogit(y, sm.add_constant(Xd)).fit(disp=0, maxiter=800)
+mn_rows = []
+for j in range(mn.params.shape[1]):
+    for k, c in enumerate(["const"] + cols):
+        mn_rows.append(dict(outcome_vs_ref=f"Y={j+1}_vs_0", term=c, OR=float(np.exp(mn.params[k, j])),
+                            se=float(mn.bse[k, j]), p=float(mn.pvalues[k, j])))
+MN = pd.DataFrame(mn_rows); MN.to_csv(Rp("multinomial_logit_ORs.csv"), index=False)
+say("\nMultinomial logit (base = 0 'no infection') - key terms:")
+say(MN[MN.term.isin(["BCG", "priorMH", "BCGxMH"])].round(4).to_string(index=False))
+def mn_joint_wald(m, cols, term):
+    """Joint Wald test for one term across all multinomial contrasts; auto-detects the
+    covariance-parameter ordering and validates it against the reported SEs."""
+    k, J = m.params.shape
+    V = np.asarray(m.cov_params()); i = cols.index(term) + 1
+    layouts = {"outcome_major": (V.reshape(J, k, J, k), lambda a, c: (a, i, c, i)),
+               "var_major": (V.reshape(k, J, k, J), lambda a, c: (i, a, i, c))}
+    for nm, (V4, ix) in layouts.items():
+        dd = np.array([V4[ix(j, j)] for j in range(J)])
+        if np.allclose(dd, m.bse[i, :] ** 2, rtol=1e-5, atol=1e-10):
+            d = np.array([[V4[ix(a, c)] for c in range(J)] for a in range(J)])
+            b = m.params[i, :]
+            w = float(b @ np.linalg.solve(d, b))
+            return nm, w, float(stats.chi2.sf(w, J))
+    return "unknown", float("nan"), float("nan")
+
+lay, w, pw = mn_joint_wald(mn, cols, "BCGxMH")
+say(f"[covariance layout: {lay}] Multinomial joint Wald for BCGxMH over all contrasts: "
+    f"chi2={w:.3f} df={mn.params.shape[1]} p={pw:.4g}  "
+    f"(top contrast Y=3 vs 0 is quasi-separated: n=24 -> read the 3-level multinomial below)")
+
+# ---- partial-PO model with cut-point-specific slopes for the three key terms
+NP = ["BCG", "priorMH", "BCGxMH"]
+g = fit_gologit(y, Xd, cols, NP)
+PROPO = golo_term_slopes(g)
+PROPO.to_csv(Rp("partial_po_threshold_specific_slopes.csv"), index=False)
+say("\nPartial-PO model on Y4 (deviations free at the two identifiable cuts Y>0, Y>1; "
+    "Y>2 is the reference):")
+say(PROPO.round(4).to_string(index=False))
+say("LR test PO vs this partial-PO model: chi2=%.3f df=%d p=%.4g (max|grad|=%.1e)"
+    % (2 * (po_nll - g["nll"]), g["npar"] - len(po_fit.x),
+       stats.chi2.sf(max(2 * (po_nll - g["nll"]), 0), g["npar"] - len(po_fit.x)), g["gnorm"]))
+for t_ in NP:
+    w, df_, p_ = golo_joint_dev_test(g, t_)
+    say(f"  joint Wald, all cut-specific deviations of {t_} = 0: chi2={w:.3f} df={df_} p={p_:.4g}")
+
+# ---- 5b. PO diagnostics + multinomial on the well-conditioned 3-level outcome Y3
+say("\n== 5b. PO DIAGNOSTICS + MULTINOMIAL ON THE 3-LEVEL OUTCOME Y3 (424 / 300 / 276) ==")
+y3 = base.Y3.values.astype(int); X3 = Xp.values.astype(float); T3 = int(y3.max())
+b3 = []
+for j in range(T3):
+    rr = Logit((base.Y3 > j).astype(float), sm.add_constant(X3)).fit(disp=0)
+    pv, bv, zv = rr.params.values, rr.bse.values, rr.pvalues.values
+    for k, c in enumerate(["const"] + cols):
+        b3.append(dict(threshold=f"Y>{j}", term=c, beta=float(pv[k]), se=float(bv[k]), p=float(zv[k])))
+B3 = pd.DataFrame(b3); B3.to_csv(Rp("po_brant_logits_Y3.csv"), index=False)
+say("threshold-specific binary-logit coefficients for Y3:")
+say(B3[B3.term != "const"].pivot(index="term", columns="threshold", values="beta").round(3).to_string())
+po3 = minimize(lambda q: nll_po(q, X3, y3, T3), np.r_[np.linspace(-1.5, 1.5, T3), np.zeros(len(cols))],
+               method="BFGS", options=dict(maxiter=5000, gtol=1e-10))
+nll3 = float(po3.fun)
+say(f"3-level proportional-odds nll={nll3:.4f} (statsmodels Y4 spec nll={po_nll:.4f}); "
+    f"3-level PO max|grad|={float(np.max(np.abs(_grad(lambda q: nll_po(q, X3, y3, T3), po3.x)))):.2e}")
+rows3 = []
+for npc in [["BCG"], ["priorMH"], ["BCGxMH"], ["BCG", "priorMH", "BCGxMH"],
+            ["patients_seen_51_100", "patients_seen_gt100", "expect_interact_Yes"], list(cols)]:
+    g3 = fit_gologit(y3, X3, cols, npc)
+    lr = 2 * (nll3 - g3["nll"]); dfd = g3["npar"] - len(po3.x)
+    rows3.append(dict(dv="Y3", non_proportional_terms="ALL_TERMS" if npc is cols else ",".join(npc),
+                      lr_chi2=lr, df=dfd, p=float(stats.chi2.sf(max(lr, 0), dfd)),
+                      max_abs_gradient=g3["gnorm"], converged=g3["ok"]))
+VAL = fit_gologit(y3, X3, cols, [])   # no non-proportional term == statsmodels PO model
+m3 = fit_po(base.Y3, Xp)
+say("\ncontrol check - hand-written generalised model with all slopes proportional vs statsmodels:")
+say(pd.DataFrame(dict(term=cols, beta_manual=[VAL["bp"][cols.index(c)] for c in cols],
+                      se_manual=[VAL["se"][T3 + cols.index(c)] for c in cols],
+                      beta_sm=[float(m3.params[c]) for c in cols],
+                      se_sm=[float(m3.bse[c]) for c in cols])).round(5).to_string(index=False))
+
+POT3 = pd.DataFrame(rows3); POT3.to_csv(Rp("po_lr_tests_Y3.csv"), index=False)
+say("\nLR tests on Y3: proportional odds vs partially non-proportional cumulative logit")
+say(POT3.round(4).to_string(index=False))
+g3 = fit_gologit(y3, X3, cols, ["BCG", "priorMH", "BCGxMH"])
+P3 = golo_term_slopes(g3); P3.to_csv(Rp("partial_po_slopes_Y3.csv"), index=False)
+say("\nPartial-PO slopes on Y3 (deviation free at cut Y>0; Y>1 reference):")
+say(P3.round(4).to_string(index=False))
+for t_ in ["BCG", "priorMH", "BCGxMH"]:
+    w_, df_, p_ = golo_joint_dev_test(g3, t_)
+    say(f"  joint Wald, deviations of {t_} = 0: chi2={w_:.3f} df={df_} p={p_:.4g}")
+mn3 = MNLogit(y3, sm.add_constant(X3)).fit(disp=0, maxiter=800)
+mrows = [dict(outcome_vs_ref=f"Y={j+1}_vs_0", term=c, OR=float(np.exp(mn3.params[k, j])),
+              se=float(mn3.bse[k, j]), p=float(mn3.pvalues[k, j]))
+         for j in range(mn3.params.shape[1]) for k, c in enumerate(["const"] + cols)]
+pd.DataFrame(mrows).to_csv(Rp("multinomial_logit_ORs_Y3.csv"), index=False)
+say("\nMultinomial logit on Y3 (base = 0 'no infection'):")
+say(pd.DataFrame(mrows).query("term in ['BCG','priorMH','BCGxMH']").round(4).to_string(index=False))
+lay3, w3, pw3 = mn_joint_wald(mn3, cols, "BCGxMH")
+say(f"[covariance layout: {lay3}] Multinomial joint Wald for BCGxMH on Y3: chi2={w3:.3f} "
+    f"df={mn3.params.shape[1]} p={pw3:.4g}")
+b_or = [float(np.exp(mn3.params[cols.index("BCGxMH") + 1, j])) for j in range(mn3.params.shape[1])]
+say("multinomial interaction ORs by contrast (Y=1/2/3 vs 0): " + ", ".join(f"{v:.3f}" for v in b_or))
+
+
+# ---- 5c. which term breaks PO, and interaction under partial PO
+FREQ = ["patients_seen_51_100", "patients_seen_gt100", "expect_interact_Yes"]
+rows_c = []
+for dv, yv, T_, nll_base in [("Y4", y, T, po_nll), ("Y3", y3, T3, nll3)]:
+    for term in cols:
+        Xuse = Xd if dv == "Y4" else X3
+        gg = fit_gologit(yv, Xuse, cols, [term], free_cuts=(T - 1 if dv == "Y4" else None))
+        lr = 2 * (nll_base - gg["nll"]); dfd = gg["npar"] - (T_ + len(cols))
+        wj, dfj, pj = golo_joint_dev_test(gg, term)
+        rows_c.append(dict(dv=dv, term=term, lr_chi2=lr, df=dfd, p=float(stats.chi2.sf(max(lr, 0), dfd)),
+                           wald_chi2=wj, wald_df=dfj, wald_p=pj, max_abs_gradient=gg["gnorm"],
+                           converged=gg["ok"]))
+POTC = pd.DataFrame(rows_c); POTC.to_csv(Rp("po_lr_tests_per_term.csv"), index=False)
+say("\n== 5c. PER-TERM PROPORTIONAL-ODDS LR TESTS  (for Y4 the cut-specific slopes are free")
+say("only at the two identifiable cuts Y>0 and Y>1, so the 24-event top category cannot")
+say("manufacture spurious non-proportionality) ==")
+say(POTC.pivot(index="term", columns="dv", values="p").round(4).to_string())
+say("same tests, Wald form (deviations = 0):")
+say(POTC.pivot(index="term", columns="dv", values="wald_p").round(4).to_string())
+
+say("\nInteraction under a PARTIALLY proportional-odds model (frequency covariates allowed")
+say("cut-point-specific slopes; BCG/priorMH/BCGxMH kept proportional):")
+pp = []
+for dv, yv, T_, Xm in [("Y4", y, T, Xd), ("Y3", y3, T3, X3)]:
+    gg = fit_gologit(yv, Xm, cols, FREQ)
+    for term in ["BCG", "priorMH", "BCGxMH"]:
+        idx = T_ + cols.index(term)
+        b_, se_ = gg["bp"][cols.index(term)], gg["se"][idx]
+        pp.append(dict(dv=dv, term=term, beta=b_, se=se_, OR=np.exp(b_), OR_lo95=np.exp(b_ - Z * se_),
+                       OR_hi95=np.exp(b_ + Z * se_), p=float(2 * stats.norm.sf(abs(b_ / se_))),
+                       max_abs_gradient=gg["gnorm"]))
+PP = pd.DataFrame(pp); PP.to_csv(Rp("partial_po_interaction_estimates.csv"), index=False)
+say(PP.round(4).to_string(index=False))
+it = ALL_S[(ALL_S.spec.str.startswith("PRIMARY")) & (ALL_S.contrast == "INTERACTION BCG x priorMH")].iloc[0]
+say(f"\nprecision: SE(beta_interaction)={it.se:.3f} -> minimum interaction OR detectable with 80% power "
+    f"(two-sided 5%) = exp(2.802*SE) = {np.exp(2.802 * it.se):.2f}; observed CI width "
+    f"({it.OR_lo95:.2f}-{it.OR_hi95:.2f}) rules out |log OR| > {max(abs(np.log(it.OR_lo95)), abs(np.log(it.OR_hi95))):.2f}")
+
+
+# ---- 5d. informative dichotomisations + severe-tail descriptives
+say("\n== 5d. DICHOTOMOUS LOGISTIC MODELS AND SEVERE-TAIL DESCRIPTIVES ==")
+from statsmodels.api import Logit as _L
+dich = {"infectious AE (Y>0)": (base.Y4 > 0).astype(int).values,
+        "moderate+severe (Y>=2)": (base.Y4 >= 2).astype(int).values,
+        "severe only (Y==3)": (base.Y4 == 3).astype(int).values,
+        "COVID AE (Y_c19>0)": (base.Y_c19 > 0).astype(int).values}
+rows_d = []
+for lab, yv in dich.items():
+    rr = _L(yv, sm.add_constant(Xd)).fit(disp=0, maxiter=200)
+    for term in ["BCG", "priorMH", "BCGxMH"]:
+        k = cols.index(term) + 1
+        b_, se_ = float(rr.params[k]), float(rr.bse[k])
+        rows_d.append(dict(model=lab, events=int(yv.sum()), term=term, OR=np.exp(b_),
+                           OR_lo95=np.exp(b_ - Z * se_), OR_hi95=np.exp(b_ + Z * se_),
+                           p=float(rr.pvalues[k])))
+DD = pd.DataFrame(rows_d); DD.to_csv(Rp("dichotomous_logistic_models.csv"), index=False)
+say(DD.round(4).to_string(index=False))
+say("\nsevere (Y==3) rates by BCG x priorMH:")
+tail_tab = base.groupby(["bcg", "prior_mh"]).agg(n=("Y4", "size"), severe=("Y4", lambda x: int((x == 3).sum())))
+tail_tab["pct_severe"] = (100 * tail_tab.severe / tail_tab.n).round(1)
+say(tail_tab.to_string())
+cells = {(b, m): (int(((base.bcg == b) & (base.prior_mh == m) & (base.Y4 == 3)).sum()),
+                  int(((base.bcg == b) & (base.prior_mh == m)).sum())) for b in (1, 0) for m in (1, 0)}
+for (b, m), (ev, n_) in sorted(cells.items()):
+    say(f"  severe {ev}/{n_} = {100*ev/n_:.1f}%  in {'BCG' if b else 'Placebo'} / priorMH={'yes' if m else 'no'}")
+for m in (1, 0):
+    e1, n1 = cells[(1, m)]; e0, n0 = cells[(0, m)]
+    orr, pf = stats.fisher_exact([[e1, n1 - e1], [e0, n0 - e0]])
+    say(f"  within priorMH={'yes' if m else 'no'}: severe BCG {e1}/{n1} vs Placebo {e0}/{n0}; "
+        f"odds ratio (Fisher, Haldane-Anscombe not applied) p={pf:.4g}")
+say("NOTE: only 24 severe events in total; the severe-only scale is not a usable test of the interaction.")
+
+# ---- summary table
+SUM = ALL_M[ALL_M.term == "BCGxMH"][["spec", "beta", "se", "OR", "OR_lo95", "OR_hi95", "p_wald"]].copy()
+SUM = SUM.merge(ALL_S[ALL_S.contrast == "INTERACTION BCG x priorMH"][["spec", "lr_chi2_interaction", "lr_df", "lr_p", "n"]],
+                on="spec", how="left")
+SUM["main_effect_priorMH_OR"] = ALL_M[ALL_M.term == "priorMH"].OR.values
+SUM["main_effect_BCG_OR"] = ALL_M[ALL_M.term == "BCG"].OR.values
+SUM["simple_BCG_or_MH_no_OR"] = ALL_S[ALL_S.contrast == "simple effect BCG | priorMH=no"].OR.values
+SUM["simple_BCG_or_MH_yes_OR"] = ALL_S[ALL_S.contrast == "simple effect BCG | priorMH=yes"].OR.values
+SUM.to_csv(Rp("summary_interaction_table.csv"), index=False)
+say("\n== SUMMARY TABLE (written to results/summary_interaction_table.csv) ==")
+say(SUM[["spec", "n", "OR", "OR_lo95", "OR_hi95", "p_wald", "lr_p", "simple_BCG_or_MH_no_OR",
+         "simple_BCG_or_MH_yes_OR", "main_effect_priorMH_OR"]].round(3).to_string(index=False))
+
+# ---------------------------------------------------------------- 6. HEADLINE
+H = ALL_S[ALL_S.spec.str.startswith("PRIMARY")]
+it = H[H.contrast == "INTERACTION BCG x priorMH"].iloc[0]
+say("\n== 6. HEADLINE (primary specification) ==")
+say(f"interaction OR = {it.OR:.3f} (95% CI {it.OR_lo95:.3f}-{it.OR_hi95:.3f}); "
+    f"Wald p = {it.p_wald:.4g}; LR chi2 = {it.lr_chi2_interaction:.3f} (df {int(it.lr_df)}), p = {it.lr_p:.4g}; "
+    f"SE(beta_int) = {it.se:.3f}")
+say(H[H.contrast.str.startswith("simple")][["contrast", "beta", "se", "OR", "OR_lo95", "OR_hi95", "p_wald"]]
+    .round(4).to_string(index=False))
+say("\nInteraction term across all specifications:")
+say(ALL_M[ALL_M.term == "BCGxMH"][["spec", "beta", "se", "OR", "OR_lo95", "OR_hi95", "p_wald"]]
+    .round(4).to_string(index=False))
+say("\nSimple effect of BCG within priorMH, all specifications:")
+say(ALL_S[ALL_S.contrast.str.startswith("simple effect BCG")][["spec", "contrast", "OR", "OR_lo95", "OR_hi95", "p_wald"]]
+    .round(4).to_string(index=False))
+say("\nArtefacts: " + ", ".join(sorted(os.listdir(Rp()))))
+with open(Rp("report.md"), "w") as f:
+    f.write("# BCG x prior medical history -> COVID-19 severity (ordinal / proportional-odds regression)\n\n"
+            "Executed by analysis/bcg_mh_severity_analysis.py\n\n```\n" + "\n".join(LOG) + "\n```\n")

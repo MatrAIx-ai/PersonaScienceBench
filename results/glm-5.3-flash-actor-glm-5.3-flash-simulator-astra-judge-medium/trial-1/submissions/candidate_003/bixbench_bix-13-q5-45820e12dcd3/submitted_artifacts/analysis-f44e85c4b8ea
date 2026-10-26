@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+DESeq2-equivalent differential expression pipeline (Python reimplementation,
+because no R/DESeq2 is available in this environment and there is no network).
+
+Reproduced DESeq2 (v1.4x) default steps:
+  1. Median-of-ratios size factors (genes with all-positive counts).
+  2. Negative Binomial GLM, log link, design ~ media + strain (IRLS, beta MLE).
+  3. Gene-wise dispersion MLE via Cox-Reid adjusted profile likelihood.
+  4. Parametric dispersion trend  alpha(mu) = a1/mu + a0  (robust fit).
+  5. MAP shrinkage of gene-wise dispersions toward the trend (log-normal
+     prior; prior variance from spread of gene-wise estimates, capped [0.25,1]).
+  6. Final dispersion = MLE if MLE > trend else MAP; refit GLM; Wald tests.
+  7. Benjamini-Hochberg with DESeq2-style independent filtering on the mean
+     normalized count (threshold maximizing rejections at alpha=0.05).
+
+Known deviations from literal DESeq2: no zero-count / outlier replacement
+(Cook's distance) logic, dispersion optimization via bounded scalar
+optimization, simplified robust trend fit and prior-variance heuristic.
+"""
+import numpy as np, pandas as pd, patsy, json, csv
+from scipy.special import gammaln
+from scipy.optimize import minimize_scalar
+
+rng = np.random.default_rng(0)
+
+# ---------------- load ----------------
+counts = pd.read_csv('data/raw_counts.csv', index_col=0)
+meta = pd.read_csv('data/experiment_metadata.csv')
+meta['Strain'] = meta['Strain'].astype(str)
+meta = meta.set_index('AzentaName').loc[counts.columns]   # align by AzentaName
+Y = counts.to_numpy(np.float64).T                          # 36 x G
+G = Y.shape[1]
+samples = list(counts.columns)
+
+# ---------------- size factors (median of ratios) ----------------
+with np.errstate(divide='ignore'):
+    gm = np.exp(np.log(Y, where=Y>0, out=np.full_like(Y, -np.inf)).mean(axis=0))                        # =0 if any count is 0
+ok = gm > 0
+sf = np.median(Y[:, ok] / gm[ok][None, :], axis=1)   # per-sample median of ratios
+sf = sf / np.exp(np.mean(np.log(sf)))                      # DESeq2 normalization
+off = np.log(sf)
+
+# ---------------- design: ~ media + strain, JBX1 (strain '1') reference ----
+form = ("~ C(Media, levels=['MMGluFeMinus','MMGluFePlus','Succinate']) + "
+        "C(Strain, levels=['1','97','98','99'])")
+D = patsy.dmatrix(form, meta, return_type='dataframe')
+X = D.to_numpy(np.float64)
+cn = list(D.columns)
+coef_idx = {c: i for i, c in enumerate(cn)}
+strain_col_prefix = [c for c in cn if c.startswith('C(Strain')]
+assert len(strain_col_prefix) == 3
+contrast_cols = {s: [c for c in strain_col_prefix if c.endswith(f"{s}]")][0]
+                 for s in ['97', '98', '99']}
+P = X.shape[1]
+print('design columns:', cn)
+
+# ---------------- IRLS NB GLM ----------------
+def irls(y, X, off, a, beta=None, maxit=100, tol=1e-10):
+    n, p = X.shape
+    if beta is None:
+        eta0 = np.log(y + 0.5) - off
+        beta = np.linalg.lstsq(X, eta0, rcond=None)[0]
+    for _ in range(maxit):
+        eta = X @ beta + off
+        mu = np.exp(np.clip(eta, -700, 700))
+        w = mu / (1.0 + a * mu)
+        z = eta + (y - mu) / mu
+        Xw = X * w[:, None]
+        A = X.T @ Xw + np.eye(p) * 1e-12
+        b = Xw.T @ z
+        try:
+            bnew = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            bnew = np.linalg.lstsq(A, b, rcond=None)[0]
+        if np.max(np.abs(bnew - beta)) < tol:
+            beta = bnew
+            break
+        beta = bnew
+    mu = np.exp(np.clip(X @ beta + off, -700, 700))
+    return beta, mu
+
+def cr_loglik(loga, y, X, off, beta=None):
+    a = float(np.exp(loga))
+    beta, mu = irls(y, X, off, a, beta=beta, maxit=50, tol=1e-9)
+    r = 1.0 / a
+    ll = np.sum(gammaln(y + r) - gammaln(r) - gammaln(y + 1.0)
+                + r * np.log(r / (r + mu)) + y * np.log(mu / (r + mu)))
+    w = mu / (1.0 + a * mu)
+    A = X.T @ (X * w[:, None])
+    _, ld = np.linalg.slogdet(A)
+    return -ll + 0.5 * ld, beta, mu          # return NEGATIVE adjusted loglik
+
+# ---------------- per-gene fits ----------------
+LA_MIN, LA_MAX = np.log(1e-4), np.log(20.0)
+grid = np.linspace(LA_MIN, LA_MAX, 25)
+beta_init_all = None
+mle = np.empty(G); beta_mle = np.empty((G, P)); mu_mle = np.empty((G, 36))
+for g in range(G):
+    y = Y[:, g]
+    # coarse grid
+    vals = []
+    b = None
+    for la in grid:
+        f, b2, _ = cr_loglik(la, y, X, off, beta=b)
+        vals.append(f); b = b2
+    vals = np.array(vals)
+    i0 = int(np.argmin(vals))
+    lo = grid[max(i0 - 1, 0)]; hi = grid[min(i0 + 1, len(grid) - 1)]
+    res = minimize_scalar(lambda la: cr_loglik(la, y, X, off, beta=b)[0],
+                          bounds=(lo, hi), method='bounded',
+                          options={'xatol': 1e-4})
+    f, b, mu = cr_loglik(res.x, y, X, off, beta=b)
+    mle[g] = np.exp(res.x); beta_mle[g] = b; mu_mle[g] = mu
+    if g % 1000 == 0:
+        print('gene-wise MLE:', g, flush=True)
+
+# ---------------- dispersion trend ----------------
+mu_norm = (Y / sf[:, None]).mean(axis=0)                # mean normalized count
+def trend_resid(p):
+    a1, a0 = np.exp(p)
+    pred = a1 / mu_norm + a0
+    return np.log(mle) - np.log(pred)
+from scipy.optimize import least_squares
+r0 = least_squares(trend_resid, x0=np.log([np.median(mle * mu_norm), np.median(mle) / 10]),
+                   loss='soft_l1', f_scale=0.5)
+a1, a0 = np.exp(r0.x)
+trend = a1 / mu_norm + a0
+print(f'trend: a1={a1:.3e} a0={a0:.3e}')
+
+# ---------------- MAP shrinkage ----------------
+dev = np.log2(mle / trend)
+prior_var = float(np.clip(np.var(dev), 0.25, 1.0))
+print('priorVar(log2 units):', round(prior_var, 4))
+
+def map_disp(g):
+    y = Y[:, g]; b0 = beta_mle[g]; lt = np.log2(trend[g])
+    def f(la):
+        nll, _, _ = cr_loglik(la / np.log(2), y, X, off, beta=b0)
+        lp = 0.5 * np.log(2 * np.pi * prior_var) + 0.5 * (np.log2(np.exp(la)) - lt) ** 2 / prior_var
+        return nll + lp
+    la0 = np.log(mle[g])
+    res = minimize_scalar(f, bounds=(LA_MIN, LA_MAX), method='bounded',
+                          options={'xatol': 1e-4})
+    return np.exp(res.x)
+
+final = np.where(mle > trend, mle, np.array([map_disp(g) for g in range(G)]))
+print('dispersion summary: trend med', np.median(trend), 'final med', np.median(final))
+
+# ---------------- Wald tests on refit GLMs ----------------
+from scipy.stats import norm as _norm
+pvals = np.full((G, 3), np.nan); lfc = np.full((G, 3), np.nan)
+for g in range(G):
+    y = Y[:, g]
+    beta, mu = irls(y, X, off, final[g], beta=beta_mle[g], maxit=100)
+    w = mu / (1.0 + final[g] * mu)
+    cov = np.linalg.inv(X.T @ (X * w[:, None]))
+    for j, s in enumerate(['97', '98', '99']):
+        k = coef_idx[contrast_cols[s]]
+        se = np.sqrt(cov[k, k])
+        z = beta[k] / se
+        lfc[g, j] = beta[k] / np.log(2)
+        pvals[g, j] = 2 * _norm.sf(abs(z))
+    if g % 1000 == 0:
+        print('wald:', g, flush=True)
+
+# ---------------- BH + independent filtering ----------------
+def bh(p):
+    p = np.asarray(p, float)
+    n = len(p); o = np.argsort(p)
+    padj = np.empty(n)
+    cum = np.minimum.accumulate((p[o] * n / np.arange(1, n + 1))[::-1])[::-1]
+    padj[o] = np.minimum(cum, 1.0)
+    return padj
+
+alpha = 0.05
+p_ok = ~np.isnan(pvals).any(axis=1)
+means_sorted = np.sort(mu_norm)
+N = G
+step = max(10, N // 200)
+best_thr, best_rej = 0.0, -1
+for i in range(10, N, step):
+    thr = (means_sorted[i - 1] + means_sorted[i]) / 2
+    keep = mu_norm > thr
+    if keep.sum() < 1: continue
+    rej = 0
+    for j in range(3):
+        pp = pvals[keep, j]; pp = pp[~np.isnan(pp)]
+        rej += int((bh(pp) < alpha).sum())
+    if rej > best_rej:
+        best_rej, best_thr = rej, thr
+print('independent filter threshold:', best_thr, 'rejections at thr:', best_rej)
+
+keep = mu_norm > best_thr
+padj = np.full((G, 3), np.nan)
+for j in range(3):
+    idx = np.where(keep & ~np.isnan(pvals[:, j]))[0]
+    padj[idx, j] = bh(pvals[idx, j])
+
+# ---------------- results ----------------
+names = {'97': 'dLasI', '98': 'dRhlI', '99': 'dLasI_dRhlI'}
+res = pd.DataFrame({'gene': counts.index, 'baseMean': mu_norm})
+for j, s in enumerate(['97', '98', '99']):
+    res[f'log2FC_{names[s]}_vs_JBX1'] = lfc[:, j]
+    res[f'p_{names[s]}'] = pvals[:, j]
+    res[f'padj_{names[s]}'] = padj[:, j]
+res.to_csv('analysis/results_padj.csv', index=False)
+
+sig = {s: np.where(np.isnan(padj[:, j]), False, padj[:, j] < 0.05)[np.where(np.isnan(padj[:, j]), False, padj[:, j] < 0.05)].size for j, s in enumerate(['97','98','99'])}
+sigv = {s: padj[:, j] < 0.05 for j, s in zip(range(3), ['97', '98', '99'])}
+sigv = {s: np.where(np.isnan(padj[:, i]), False, padj[:, i] < 0.05) for i, s in enumerate(['97','98','99'])}
+print('DE counts per contrast (padj<0.05):', {names[s]: int(sigv[s].sum()) for s in ['97','98','99']})
+
+# main mapping: 97=dLasI, 98=dRhlI, 99=double
+main = ((sigv['97'] | sigv['98']) & ~sigv['99']).sum()
+sens = {}
+for dbl in ['97', '98', '99']:
+    singles = [s for s in ['97', '98', '99'] if s != dbl]
+    n = int(((sigv[singles[0]] | sigv[singles[1]]) & ~sigv[dbl]).sum())
+    sens[dbl] = n
+out = {'main_97lasI_98rhlI_99double': int(main),
+       'sensitivity_counts_by_double_mutant_code': sens,
+       'DE_per_contrast': {names[s]: int(sigv[s].sum()) for s in ['97','98','99']}}
+json.dump(out, open('analysis/summary.json', 'w'), indent=2)
+print(json.dumps(out, indent=2))

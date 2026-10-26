@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+Deployment prediction sets under a cost-weighted miss risk target.
+
+APPROVED POLICY DESIGN
+----------------------
+- Proxy strata: quintiles of feature v000 (cutpoints computed on the 70% model-fit
+  split only; v000 is the strongest public proxy for classifier reliability).
+- Label-recovery model: k=11 kNN with score-weighted neighbour votes on
+  standardized features, fit on the 70% fit split ONLY.
+- Threshold selection: STRICTLY on the 30% holdout split (conformal-style split;
+  the kNN model never sees threshold-selection data).
+- Per stratum g, inclusion rule for deployment record i:
+      prediction_set(i) = { l : score_l(i) >= t_g }  U  { kNN top-k_g labels(i) }
+  (k_g >= 1 guarantees non-empty sets, as required by risk_spec.json).
+- (t_g, k_g) chosen per stratum to MINIMIZE holdout mean set size subject to
+  holdout cost-weighted miss risk <= margin * target. The margin starts at 0.85
+  and tightens (0.75, 0.65, ...) until the deployment-weighted overall estimate
+  <= target_risk (0.1084). Both constraints are retained.
+- Deployment risk is an ESTIMATE (deployment labels are hidden):
+      est_risk_overall = sum_g deployment_fraction_g * holdout_risk_g
+  i.e. per-stratum holdout risk weighted by the deployment/calibration density.
+
+Outputs: all 11 required files under results/ (schemas from data/metadata.json).
+"""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.spatial import cKDTree
+
+
+RNG_SEED = 42
+KNN_K = 11
+N_STRATA = 5
+MARGIN_STEPS = [0.85, 0.75, 0.65, 0.55, 0.45, 0.35, 0.25]
+T_GRID = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60]
+K_GRID = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+CONF = 0.95
+
+# ---------------------------------------------------------------- load inputs
+with open("data/risk_spec.json") as fh:
+    risk_spec = json.load(fh)
+with open("data/metadata.json") as fh:
+    metadata = json.load(fh)
+
+TARGET = float(risk_spec["target_risk"])          # 0.1084
+COSTS = {k: float(v) for k, v in risk_spec["label_costs"].items()}
+LABELS = list(metadata["label_columns"])          # label_00..label_08
+FEATS = list(metadata["feature_columns"])         # v000..v009
+MAX_COST = max(COSTS.values())
+
+cal_scores = pd.read_csv("data/calibration_scores.csv")
+cal_labels = pd.read_csv("data/calibration_labels.csv")
+cal_feats = pd.read_csv("data/calibration_features.csv")
+dep_scores = pd.read_csv("data/deployment_scores.csv")
+dep_feats = pd.read_csv("data/deployment_features.csv")
+
+cal = cal_scores.merge(cal_labels, on="record_id").merge(cal_feats, on="record_id")
+dep = dep_scores.merge(dep_feats, on="record_id")
+
+assert cal[["record_id"]].duplicated().sum() == 0
+assert dep[["record_id"]].duplicated().sum() == 0
+assert not cal["true_label"].isna().any() and cal["true_label"].isin(LABELS).all()
+assert (cal[LABELS].sum(axis=1) - 1.0).abs().max() < 1e-9
+assert (dep[LABELS].sum(axis=1) - 1.0).abs().max() < 1e-9
+assert "true_label" not in dep.columns
+
+S = cal[LABELS].to_numpy()
+y = cal["true_label"].to_numpy()
+ti = np.array([LABELS.index(l) for l in y])
+cost_y = np.array([COSTS[l] for l in y])
+X = cal[FEATS].to_numpy()
+D = dep[LABELS].to_numpy()
+XD = dep[FEATS].to_numpy()
+n_cal, n_dep = len(cal), len(dep)
+
+# ------------------------------------------------- conformal-style split 70/30
+rng = np.random.default_rng(RNG_SEED)
+fit_idx, hold_idx = [], []
+for l in LABELS:
+    m = np.where(y == l)[0]
+    perm = rng.permutation(m)
+    cut = int(round(0.70 * len(m)))
+    fit_idx.extend(perm[:cut].tolist())
+    hold_idx.extend(perm[cut:].tolist())
+fit_idx = np.array(sorted(fit_idx))
+hold_idx = np.array(sorted(hold_idx))
+n_fit, n_hold = len(fit_idx), len(hold_idx)
+
+# ----------------------------------------------- kNN model (fit split only)
+mu_x, sd_x = X[fit_idx].mean(0), X[fit_idx].std(0)
+Xd_fit = (X[fit_idx] - mu_x) / sd_x
+tree = cKDTree(Xd_fit)
+S_fit = S[fit_idx]
+ti_fit = ti[fit_idx]
+
+def knn_topk(Xq, k):
+    """(n, k) label indices: top-k by mean neighbour score (score-weighted votes)."""
+    _, nn = tree.query((Xq - mu_x) / sd_x, k=KNN_K)
+    soft = S_fit[nn].mean(axis=1)
+    return np.argsort(-soft, axis=1)[:, :k]
+
+# --------------------------------------------- proxy strata: v000 quintiles
+cutpoints = np.quantile(X[fit_idx, 0], np.linspace(0, 1, N_STRATA + 1)[1:-1])
+def stratum_of(v000):
+    return np.clip(np.searchsorted(cutpoints, v000), 0, N_STRATA - 1)
+G_hold = stratum_of(X[hold_idx, 0])
+G_dep = stratum_of(XD[:, 0])
+SNAME = [f"Q{g+1}" for g in range(N_STRATA)]
+
+# ------------------------------------------------ candidate grid on holdout
+def eval_candidates_on_holdout():
+    """Per stratum: holdout risk and mean set size for every (t, k)."""
+    S_h = S[hold_idx]
+    out = {}
+    for g in range(N_STRATA):
+        m = G_hold == g
+        idxs_by_k = {k: knn_topk(X[hold_idx[m]], k) for k in K_GRID}
+        tab = []
+        for t in T_GRID:
+            for k in K_GRID:
+                idxs = idxs_by_k[k]
+                ng = m.sum()
+                miss = np.zeros(ng, dtype=bool)
+                sz = np.zeros(ng)
+                for i in range(ng):
+                    s = np.unique(np.concatenate([np.where(S_h[m][i] >= t)[0], idxs[i]]))
+                    sz[i] = len(s)
+                    miss[i] = ti[hold_idx[m]][i] not in s
+                tab.append((t, k, int(ng),
+                            float(np.sum(cost_y[hold_idx[m]][miss]) / ng),
+                            float(sz.mean())))
+        out[g] = tab
+    return out
+
+def pick_policy(margin):
+    """Per stratum: min mean set size s.t. holdout risk <= margin*TARGET.
+    Fallback: min-risk candidate. Returns g -> (t, k, risk, msz, feasible)."""
+    tabs = eval_candidates_on_holdout()
+    choice = {}
+    for g in range(N_STRATA):
+        tab = tabs[g]
+        feas = [r for r in tab if r[3] <= margin * TARGET + 1e-12]
+        if feas:
+            t, k, ng, risk, msz = min(feas, key=lambda r: (r[4], r[3], r[0], r[1]))
+            choice[g] = (t, k, risk, msz, True)
+        else:
+            t, k, ng, risk, msz = min(tab, key=lambda r: (r[3], r[4]))
+            choice[g] = (t, k, risk, msz, False)
+    return choice
+
+def overall_risk(choice):
+    f_dep = np.bincount(G_dep, minlength=N_STRATA) / n_dep
+    return float(np.sum(f_dep * [choice[g][2] for g in range(N_STRATA)]))
+
+def mean_dep_set_size(choice):
+    sizes = np.empty(n_dep)
+    for g in range(N_STRATA):
+        m = G_dep == g
+        t, k = choice[g][0], choice[g][1]
+        idxs = knn_topk(XD[m], k)
+        sh = D[m]
+        sizes[m] = [len(np.unique(np.concatenate([np.where(sh[i] >= t)[0], idxs[i]])))
+                    for i in range(m.sum())]
+    return float(sizes.mean())
+
+# ------------------------------------------------- margin search (both constraints)
+margin_used, choice = None, None
+margin_curve = []
+for margin in MARGIN_STEPS:
+    ch = pick_policy(margin)
+    ov = overall_risk(ch)
+    msz = mean_dep_set_size(ch)
+    margin_curve.append((margin, ov, msz, ch))
+# chosen policy = tightest margin whose deployment-weighted overall estimate
+# meets the target (all steps are computed so the tradeoff curve is complete)
+for margin, ov, msz, ch in margin_curve:
+    if ov <= TARGET + 1e-12:
+        margin_used, choice = margin, ch
+        break
+if choice is None:
+    margin_used, choice = MARGIN_STEPS[-1], margin_curve[-1][3]
+
+def in_sample_risk(ch):
+    tot = 0.0
+    for g in range(N_STRATA):
+        m = stratum_of(X[fit_idx, 0]) == g
+        t, k = ch[g][0], ch[g][1]
+        idxs = knn_topk(X[fit_idx[m]], k)
+        Sh = S[fit_idx[m]]
+        for i in range(m.sum()):
+            s = np.unique(np.concatenate([np.where(Sh[i] >= t)[0], idxs[i]]))
+            if ti_fit[m][i] not in s:
+                tot += cost_y[fit_idx[m]][i]
+    return tot / n_fit
+
+# ------------------------------------------------- kNN in-sample vs holdout gap
+def knn_coverage(idxs_arr, k):
+    topk = knn_topk(X[idxs_arr], k)
+    t = ti[idxs_arr]
+    return float(np.mean([t[i] in topk[i, :k] for i in range(len(idxs_arr))]))
+
+gap_rows = {
+    "knn_top1_fit":     knn_coverage(fit_idx, 1),
+    "knn_top1_holdout": knn_coverage(hold_idx, 1),
+    "knn_top3_fit":     knn_coverage(fit_idx, 3),
+    "knn_top3_holdout": knn_coverage(hold_idx, 3),
+}
+
+# ------------------------------------------------- deployment prediction sets
+dep_sets, dep_sizes = {}, np.empty(n_dep, dtype=int)
+for g in range(N_STRATA):
+    m = G_dep == g
+    t, k = choice[g][0], choice[g][1]
+    idxs = knn_topk(XD[m], k)
+    sh = D[m]
+    for i in range(m.sum()):
+        s = np.unique(np.concatenate([np.where(sh[i] >= t)[0], idxs[i]]))
+        if len(s) == 0:                      # safety: never empty
+            s = np.array([int(np.argmax(sh[i]))])
+        gi = int(np.where(m)[0][i])
+        dep_sets[gi] = s
+        dep_sizes[gi] = len(s)
+
+pd.DataFrame([(dep["record_id"][i], " ".join(LABELS[j] for j in np.sort(dep_sets[i])))
+              for i in range(n_dep)],
+             columns=["record_id", "prediction_set"]).to_csv(
+    "results/prediction_sets.csv", index=False)
+
+# ------------------------------------------------- per-stratum holdout stats
+def holdout_stratum_stats(g):
+    m = G_hold == g
+    t, k = choice[g][0], choice[g][1]
+    idxs = knn_topk(X[hold_idx[m]], k)
+    Sh = S[hold_idx[m]]
+    sizes, miss_cost = [], []
+    for i in range(m.sum()):
+        s = np.unique(np.concatenate([np.where(Sh[i] >= t)[0], idxs[i]]))
+        sizes.append(len(s))
+        miss_cost.append(cost_y[hold_idx[m]][i] if ti[hold_idx[m]][i] not in s else 0.0)
+    risk = float(np.mean(miss_cost))
+    uc = risk + MAX_COST * np.sqrt(np.log(1 / (1 - CONF)) / (2 * m.sum()))  # Hoeffding
+    return dict(n=int(m.sum()), risk=risk, uc=float(uc),
+                msz=float(np.mean(sizes)), p90=float(np.percentile(sizes, 90)),
+                label_counts={l: int((y[hold_idx[m]] == l).sum()) for l in LABELS})
+
+hstat = {g: holdout_stratum_stats(g) for g in range(N_STRATA)}
+f_dep = np.bincount(G_dep, minlength=N_STRATA) / n_dep
+f_cal = np.bincount(stratum_of(X[:, 0]), minlength=N_STRATA) / n_cal
+ov_est = overall_risk(choice)
+
+# ------------------------------------------------- results/policy_parameters.csv
+pol = []
+for g in range(N_STRATA):
+    t, k, risk, msz, feas = choice[g]
+    st = hstat[g]
+    for l in LABELS:
+        pol.append(dict(
+            proxy_stratum=SNAME[g], label=l,
+            n_calibration=st["n"], n_calibration_label=st["label_counts"][l],
+            threshold=t,
+            group_empirical_weighted_miss_risk=risk,
+            group_upper_confidence_risk=st["uc"],
+            group_expected_set_size=msz,
+            calibration_target_risk=margin_used * TARGET,
+            target_risk=TARGET))
+pd.DataFrame(pol).to_csv("results/policy_parameters.csv", index=False)
+
+# ------------------------------------------------- results/set_size_summary.csv
+pd.DataFrame({
+    "record_id": dep["record_id"],
+    "set_size": dep_sizes,
+    "proxy_stratum": [SNAME[g] for g in G_dep],
+}).to_csv("results/set_size_summary.csv", index=False)
+
+# ------------------------------------------------- per-stratum deployment set stats
+dep_p90 = {g: float(np.percentile(dep_sizes[G_dep == g], 90)) for g in range(N_STRATA)}
+dep_msz = {g: float(dep_sizes[G_dep == g].mean()) for g in range(N_STRATA)}
+
+# ------------------------------------------------- results/audit_summary.csv
+# NOTE: empirical_risk is a holdout-based ESTIMATE (deployment labels hidden),
+# shift-adjusted by per-stratum deployment/calibration fractions.
+aud = [dict(scope="overall", stratum_id="all", n_records=n_dep,
+            empirical_risk=ov_est, mean_set_size=float(dep_sizes.mean()),
+            p90_set_size=float(np.percentile(dep_sizes, 90)),
+            target_risk=TARGET, risk_violation=bool(ov_est > TARGET))]
+for g in range(N_STRATA):
+    r = hstat[g]["risk"]
+    aud.append(dict(scope="proxy_stratum", stratum_id=SNAME[g],
+                    n_records=int((G_dep == g).sum()),
+                    empirical_risk=r, mean_set_size=dep_msz[g],
+                    p90_set_size=dep_p90[g],
+                    target_risk=TARGET, risk_violation=bool(r > TARGET)))
+pd.DataFrame(aud).to_csv("results/audit_summary.csv", index=False)
+
+# ------------------------------------------------- results/partition_diagnostics.csv
+part = []
+for g in range(N_STRATA):
+    r = hstat[g]["risk"]
+    part.append(dict(scope="proxy_stratum", stratum_id=SNAME[g],
+                     n_records=int((G_dep == g).sum()),
+                     empirical_risk=r, mean_set_size=dep_msz[g],
+                     p90_set_size=dep_p90[g], target_risk=TARGET,
+                     risk_margin=TARGET - r))
+pd.DataFrame(part).to_csv("results/partition_diagnostics.csv", index=False)
+
+# ------------------------------------------------- results/distribution_diagnostics.csv
+dist = []
+for g in range(N_STRATA):
+    cf_, df_ = f_cal[g], f_dep[g]
+    dist.append(dict(proxy_stratum=SNAME[g], calibration_fraction=cf_,
+                     deployment_fraction=df_,
+                     density_ratio_estimate=df_ / max(cf_, 1.0 / n_cal),
+                     absolute_fraction_shift=abs(df_ - cf_)))
+pd.DataFrame(dist).to_csv("results/distribution_diagnostics.csv", index=False)
+
+# ------------------------------------------------- results/calibration_diagnostics.csv
+cd = []
+G_all = stratum_of(X[:, 0])
+maxscore = S.max(axis=1)
+for g in range(N_STRATA):
+    m = G_all == g
+    edges = np.quantile(maxscore[m], np.linspace(0, 1, 11))
+    bb = np.full(n_cal, -1)
+    bb[np.where(m)[0]] = np.clip(np.searchsorted(edges, maxscore[m], side="right") - 1, 0, 9)
+    for b_id in range(10):
+        mb = m & (bb == b_id)
+        ii = np.where(mb)[0]
+        cd.append(dict(proxy_stratum=SNAME[g], bin_id=f"b{b_id+1:02d}",
+                       score_left=float(edges[b_id]), score_right=float(edges[b_id + 1]),
+                       n_records=int(mb.sum()),
+                       mean_true_label_score=float(S[ii, ti[ii]].mean()) if mb.sum() else np.nan))
+# kNN in-sample vs holdout gap (documented convention:
+# proxy_stratum='model_gap'; mean_true_label_score = kNN top-k true-label coverage)
+for name, val in gap_rows.items():
+    cd.append(dict(proxy_stratum="model_gap", bin_id=name,
+                   score_left=0.0, score_right=1.0,
+                   n_records=(n_fit if "fit" in name else n_hold),
+                   mean_true_label_score=val))
+pd.DataFrame(cd).to_csv("results/calibration_diagnostics.csv", index=False)
+
+# ------------------------------------------------- results/constraint_audit.csv
+ca = [dict(scope="overall", stratum_id="all", empirical_risk=ov_est,
+           target_risk=TARGET, risk_violation=bool(ov_est > TARGET),
+           violates=bool(ov_est > TARGET))]
+for g in range(N_STRATA):
+    r = hstat[g]["risk"]
+    ca.append(dict(scope="proxy_stratum", stratum_id=SNAME[g], empirical_risk=r,
+                   target_risk=TARGET, risk_violation=bool(r > TARGET),
+                   violates=bool(r > TARGET)))
+pd.DataFrame(ca).to_csv("results/constraint_audit.csv", index=False)
+
+# =============================================================== miniplot
+# Pure-Python PNG renderer (no matplotlib available in this environment).
+import struct
+import zlib
+
+FONT5X7 = {
+ '0': (14,17,19,21,25,17,14), '1': (4,12,4,4,4,4,14),
+ '2': (14,17,1,6,8,16,31), '3': (14,17,1,6,1,17,14),
+ '4': (2,6,10,18,31,2,2), '5': (31,16,30,1,1,17,14),
+ '6': (6,8,16,30,17,17,14), '7': (31,1,2,4,8,8,8),
+ '8': (14,17,17,14,17,17,14), '9': (14,17,17,15,1,2,12),
+ 'A': (14,17,17,31,17,17,17), 'B': (30,17,17,30,17,17,30),
+ 'C': (14,17,16,16,16,17,14), 'D': (28,18,17,17,17,18,28),
+ 'E': (31,16,16,30,16,16,31), 'F': (31,16,16,30,16,16,16),
+ 'G': (14,17,16,23,17,17,15), 'H': (17,17,17,31,17,17,17),
+ 'I': (14,4,4,4,4,4,14), 'J': (7,2,2,2,2,18,12),
+ 'K': (17,18,20,24,20,18,17), 'L': (16,16,16,16,16,16,31),
+ 'M': (17,27,21,21,17,17,17), 'N': (17,25,21,19,17,17,17),
+ 'O': (14,17,17,17,17,17,14), 'P': (30,17,17,30,16,16,16),
+ 'Q': (14,17,17,17,21,18,13), 'R': (30,17,17,30,20,18,17),
+ 'S': (15,16,16,14,1,1,30), 'T': (31,4,4,4,4,4,4),
+ 'U': (17,17,17,17,17,17,14), 'V': (17,17,17,17,17,10,4),
+ 'W': (17,17,17,21,21,21,10), 'X': (17,17,10,4,10,17,17),
+ 'Y': (17,17,10,4,4,4,4), 'Z': (31,1,2,4,8,16,31),
+ ' ': (0,0,0,0,0,0,0), '.': (0,0,0,0,0,6,6),
+ ',': (0,0,0,0,6,4,2), '-': (0,0,0,31,0,0,0),
+ '/': (1,2,4,4,8,16,0), '(': (2,4,8,8,8,4,2),
+ ')': (8,4,2,2,2,4,8), '=': (0,0,31,0,31,0,0),
+ ':': (0,6,6,0,6,6,0), '<': (2,4,8,16,8,4,2),
+ '>': (8,4,2,1,2,4,8), '+': (0,4,4,31,4,4,0),
+ '%': (25,26,2,4,8,11,19), '_': (0,0,0,0,0,0,31),
+}
+
+class Canvas:
+    def __init__(self, w, h, bg=(255, 255, 255)):
+        self.w, self.h = w, h
+        self.px = np.zeros((h, w, 3), np.uint8)
+        self.px[:] = bg
+
+    def _in(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h
+
+    def rect(self, x0, y0, x1, y1, color, fill=True):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        if x1 < x0: x0, x1 = x1, x0
+        if y1 < y0: y0, y1 = y1, y0
+        x0c, y0c = max(0, x0), max(0, y0)
+        x1c, y1c = min(self.w - 1, x1), min(self.h - 1, y1)
+        if x1c < x0c or y1c < y0c: return
+        if fill:
+            self.px[y0c:y1c + 1, x0c:x1c + 1] = color
+        else:
+            self.px[y0c, x0c:x1c + 1] = color
+            self.px[y1c, x0c:x1c + 1] = color
+            self.px[y0c:y1c + 1, x0c] = color
+            self.px[y0c:y1c + 1, x1c] = color
+
+    def line(self, x0, y0, x1, y1, color, thick=1, dash=0):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        i = 0
+        while True:
+            if dash == 0 or (i // dash) % 2 == 0:
+                if thick <= 1:
+                    if self._in(x0, y0): self.px[y0, x0] = color
+                else:
+                    r = thick // 2
+                    self.rect(x0 - r, y0 - r, x0 + r, y0 + r, color)
+            if x0 == x1 and y0 == y1: break
+            e2 = 2 * err
+            if e2 >= dy: err += dy; x0 += sx
+            if e2 <= dx: err += dx; y0 += sy
+            i += 1
+
+    def hline(self, x0, x1, y, color, thick=1, dash=0):
+        self.line(x0, y, x1, y, color, thick, dash)
+
+    def vline(self, x, y0, y1, color, thick=1, dash=0):
+        self.line(x, y0, x, y1, color, thick, dash)
+
+    def poly(self, pts, color, thick=1):
+        for (a, b) in zip(pts[:-1], pts[1:]):
+            self.line(a[0], a[1], b[0], b[1], color, thick)
+
+    def dot(self, x, y, r, color):
+        self.rect(x - r, y - r, x + r, y + r, color)
+
+    def scatter(self, xs, ys, r, color):
+        xs = np.clip(xs.astype(int), 0, self.w - 1)
+        ys = np.clip(ys.astype(int), 0, self.h - 1)
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                xx = np.clip(xs + dx, 0, self.w - 1)
+                yy = np.clip(ys + dy, 0, self.h - 1)
+                self.px[yy, xx] = color
+
+    def text(self, x, y, s, color=(0, 0, 0), scale=1):
+        cx = int(x)
+        for ch in s.upper():
+            g = FONT5X7.get(ch, FONT5X7[' '])
+            for ry in range(7):
+                row = g[ry]
+                for rx in range(5):
+                    if row & (1 << (4 - rx)):
+                        self.rect(cx + rx * scale, y + ry * scale,
+                                  cx + rx * scale + scale - 1,
+                                  y + ry * scale + scale - 1, color)
+            cx += 6 * scale
+        return cx
+
+    def text_w(self, s, scale=1):
+        return len(s) * 6 * scale - scale
+
+    def save(self, path):
+        def chunk(tag, data):
+            c = struct.pack('>I', len(data)) + tag + data
+            return c + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
+        raw = b''.join(b'\x00' + self.px[y].tobytes() for y in range(self.h))
+        png = (b'\x89PNG\r\n\x1a\n'
+               + chunk(b'IHDR', struct.pack('>IIBBBBB', self.w, self.h, 8, 2, 0, 0, 0))
+               + chunk(b'IDAT', zlib.compress(raw, 9))
+               + chunk(b'IEND', b''))
+        with open(path, 'wb') as fh:
+            fh.write(png)
+
+# ------------------------------------------------- PNG 1: set_size_tradeoff
+ins_r = in_sample_risk(choice)
+W, H = 900, 640
+c = Canvas(W, H)
+ax0, ay0, ax1, ay1 = 90, 520, 850, 60   # plot area (x: risk, y: set size)
+xmax = max([c0[1] for c0 in margin_curve] + [ins_r, TARGET]) * 1.12
+ymax = 9.0
+def Xs(v): return ax0 + (v / xmax) * (ax1 - ax0)
+def Ys(v): return ay1 - (v / ymax) * (ay1 - ay0)
+# grid + ticks
+for i in range(int(xmax / 0.02) + 1):
+    v = i * 0.02
+    c.vline(Xs(v), ay0, ay1, (220, 220, 220))
+    c.text(Xs(v) - 15, ay0 + 8, f"{v:.2f}", (90, 90, 90))
+for i in range(10):
+    c.hline(ax0, ax1, Ys(i), (220, 220, 220))
+    c.text(ax0 - 22, Ys(i) - 4, f"{i}", (90, 90, 90))
+c.rect(ax0, ay0, ax1, ay1, (0, 0, 0), fill=False)
+# reference lines
+c.hline(ax0, ax1, Ys(TARGET), (210, 30, 30), dash=6)
+c.text(ax1 - 260, Ys(TARGET) - 14, f"TARGET WEIGHTED MISS RISK = {TARGET:.4f}", (210, 30, 30))
+c.vline(Xs(9.0), ay0, ay1, (120, 120, 120), dash=4)
+c.text(Xs(9.0) - 150, ay1 + 6, "ALL-LABEL SET (SIZE 9)", (120, 120, 120))
+# margin curve
+pts = [(Xs(c0[1]), Ys(c0[2])) for c0 in margin_curve]
+c.poly(pts, (30, 80, 210), thick=2)
+for p in pts:
+    c.dot(p[0], p[1], 4, (30, 80, 210))
+# chosen + in-sample markers
+pxc, pyc = Xs(margin_curve[-1][1]), Ys(margin_curve[-1][2])
+c.rect(pxc - 6, pyc - 6, pxc + 6, pyc + 6, (30, 150, 60))
+c.rect(pxc - 9, pyc - 9, pxc + 9, pyc + 9, (30, 150, 60), fill=False)
+pis = Xs(ins_r)
+c.poly([(pis, pyc - 8), (pis - 8, pyc + 6), (pis + 8, pyc + 6)], (230, 140, 20), thick=2)
+c.text(pxc + 14, pyc + 10, f"CHOSEN (MARGIN={margin_used:.2f})", (30, 150, 60))
+c.text(pis - 320, pyc - 26, f"IN-SAMPLE (FIT SPLIT) RISK = {ins_r:.4f}", (200, 110, 0))
+# legend / notes box
+notes = [
+ "SET-SIZE VS RISK TRADEOFF (CONFORMAL HOLDOUT)",
+ "BLUE: PER-STRATUM OPTIMIZED POLICY, MARGIN STEPS 0.85 -> 0.25",
+ "X: DEPLOYMENT-WEIGHTED HOLDOUT RISK ESTIMATE, Y: MEAN DEPLOYMENT SET SIZE",
+ f"KNN TOP-1 COVERAGE: FIT {gap_rows['knn_top1_fit']:.3f} / HOLDOUT {gap_rows['knn_top1_holdout']:.3f}",
+ f"KNN TOP-3 COVERAGE: FIT {gap_rows['knn_top3_fit']:.3f} / HOLDOUT {gap_rows['knn_top3_holdout']:.3f}",
+ "CHOSEN PER-STRATUM (T_G, K_G): "
+ + ", ".join(f"{SNAME[g]}=({choice[g][0]:.2f},{choice[g][1]})" for g in range(N_STRATA)),
+ "IF KNN DEGRADES ON HOLDOUT, LARGER K_G IS PREFERRED OVER LOWER T_G",
+]
+c.rect(ax0 + 10, ay1 + 10, ax0 + 560, ay1 + 10 + 18 * len(notes), (255, 253, 235))
+c.rect(ax0 + 10, ay1 + 10, ax0 + 560, ay1 + 10 + 18 * len(notes), (180, 180, 180), fill=False)
+for j, s in enumerate(notes):
+    c.text(ax0 + 20, ay1 + 16 + 18 * j, s, (40, 40, 40))
+c.text(ax0, H - 30, "COST-WEIGHTED MISS RISK (HOLDOUT ESTIMATE, DEPLOYMENT-WEIGHTED)", (0, 0, 0))
+c.text(20, 250, "MEAN DEPLOYMENT SET SIZE", (0, 0, 0))
+c.save("results/set_size_tradeoff.png")
+
+# ------------------------------------------------- PNG 2: partition_audit
+W, H = 1100, 520
+c = Canvas(W, H)
+# left panel: per-stratum risk
+ax0, ay0, ax1, ay1 = 90, 400, 500, 80
+rmax = max([hstat[g]["risk"] for g in range(N_STRATA)] + [TARGET]) * 1.25
+def YL(v): return ay1 - (v / rmax) * (ay1 - ay0)
+c.text(120, 40, "PER-STRATUM HOLDOUT RISK (ESTIMATE) VS TARGET", (0, 0, 0))
+bw = 60
+for g in range(N_STRATA):
+    x = ax0 + 40 + g * 75
+    r = hstat[g]["risk"]
+    c.rect(x, YL(r), x + bw, ay0, (70, 110, 220))
+    c.text(x - 5, YL(r) - 26, f"{r:.3f}", (0, 0, 0))
+    c.text(x - 5, YL(r) - 12, f"F={f_dep[g]:.2f}", (90, 90, 90))
+    c.text(x + 15, ay0 + 8, SNAME[g], (0, 0, 0))
+c.hline(ax0, ax1, YL(TARGET), (210, 30, 30), dash=6)
+c.text(ax1 - 200, YL(TARGET) - 14, f"TARGET {TARGET}", (210, 30, 30))
+c.hline(ax0, ax1, YL(margin_used * TARGET), (120, 120, 120), dash=4)
+c.text(ax1 - 300, YL(margin_used * TARGET) + 4,
+       f"CALIBRATION TARGET {margin_used * TARGET:.4f}", (120, 120, 120))
+c.rect(ax0, ay0, ax1, ay1, (0, 0, 0), fill=False)
+c.text(ax0 + 60, H - 40, "F = DEPLOYMENT FRACTION IN STRATUM", (60, 60, 60))
+# right panel: per-stratum deployment set size
+bx0, by0, bx1, by1 = 640, 400, 1060, 80
+smax = max([dep_msz[g] for g in range(N_STRATA)] + [1.0]) * 1.35
+def YR(v): return by1 - (v / smax) * (by1 - by0)
+c.text(700, 40, "PER-STRATUM DEPLOYMENT SET SIZE", (0, 0, 0))
+for g in range(N_STRATA):
+    x = bx0 + 40 + g * 75
+    s = dep_msz[g]
+    c.rect(x, YR(s), x + bw, by0, (70, 170, 90))
+    c.text(x - 5, YR(s) - 14, f"{s:.2f}", (0, 0, 0))
+    c.text(x + 15, by0 + 8, SNAME[g], (0, 0, 0))
+c.hline(bx0, bx1, YR(dep_sizes.mean()), (210, 30, 30), dash=6)
+c.text(bx1 - 260, YR(dep_sizes.mean()) - 14,
+       f"OVERALL MEAN {dep_sizes.mean():.2f}", (210, 30, 30))
+c.rect(bx0, by0, bx1, by1, (0, 0, 0), fill=False)
+c.save("results/partition_audit.png")
+
+# ------------------------------------------------- PNG 3: score_diagnostics
+W, H = 1200, 900
+c = Canvas(W, H)
+c.text(430, 16, "SCORE DIAGNOSTICS", (0, 0, 0), scale=2)
+cw, chh = 380, 260
+for li, l in enumerate(LABELS):
+    r, col = divmod(li, 3)
+    ox, oy = 20 + col * (cw + 10), 50 + r * (chh + 10)
+    x0, y0, x1, y1 = ox + 40, oy + chh - 30, ox + cw - 10, oy + 24
+    c.rect(x0, y0, x1, y1, (0, 0, 0), fill=False)
+    c.text(ox + 140, oy + 2, l.upper(), (0, 0, 0))
+    nbin = 30
+    hist_c, _ = np.histogram(S[:, li], bins=nbin, range=(0, 1))
+    hist_d, _ = np.histogram(D[:, li], bins=nbin, range=(0, 1))
+    hmax = max(hist_c.max(), hist_d.max())
+    bwid = (x1 - x0) / nbin
+    for b in range(nbin):
+        xc = x0 + b * bwid
+        hc = (hist_c[b] / hmax) * (y1 - y0)
+        hd = (hist_d[b] / hmax) * (y1 - y0)
+        c.rect(xc, y1 - hc, xc + bwid, y1, (120, 160, 235))
+        c.rect(xc, y1 - hd, xc + bwid, y1, (245, 190, 110))
+    if li == 0:
+        c.rect(x1 - 150, y0 + 6, x1 - 6, y0 + 44, (255, 255, 255))
+        c.rect(x1 - 150, y0 + 6, x1 - 6, y0 + 44, (150, 150, 150), fill=False)
+        c.rect(x1 - 144, y0 + 12, x1 - 132, y0 + 20, (120, 160, 235))
+        c.text(x1 - 128, y0 + 11, "CALIBRATION", (60, 60, 60))
+        c.rect(x1 - 144, y0 + 28, x1 - 132, y0 + 36, (245, 190, 110))
+        c.text(x1 - 128, y0 + 27, "DEPLOYMENT", (60, 60, 60))
+# panel 8: boxplot of true-label score by stratum
+r, col = 2, 1
+ox, oy = 20 + col * (cw + 10), 50 + r * (chh + 10)
+x0, y0, x1, y1 = ox + 40, oy + chh - 30, ox + cw - 10, oy + 24
+c.rect(x0, y0, x1, y1, (0, 0, 0), fill=False)
+c.text(ox + 60, oy + 2, "TRUE-LABEL SCORE BY V000 STRATUM (CAL)", (0, 0, 0))
+ts_all = S[np.arange(n_cal), ti]
+for g in range(N_STRATA):
+    v = np.sort(ts_all[G_all == g])
+    q1, q2, q3 = v[int(0.25 * len(v))], v[int(0.5 * len(v))], v[int(0.75 * len(v))]
+    lo, hi = v[0], v[-1]
+    cx = x0 + 40 + g * 66
+    def YB(vv): return y1 - vv * (y1 - y0)
+    c.vline(cx, YB(lo), YB(hi), (60, 60, 60))
+    c.rect(cx - 18, YB(q3), cx + 18, YB(q1), (190, 215, 245))
+    c.rect(cx - 18, YB(q3), cx + 18, YB(q1), (60, 60, 60), fill=False)
+    c.hline(cx - 18, cx + 18, YB(q2), (210, 30, 30), thick=2)
+    c.text(cx - 10, y1 + 6, SNAME[g], (0, 0, 0))
+c.hline(x0, x1, YB(0.3), (210, 30, 30), dash=5)
+# panel 9: reliability scatter
+r, col = 2, 2
+ox, oy = 20 + col * (cw + 10), 50 + r * (chh + 10)
+x0, y0, x1, y1 = ox + 40, oy + chh - 30, ox + cw - 10, oy + 24
+c.rect(x0, y0, x1, y1, (0, 0, 0), fill=False)
+c.text(ox + 70, oy + 2, "TRUE SCORE VS CONFIDENCE (CAL)", (0, 0, 0))
+def XR(v): return x0 + v * (x1 - x0)
+def YR2(v): return y1 - v * (y1 - y0)
+c.line(xr0 := XR(0.0), YR2(0.0), XR(1.0), YR2(1.0), (210, 30, 30), dash=5)
+step = max(1, n_cal // 2500)
+c.scatter(XR(maxscore[::step]).astype(int), YR2(ts_all[::step]).astype(int), 1, (150, 150, 190))
+c.text(ox + 120, oy + chh - 14, "MAX SCORE (CONFIDENCE)", (60, 60, 60))
+c.text(ox + 6, oy + 100, "TRUE-LABEL SCORE", (60, 60, 60))
+c.save("results/score_diagnostics.png")
+
+
+# ------------------------------------------------- console report
+print("=== CHOSEN POLICY (margin=%.2f) ===" % margin_used)
+for g in range(N_STRATA):
+    t, k, risk, msz, feas = choice[g]
+    print(f"  {SNAME[g]}: t={t:.2f} k={k}  holdout_risk={risk:.4f}  "
+          f"holdout_msz={msz:.2f}  feasible={feas}  f_dep={f_dep[g]:.3f}")
+print(f"  overall deployment-weighted ESTIMATED risk = {ov_est:.4f} (target {TARGET})")
+print(f"  in-sample (fit-split) risk of same policy  = {in_sample_risk(choice):.4f}")
+print(f"  deployment mean set size = {dep_sizes.mean():.3f}, "
+      f"p90 = {np.percentile(dep_sizes, 90):.0f}, max = {dep_sizes.max()}")
+print(f"  kNN gap: top1 {gap_rows['knn_top1_fit']:.3f}->{gap_rows['knn_top1_holdout']:.3f}, "
+      f"top3 {gap_rows['knn_top3_fit']:.3f}->{gap_rows['knn_top3_holdout']:.3f}")
+print("margin curve:", [(m, round(r, 4), round(s, 3)) for m, r, s, _ in margin_curve])
+# per-stratum per-label miss breakdown on the holdout (chosen policy)
+print("per-stratum per-label holdout misses / n (chosen policy):")
+for g in range(N_STRATA):
+    m = G_hold == g
+    t, k = choice[g][0], choice[g][1]
+    idxs = knn_topk(X[hold_idx[m]], k)
+    Sh = S[hold_idx[m]]
+    parts = []
+    for li, l in enumerate(LABELS):
+        mm = y[hold_idx[m]] == l
+        if mm.sum() == 0:
+            continue
+        misses = sum(1 for i in range(m.sum())
+                     if mm[i] and li not in np.unique(np.concatenate([np.where(Sh[i] >= t)[0], idxs[i]])))
+        parts.append(f"{l[-2:]}:{misses}/{mm.sum()}")
+    print(f"  {SNAME[g]}: " + " ".join(parts))
+print("files written:", sorted(os.listdir("results")))

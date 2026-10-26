@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BixBench episode bix-5-q1
+Question: "Which is statistically the most enriched GO biological process in
+          samples from diseased patients compared to control?"
+
+Pipeline:
+  1) Differential expression (DESeq2-inspired, implemented with numpy/scipy)
+     - 14 annotated samples (MGD1640F/MGD1641F excluded)
+     - integer count matrix, prefilter: row sum >= 10 across 14 samples
+     - median-of-ratios size factors (DESeq2)
+     - NB-GLM log(mu) = X*beta + log(size factor),  X = [1, sexM, disease]
+       reference = control  ->  positive log2FC = UP in disease
+     - per-gene dispersion (Cox-Reid adjusted NB MLE) + empirical-Bayes shrinkage
+     - Wald test on disease coefficient, BH adjustment; |log2FC| threshold = 0
+  2) GO biological process enrichment (hypergeometric / Fisher, one-tailed)
+     background = protein_coding genes that entered the DE test (after prefilter)
+     BH across all BP terms; 'most enriched' = smallest padj (tie: raw p, then enrichment)
+     GO annotation source is RE-DISCOVERED at runtime (goa_human / gene2go / *.obo / *.gmt,
+     gseapy/goatools/mygene, R + org.Hs.eg.db/GO.db). If none exists, this step documents
+     the missing resource and terminates with an explicit statement (no fabricated data).
+"""
+import os, sys, glob, subprocess, gzip, itertools, re, json, shutil
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.optimize import minimize_scalar
+from scipy.special import gammaln
+
+RNG = np.random.default_rng(0)
+DATA = "data"
+OUT = "outputs"
+sys.stdout.reconfigure(line_buffering=True)
+os.makedirs(OUT, exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# 1. Load data
+# ----------------------------------------------------------------------------
+fc = pd.read_csv(f"{DATA}/Issy_ASXL1_fibro_featureCounts_GeneTable_final.txt",
+                 sep=r"\s+")
+cd = pd.read_excel(f"{DATA}/Issy_ASXL1_fibro_coldata_gender.xlsx")
+
+annot_samples = list(cd["sample"])
+counts = fc[["Geneid"] + annot_samples].copy()
+counts[annot_samples] = counts[annot_samples].astype(int)
+counts = counts.set_index("Geneid")
+
+design = pd.DataFrame({
+    "sexM":   (cd["sex"] == "M").astype(int).values,
+    "disease": (cd["condition"] == "disease").astype(int).values,
+}, index=annot_samples)
+X = np.column_stack([np.ones(len(annot_samples)), design["sexM"], design["disease"]])
+p = X.shape[1]
+n_samp = len(annot_samples)
+df_resid = n_samp - p
+
+print("=" * 78)
+print("STEP 0 | inputs")
+print("  featureCounts rows/cols:", fc.shape, "| samples:", len(annot_samples))
+print("  coldata: disease=%d control=%d, sex %s, NA=%d"
+      % ((cd.condition=="disease").sum(), (cd.condition=="control").sum(),
+         dict(cd.sex.value_counts()), int(cd.isna().sum().sum())))
+
+# ----------------------------------------------------------------------------
+# 2. Prefilter
+# ----------------------------------------------------------------------------
+keep = counts.sum(axis=1) >= 10
+cnt = counts.loc[keep]
+print("\nSTEP 1 | prefilter (rowSum >= 10 over 14 samples):")
+print("  genes before:", counts.shape[0], "| after:", cnt.shape[0])
+
+# ----------------------------------------------------------------------------
+# 3. Median-of-ratios size factors (DESeq2)
+# ----------------------------------------------------------------------------
+def median_of_ratios_size_factors(mat):
+    gm = np.exp(np.nanmean(np.where(mat > 0, np.log(mat), np.nan), axis=1))
+    valid = np.isfinite(gm) & (gm > 0)
+    ratios = np.where(valid[:, None], mat[valid] / gm[valid, None], np.nan)
+    sf = np.nanmedian(ratios, axis=0)
+    sf = sf / np.exp(np.mean(np.log(sf)))
+    return sf
+
+mat = cnt.to_numpy().astype(float)
+sf = median_of_ratios_size_factors(mat)
+print("\nSTEP 2 | size factors (median-of-ratios, centered):")
+print("  ", dict(zip(annot_samples, np.round(sf, 3))))
+
+# ----------------------------------------------------------------------------
+# 4. NB-GLM helper functions
+# ----------------------------------------------------------------------------
+def nb_loglik(y, mu, phi):
+    inv = 1.0 / np.maximum(phi, 1e-12)
+    ll = (np.where(y > 0, gammaln(y + inv), 0.0) - gammaln(inv) - gammaln(y + 1)
+          + y * np.log(np.maximum(phi * mu, 1e-300))
+          - (y + inv) * np.log1p(np.maximum(phi * mu, 1e-300)))
+    return np.sum(ll)
+
+def irls_beta(y, off, phi, X, beta0, iters=30, tol=1e-7):
+    beta = beta0.copy().astype(float)
+    last_beta = beta.copy()
+    for _ in range(iters):
+        eta = np.clip(X @ beta + off, -30.0, 30.0)
+        mu = np.clip(np.exp(eta), 1e-10, 1e12)
+        w = mu / (1.0 + phi * mu)
+        w = np.clip(w, 1e-12, 1e12)
+        z = np.clip(eta - off + (y - mu) / np.maximum(mu, 1e-10), -50.0, 50.0)
+        Xw = X * np.sqrt(w)[:, None]
+        zw = z * np.sqrt(w)
+        if not (np.all(np.isfinite(Xw)) and np.all(np.isfinite(zw))):
+            break
+        try:
+            beta_new, *_ = np.linalg.lstsq(Xw, zw, rcond=None)
+        except np.linalg.LinAlgError:
+            break
+        if not np.all(np.isfinite(beta_new)):
+            break
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new; break
+        beta = beta_new
+    eta = np.clip(X @ beta + off, -30.0, 30.0)
+    mu = np.clip(np.exp(eta), 1e-10, 1e12)
+    return beta, mu
+
+def cr_adjusted_disp(y, mu, X, lo=-18.0, hi=10.0, tol=1e-4):
+    """Fast golden-section minimization over log(phi) of the Cox-Reid adjusted
+    NB profile log-likelihood (DESeq2 gene-wise dispersion). Vectorized numpy."""
+    yf = y.astype(float)
+    logY1 = gammaln(yf + 1.0)
+    GR = (1.0 + np.sqrt(5.0)) / 2.0
+
+    def profile(logphi):
+        phi = np.exp(float(logphi))
+        inv = 1.0 / phi
+        # negative profile log-likelihood (CR-adjusted)
+        ll = (gammaln(yf + inv) - gammaln(inv) - logY1
+              + yf * np.log(np.maximum(phi * mu, 1e-300))
+              - (yf + inv) * np.log1p(np.maximum(phi * mu, 1e-300)))
+        w = np.clip(mu / (1.0 + phi * mu), 1e-12, 1e12)
+        Xw = X * np.sqrt(w)[:, None]
+        R = np.linalg.qr(Xw, mode="r")
+        d = np.clip(np.abs(np.diag(R)), 1e-15, None)
+        ldet = 2.0 * np.sum(np.log(d))
+        return -(np.sum(ll) - 0.5 * ldet)
+
+    a, b = lo, hi
+    c = b - (b - a) / GR
+    d = a + (b - a) / GR
+    fc, fd = profile(c), profile(d)
+    while abs(b - a) > tol:
+        if fc < fd:
+            b, fd = d, fc
+            d = c
+            c = b - (b - a) / GR
+            fc = profile(c)
+        else:
+            a, fc = c, fd
+            c = d
+            d = a + (b - a) / GR
+            fd = profile(d)
+    return np.exp((a + b) / 2.0)
+
+# ----------------------------------------------------------------------------
+# 5. Per-gene NB-GLM fit: genewise dispersion + beta (MLE, CR-adjusted)
+# ----------------------------------------------------------------------------
+off = np.log(sf)
+gene_ids = cnt.index.to_numpy()
+Y = cnt.to_numpy().astype(float)
+
+beta_disease_gw = np.full(len(gene_ids), np.nan)
+se_disease_gw   = np.full(len(gene_ids), np.nan)
+phi_gw          = np.full(len(gene_ids), np.nan)
+mean_expr       = np.full(len(gene_ids), np.nan)
+beta_matrix     = np.full((len(gene_ids), p), np.nan)
+
+for i in range(len(gene_ids)):
+    y = Y[i]
+    # 1) Poisson GLM fit -> provisional means
+    beta0, mu = irls_beta(y, off, 1e-8, X, np.zeros(p))
+    # 2) gene-wise dispersion: CR-adjusted NB MLE given the fitted means (DESeq2-style)
+    phi = cr_adjusted_disp(y, mu, X)
+    # 3) refit mean model under NB to get a stable beta0 for the final pass
+    beta1, mu1 = irls_beta(y, off, phi, X, beta0)
+    w = mu1 / (1.0 + phi * mu1)
+    w = np.clip(w, 1e-12, 1e12)
+    Xw = X * np.sqrt(w)[:, None]
+    covb = np.linalg.pinv(Xw.T @ Xw)
+    se = np.sqrt(np.diag(covb))
+    beta_disease_gw[i] = beta1[2]
+    se_disease_gw[i]   = se[2]
+    phi_gw[i]          = phi
+    mean_expr[i]       = np.exp(np.mean(np.log(np.maximum(mu1 / sf, 1e-12))))
+    beta_matrix[i]     = beta1
+    if (i + 1) % 8000 == 0:
+        print("   ...fitted %d/%d genes" % (i + 1, len(gene_ids)), flush=True)
+print("\nSTEP 3 | per-gene NB-GLM (CR-adjusted dispersion MLE + Wald):")
+print("  genes fitted:", int(np.isfinite(beta_disease_gw).sum()))
+
+# ----------------------------------------------------------------------------
+# 6. Empirical-Bayes shrinkage of dispersions toward a mean-trend
+# ----------------------------------------------------------------------------
+ok = np.isfinite(phi_gw) & (phi_gw > 1e-8) & np.isfinite(mean_expr) & (mean_expr > 0)
+logphi = np.log(phi_gw[ok]); logm = np.log(mean_expr[ok])
+nbins = 30
+bin_edge = np.linspace(logm.min(), logm.max(), nbins + 1)
+bx = []; by = []
+for b in range(nbins):
+    m = (logm >= bin_edge[b]) & (logm < bin_edge[b + 1])
+    if m.sum() >= 3:
+        bx.append(np.median(logm[m])); by.append(np.median(logphi[m]))
+bx = np.array(bx); by = np.array(by)
+trend_par = np.polyfit(bx, by, 2) if len(bx) >= 3 else np.polyfit(bx, by, 1)
+logphi_trend = np.polyval(trend_par, logm)
+
+s2 = 2.0 / df_resid                       # approx sampling variance of log(phi_gw)
+tau2 = max(0.0, float(np.mean((logphi - logphi_trend) ** 2) - s2))
+if tau2 <= 0:
+    tau2 = 1e-6
+logphi_final = (logphi_trend / tau2 + logphi / s2) / (1.0 / tau2 + 1.0 / s2)
+phi_final = np.full(len(gene_ids), np.nan)
+phi_final[ok] = np.exp(logphi_final)
+trend_fill = np.polyval(trend_par, np.log(np.maximum(mean_expr[~ok], 1e-12)))
+phi_final[~ok] = np.exp(np.clip(trend_fill, -18, 10))
+phi_final = np.clip(phi_final, 1e-8, None)
+print("  empirical-Bayes shrinkage: tau2 = %.4g (prior variance)" % tau2)
+
+# ----------------------------------------------------------------------------
+# 7. Final fit with shrunken dispersion -> Wald test + BH
+# ----------------------------------------------------------------------------
+beta_f = np.full((len(gene_ids), p), np.nan)
+se_f   = np.full((len(gene_ids), p), np.nan)
+for i in range(len(gene_ids)):
+    y = Y[i]
+    beta0, mu = irls_beta(y, off, phi_final[i], X, beta_matrix[i])
+    w = mu / (1.0 + phi_final[i] * mu)
+    Xw = X * np.sqrt(w)[:, None]
+    covb = np.linalg.pinv(Xw.T @ Xw)
+    beta_f[i] = beta0
+    se_f[i] = np.sqrt(np.diag(covb))
+
+lfc = beta_f[:, 2] / np.log(2.0)
+se_lfc = se_f[:, 2] / np.log(2.0)
+z = lfc / se_lfc
+pval = 2.0 * stats.norm.sf(np.abs(z))
+mask = np.isfinite(pval) & (pval > 0) & (pval < 1)
+padj = np.full(len(pval), np.nan)
+padj[mask] = stats.false_discovery_control(pval[mask], method="bh")
+
+res = pd.DataFrame({
+    "gene_id": gene_ids, "baseMean": mean_expr, "log2FoldChange": lfc,
+    "lfcSE": se_lfc, "stat": z, "pvalue": pval, "padj": padj,
+    "dispersion": phi_final,
+})
+res = res.sort_values("padj").reset_index(drop=True)
+
+sig = (res["padj"] < 0.05) & np.isfinite(res["padj"])
+n_up = int(((sig) & (res["log2FoldChange"] > 0)).sum())
+n_dn = int(((sig) & (res["log2FoldChange"] < 0)).sum())
+print("\nSTEP 4 | DE results (|log2FC| threshold = 0, padj<0.05, BH):")
+print("  significant DE genes: %d   (UP in disease: %d | DOWN: %d)" % (sig.sum(), n_up, n_dn))
+
+res.to_csv(f"{OUT}/DE_results_full.csv", index=False)
+
+genc = pd.read_csv(f"{DATA}/gencode.v31.primary_assembly.genes.csv",
+                   dtype={"hgnc_id": str})
+g_gene = genc[genc["type"] == "gene"][["gene_id", "gene_name", "gene_type", "hgnc_id"]]
+res_ann = res.merge(g_gene, on="gene_id", how="left")
+res_ann["Direction"] = np.where(res_ann["log2FoldChange"] > 0, "UP",
+                                np.where(res_ann["log2FoldChange"] < 0, "DOWN", "NA"))
+res_ann.to_csv(f"{OUT}/DE_results_annotated.csv", index=False)
+
+print("\n  Top 15 DE genes by padj:")
+print(res_ann.loc[sig].head(15)[["gene_id", "gene_name", "gene_type",
+      "log2FoldChange", "pvalue", "padj", "Direction"]].to_string(index=False))
+
+pidx = g_gene["gene_type"] == "protein_coding"
+pc_ids = set(g_gene.loc[pidx, "gene_id"])
+tested_pc = [g for g in gene_ids if g in pc_ids]
+res_lookup = res.set_index("gene_id")
+sig_pc = [g for g in tested_pc if res_lookup.loc[g, "padj"] < 0.05]
+up_pc  = [g for g in sig_pc if res_lookup.loc[g, "log2FoldChange"] > 0]
+dn_pc  = [g for g in sig_pc if res_lookup.loc[g, "log2FoldChange"] < 0]
+print("\n  protein_coding genes entering DE test (background): %d" % len(tested_pc))
+print("  significant DE (protein_coding): %d  (UP: %d, DOWN: %d)"
+      % (len(sig_pc), len(up_pc), len(dn_pc)))
+
+# ----------------------------------------------------------------------------
+# 8. GO biological process enrichment -- runtime re-discovery of sources
+# ----------------------------------------------------------------------------
+print("\n" + "=" * 78)
+print("STEP 5 | GO BP enrichment")
+print("  Runtime re-discovery of GO annotation sources:")
+def log_find(msg):
+    print("   [find] " + msg)
+
+goa_path = None; obo_path = None; gene2go_path = None
+
+search_roots = ["/workspace", "/usr/share", "/usr/local", "/home", "/opt", "/tmp",
+              "/var/lib", "/srv"]
+skip_dirs = {"proc", "sys", "dev", "node_modules", "cuda", ".git"}
+name_hints = ("goa_human", "gene2go", ".obo", ".gmt", "msigdb",
+              "org.hs.eg.db", "go.db", "go_annotation", "go_term", "go-basic")
+hits = []
+dirs_seen = 0
+for root in search_roots:
+    if not os.path.isdir(root):
+        continue
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in skip_dirs]
+        dirs_seen += 1
+        if dirs_seen > 60000:
+            break
+        for fn in fns:
+            ln = fn.lower()
+            if any(h in ln for h in name_hints) and not ln.startswith("libgoa"):
+                hits.append(os.path.join(dp, fn))
+excl = ["goa-1.0", "goa-", "goa-backend", "goals", "goaccess", "goa-oauth",
+        "goa-daemon", "goa-identity", "goa-monitor", "goa-panel", "goa-volume",
+        "goa-account", "goalseek"]
+real = [h for h in hits if not any(x in os.path.basename(h).lower() for x in excl)
+        and "libgoa" not in os.path.basename(h).lower()]
+log_find("bounded os.walk: %d dirs seen, %d potential hits, %d non-system"
+         % (dirs_seen, len(hits), len(real)))
+if not real:
+    # fast whole-system fallback
+    try:
+        r = subprocess.run(
+            ["find", "/", "-xdev",
+             "-iname", "*goa_human*", "-o", "-iname", "gene2go*", "-o",
+             "-iname", "*.obo", "-o", "-iname", "*.gmt", "-o",
+             "-iname", "org.Hs.eg.db*", "-o", "-iname", "GO.db*",
+             "-not", "-path", "/proc/*", "-not", "-path", "/sys/*"],
+            capture_output=True, text=True, timeout=40)
+        cand = [l for l in r.stdout.splitlines() if l]
+        real = [h for h in cand if "libgoa" not in os.path.basename(h).lower()
+                and not any(x in os.path.basename(h).lower() for x in excl)]
+        log_find("find fallback: %d candidate paths" % len(real))
+    except Exception as e:
+        log_find("find fallback failed: %s" % e)
+for h in real[:20]:
+    log_find("  %s" % h)
+    b = os.path.basename(h).lower()
+    if "goa_human" in b and goa_path is None:
+        goa_path = h
+    elif re.match(r"go-basic.*\.obo(\.gz)?$", b) and obo_path is None:
+        obo_path = h
+    elif "gene2go" in b and gene2go_path is None:
+        gene2go_path = h
+
+import importlib
+for pkg_name in ["gseapy", "goatools", "mygene", "biopython", "rpy2", "pydeseq2"]:
+    try:
+        mod = importlib.import_module(pkg_name)
+        log_find("python package present: %s" % pkg_name)
+    except ImportError:
+        pass
+
+rscript = shutil.which("Rscript") or ""
+if rscript:
+    log_find("Rscript found: %s" % rscript)
+    probe = ("suppressMessages(library(org.Hs.eg.db));"
+             "suppressMessages(library(GO.db));cat('OK')")
+    rp = subprocess.run([rscript, "-e", probe], capture_output=True, text=True, timeout=60)
+    log_find("R org.Hs.eg.db/GO.db probe: " + ("OK" if rp.returncode == 0 and "OK" in rp.stdout else "NOT AVAILABLE"))
+else:
+    log_find("Rscript: NOT FOUND")
+
+try:
+    import socket
+    socket.setdefaulttimeout(4)
+    socket.create_connection(("1.1.1.1", 443))
+    log_find("network: reachable")
+except Exception as e:
+    log_find("network: NOT reachable (%s)" % type(e).__name__)
+
+# --- Hypergeometric GO engine (ready once annotation present) ---
+def parse_goa_human(path):
+    ens_by_go = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("!"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 17 or f[8] != "P":
+                continue
+            go = f[4]
+            ens = None
+            for xref in f[16].split("|"):
+                if xref.startswith("Ensembl:"):
+                    ens = xref.split(":", 1)[1].split(".")[0]; break
+            if ens:
+                ens_by_go.setdefault(go, set()).add(ens)
+    return ens_by_go
+
+def parse_obo_terms(path):
+    terms = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    cur_id = cur_name = None
+    with opener(path, "rt", errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if line == "[Term]":
+                cur_id = cur_name = None
+            elif line.startswith("id: "):
+                cur_id = line[4:]
+            elif line.startswith("name: ") and cur_id:
+                cur_name = line[6:]
+            elif line == "" and cur_id and cur_name:
+                terms[cur_id] = cur_name
+                cur_id = cur_name = None
+    return terms
+
+def run_go_enrichment(de_ids, background_ids, go_to_genes, term_names, label):
+    de_set = set(de_ids); bg_set = set(background_ids)
+    N = len(bg_set); n = len(de_set & bg_set)
+    rows = []
+    for go, genes in go_to_genes.items():
+        term_genes = set(genes) & bg_set
+        K = len(term_genes)
+        if K == 0:
+            continue
+        k = len(term_genes & de_set)
+        if k == 0:
+            continue
+        p = stats.hypergeom.sf(k - 1, N, K, n)
+        rows.append({"GO_ID": go, "Term": term_names.get(go, go),
+                     "k_DE_in_term": k, "K_term_size": K, "n_DE": n, "N_bg": N,
+                     "Enrichment_ratio": (k / n) / (K / N), "pvalue": p})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        print("   [%s] no overlapping BP terms -> no enrichment" % label)
+        return df
+    df = df.sort_values("pvalue")
+    df["padj"] = stats.false_discovery_control(df["pvalue"].to_numpy(), method="bh")
+    df = df.sort_values(["padj", "pvalue", "Enrichment_ratio"])
+    df.to_csv(f"{OUT}/GO_BP_enrichment_{label}.csv", index=False)
+    return df
+
+go_sets = None; go_names = {}; go_source_desc = "NONE"
+if goa_path:
+    go_sets = parse_goa_human(goa_path); go_source_desc = "goa_human: %s" % goa_path
+elif gene2go_path:
+    go_source_desc = "gene2go: %s (needs Entrez->Ensembl map, absent; skipped)" % gene2go_path
+if obo_path:
+    go_names = parse_obo_terms(obo_path)
+
+if go_sets is not None:
+    log_find("Using GO annotation source: %s ; BP terms: %d" % (go_source_desc, len(go_sets)))
+    main = run_go_enrichment(sig_pc, tested_pc, go_sets, go_names, "main_allDE")
+    up   = run_go_enrichment(up_pc,   tested_pc, go_sets, go_names, "sensitivity_UP")
+    print("\n  MAIN (all DE, up+down) top 10 BP terms:")
+    if not main.empty:
+        print(main.head(10)[["GO_ID","Term","k_DE_in_term","K_term_size",
+              "Enrichment_ratio","pvalue","padj"]].to_string(index=False))
+    print("\n  SENSITIVITY (UP-only) top 10 BP terms:")
+    if not up.empty:
+        print(up.head(10)[["GO_ID","Term","k_DE_in_term","K_term_size",
+              "Enrichment_ratio","pvalue","padj"]].to_string(index=False))
+else:
+    print("   !! NO GO annotation resource available in this environment.")
+    print("   !! DE analysis fully computed; hypergeometric GO engine implemented and ready")
+    print("       (goa_human / gene2go+obo / gmt / R-org.Hs.eg.db) but NO annotation source")
+    print("       was found -> GO enrichment term NOT computed (no fabricated data).")
+    print("   !! GO source used: %s" % go_source_desc)
+
+summary = {
+    "n_genes_total": int(counts.shape[0]),
+    "n_genes_after_prefilter": int(cnt.shape[0]),
+    "n_samples": n_samp,
+    "design": "~ sex + condition (reference=control)",
+    "n_sig_de": int(sig.sum()),
+    "n_up_disease": n_up,
+    "n_down_disease": n_dn,
+    "n_pc_background": len(tested_pc),
+    "n_sig_de_pc": len(sig_pc),
+    "go_annotation_source": go_source_desc,
+    "enrichment_computed": go_sets is not None,
+}
+with open(f"{OUT}/summary.json", "w") as fh:
+    json.dump(summary, fh, indent=2, default=str)
+print("\nDONE. Outputs in ./%s : DE_results_full.csv, DE_results_annotated.csv, summary.json%s"
+      % (OUT, ", GO_BP_enrichment_*.csv" if go_sets is not None else ""))

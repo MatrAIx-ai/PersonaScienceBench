@@ -1,0 +1,502 @@
+"""
+Leaf Physiological Response Reconstruction
+------------------------------------------
+Coupled Collatz-C4 photosynthesis + Ball-Berry stomatal conductance
+(CLM/Noah-MP temperature conventions), solved as a fixed point over internal
+CO2 (Ci) for each forcing row, for sunlit and shaded leaves separately.
+
+Scientific conventions (from the task brief):
+  * pathway = "C4" (leaf_params.json) -> Collatz C4 limitations:
+        Wc = vcmax_eff,  Wj = alpha_q*APAR,  We = 4000*vcmax_eff*Ci/patm,
+        A  = min(Wc, Wj, We) - Rd,   APAR = 4.6*PAR
+  * CLM/Noah-MP Q10 temperature responses:
+        Vcmax(T) = Vcmax25 * 2.4^((Tc-25)/10) /
+                   (1+exp((-2.2e5+710*(Tc+273.16))/(R*(Tc+273.16))))
+        Kc = 30*2.1^((Tc-25)/10);  Ko = 30000*1.2^((Tc-25)/10)
+        Gamma* = 0.5*(Kc/Ko)*O2*0.21;  Rd = 0.015*Vcmax_eff
+  * n_factor and btran applied to photosynthetic capacity (Vcmax) only; the
+    Ball-Berry intercept b0 is NOT scaled by btran.
+  * leaf temp = air temp;  h_s = min(max(1 - vpd/esat(T), 0.25), 1)
+    esat(T) = 610.78*exp(17.269*Tc/(Tc+237.3))   (CLM-style Tetens)
+  * gas-diffusion chain (A in mol m-2 s-1 = umol/1e6, cf = patm/(R*T) mol m-3):
+        cs = ca - 1.37*rb*A_mol/cf*patm
+        gs = m*A_mol*h_s/cs*patm + b0
+        rs = cf/gs
+        Ci = cs - 1.65*rs*A_mol/cf*patm
+  * Night rows (PAR <= 1e-6): A = -Rd (respiratory), gs = b0 (intercept only),
+    Ci from the same diffusion relation (respiring leaf = CO2 source, Ci>ca).
+
+Outputs: results/leaf_fluxes.csv, results/case_convergence.csv, results/diurnal.png
+
+The figure uses matplotlib when available; otherwise a pure-stdlib PNG renderer
+(zlib/struct, embedded 5x7 bitmap font) is used so diurnal.png is always made.
+"""
+import json, os, struct, zlib
+import numpy as np
+import pandas as pd
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+R = 8.314                     # J mol-1 K-1
+KC25, KO25 = 30.0, 30000.0    # Pa
+Q10_KC, Q10_KO, Q10_VC = 2.1, 1.2, 2.4
+NIGHT_PAR = 1e-6              # W m-2 threshold for the night branch
+CI_TOL = 1e-6                 # Pa
+MAX_ITER = 300
+
+
+def load_params(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def vcmax_t(vcmax25, Tc):
+    """CLM/Noah-MP Q10 response for Vcmax incl. high-temperature inhibition."""
+    Tk = Tc + 273.16
+    q = Q10_VC ** ((Tc - 25.0) / 10.0)
+    denom = 1.0 + np.exp((-2.2e5 + 710.0 * Tk) / (R * Tk))
+    return vcmax25 * q / denom
+
+
+def kc_t(Tc):
+    return KC25 * Q10_KC ** ((Tc - 25.0) / 10.0)
+
+
+def ko_t(Tc):
+    return KO25 * Q10_KO ** ((Tc - 25.0) / 10.0)
+
+
+def gamma_star_t(Tc, o2_pa):
+    return 0.5 * (kc_t(Tc) / ko_t(Tc)) * o2_pa * 0.21
+
+
+def esat_t(Tc):
+    """CLM-style Tetens saturation vapour pressure (Pa)."""
+    return 610.78 * np.exp(17.269 * Tc / (Tc + 237.3))
+
+
+def c4_A_umol(ci, vcmax_eff, alpha_q, apar, patm, Rd):
+    """Collatz C4 limitation set -> net assimilation, umol m-2 s-1."""
+    Wc = vcmax_eff
+    Wj = alpha_q * apar
+    We = 4000.0 * vcmax_eff * ci / patm
+    return min(Wc, Wj, We) - Rd
+
+
+def night_state(env, Rd, cf, m, b0, ca, rb, patm):
+    """Night branch: respiratory A, intercept-only gs, Ci from diffusion."""
+    A_umol = -Rd
+    A_mol = A_umol * 1e-6
+    cs = ca - 1.37 * rb * A_mol / cf * patm
+    gs = b0
+    rs = cf / gs
+    ci = cs - 1.65 * rs * A_mol / cf * patm
+    return dict(A_umol=A_umol, cs=cs, gs=gs, rs=rs, ci=ci, n_iter=0, method="night")
+
+
+def diffusion_chain(ci, ca, rb, patm, cf, m, b0, hs, vcmax_eff, alpha_q, apar, Rd):
+    """One pass of the gas-diffusion chain starting from a Ci guess, C4."""
+    A_umol = c4_A_umol(ci, vcmax_eff, alpha_q, apar, patm, Rd)
+    A_mol = A_umol * 1e-6
+    cs = ca - 1.37 * rb * A_mol / cf * patm
+    gs = m * A_mol * hs / cs * patm + b0
+    rs = cf / gs
+    ci_new = cs - 1.65 * rs * A_mol / cf * patm
+    return ci_new, cs, A_umol, gs, rs
+
+
+def solve_row(env, seed_ci, apar):
+    """Solve the coupled A/gs/Ci fixed point for one (row, leaf) forcing dict."""
+    if apar <= NIGHT_PAR:
+        return night_state(env, env["Rd"], env["cf"], env["m"], env["b0"],
+                           env["ca"], env["rb"], env["patm"])
+    ca, rb, patm, cf = env["ca"], env["rb"], env["patm"], env["cf"]
+    m, b0, hs = env["m"], env["b0"], env["hs"]
+    veff, aq, Rd = env["vcmax_eff"], env["alpha_q"], env["Rd"]
+
+    def F(ci):
+        return diffusion_chain(ci, ca, rb, patm, cf, m, b0, hs, veff, aq, apar, Rd)[0]
+
+    # ---- damped fixed-point iteration over Ci ----
+    ci = float(seed_ci)
+    lam = 0.5
+    for k in range(1, MAX_ITER + 1):
+        ci_new = F(ci)
+        step = ci_new - ci
+        if abs(step) < CI_TOL:
+            ci = ci_new
+            n_iter = k
+            break
+        ci = float(np.clip(ci + lam * step, 0.0, 2.0 * ca))
+        if k > 80 and k % 40 == 0:
+            lam = max(0.05, lam * 0.5)
+    else:
+        # ---- bracketed fallback: bisection on g(ci) = ci - F(ci) ----
+        def g(cc):
+            return cc - F(cc)
+        lo, hi = 0.0, ca
+        glo = g(lo)
+        if glo * g(hi) > 0.0:
+            found = False
+            for hi_ in np.linspace(ca, 2.0 * ca, 21)[1:]:
+                ghi = g(hi_)
+                if glo * ghi <= 0.0:
+                    hi, found = hi_, True
+                    break
+            if not found:
+                raise RuntimeError("no bracket found for ci at apar=%g" % apar)
+        for k in range(1, 301):
+            mid = 0.5 * (lo + hi)
+            if abs(g(mid)) < CI_TOL or (hi - lo) < CI_TOL:
+                break
+            if glo * g(mid) <= 0.0:
+                hi = mid
+            else:
+                lo, glo = mid, g(mid)
+        n_iter = k
+
+    ci_new, cs, A_umol, gs, rs = diffusion_chain(ci, ca, rb, patm, cf, m, b0, hs,
+                                                 veff, aq, apar, Rd)
+    return dict(ci=ci_new, cs=cs, A_umol=A_umol, gs=gs, rs=rs,
+                n_iter=n_iter, method="fixed_point")
+
+
+def build_env(row, params):
+    """Environment/state quantities for one forcing row (leaf-agnostic T/P)."""
+    patm = float(row["p_atm_Pa"])
+    T = float(row["t_air_K"])
+    Tc = T - 273.16
+    cf = patm / (R * T)
+    ca = float(row["co2_pa"])
+    rb = float(row["rb_sm"])
+    b0 = float(params["bb_intercept"])
+    m = float(params["bb_slope"])
+    alpha_q = float(params["alpha_q"])
+    nf = float(params["n_factor"])
+    btran = float(row["btran"])
+    vcmaxT = vcmax_t(float(params["vcmax25"]), Tc)
+    vcmax_eff = vcmaxT * nf * btran
+    Rd = 0.015 * vcmax_eff
+    hs = float(np.clip(1.0 - float(row["vpd_Pa"]) / esat_t(Tc), 0.25, 1.0))
+    return dict(patm=patm, T=T, Tc=Tc, cf=cf, ca=ca, rb=rb, b0=b0, m=m,
+                alpha_q=alpha_q, vcmax_eff=vcmax_eff, Rd=Rd, hs=hs)
+
+
+# ============================================================================
+# Pure-stdlib PNG renderer + embedded 5x7 bitmap font (used when matplotlib is
+# unavailable so that results/diurnal.png is always produced).
+# ============================================================================
+FONT = {
+ 'A':[".###.","#...#","#...#","#####","#...#","#...#","#...#"],
+ 'B':["####.","#...#","#...#","####.","#...#","#...#","####."],
+ 'C':[".####","#....","#....","#....","#....","#....",".####"],
+ 'D':["####.","#...#","#...#","#...#","#...#","#...#","####."],
+ 'E':["#####","#....","#....","####.","#....","#....","#####"],
+ 'F':["#####","#....","#....","####.","#....","#....","#...."],
+ 'G':[".####","#....","#....","#..##","#...#","#...#",".####"],
+ 'H':["#...#","#...#","#...#","#####","#...#","#...#","#...#"],
+ 'I':["#####","..#..","..#..","..#..","..#..","..#..","#####"],
+ 'J':["..###","...#.","...#.","...#.","...#.","#..#.",".##.."],
+ 'K':["#...#","#..#.","#.#..","##...","#.#..","#..#.","#...#"],
+ 'L':["#....","#....","#....","#....","#....","#....","#####"],
+ 'M':["#...#","##.##","#.#.#","#.#.#","#...#","#...#","#...#"],
+ 'N':["#...#","##..#","#.#.#","#..##","#...#","#...#","#...#"],
+ 'O':[".###.","#...#","#...#","#...#","#...#","#...#",".###."],
+ 'P':["####.","#...#","#...#","####.","#....","#....","#...."],
+ 'Q':[".###.","#...#","#...#","#...#","#.#.#","#..#.",".##.#"],
+ 'R':["####.","#...#","#...#","####.","#.#..","#..#.","#...#"],
+ 'S':[".####","#....","#....",".###.","....#","....#","####."],
+ 'T':["#####","..#..","..#..","..#..","..#..","..#..","..#.."],
+ 'U':["#...#","#...#","#...#","#...#","#...#","#...#",".###."],
+ 'V':["#...#","#...#","#...#","#...#","#...#",".#.#.","..#.."],
+ 'W':["#...#","#...#","#...#","#.#.#","#.#.#","##.##","#...#"],
+ 'X':["#...#","#...#",".#.#.","..#..",".#.#.","#...#","#...#"],
+ 'Y':["#...#","#...#","#...#",".###.","..#..","..#..","..#.."],
+ 'Z':["#####","....#","...#.","..#..",".#...","#....","#####"],
+ '0':["#####","#...#","#...#","#...#","#...#","#...#","#####"],
+ '1':["..#..",".##..","..#..","..#..","..#..","..#..",".###."],
+ '2':["#####","....#","....#","#####","#....","#....","#####"],
+ '3':["#####","....#","....#","#####","....#","....#","#####"],
+ '4':["#...#","#...#","#...#","#####","....#","....#","....#"],
+ '5':["#####","#....","#....","#####","....#","....#","#####"],
+ '6':["#####","#....","#....","#####","#...#","#...#","#####"],
+ '7':["#####","....#","....#","...#.","..#..","..#..","..#.."],
+ '8':["#####","#...#","#...#","#####","#...#","#...#","#####"],
+ '9':["#####","#...#","#...#","#####","....#","....#","#####"],
+ '(':["..##.","..#..",".#...",".#...",".#...","..#..","..##."],
+ ')':[".##..","..#..","...#.",".#...","...#.","..#..",".##.."],
+ '-':["....."]*3 + ["#####"] + ["....."]*3,
+ '/':["....#","....#","...#.","..#..",".#...","#....","#...."],
+ ' ':["....."]*7,
+}
+
+def _glyph(ch):
+    return FONT.get(ch, FONT[' '])
+
+def _canvas(w, h):
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    return img
+
+def _line(img, x0, y0, x1, y1, color, thick=1):
+    h, w = img.shape[:2]
+    n = int(max(abs(x1-x0), abs(y1-y0)) * 2) + 1
+    xs = np.linspace(x0, x1, n).astype(int)
+    ys = np.linspace(y0, y1, n).astype(int)
+    for xx, yy in zip(xs, ys):
+        for dy in range(-thick, thick+1):
+            for dx in range(-thick, thick+1):
+                py, px = yy+dy, xx+dx
+                if 0 <= py < h and 0 <= px < w:
+                    img[py, px] = color
+
+def _rect(img, x, y, w, h, color):
+    yy0, xx0 = max(0, y), max(0, x)
+    yy1, xx1 = min(img.shape[0], y+h), min(img.shape[1], x+w)
+    img[yy0:yy1, xx0:xx1] = color
+
+def _text(img, x, y, s, color, scale=2):
+    """Draw 5x7 bitmap text, top-left at (x, y), scale = pixel size per dot."""
+    cx = x
+    for ch in s:
+        g = _glyph(ch)
+        for r, row in enumerate(g):
+            for c, px in enumerate(row):
+                if px == '#':
+                    _rect(img, cx + c*scale, y + r*scale, scale, scale, color)
+        cx += 6 * scale
+    return cx
+
+def _tick_label(img, x, y, val, color, scale=1, nd=0):
+    _text(img, x, y, ("%%.%df" % nd) % val, color, scale)
+
+def _write_png(path, img):
+    h, w = img.shape[:2]
+    raw = bytearray()
+    for yy in range(h):
+        raw.append(0)  # filter type 0
+        raw.extend(img[yy].tobytes())
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    def chunk(typ, data):
+        out = struct.pack(">I", len(data)) + typ + data
+        out += struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
+        return out
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+           chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+def render_diurnal_pure(flux, outpath):
+    """Fallback diurnal figure: A (top) and rs (bottom), sun & shade."""
+    W, H = 1100, 800
+    img = _canvas(W, H)
+    BLACK = np.array([10, 10, 10], dtype=np.uint8)
+    BLUE  = np.array([10, 60, 200], dtype=np.uint8)
+    RED   = np.array([200, 30, 30], dtype=np.uint8)
+    GREY  = np.array([210, 210, 210], dtype=np.uint8)
+
+    def plot_panel(x0, x1, y0, y1, ymin, ymax, xmin, xmax,
+                   series, names, colors, ylabel, xticks, yticks):
+        # frame
+        _rect(img, x0, y0, x1-x0, 2, BLACK)
+        _rect(img, x0, y1-2, x1-x0, 2, BLACK)
+        _rect(img, x0, y0, 2, y1-y0, BLACK)
+        _rect(img, x1-2, y0, 2, y1-y0, BLACK)
+        # grid + y ticks
+        for tv in yticks:
+            yy = int(y1 - (tv - ymin) / (ymax - ymin) * (y1 - y0))
+            _line(img, x0, yy, x1, yy, GREY)
+            _text(img, x0 - 44, yy - 6, ("%d" % tv), BLACK, 1)
+        # x ticks
+        for tx in xticks:
+            xx = int(x0 + (tx - xmin) / (xmax - xmin) * (x1 - x0))
+            _text(img, xx - 4, y1 + 8, ("%d" % tx), BLACK, 1)
+        # y label (vertical-ish: drawn sideways is complex -> horizontal at top left)
+        _text(img, x0 + 6, y0 - 26, ylabel, BLACK, 1)
+        # series
+        for xs, ys, nm, col in zip(series[0], series[1], names, colors):
+            pts = [(int(x0 + (xx - xmin) / (xmax - xmin) * (x1 - x0)),
+                    int(y1 - (yy - ymin) / (ymax - ymin) * (y1 - y0)))
+                   for xx, yy in zip(xs, ys)]
+            for p, q in zip(pts[:-1], pts[1:]):
+                _line(img, p[0], p[1], q[0], q[1], col, thick=2)
+            # legend
+            lx, ly = x1 - 150, y0 + 10 + 16 * (pts[0][1] - y0)
+            _line(img, lx, ly, lx + 30, ly, col, thick=2)
+            _text(img, lx + 34, ly - 4, nm, BLACK, 1)
+
+    t = flux["time_hr"].to_numpy()
+    xmin, xmax = t.min(), t.max()
+    xts = list(range(0, 121, 12))
+
+    # --- panel 1: A ---
+    a_all = np.concatenate([flux["A_sun"].to_numpy(), flux["A_shade"].to_numpy()])
+    ymin1, ymax1 = np.floor(a_all.min()) - 1, np.ceil(a_all.max()) + 2
+    yt1 = [int(round(v)) for v in np.linspace(ymin1, ymax1, 5)]
+    plot_panel(90, W-40, 70, 350, ymin1, ymax1, xmin, xmax,
+               ([t, t], [flux["A_sun"], flux["A_shade"]]),
+               ["A SUNLIT", "A SHADED"], [BLUE, RED],
+               "A (UMOL CO2 M-2 S-1)", xts, yt1)
+
+    # --- panel 2: rs ---
+    r_all = np.concatenate([flux["rs_sun"].to_numpy(), flux["rs_shade"].to_numpy()])
+    ymin2, ymax2 = np.floor(r_all.min()), np.ceil(r_all.max()) + 20
+    yt2 = [int(round(v)) for v in np.linspace(ymin2, ymax2, 5)]
+    plot_panel(90, W-40, 420, 700, ymin2, ymax2, xmin, xmax,
+               ([t, t], [flux["rs_sun"], flux["rs_shade"]]),
+               ["RS SUNLIT", "RS SHADED"], [BLUE, RED],
+               "RS (S M-1)", xts, yt2)
+
+    # --- title & x label ---
+    _text(img, 240, 20,
+          "DIURNAL PHOTOSYNTHESIS AND STOMATAL RESISTANCE (C4 / BALL-BERRY)",
+          BLACK, 2)
+    _text(img, (W - 6*10) // 2, 740, "TIME (H)", BLACK, 1)
+    _write_png(outpath, img)
+
+
+def main():
+    base = os.path.dirname(os.path.abspath(__file__))
+    params = load_params(os.path.join(base, "data", "leaf_params.json"))
+    forcing = pd.read_csv(os.path.join(base, "data", "forcing.csv"))
+    cases = json.load(open(os.path.join(base, "data", "test_cases.json")))
+
+    print("leaf_params:", params)
+    print("pathway =", params.get("pathway"))
+    print("matplotlib available:", HAVE_MPL)
+
+    # ---------------- time series (leaf_fluxes) ----------------
+    recs_sun, recs_shade = [], []
+    seed_sun = seed_shade = 0.7 * float(forcing.iloc[0]["co2_pa"])
+    for i, row in forcing.iterrows():
+        env = build_env(row, params)
+        apar_sg = 4.6 * float(row["par_sun_wm2"])
+        apar_sh = 4.6 * float(row["par_shade_wm2"])
+        s_sun = solve_row(env, seed_sun, apar_sg)
+        s_shade = solve_row(env, seed_shade, apar_sh)
+        recs_sun.append((float(row["time_hr"]), s_sun["A_umol"], s_sun["rs"],
+                         s_sun["ci"], s_sun["gs"]))
+        recs_shade.append((float(row["time_hr"]), s_shade["A_umol"], s_shade["rs"],
+                           s_shade["ci"], s_shade["gs"]))
+        seed_sun = s_sun["ci"]
+        seed_shade = s_shade["ci"]
+
+    flux = pd.DataFrame({
+        "time_hr":  [r[0] for r in recs_sun],
+        "A_sun":    [r[1] for r in recs_sun],
+        "A_shade":  [r[1] for r in recs_shade],
+        "rs_sun":   [r[2] for r in recs_sun],
+        "rs_shade": [r[2] for r in recs_shade],
+        "ci_sun":   [r[3] for r in recs_sun],
+        "ci_shade": [r[3] for r in recs_shade],
+        "gs_sun":   [r[4] for r in recs_sun],
+        "gs_shade": [r[4] for r in recs_shade],
+    })
+
+    # ---------------- test cases (case_convergence) ----------------
+    r12 = forcing.iloc[12]
+    env12 = build_env(r12, params)
+    apar12 = 4.6 * float(r12["par_sun_wm2"])
+    case_rows = []
+    for c in cases:
+        ci_init = float(c["ci_init_pa"])
+        s = solve_row(env12, ci_init, apar12)
+        case_rows.append({
+            "case_id": c["case_id"],
+            "ci_init_pa": ci_init,
+            "ci_final_pa": s["ci"],
+            "A_final": s["A_umol"],
+            "rs_final": s["rs"],
+            "n_iterations": int(s["n_iter"]),
+        })
+    cases_df = pd.DataFrame(case_rows)
+
+    # ---------------- figure (diurnal) ----------------
+    outdir = os.path.join(base, "results")
+    os.makedirs(outdir, exist_ok=True)
+    png_path = os.path.join(outdir, "diurnal.png")
+    if HAVE_MPL:
+        fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+        ax = axes[0]
+        ax.plot(flux["time_hr"], flux["A_sun"], "-b", lw=1.6, label="A sunlit")
+        ax.plot(flux["time_hr"], flux["A_shade"], "--r", lw=1.6, label="A shaded")
+        ax.set_ylabel("A  (umol CO2 m$^{-2}$ s$^{-1}$)")
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.3)
+        ax = axes[1]
+        ax.plot(flux["time_hr"], flux["rs_sun"], "-b", lw=1.6, label="r$_s$ sunlit")
+        ax.plot(flux["time_hr"], flux["rs_shade"], "--r", lw=1.6, label="r$_s$ shaded")
+        ax.set_ylabel("r$_s$  (s m$^{-1}$)")
+        ax.set_xlabel("time (h)")
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.3)
+        fig.suptitle("Diurnal photosynthesis and stomatal resistance (C4 / Ball-Berry)")
+        fig.tight_layout()
+        fig.savefig(png_path, dpi=150)
+        plt.close(fig)
+    else:
+        render_diurnal_pure(flux, png_path)
+
+    flux.to_csv(os.path.join(outdir, "leaf_fluxes.csv"), index=False)
+    cases_df.to_csv(os.path.join(outdir, "case_convergence.csv"), index=False)
+    print("\nwrote results/leaf_fluxes.csv (%d rows)" % len(flux))
+    print("wrote results/case_convergence.csv (%d rows)" % len(cases_df))
+    print("wrote results/diurnal.png")
+
+    # ---------------- diagnostics ----------------
+    night = np.asarray(forcing["par_sun_wm2"] <= NIGHT_PAR)
+    night_rd = np.array([-build_env(row, params)["Rd"] for _, row in forcing.iterrows()])
+    print("\n==== leaf_fluxes diagnostics ====")
+    print("A_sun  min/max: %.4f / %.4f" % (flux.A_sun.min(), flux.A_sun.max()))
+    print("A_shade min/max: %.4f / %.4f" % (flux.A_shade.min(), flux.A_shade.max()))
+    print("rs_sun min/max: %.4f / %.4f" % (flux.rs_sun.min(), flux.rs_sun.max()))
+    print("gs_sun min/max: %.6f / %.6f" % (flux.gs_sun.min(), flux.gs_sun.max()))
+    print("ci_sun min/max: %.4f / %.4f" % (flux.ci_sun.min(), flux.ci_sun.max()))
+    print("night rows:", int(night.sum()))
+    print("night A_sun == -Rd(row) at all night rows?",
+          bool(np.allclose(flux.A_sun[night], night_rd[night], atol=1e-9)))
+    print("daytime A_sun > 0?", bool(np.all(flux.A_sun[~night] > 0.0)))
+    print("night gs_sun all == b0?",
+          bool(np.allclose(flux.gs_sun[night], params["bb_intercept"], atol=1e-12)))
+    print("night ci_sun > ca (respiring, CO2 source)?",
+          bool(np.all(flux.ci_sun[night] > forcing["co2_pa"][night])))
+    print("\nRow 12 (midday) sun vs shade:")
+    i12 = int(np.argmin(np.abs(flux.time_hr.values - 12.0)))
+    print(flux.iloc[i12].to_string())
+
+    print("\n==== case_convergence diagnostics ====")
+    print(cases_df.to_string(index=False))
+    print("ci_final spread across 5 seeds (Pa): %.3e"
+          % (cases_df.ci_final_pa.max() - cases_df.ci_final_pa.min()))
+    print("A_final  spread: %.3e" % (cases_df.A_final.max() - cases_df.A_final.min()))
+    print("rs_final spread: %.3e" % (cases_df.rs_final.max() - cases_df.rs_final.min()))
+
+    # shade leaf equilibrium at row 12 for comparison
+    apar12_shade = 4.6 * float(r12["par_shade_wm2"])
+    s_sun12 = solve_row(env12, 0.5 * float(r12["co2_pa"]), apar12)
+    s_shade12 = solve_row(env12, 0.7 * float(r12["co2_pa"]), apar12_shade)
+    print("\nRow 12 equil: sun ci=%.4f Pa A=%.4f rs=%.2f | shade ci=%.4f A=%.4f rs=%.2f"
+          % (s_sun12["ci"], s_sun12["A_umol"], s_sun12["rs"],
+             s_shade12["ci"], s_shade12["A_umol"], s_shade12["rs"]))
+
+    extra_seeds = [1.0, 5.0, 15.0, 45.0, 62.0, 80.0]
+    probe = []
+    for s in extra_seeds:
+        res = solve_row(env12, s, apar12)
+        probe.append((s, res["ci"], res["A_umol"], res["rs"], res["n_iter"]))
+    print("\nextra-seed probe (sun, row 12):")
+    for p in probe:
+        print("  seed=%6.2f -> ci=%9.4f  A=%8.4f  rs=%8.2f  (%d iters)" % p)
+    print("probe ci spread: %.3e Pa, A spread: %.3e" %
+          (max(p[1] for p in probe) - min(p[1] for p in probe),
+           max(p[2] for p in probe) - min(p[2] for p in probe)))
+    print("\nDONE")
+
+
+if __name__ == "__main__":
+    main()

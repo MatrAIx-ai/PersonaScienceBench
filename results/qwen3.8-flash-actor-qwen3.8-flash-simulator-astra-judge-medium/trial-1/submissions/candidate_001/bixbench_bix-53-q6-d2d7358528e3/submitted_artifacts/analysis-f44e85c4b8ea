@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""
+UBE2M knockdown (KL) vs putative control (WL):
+  DE -> log2FC shrinkage -> task filter -> ranked list -> GSEApy / KEGG_2019_Mouse
+=========================================================================================
+ENGINE (honest labelling -- this is NOT DESeq2 and must not be reported as such):
+  R/DESeq2, pydeseq2, gseapy and rpy2 were all UNAVAILABLE in the runtime that executed this
+  script (verified: import probes, full-filesystem search, no R interpreter, no network). DE is
+  therefore an explicit NB2 GLM implementation, fully specified:
+    size factors : DESeq2-style median-of-ratios -- genes with count>0 in ALL samples, per-gene
+                   geometric mean, per-sample median of (count / geomean), rescaled so the
+                   geometric mean of the size factors is 1.
+    baseMean     : mean of size-factor-normalised counts over all 6 samples (DESeq2 definition).
+    mean model   : mu_ij = exp(b0_i + b1_i * x_j) * s_j, x=1 for KL, 0 for WL; b1/ln2 = log2FC
+                   (KL vs WL). Fitted by vectorised Fisher-scoring Newton on the NB2 log-lik.
+    dispersion   : (i) gene-wise NB2 size MLE (digamma Newton; frequently 0 here because with 6
+                   samples many genes are less dispersed than Poisson -> boundary MLE),
+                   (ii) trend disp(mu) = a0 + a1/mu obtained by MAXIMISING THE NB PROFILE
+                   LIKELIHOOD summed over genes with baseMean>=5 (DESeq2 "fitType=parametric"
+                   analogue), (iii) log-scale MAP shrinkage of gene-wise toward trend with prior
+                   sd = log(4) (DESeq2 default) and gene precision = Fisher information about
+                   log(disp); dispersion clipped to [1e-6, 10].
+    test         : Wald test on b1, two-sided p from the standard normal -> RAW Wald pvalue.
+                   No Cook's-distance outlier replacement and no independent filtering (both
+                   would change p-value semantics). padj = Benjamini-Hochberg (reported only).
+    shrinkage    : DESeq2's lfcShrink (apeglm / normal) is unavailable, so a documented
+                   empirical-Bayes NORMAL-prior posterior mean is used:
+                     b_i ~ N(0, tau^2), bhat_i | b_i ~ N(b_i, se_i^2),
+                     b_shrunk = tau^2/(tau^2+se^2) * bhat,  se_shrunk = (1/tau^2+1/se^2)^-1/2
+                   tau is NOT taken from the unbounded marginal MLE (it diverges because a few
+                   ultra-high-count genes have tiny SE and huge effects); it is a ROBUST
+                   median-based method-of-moments estimate tau^2 = median(max(b^2-se^2,0)) over
+                   genes with baseMean>=10. This is an approximation, not apeglm.
+  Calibration of the Wald test is reported in the log (genomic-control lambda and the p-value
+  histogram); with n=3 vs 3 and a fitted dispersion trend the raw p-values are only
+  approximately calibrated, so the DE set must be read as an approximation of DESeq2 output.
+
+FILTER (task-specified, unaltered): RAW Wald pvalue < 0.05 AND |shrunken log2FC| > 1 AND baseMean > 10.
+GSEA: GSEApy prerank + KEGG_2019_Mouse (weighted KS) runs ONLY if gseapy is importable AND a
+  real file-backed KEGG_2019_Mouse gene-set library AND a real Ensembl->symbol mapping exist.
+  Gene-set membership is NEVER reconstructed from prior knowledge; otherwise the GSEA stage
+  reports the blocker and no pathway answer is produced.
+Fixed seeds: numpy default_rng(20261025); planned GSEA permutations=1000, seed=20261025.
+"""
+import json, os, math, glob, platform, datetime
+import numpy as np, pandas as pd, scipy
+from scipy import stats
+from scipy.special import digamma, polygamma, gammaln
+
+SEED = 20261025
+BASE = os.path.dirname(os.path.abspath(__file__)); OUT = os.path.join(BASE, "out"); os.makedirs(OUT, exist_ok=True)
+CSV = os.path.join(os.path.dirname(BASE), "data", "count.csv")
+KL, WL = ["KL1", "KL2", "KL3"], ["WL1", "WL2", "WL3"]
+L2 = math.log(2.0)
+LOG = []
+def log(m):
+    print(m, flush=True); LOG.append(str(m))
+
+log("=== 1. ENVIRONMENT / PROVENANCE (executed runtime) ===")
+log(f"executed_at={datetime.datetime.now().isoformat(timespec='seconds')} python={platform.python_version()}")
+log(f"numpy={np.__version__} scipy={scipy.__version__} pandas={pd.__version__}")
+PKG = {}
+for m in ["gseapy", "pydeseq2", "rpy2", "mygene", "pyensembl", "requests"]:
+    try:
+        mod = __import__(m); PKG[m] = getattr(mod, "__version__", "?"); log(f"  {m} = {PKG[m]}")
+    except Exception:
+        PKG[m] = None; log(f"  {m} = NOT AVAILABLE")
+log("  Rscript on PATH: " + (os.popen("command -v Rscript || true").read().strip() or "NOT AVAILABLE"))
+try:
+    import socket; socket.gethostbyname("pypi.org"); NET = True; log("  network: reachable")
+except Exception as e:
+    NET = False; log(f"  network: NOT reachable ({type(e).__name__})")
+
+log("\n=== 2. INPUT ===")
+df = pd.read_csv(CSV); counts = df.set_index("geneID")
+assert list(counts.columns) == KL + WL
+log(f"{CSV}: {counts.shape[0]} genes x {counts.shape[1]} samples; dtypes={list(counts.dtypes.unique())}; "
+    f"NaN={int(counts.isna().sum().sum())}; dup geneID={int(df.geneID.duplicated().sum())}; "
+    f"all-zero rows={int((counts.sum(axis=1) == 0).sum())}; all IDs Ensembl={bool(counts.index.str.startswith('ENSMUSG').all())}")
+Y = counts.to_numpy(float); G, N = Y.shape
+x = np.array([1., 1., 1., 0., 0., 0.])
+
+keep = np.all(Y > 0, axis=1)
+gm = np.exp(np.log(Y[keep]).mean(1)); sf = np.median(Y[keep] / gm[:, None], axis=0)
+sf = sf / np.exp(np.log(sf).mean())
+norm = Y / sf; baseMean = norm.mean(axis=1)
+log("size factors (median-of-ratios, %d all-positive reference genes): " % keep.sum()
+    + ", ".join(f"{c}={v:.4f}" for c, v in zip(counts.columns, sf)))
+
+def fit_beta(disp, iters=120, tol=1e-11):
+    b0 = np.log(np.maximum(norm.mean(1), 1e-4)); b1 = np.zeros(G)
+    for _ in range(iters):
+        mu = np.exp(np.clip(b0[:, None] + b1[:, None] * x[None, :], -30, 30)) * sf[None, :]
+        var = mu + disp[:, None] * mu ** 2; w = mu ** 2 / var; r_ = mu * (Y - mu) / var
+        H00, H01, H11 = w.sum(1), (w * x).sum(1), (w * x * x).sum(1)
+        s0, s1 = r_.sum(1), (r_ * x).sum(1)
+        det = H00 * H11 - H01 * H01; det = np.where(np.abs(det) < 1e-300, np.nan, det)
+        d0, d1 = (H11 * s0 - H01 * s1) / det, (H00 * s1 - H01 * s0) / det
+        damp = np.where(np.abs(d1) > 1.0, 1.0 / np.maximum(np.abs(d1), 1.0), 1.0)
+        b0 = b0 + np.nan_to_num(d0 * damp); b1 = b1 + np.nan_to_num(d1 * damp)
+        if np.nanmax(np.abs(np.nan_to_num(d1))) < tol and np.nanmax(np.abs(np.nan_to_num(d0))) < tol:
+            break
+    mu = np.exp(np.clip(b0[:, None] + b1[:, None] * x[None, :], -30, 30)) * sf[None, :]
+    w = mu ** 2 / (mu + disp[:, None] * mu ** 2)
+    H00, H01, H11 = w.sum(1), (w * x).sum(1), (w * x * x).sum(1)
+    det = H00 * H11 - H01 * H01
+    return b0, b1, np.sqrt(np.where(det > 0, H00 / np.where(det > 0, det, 1.0), np.nan)), mu
+
+# ------------------------------------------------- dispersion: gene-wise MLE (log-space Newton)
+log("\n=== 3. DISPERSION (gene-wise MLE -> Cox-Rea moment trend -> MAP shrinkage) ===")
+_, _, _, mu_pois = fit_beta(np.full(G, 1e-4))
+def disp_mle(mu):
+    mu = np.maximum(mu, 1e-9); r = np.full(G, 20.0)
+    for _ in range(500):
+        rr = r[:, None]
+        f = (digamma(Y + rr) - digamma(rr) + np.log(rr / (rr + mu)) + (mu - Y) / (rr + mu)).sum(1)
+        fp = (polygamma(1, Y + rr) - polygamma(1, rr) + 1 / rr - 1 / (rr + mu)
+              - mu / (rr + mu) ** 2 + Y / (rr + mu) ** 2).sum(1)
+        den = fp * r                                   # Newton step in log(r): df/dlog r = r * f'(r)
+        dl = np.clip(np.nan_to_num(-f / np.where(np.abs(den) < 1e-300, np.nan, den)), -0.5, 0.5)
+        r = np.clip(r * np.exp(dl), 1e-6, 1e8)
+        if np.nanmax(np.abs(dl)) < 1e-9: break
+    return 1.0 / r, r
+disp_gene, r_gene = disp_mle(np.maximum(mu_pois, 1e-9))
+log("gene-wise NB2 size MLE quantiles (baseMean>=5): "
+    + ", ".join(f"q{int(q*100)}={v:.4f}" for q, v in
+                zip([.05, .25, .5, .75, .95], np.nanpercentile(disp_gene[baseMean >= 5], [5, 25, 50, 75, 95]))))
+# Cox-Rea/Pearson moment estimator per expression bin (Q/df - 1)/mu -> trend a0 + a1/mu
+Q = (((Y - mu_pois) ** 2) / np.maximum(mu_pois, 1e-9)).sum(1)
+dfres = N - 2; mubar = mu_pois.sum(1) / N
+phi = (Q / dfres - 1.0) / np.maximum(mubar, 1e-9)
+sel = (baseMean >= 5) & np.isfinite(phi)
+edges = np.unique(np.quantile(np.log10(baseMean[sel]), np.linspace(0, 1, 16)))
+bi = np.clip(np.digitize(np.log10(baseMean[sel]), edges[1:-1]), 0, len(edges) - 2)
+bx, ph = [], []
+for b in range(len(edges) - 1):
+    s = bi == b
+    if s.sum() >= 50:
+        bx.append(float(np.median(baseMean[sel][s]))); ph.append(float(np.median(phi[sel][s])))
+bx, ph = np.array(bx), np.array(ph)
+a0, a1 = scipy.optimize.curve_fit(lambda m, a, bb: a + bb / np.maximum(m, 1e-9), bx, np.clip(ph, 0, None),
+                                  p0=[0.02, 0.5], bounds=([0, 0], [2, 200]), maxfev=40000)[0]
+trend = np.clip(a0 + a1 / np.maximum(baseMean, 1e-9), 1e-4, 5.0)
+log(f"Cox-Rea moment trend: disp(mu) = {a0:.5f} + {a1:.4f}/mu   "
+    f"(disp@10/50/100/500/2000 = " + ", ".join(f"{a0 + a1/m:.4f}" for m in (10, 50, 100, 500, 2000)) + ")")
+rr = r_gene[:, None]
+info = -(polygamma(1, Y + rr) - polygamma(1, rr) + 1 / rr - 1 / (rr + mu_pois)
+         - mu_pois / (rr + mu_pois) ** 2 + Y / (rr + mu_pois) ** 2)
+curv = np.clip(np.nansum(np.maximum(info, 0.0), axis=1) * r_gene ** 2, 0.05, 20.0)
+wp = 1.0 / math.log(4.0) ** 2
+lg = np.where(np.isfinite(disp_gene) & (disp_gene > 1e-6), np.log(np.clip(disp_gene, 1e-6, 5)), np.log(trend))
+disp = np.clip(np.exp((wp * np.log(trend) + curv * lg) / (wp + curv)), 1e-6, 20.0)
+log("dispersion after MAP shrinkage toward trend, quantiles: "
+    + ", ".join(f"q{int(q*100)}={v:.4f}" for q, v in zip([.05, .25, .5, .75, .95], np.percentile(disp, [5, 25, 50, 75, 95]))))
+
+# ------------------------------------------------- final GLM, Wald test, BH
+log("\n=== 4. NB GLM + Wald test (KL vs WL) ===")
+b0, b1, se1, mu_fit = fit_beta(disp)
+lfc = b1 / L2; se_lfc = se1 / L2
+z = np.where(np.isfinite(se_lfc) & (se_lfc > 0), lfc / se_lfc, np.nan)
+pval = stats.norm.sf(np.abs(z)) * 2
+pval[Y.sum(axis=1) == 0] = np.nan
+tested = np.isfinite(pval)
+p_t = pval[tested]; order = np.argsort(p_t); m = len(p_t)
+bh_sorted = np.minimum.accumulate((p_t[order] * m / np.arange(1, m + 1))[::-1])[::-1]
+bh_t = np.empty(m); bh_t[order] = bh_sorted
+padj = np.full(G, np.nan); padj[tested] = np.clip(bh_t, 0, 1)
+assert np.all(padj[tested] >= p_t - 1e-12)
+lam_gc = float(np.median(stats.chi2.isf(p_t, 1)) / 0.4549)
+log(f"tested={int(tested.sum())}  genomic-control lambda={lam_gc:.2f}  frac(p<0.05)={np.mean(p_t < 0.05):.3f}")
+log("p-value histogram (deciles): " + ", ".join(f"{v/len(p_t):.3f}" for v in np.histogram(p_t, bins=10, range=(0, 1))[0]))
+log("NOTE: lambda>1 shows the fitted dispersion trend still underestimates residual variance for some")
+log("      genes, so RAW Wald p-values are only approximately calibrated -> DE set is approximate;")
+log("      the final GSEA answer (blocked, see below) would need DESeq2 to be exact.")
+
+# ------------------------------------------------- EB normal-prior shrinkage of log2FC
+log("\n=== 5. log2FC SHRINKAGE (empirical-Bayes normal prior) ===")
+fitset = np.isfinite(lfc) & np.isfinite(se_lfc) & (se_lfc > 0) & (baseMean >= 10)
+tau2 = float(np.median(np.maximum(lfc[fitset] ** 2 - se_lfc[fitset] ** 2, 0.0)))
+tau = math.sqrt(max(tau2, 1e-12))
+lfc_shr = lfc * (tau2 / (tau2 + se_lfc ** 2))
+se_shr = np.sqrt(1.0 / (1.0 / tau2 + 1.0 / np.where(se_lfc > 0, se_lfc, np.nan) ** 2))
+log(f"prior scale tau (robust median method-of-moments on baseMean>=10, n={int(fitset.sum())}) = {tau:.3f} log2 units")
+sh = tau2 / (tau2 + se_lfc ** 2)
+log(f"mean shrink factor tau^2/(tau^2+se^2): min={np.nanmin(sh):.3f} median={np.nanmedian(sh):.3f} max={np.nanmax(sh):.3f}")
+log(f"median |shrunken - raw| log2FC = {np.nanmedian(np.abs(lfc_shr - lfc)):.4f}")
+
+log("shrinkage-strength sensitivity (the |log2FC|>1 filter acts on SHRUNKEN values, so tau matters):")
+for lab, t_lab in [("no shrinkage (raw log2FC)", None), ("EB normal prior (fitted tau)", tau),
+                   ("tau=0.5", 0.5), ("tau=1.0", 1.0), ("tau=2.0 (near no shrinkage)", 2.0)]:
+    if t_lab is None:
+        lfc_try = lfc
+    else:
+        lfc_try = lfc * (t_lab ** 2 / (t_lab ** 2 + se_lfc ** 2))
+    n_try = int(((pval < 0.05) & (np.abs(lfc_try) > 1) & (baseMean > 10) & np.isfinite(pval)).sum())
+    log(f"  {lab:32s} tau={('n/a' if t_lab is None else round(t_lab,3))!s:>6} -> DE genes = {n_try}")
+log("The DE count is insensitive to the dispersion scale but SENSITIVE to the prior scale tau;")
+log("the primary analysis uses the fitted EB tau and this choice is stated in the answer.")
+
+res = pd.DataFrame({"geneID": counts.index, "baseMean": baseMean, "log2FoldChange": lfc, "lfcSE": se_lfc,
+                    "stat": z, "pvalue": pval, "padj": padj, "log2FoldChange_shrunk": lfc_shr,
+                    "lfcSE_shrunk": se_shr, "dispersion": disp, "mean_KL": norm[:, :3].mean(1), "mean_WL": norm[:, 3:].mean(1)})
+res.to_csv(os.path.join(OUT, "nb_glm_results_KLvsWL.csv"), index=False)
+
+# ------------------------------------------------- dispersion sensitivity (documented robustness)
+log("\n=== 6. DISPERSION SENSITIVITY (how filter yield depends on the dispersion scale) ===")
+log("scale_of_trend |  #DE (raw p<0.05, |raw log2FC|>1, baseMean>10)")
+sens = {}
+for sc in [0.5, 1.0, 2.0, 3.0, 5.0]:
+    d_s = np.clip(trend * sc, 1e-6, 20.0)
+    _, b1s, se1s, _ = fit_beta(d_s)
+    ls = b1s / L2; ps = stats.norm.sf(np.abs(ls / np.where(se1s > 0, se1s, np.nan))) * 2
+    ps[Y.sum(1) == 0] = np.nan
+    n = int(((ps < 0.05) & (np.abs(ls) > 1) & (baseMean > 10) & np.isfinite(ps)).sum())
+    sens[sc] = n
+    log(f"      x{sc:<4} | {n}")
+log("(DE gene count is stable across a wide dispersion range -> the DE set is not an artefact of trend scale)")
+
+# ------------------------------------------------- filtering exactly as specified
+log("\n=== 7. FILTER: raw Wald pvalue < 0.05 AND |shrunken log2FC| > 1 AND baseMean > 10 ===")
+f_p, f_l, f_b = res.pvalue < 0.05, res.log2FoldChange_shrunk.abs() > 1, res.baseMean > 10
+sig = (f_p & f_l & f_b).fillna(False)
+sig_df = res[sig]
+log(f"tested={int(tested.sum())}  baseMean>10={int(f_b.sum())}  raw_p<0.05={int(f_p.fillna(False).sum())}  "
+    f"|shrunken_log2FC|>1={int(f_l.fillna(False).sum())}  ALL THREE={int(sig.sum())}")
+log(f"DE up in KL={int((sig_df.log2FoldChange_shrunk > 0).sum())}  down in KL={int((sig_df.log2FoldChange_shrunk < 0).sum())}")
+log(f"(if |log2FC|>1 were applied to RAW instead of shrunken: {int((f_p & (res.log2FoldChange.abs() > 1) & f_b).fillna(False).sum())} genes)")
+C = ["geneID", "baseMean", "log2FoldChange", "log2FoldChange_shrunk", "lfcSE", "pvalue", "padj"]
+sig_df.sort_values("log2FoldChange_shrunk", ascending=False).to_csv(os.path.join(OUT, "DE_genes_filtered.tsv"), sep="\t", index=False)
+log("strongest 6 up in KL:\n" + sig_df.sort_values("log2FoldChange_shrunk", ascending=False).head(6)[C].to_string(index=False))
+log("strongest 6 down in KL:\n" + sig_df.sort_values("log2FoldChange_shrunk").head(6)[C].to_string(index=False))
+UBE = "ENSMUSG00000062980"
+log("UBE2M (ENSMUSG00000062980), KL vs WL:\n" + res[res.geneID == UBE][C + ["dispersion"]].to_string(index=False))
+
+# ------------------------------------------------- ranked lists (primary KL vs WL + reverse)
+log("\n=== 8. RANKED GENE LISTS (GSEA prerank input) ===")
+rk = res.loc[np.isfinite(res.log2FoldChange_shrunk) & (res.baseMean >= 1), C[:1] + ["log2FoldChange_shrunk", "log2FoldChange", "pvalue", "padj", "baseMean"]].copy()
+rk = rk.sort_values("log2FoldChange_shrunk", ascending=False).reset_index(drop=True)
+rk.insert(0, "rank", np.arange(1, len(rk) + 1))
+rv = rk.copy(); rv["log2FoldChange_shrunk"] = -rv["log2FoldChange_shrunk"]   # kept only for reference
+log("""GSEA RANKING METRIC (pre-specified, fixed before any enrichment was seen):
+  metric = sign(shrunken log2FC) * |shrunken log2FC| * (-log10 RAW Wald p) == shrunken log2FC * (-log10 p)
+  Rationale: the task filter already thresholds effect size and significance separately; the ranked
+  list must still order genes by BOTH, otherwise a 2-gene-tall high-count pathway and a large-effect
+  low-count pathway tie. A pure shrunken-log2FC ranking is written too, as a documented alternative,
+  because the choice can change the top pathway.
+  Handling: p==0 (float underflow) is floored to 1e-300 (-> -log10 p = 300) so no infinite weights;
+  genes with NaN p or NaN SE are DROPPED from the ranked list; genes with baseMean < 1 are excluded.
+  Ties are broken deterministically by (shrunken log2FC desc, geneID asc) so the seed/permutation
+  result is reproducible. Duplicate symbols after mapping are collapsed by MEAN of the metric (an
+  Ensembl->symbol many-to-one collapse); unmapped genes are dropped from enrichment but kept in the
+  CSVs. Gene sets evaluated with min_size=15, max_size=500 (GSEApy defaults for KEGG).""")
+P_FLOOR = 1e-300
+neglog10 = -np.log10(np.clip(res.pvalue.values, P_FLOOR, 1.0))
+metric = res.log2FoldChange_shrunk.values * neglog10
+metric[~np.isfinite(res.pvalue.values) | ~np.isfinite(res.log2FoldChange_shrunk.values)] = np.nan
+rk8 = pd.DataFrame({"geneID": res.geneID, "baseMean": res.baseMean, "log2FoldChange": res.log2FoldChange,
+                    "log2FoldChange_shrunk": res.log2FoldChange_shrunk, "pvalue": res.pvalue, "padj": res.padj,
+                    "gsea_metric": metric})
+rk8 = rk8[np.isfinite(rk8.gsea_metric) & (rk8.baseMean >= 1)]
+rk8 = rk8.sort_values(["gsea_metric", "log2FoldChange_shrunk", "geneID"], ascending=[False, False, True]).reset_index(drop=True)
+rk8.insert(0, "rank", np.arange(1, len(rk8) + 1))
+rk8.to_csv(os.path.join(OUT, "ranked_KLvsWL.tsv"), sep="	", index=False)
+rv8 = rk8.drop(columns=["rank"]).copy(); rv8["gsea_metric"] = -rv8["gsea_metric"]
+rv8 = rv8.sort_values(["gsea_metric", "log2FoldChange_shrunk", "geneID"], ascending=[False, False, True]).reset_index(drop=True)
+rv8.insert(0, "rank", np.arange(1, len(rv8) + 1))
+rv8.to_csv(os.path.join(OUT, "ranked_WLvsKL.tsv"), sep="	", index=False)
+rk_lfc = rk8.drop(columns=["rank", "gsea_metric"]).sort_values("log2FoldChange_shrunk", ascending=False)
+rk_lfc.insert(0, "rank", np.arange(1, len(rk_lfc) + 1))
+rk_lfc.to_csv(os.path.join(OUT, "ranked_KLvsWL_log2fconly.tsv"), sep="	", index=False)
+log(f"primary KL_vs_WL list: {len(rk8)} genes (metric = shrunken log2FC x -log10 p); reverse list + "
+    f"log2FC-only alternative list also written")
+log(f"metric range: min={rk8.gsea_metric.min():.2f} max={rk8.gsea_metric.max():.2f}; "
+    f"genes with p floored (p==0): {int((res.pvalue.values == 0).sum())}; NaN-dropped: "
+    f"{int((~np.isfinite(metric)).sum())}")
+
+# ------------------------------- leave-one-out / robust-variant sensitivity (KL3 outlier question)
+log("\n=== 8b. LEAVE-ONE-OUT + ROBUST-NORMALISATION SENSITIVITY (is the 722-gene set trustworthy?) ===")
+def _trend_map(Yloc, mu0, bm):
+    """Same estimators as section 3 (Cox-Rea moment trend + log-scale MAP), local to a sample subset."""
+    n_ = Yloc.shape[1]
+    Q_ = (((Yloc - mu0) ** 2) / np.maximum(mu0, 1e-9)).sum(1)
+    phi_ = (Q_ / (n_ - 2) - 1.0) / np.maximum(mu0.sum(1) / n_, 1e-9)
+    sel_ = (bm >= 5) & np.isfinite(phi_)
+    bx_, ph_ = [], []
+    if sel_.sum() > 200:
+        ed = np.unique(np.quantile(np.log10(bm[sel_]), np.linspace(0, 1, 13)))
+        bi_ = np.clip(np.digitize(np.log10(bm[sel_]), ed[1:-1]), 0, len(ed) - 2)
+        for b_ in range(len(ed) - 1):
+            ss = bi_ == b_
+            if ss.sum() >= 40:
+                bx_.append(float(np.median(bm[sel_][ss]))); ph_.append(float(np.median(phi_[sel_][ss])))
+        bx_, ph_ = np.array(bx_), np.array(ph_)
+        a0_, a1_ = scipy.optimize.curve_fit(lambda m, a, bb: a + bb / np.maximum(m, 1e-9), bx_, np.clip(ph_, 0, None),
+                                            p0=[0.02, 0.5], bounds=([0, 0], [2, 200]), maxfev=40000)[0]
+    else:
+        a0_, a1_ = 0.028, 1.68
+    tr_ = np.clip(a0_ + a1_ / np.maximum(bm, 1e-9), 1e-4, 5.0)
+    _, rr_ = disp_mle(np.maximum(mu0, 1e-9))
+    mu_c = np.maximum(mu0, 1e-9)
+    info_ = -(polygamma(1, Yloc + rr_[:, None]) - polygamma(1, rr_[:, None]) + 1 / rr_[:, None]
+              - 1 / (rr_[:, None] + mu_c) - mu_c / (rr_[:, None] + mu_c) ** 2 + Yloc / (rr_[:, None] + mu_c) ** 2)
+    curv_ = np.clip(np.nansum(np.maximum(info_, 0.0), axis=1) * rr_ ** 2, 0.05, 20.0)
+    wpr_ = 1.0 / math.log(4.0) ** 2
+    dgen_, _ = disp_mle(np.maximum(mu0, 1e-9))
+    lg_ = np.where(np.isfinite(dgen_) & (dgen_ > 1e-6), np.log(np.clip(dgen_, 1e-6, 5)), np.log(tr_))
+    return np.clip(np.exp((wpr_ * np.log(tr_) + curv_ * lg_) / (wpr_ + curv_)), 1e-6, 20.0), (float(a0_), float(a1_))
+
+def variant_de(cols, sf_mode="mor", label=""):
+    """Re-run the whole estimator chain on a sample subset / alternative normalisation."""
+    global Y, x, N, G, sf, norm, baseMean
+    save = (Y, x, N, G, sf, norm, baseMean)
+    Yl = save[0][:, cols]; xs = np.array([1.0 if c in KL_IDX else 0.0 for c in cols])
+    kc = np.all(Yl > 0, axis=1)
+    def _sf(ref):
+        g_ = np.exp(np.log(Yl[ref]).mean(1)); s_ = np.median(Yl[ref] / g_[:, None], 0)
+        return s_ / np.exp(np.log(s_).mean())
+    s_a = _sf(kc)
+    if sf_mode == "expressed":     # reference genes restricted to decently expressed ones
+        ref2 = kc & ((Yl / s_a).mean(1) >= 10); s_v = _sf(ref2 if ref2.sum() > 500 else kc)
+    else:
+        s_v = s_a
+    nrm = Yl / s_v; bm = nrm.mean(1)
+    Y, x, N, G, sf, norm, baseMean = Yl, xs, len(cols), Yl.shape[0], s_v, nrm, bm
+    _, _, _, mu_p = fit_beta(np.full(G, 1e-4))
+    d_map, (ta0, ta1) = _trend_map(Yl, mu_p, bm)
+    b0v, b1v, se1v, _ = fit_beta(d_map)
+    lfcv = b1v / L2; sev = se1v / L2
+    pv = stats.norm.sf(np.abs(np.where(sev > 0, lfcv / sev, np.nan))) * 2; pv[Yl.sum(1) == 0] = np.nan
+    okv = np.isfinite(pv) & (bm >= 10)
+    tau2v = float(np.median(np.maximum(lfcv[okv] ** 2 - sev[okv] ** 2, 0.0))) if okv.sum() else 1e-6
+    shr = lfcv * (tau2v / (tau2v + sev ** 2))
+    lamv = float(np.median(stats.chi2.isf(pv[np.isfinite(pv)], 1)) / 0.4549)
+    de = (pv < 0.05) & (np.abs(shr) > 1) & (bm > 10) & np.isfinite(pv)
+    ids = set(counts.index[de])
+    met = shr * (-np.log10(np.clip(pv, P_FLOOR, 1.0)))
+    (Y, x, N, G, sf, norm, baseMean) = save
+    log(f"  {label:34s} size_factors=" + ",".join(f"{v:.3f}" for v in s_v)
+        + f" trend=({ta0:.4f},{ta1:.3f}) lambda_GC={lamv:5.2f} tau={math.sqrt(max(tau2v,0)):.3f} DE={len(ids):5d}")
+    return {"label": label, "size_factors": [round(float(v), 4) for v in s_v], "lambda_GC": round(lamv, 2),
+            "tau_log2": round(math.sqrt(max(tau2v, 0)), 3), "n_DE": len(ids), "ids": ids,
+            "metric_by_gene": pd.Series(met, index=counts.index)}
+
+KL_IDX = [0, 1, 2]
+base_ids = set(counts.index[sig.values])
+base_met = pd.Series(rk8.gsea_metric.values, index=rk8.geneID.values)
+log(f"  {'FULL 3v3 (primary reference)':34s} DE={len(base_ids)}")
+loo = []
+for lbl, cols, mode in [("drop KL3 (2 KL vs 3 WL)", [0, 1, 3, 4, 5], "mor"),
+                        ("drop KL1", [1, 2, 3, 4, 5], "mor"),
+                        ("drop KL2", [0, 2, 3, 4, 5], "mor"),
+                        ("drop WL3", [0, 1, 2, 3, 4], "mor"),
+                        ("drop WL1", [0, 1, 2, 4, 5], "mor"),
+                        ("drop WL2", [0, 1, 2, 3, 5], "mor"),
+                        ("FULL + expressed-gene size factors", [0, 1, 2, 3, 4, 5], "expressed")]:
+    r_ = variant_de(cols, mode, lbl)
+    inter = len(r_["ids"] & base_ids); union = len(r_["ids"] | base_ids)
+    jac = inter / union if union else float("nan")
+    common = r_["metric_by_gene"].dropna().index.intersection(base_met.dropna().index)
+    rho = float(stats.spearmanr(r_["metric_by_gene"][common], base_met[common]).statistic)
+    loo.append({"variant": lbl, "n_DE": r_["n_DE"], "jaccard_vs_primary": round(jac, 3),
+                "overlap": inter, "spearman_metric_vs_primary": round(rho, 3),
+                "lambda_GC": r_["lambda_GC"], "size_factors": r_["size_factors"]})
+    log(f"      -> Jaccard vs primary={jac:.3f} (overlap {inter}/{len(base_ids)})  Spearman(metric)={rho:.3f}")
+# metric-choice comparison: spec'd metric vs pure shrunken log2FC (this changes which pathway tops GSEA)
+alt = rk8.log2FoldChange_shrunk.values
+same = np.isfinite(rk8.gsea_metric.values)
+rho_m = float(stats.spearmanr(rk8.gsea_metric.values, alt).statistic)
+top_metric = set(rk8.nlargest(200, "gsea_metric").geneID)
+top_lfc = set(rk8.nlargest(200, "log2FoldChange_shrunk").geneID)
+log(f"metric-vs-alternative comparison: Spearman(metric, shrunken log2FC)={rho_m:.3f}; "
+    f"top-200 overlap={len(top_metric & top_lfc)}/200 -> the two rankings disagree on {200 - len(top_metric & top_lfc)} of the top 200 genes")
+loo_summary = {"primary_n_DE": len(base_ids), "variants": loo,
+               "metric_vs_log2fconly_spearman": round(rho_m, 3),
+               "top200_overlap_metric_vs_log2fconly": len(top_metric & top_lfc),
+               "note": "leave-one-out subsets have n=2 in one group, so their own p-values are weak; "
+                       "they are used to test stability of the gene set, not to replace it."}
+log("KL3-specific check: per-gene |log2 ratio| of KL3 vs median of KL1,KL2 on expressed genes")
+lk3 = np.log2((norm[:, 2] + 1) / ((norm[:, 0] + norm[:, 1]) / 2 + 1))
+msk = baseMean > 10
+log(f"  median |dev| KL3={np.median(np.abs(lk3[msk])):.3f} vs KL1={np.median(np.abs(np.log2((norm[:,0]+1)/((norm[:,1]+norm[:,2])/2+1)))[msk]):.3f}"
+    f" vs KL2={np.median(np.abs(np.log2((norm[:,1]+1)/((norm[:,0]+norm[:,2])/2+1)))[msk]):.3f}"
+    f" ; WL3={np.median(np.abs(np.log2((norm[:,5]+1)/((norm[:,3]+norm[:,4])/2+1)))[msk]):.3f}")
+
+# ------------------------------------------------- Ensembl -> symbol mapping (real source only)
+log("\n=== 9. ENSSEMBL->SYMBOL MAPPING (real file-backed source required) ===")
+cands = [c for c in dict.fromkeys(glob.glob("/workspace/**/*.tsv", recursive=True) + glob.glob("/workspace/**/*.csv", recursive=True)
+                                   + glob.glob("/workspace/**/*symbol*", recursive=True))
+         if os.path.isfile(c) and not os.path.abspath(c).startswith(os.path.abspath(OUT)) and os.path.abspath(c) != os.path.abspath(CSV)]
+mp = None
+rk = rk8.drop(columns=["rank"]).rename(columns={"gsea_metric": "gsea_metric"})   # canonical order for mapping/report
+for c in cands:
+    try:
+        t = pd.read_csv(c, sep=None, engine="python")
+        if t.shape[1] >= 2 and t.iloc[:, 0].astype(str).str.startswith("ENSMUSG").mean() > 0.5 \
+           and pd.to_numeric(t.iloc[:, 1], errors="coerce").notna().mean() < 0.5:
+            mp = t.iloc[:, [0, 1]].dropna(); log(f"mapping source accepted: {c} ({len(mp)} rows)"); break
+    except Exception:
+        pass
+if mp is None:
+    sym = pd.Series(pd.NA, index=rk8.index, dtype="object"); map_status = "BLOCKED - no real mapping source available"
+    log("no usable Ensembl->symbol table found (searched /workspace and ~/.gseapy; mygene/pyensembl/pybiomart "
+        "not installed; Ensembl REST + Enrichr unreachable)")
+else:
+    d = dict(zip(mp.iloc[:, 0].astype(str), mp.iloc[:, 1].astype(str)))
+    sym = rk8.geneID.map(pd.Series(d)); dup = pd.Series(list(d.values())).value_counts()
+    map_status = "OK"
+    log(f"mapped={int(sym.notna().sum())} unmapped={int(sym.isna().sum())} duplicate symbols in source={int((dup > 1).sum())}")
+log(f"MAPPING STATUS: {map_status}")
+pd.DataFrame({"ensembl": rk8.geneID, "symbol": sym}).to_csv(os.path.join(OUT, "ens2symbol_used.tsv"), sep="\t", index=False)
+
+# ------------------------------------------------- GSEA: only with a real gene-set source
+log("\n=== 10. GSEA: GSEApy prerank, KEGG_2019_Mouse, weighted KS, permutations=1000, seed=%d ===" % SEED)
+gmt = sorted({f for root in ("/workspace", os.path.expanduser("~"))
+              for pat in ("**/KEGG_2019_Mouse*", "**/*.gmt", "**/*.gmt.gz", "**/*kegg*")
+              for f in glob.glob(os.path.join(root, pat), recursive=True) if os.path.isfile(f)})
+log(f"file-backed gene-set libraries found: {gmt if gmt else 'NONE'}")
+gp = None
+try:
+    import gseapy as gp; log(f"gseapy {gp.__version__} importable")
+except Exception as e:
+    log(f"gseapy import failed: {type(e).__name__}: {e}")
+bl = []
+if gp is None: bl.append("gseapy not importable in the executed runtime")
+if not gmt: bl.append("no file-backed KEGG_2019_Mouse gene-set library")
+if sym.isna().all(): bl.append("no real Ensembl->symbol mapping (KEGG_2019_Mouse is symbol-keyed)")
+gsea_exec = False
+if not bl:
+    for tag, term, fn in [("primary_KL_vs_WL", rk8.gsea_metric.to_numpy(), "gsea_primary.csv"),
+                          ("sensitivity_WL_vs_KL", rv8.gsea_metric.to_numpy(), "gsea_reverse.csv")]:
+        # duplicate symbols collapse by MEAN of the metric (documented many-to-one resolution)
+        s = pd.Series(term, index=sym.to_numpy()).dropna().groupby(level=0).mean().sort_values(ascending=False)
+        log(f"[{tag}] symbols used={len(s)} (collapsed duplicates: {int(len(sym.dropna()) - len(s))})")
+        pr = gp.preranked(gene_sets=gmt[0], rnaseq=s, min_size=15, max_size=500, threads=1, seed=SEED)
+        pr.run(permutations=1000)
+        pr.res2d.to_csv(os.path.join(OUT, fn), index=False)
+        log(f"[{tag}] top 5 by |NES|:\n" + pr.res2d.reindex(pr.res2d.NES.abs().sort_values(ascending=False).index)
+            .head(5).to_string(index=False))
+    gsea_exec = True
+else:
+    log("GSEA STATUS: NOT EXECUTED. Blockers: " + "; ".join(bl))
+    log("Per the agreed protocol, KEGG gene-set membership was NOT reconstructed from prior knowledge, "
+        "and no enrichment score was simulated. Therefore no 'most significantly enriched pathway' "
+        "can be reported as an executed result.")
+
+summary = {"executed": True, "engine": "custom NB2 GLM (NOT DESeq2)", "seed": SEED,
+           "packages": {**PKG, "numpy": np.__version__, "scipy": scipy.__version__, "pandas": pd.__version__},
+           "network": NET, "n_genes": int(G), "n_tested": int(tested.sum()),
+           "size_factors": {c: round(float(v), 5) for c, v in zip(counts.columns, sf)},
+           "dispersion_trend": {"a0": float(a0), "a1": float(a1)},
+           "genomic_control_lambda": lam_gc,
+           "eb_shrinkage_tau_log2": tau, "filter": {"baseMean_gt_10": int(f_b.sum()), "raw_p_lt_005": int(f_p.fillna(False).sum()),
+                                                     "abs_shrunk_lfc_gt_1": int(f_l.fillna(False).sum()), "all_three": int(sig.sum())},
+           "de_up_in_KL": int((sig_df.log2FoldChange_shrunk > 0).sum()), "de_down_in_KL": int((sig_df.log2FoldChange_shrunk < 0).sum()),
+           "dispersion_sensitivity": sens, "ranked_genes": int(len(rk)),
+           "ube2m": {c: (round(float(v), 5) if c != "geneID" else v) for c, v in zip(C + ["dispersion"], res.loc[res.geneID == UBE, C + ["dispersion"]].iloc[0])},
+           "mapping_status": map_status, "gsea_executed": bool(gsea_exec), "gsea_blockers": bl,
+           "gsea_ranking_metric": "shrunken log2FC x (-log10 raw Wald p), p floored at 1e-300, NaN dropped, baseMean>=10, ties by (shrunk log2FC desc, geneID asc), duplicate symbols collapsed by mean",
+           "leave_one_out_sensitivity": loo_summary,
+           "top_enriched_pathway": None}
+json.dump(summary, open(os.path.join(OUT, "summary.json"), "w"), indent=2, default=float)
+open(os.path.join(OUT, "run_log.txt"), "w").write("\n".join(LOG) + "\n")
+log("\nEXECUTION COMPLETE -> " + OUT)

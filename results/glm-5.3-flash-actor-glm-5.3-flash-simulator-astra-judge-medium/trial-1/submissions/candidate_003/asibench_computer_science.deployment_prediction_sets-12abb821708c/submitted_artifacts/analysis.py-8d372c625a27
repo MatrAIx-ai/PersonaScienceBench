@@ -1,0 +1,366 @@
+"""
+Deployment prediction sets under a label-weighted miss risk target.
+
+Method (approved plan):
+  * Strata (proxy_stratum): 3 terciles of a feature-based difficulty score
+    d(x) = 0.5*v000 + 0.5*v001 (the two features most correlated with
+    calibration correctness, r = 0.43 / 0.39). Tercile edges are computed on
+    calibration and applied unchanged to deployment.
+  * Policy: stratum- and label-conditional split-conformal thresholds.
+    For stratum g, label k: tau_{g,k} = the k_ord-th smallest calibration
+    score of label k among true-label-k records in stratum g, with
+    k_ord = floor(r_{g,k} * (n_{g,k} + 1)).  By exchangeability of the
+    calibration sample, P(p_k < tau_{g,k} | y = k, g) <= r_{g,k}.
+    Prediction set S(x) = {k : p_k >= tau_{g(x),k}}, plus the argmax label
+    (guarantees non-empty sets, required by the spec).
+  * Risk allocation: r_{g,k} = min(alpha_g * n_g / (K * n_{g,k} * c_k), 1)
+    (equal risk contribution per (stratum, label) cell), so that
+    sum_k (n_{g,k}/n_g) * c_k * r_{g,k} = alpha_g exactly when uncapped, and
+    <= alpha_g under the cap.  Overall risk <= sum_g m_g^dep * alpha_g <= target.
+  * Delta split (delta = 0.1366), documented here:
+      - delta_overall = delta/2 = 0.0683 is reserved for the deployment-wide
+        (scope='overall') Hoeffding UCB check.
+      - delta/2 is split across the K=3 strata proportionally to calibration
+        stratum mass: delta_g = (delta/2) * n_g / n_cal.
+      - UCB convention chosen: Hoeffding,
+            UCB(s) = empirical_risk(s) + sqrt(ln(1/delta_s) / (2 * n_s)).
+    Per-stratum calibration target alpha_g = target - slack_g with
+    slack_g = sqrt(ln(1/delta_g) / (2 * n_g)) so that each stratum's UCB also
+    stays <= target where feasible (dual-safe: marginal AND group-conditional).
+  * Honest empirical-risk estimates: 2-fold cross-fitting with a FIXED fold
+    split (seeded). Thresholds (and the alpha_g / r_{g,k} allocation) are
+    calibrated on one fold and evaluated on the other; the audit
+    empirical_risk values pool the two folds. Final deployment thresholds are
+    re-calibrated on the full calibration set.
+  * Dual-safe alpha_g: each stratum's alpha_g is set by bisection to the
+    largest value whose cross-fit empirical risk + Hoeffding slack stays
+    <= target (so every stratum UCB <= 0.1084 as well as the overall risk).
+  * No cross-stratum fallback is used: the order-statistic bound
+    P(p_k < tau_{g,k} | y=k, g) <= k_ord/(n_{g,k}+1) <= r_{g,k} is exact for
+    ANY cell size n_{g,k} >= 1 (small cells only lose quantile granularity),
+    whereas a global-cell threshold would NOT control the within-stratum miss
+    probability under the observed difficulty stratification.  Degenerate
+    cells with k_ord = 0 (tolerance below the achievable resolution) get
+    threshold 0 (label always included; miss prob ~0) and are logged.
+  * Risk reading: unnormalized weighted miss risk
+    (1/n) * sum_i c(y_i) * 1{y_i not in S(x_i)}  (conservative under either
+    normalization convention).
+  * Column conventions: risk_violation = max(0, empirical_risk - target_risk)
+    (numeric violation amount); violates = boolean
+    (empirical_risk > target_risk).  risk_margin = target_risk - empirical_risk.
+No reference/ files are read; deployment labels are never used.
+"""
+import json
+import numpy as np
+import pandas as pd
+import plotlib
+from pathlib import Path
+
+RNG = np.random.default_rng(20260717)
+DATA = Path("data")
+RES = Path("results")
+RES.mkdir(exist_ok=True)
+
+meta = json.loads((DATA / "metadata.json").read_text())
+spec = json.loads((DATA / "risk_spec.json").read_text())
+LABELS = meta["label_columns"]
+K = len(LABELS)
+TARGET = spec["target_risk"]
+DELTA = spec["delta"]
+COST = np.array([spec["label_costs"][l] for l in LABELS])
+
+cal_f = pd.read_csv(DATA / "calibration_features.csv")
+cal_y = pd.read_csv(DATA / "calibration_labels.csv")
+cal_s = pd.read_csv(DATA / "calibration_scores.csv")
+dep_f = pd.read_csv(DATA / "deployment_features.csv")
+dep_s = pd.read_csv(DATA / "deployment_scores.csv")
+assert (cal_f.record_id.values == cal_s.record_id.values).all()
+assert (cal_f.record_id.values == cal_y.record_id.values).all()
+assert (dep_f.record_id.values == dep_s.record_id.values).all()
+
+S = cal_s[LABELS].values
+D = dep_s[LABELS].values
+yidx = np.array([LABELS.index(l) for l in cal_y.true_label.values])
+
+# ---------------------------------------------------------------- strata ----
+DIFF_W = {"v000": 0.5, "v001": 0.5}
+def diff_score(df):
+    return sum(w * df[c].values for c, w in DIFF_W.items())
+
+d_cal = diff_score(cal_f)
+edges = np.quantile(d_cal, [1 / 3, 2 / 3])
+STRATA = ["stratum_low", "stratum_mid", "stratum_high"]
+def stratum_of(d):
+    return np.digitize(d, edges)  # 0,1,2
+g_cal = stratum_of(d_cal)
+g_dep = stratum_of(diff_score(dep_f))
+
+# ------------------------------------------------- threshold calibration ----
+def calibrate(scores, y, g, alpha_by_g):
+    """Threshold matrix tau[g, k] via order-statistic conformal rule.
+
+    tau[g,k] = k_ord-th smallest score of label k among true-label-k records
+    in stratum g, k_ord = floor(r_{g,k} * (n_{g,k} + 1)).  Valid for any
+    n_{g,k} >= 1; k_ord = 0 => threshold 0 (label always included).
+    """
+    tau = np.zeros((3, K))
+    degenerate_cells = []
+    for gi in range(3):
+        for k in range(K):
+            sel = (g == gi) & (y == k)
+            n_gk = int(sel.sum())
+            r = min(alpha_by_g[gi] * (g == gi).sum() / (K * max(n_gk, 1) * COST[k]), 1.0)
+            k_ord = int(np.floor(r * (n_gk + 1)))
+            if k_ord == 0 and n_gk > 0:
+                degenerate_cells.append((STRATA[gi], LABELS[k], n_gk, round(r, 4)))
+            k_ord = min(k_ord, n_gk)
+            tau[gi, k] = 0.0 if k_ord == 0 else float(np.sort(scores[sel, k])[k_ord - 1])
+    return tau, degenerate_cells
+
+def apply_sets(scores, g, tau):
+    sets = scores >= tau[g]
+    sets[np.arange(len(scores)), scores.argmax(1)] = True
+    return sets
+
+# Fixed 2-fold split (seeded) so that all cross-fit evaluations, including the
+# alpha_g bisection, use the same folds and are mutually comparable.
+FOLD = RNG.permutation(len(S)) % 2
+
+def cross_fit_eval(scores, y, g, alpha_by_g, fold=None):
+    """Cross-fitted misses/sizes: thresholds from the other fold, evaluation
+    on the held-out fold.  Returns (miss, sizes)."""
+    if fold is None:
+        fold = FOLD
+    n = len(scores)
+    miss = np.zeros(n, bool)
+    sizes = np.zeros(n, int)
+    for f in (0, 1):
+        tr, te = fold != f, fold == f
+        tau, _ = calibrate(scores[tr], y[tr], g[tr], alpha_by_g)
+        st = apply_sets(scores[te], g[te], tau)
+        miss[te] = ~st[np.arange(int(te.sum())), y[te]]
+        sizes[te] = st.sum(1)
+    return miss, sizes
+
+def stratum_risk(miss, g):
+    return np.array([(COST[yidx[g == i]] * miss[g == i]).mean() if (g == i).any() else 0.0
+                     for i in range(3)])
+
+# ---------------------------------------- per-stratum targets (dual-safe) ---
+n_cal = len(S)
+n_g = np.array([(g_cal == i).sum() for i in range(3)])
+delta_g = (DELTA / 2) * n_g / n_cal
+delta_overall = DELTA / 2
+slack_g = np.sqrt(np.log(1 / delta_g) / (2 * n_g))
+slack_overall = np.sqrt(np.log(1 / delta_overall) / (2 * n_cal))
+
+print(f"delta split: overall={delta_overall:.4f}, strata={[round(float(v),4) for v in delta_g]}")
+print(f"slack per stratum: {[round(float(v),4) for v in slack_g]} (overall slack {slack_overall:.4f})")
+
+# Bisection: largest alpha_g whose cross-fit empirical risk + Hoeffding slack
+# stays <= TARGET (dual-safe: marginal AND group-conditional control).
+alpha_g = np.zeros(3)
+for gi in range(3):
+    lo, hi = 1e-4, TARGET
+    def ucb_of(a):
+        m_, _s = cross_fit_eval(S, yidx, g_cal, np.where(np.arange(3) == gi, a, 0.0))
+        return stratum_risk(m_, g_cal)[gi] + slack_g[gi]
+    if ucb_of(hi) <= TARGET:
+        alpha_g[gi] = hi
+    else:
+        for _ in range(10):
+            mid = 0.5 * (lo + hi)
+            if ucb_of(mid) <= TARGET: lo = mid
+            else: hi = mid
+        alpha_g[gi] = lo
+print(f"alpha_g (calibration targets, dual-safe): {[round(float(v),4) for v in alpha_g]}")
+
+# -------------------------------------------------- final policy (full cal) -
+tau_full, degenerate_cells = calibrate(S, yidx, g_cal, alpha_g)
+print("degenerate cells (k_ord=0, threshold 0 => label always included):", degenerate_cells)
+dep_sets = apply_sets(D, g_dep, tau_full)
+dep_sizes = dep_sets.sum(1)
+
+# ----------------------------------------------------- cross-fit estimates --
+miss, sizes_cf = cross_fit_eval(S, yidx, g_cal, alpha_g)
+risk_g_cf = stratum_risk(miss, g_cal)
+risk_overall_cal = float((COST[yidx] * miss).mean())      # calibration-mass weighted
+m_dep = np.array([(g_dep == i).mean() for i in range(3)]) # deployment stratum masses
+m_cal = n_g / n_cal
+risk_overall_dep = float((m_dep * risk_g_cf).sum())       # deployment-mass weighted
+ucb_g = risk_g_cf + slack_g
+ucb_overall = risk_overall_dep + np.sqrt(np.log(1 / delta_overall) / (2 * n_cal))
+
+# ------------------------------------------------------------- output files -
+# prediction_sets.csv
+pred = pd.DataFrame({
+    "record_id": dep_f.record_id.values,
+    "prediction_set": [" ".join(LABELS[k] for k in np.where(r)[0]) for r in dep_sets],
+})
+assert (pred.prediction_set.str.len() > 0).all(), "empty prediction set found"
+pred.to_csv(RES / "prediction_sets.csv", index=False)
+
+# set_size_summary.csv
+pd.DataFrame({"record_id": dep_f.record_id.values,
+              "set_size": dep_sizes,
+              "proxy_stratum": [STRATA[i] for i in g_dep]}).to_csv(
+    RES / "set_size_summary.csv", index=False)
+
+# policy_parameters.csv (one row per stratum x label)
+rows = []
+for gi in range(3):
+    sel = g_cal == gi
+    n_gk = np.array([int((sel & (yidx == k)).sum()) for k in range(K)])
+    for k in range(K):
+        rows.append({
+            "proxy_stratum": STRATA[gi], "label": LABELS[k],
+            "n_calibration": int(sel.sum()), "n_calibration_label": int(n_gk[k]),
+            "threshold": float(tau_full[gi, k]),
+            "group_empirical_weighted_miss_risk": float(risk_g_cf[gi]),
+            "group_upper_confidence_risk": float(ucb_g[gi]),
+            "group_expected_set_size": float(dep_sizes[g_dep == gi].mean()),
+            "calibration_target_risk": float(alpha_g[gi]),
+            "target_risk": TARGET,
+        })
+pd.DataFrame(rows).to_csv(RES / "policy_parameters.csv", index=False)
+
+# audit_summary.csv / partition_diagnostics.csv / constraint_audit.csv
+def scope_rows():
+    out = [("overall", "all", int(len(D)), risk_overall_dep,
+            float(dep_sizes.mean()), float(np.percentile(dep_sizes, 90)), TARGET)]
+    for gi in range(3):
+        s = dep_sizes[g_dep == gi]
+        out.append(("proxy_stratum", STRATA[gi], int((g_dep == gi).sum()),
+                    float(risk_g_cf[gi]), float(s.mean()),
+                    float(np.percentile(s, 90)), TARGET))
+    return out
+
+aud = scope_rows()
+pd.DataFrame([{"scope": a, "stratum_id": b, "n_records": c, "empirical_risk": d,
+               "mean_set_size": e, "p90_set_size": f, "target_risk": t,
+               "risk_violation": max(0.0, d - t)} for a, b, c, d, e, f, t in aud]
+             ).to_csv(RES / "audit_summary.csv", index=False)
+pd.DataFrame([{"scope": a, "stratum_id": b, "n_records": c, "empirical_risk": d,
+               "mean_set_size": e, "p90_set_size": f, "target_risk": t,
+               "risk_margin": t - d} for a, b, c, d, e, f, t in aud]
+             ).to_csv(RES / "partition_diagnostics.csv", index=False)
+cons = [("overall", "all", risk_overall_dep, TARGET, ucb_overall)] + \
+       [("proxy_stratum", STRATA[gi], float(risk_g_cf[gi]), TARGET, float(ucb_g[gi]))
+        for gi in range(3)]
+pd.DataFrame([{"scope": a, "stratum_id": b, "empirical_risk": r, "target_risk": t,
+               "risk_violation": max(0.0, r - t), "violates": bool(r > t)}
+              for a, b, r, t, u in cons]
+             ).to_csv(RES / "constraint_audit.csv", index=False)
+print("upper-confidence risks (kept in policy_parameters / log):",
+      [(a, round(u, 4)) for a, b, r, t, u in cons])
+
+# distribution_diagnostics.csv
+m_cal = n_g / n_cal
+dd = [{"proxy_stratum": STRATA[gi],
+       "calibration_fraction": float(m_cal[gi]),
+       "deployment_fraction": float(m_dep[gi]),
+       "density_ratio_estimate": float(m_dep[gi] / max(m_cal[gi], 1e-6)),
+       "absolute_fraction_shift": float(abs(m_dep[gi] - m_cal[gi]))} for gi in range(3)]
+pd.DataFrame(dd).to_csv(RES / "distribution_diagnostics.csv", index=False)
+
+# calibration_diagnostics.csv (per stratum, 5 equal-count bins of max-prob)
+mp = S.max(1)
+true_score = S[np.arange(n_cal), yidx]
+cd = []
+for gi in range(3):
+    m = g_cal == gi
+    qs = np.quantile(mp[m], np.linspace(0, 1, 6))
+    qs[0], qs[-1] = 0.0, 1.0
+    for b in range(5):
+        bm = m & (mp > qs[b]) & (mp <= qs[b + 1]) if b else m & (mp <= qs[b + 1])
+        cd.append({"proxy_stratum": STRATA[gi], "bin_id": f"bin_{b}",
+                   "score_left": float(qs[b]), "score_right": float(qs[b + 1]),
+                   "n_records": int(bm.sum()),
+                   "mean_true_label_score": float(true_score[bm].mean()) if bm.any() else 0.0})
+pd.DataFrame(cd).to_csv(RES / "calibration_diagnostics.csv", index=False)
+
+
+# ------------------------------------------------------------------ plots ---
+# NOTE: matplotlib is unavailable in this environment (no network to install),
+# so figures are rendered with a minimal pure-numpy PNG writer (plotlib.py).
+# All three PNGs are drawn from the same computed quantities as the CSVs.
+
+# 1) set_size_tradeoff.png : alpha sweep (cross-fit) -> mean size & risk
+grid = np.linspace(0.02, 0.30, 15)
+sizes_g, risks_g = [], []
+for a in grid:
+    ag = np.maximum(a - slack_g, 1e-4)
+    m_, s_ = cross_fit_eval(S, yidx, g_cal, ag)
+    sizes_g.append(float(s_.mean()))
+    risks_g.append(float((COST[yidx] * m_).mean()))
+
+fig = plotlib.Fig(1000, 400)
+p1 = fig.panel(70, 50, 480, 300, (grid[0], grid[-1]), (min(sizes_g), max(sizes_g)),
+               title="SET SIZE VS RISK TARGET", xlabel="ALPHA_G", ylabel="MEAN SET SIZE")
+p1.line(grid, sizes_g, plotlib.BLUE)
+p1.marker_vline(alpha_g.mean(), plotlib.RED)
+p1.text_px(500, 70, "RED DASH: OPERATING ALPHA_G = %.3f" % alpha_g.mean())
+p2 = fig.panel(560, 50, 970, 300, (grid[0], grid[-1]), (0, max(max(risks_g), TARGET) * 1.1),
+               title="ACHIEVED RISK VS TARGET", xlabel="ALPHA_G", ylabel="WEIGHTED MISS RISK")
+p2.line(grid, risks_g, plotlib.GREEN)
+p2.hline(TARGET, (0, 0, 0))
+p2.text_px(600, 330, "DASHED: TARGET RISK = %.4f" % TARGET)
+fig.save(RES / "set_size_tradeoff.png")
+
+# 2) partition_audit.png : per-stratum risk/UCB + cal-vs-dep mass shift
+fig = plotlib.Fig(1000, 400)
+p1 = fig.panel(70, 50, 480, 300, (-0.5, 2.5), (0, max(ucb_g.max(), TARGET) * 1.25),
+               title="PER-STRATUM RISK VS TARGET", xlabel="", ylabel="RISK")
+for gi in range(3):
+    p1.bar(gi - 0.18, risk_g_cf[gi], 0.34, plotlib.BLUE)
+    p1.bar(gi + 0.18, ucb_g[gi], 0.34, plotlib.ORANGE)
+    p1.text_px(p1.xp(gi) - 30, 308, STRATA[gi].upper(), scale=1)
+p1.hline(TARGET, (0, 0, 0))
+fig.c.rect(60, 20, 76, 32, plotlib.BLUE); fig.text(82, 22, "EMPIRICAL RISK (CROSS-FIT)", scale=1)
+fig.c.rect(300, 20, 316, 32, plotlib.ORANGE); fig.text(322, 22, "UCB (HOEFFDING)", scale=1)
+fig.text(520, 22, "DASHED: TARGET = %.4f" % TARGET, scale=1)
+p2 = fig.panel(560, 50, 970, 300, (-0.5, 2.5), (0, max(m_cal.max(), m_dep.max()) * 1.3),
+               title="STRATUM MASS SHIFT (CAL VS DEP)", xlabel="", ylabel="FRACTION")
+for gi in range(3):
+    p2.bar(gi - 0.18, m_cal[gi], 0.34, plotlib.BLUE)
+    p2.bar(gi + 0.18, m_dep[gi], 0.34, plotlib.ORANGE)
+    p2.text_px(p2.xp(gi) - 42, p2.yp(max(m_cal[gi], m_dep[gi])) - 14,
+               "DR=%.2f" % (m_dep[gi] / m_cal[gi]), scale=1)
+    p2.text_px(p2.xp(gi) - 30, 308, STRATA[gi].upper(), scale=1)
+fig.text(600, 330, "DR = DEPLOYMENT/CALIBRATION DENSITY RATIO", scale=1)
+fig.save(RES / "partition_audit.png")
+
+# 3) score_diagnostics.png : per-class score means + reliability curve
+fig = plotlib.Fig(1050, 420)
+p1 = fig.panel(70, 50, 560, 330, (-0.5, K - 0.5),
+               (0, max(S.mean(0).max(), D.mean(0).max()) * 1.2),
+               title="MEAN CLASS SCORE: CAL VS DEP", xlabel="", ylabel="MEAN SCORE")
+for k in range(K):
+    p1.bar(k - 0.2, S.mean(0)[k], 0.38, plotlib.BLUE)
+    p1.bar(k + 0.2, D.mean(0)[k], 0.38, plotlib.ORANGE)
+    p1.text_px(p1.xp(k) - 22, 338, LABELS[k].replace("LABEL_", "L"), scale=1)
+fig.c.rect(60, 20, 76, 32, plotlib.BLUE); fig.text(82, 22, "CALIBRATION", scale=1)
+fig.c.rect(240, 20, 256, 32, plotlib.ORANGE); fig.text(262, 22, "DEPLOYMENT", scale=1)
+p2 = fig.panel(640, 50, 1010, 330, (0, 1), (0, 1),
+               title="SCORE RELIABILITY (CALIBRATION)", xlabel="MEAN PREDICTED MAX PROB",
+               ylabel="MEAN TRUE-SCORE")
+bins = np.quantile(mp, np.linspace(0, 1, 11)); bins[0], bins[-1] = 0.0, 1.0
+pred_prob, true_sc = [], []
+for b in range(10):
+    bm = (mp > bins[b]) & (mp <= bins[b + 1]) if b else (mp <= bins[b + 1])
+    pred_prob.append(float(mp[bm].mean())); true_sc.append(float(true_score[bm].mean()))
+p2.line(pred_prob, true_sc, plotlib.GREEN)
+p2.line([0, 1], [0, 1], (150, 150, 150), 1)
+p2.text_px(700, 350, "GREEN: OBSERVED - GRAY: IDEAL Y = X")
+fig.save(RES / "score_diagnostics.png")
+
+print("\n=== SUMMARY ===")
+print("overall estimated risk (deployment-mass weighted): %.4f (target %.4f)" % (risk_overall_dep, TARGET))
+print("overall UCB: %.4f" % ucb_overall)
+print("per-stratum risk / UCB / alpha_g:", np.round(risk_g_cf, 4), np.round(ucb_g, 4), np.round(alpha_g, 4))
+print("deployment mean set size: %.3f, p90: %.1f, max: %d (trivial set = 9)"
+      % (dep_sizes.mean(), np.percentile(dep_sizes, 90), dep_sizes.max()))
+print("degenerate cells:", degenerate_cells)
+print("deployment set-size histogram:", np.bincount(dep_sizes, minlength=10)[:10])
+print("deployment stratum sizes:", [(STRATA[i], int((g_dep == i).sum())) for i in range(3)])
+print("risk_violation flags:", [bool(r > TARGET) for r in [risk_overall_dep] + list(risk_g_cf)])

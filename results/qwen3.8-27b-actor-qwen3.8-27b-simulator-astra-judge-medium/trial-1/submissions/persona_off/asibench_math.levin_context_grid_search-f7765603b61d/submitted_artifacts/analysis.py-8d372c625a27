@@ -1,0 +1,732 @@
+"""
+analysis.py -- action-selection model for deterministic symbolic grid-search levels.
+
+Learns from solved training trajectories (data/training_levels.json, 260 levels)
+and provides `action_probs(level, state, legal_actions)` for the scorer's search.
+
+Model
+-----
+Weighted additive (log-linear) frequency model over compound local contexts:
+
+    score(a | ctx) = base(a)
+                   + W_prev_sleg[(prev, straight_legal, a)]
+                   + W_prev_run [(prev, run_bucket, straight_legal, a)]
+                   + W_turns    [(turns_bucket, straight_legal, a)]
+                   + W_gdir     [(g_neighbor_dir, a)]
+                   + 0.1 * ( W_cell[(cell, a)] + W_neigh[(neighbors, a)]
+                             + W_dphase[(depth_phase, a)] + W_dmod[(depth_mod, a)]
+                             + W_tail[(history_tail, a)] )
+
+Each W is a Laplace-smoothed maximum-likelihood log-odds weight
+log P(a | context) - log P(a | table marginal), so contexts seen in training
+contribute their empirical log-odds and unseen contexts contribute ~0.
+
+Empirical findings that drive the design (all verified on the training data):
+  * Solutions are straight segments; a turn occurs exactly when the straight
+    cell is walled (385/385 turn steps have '#' beyond the corner in the old
+    heading; 0/6079 straight-legal steps turn).
+  * Turn direction at a free corner is ~a coin flip (left 130 / right 117);
+    no tile-character rule beats chance (best simple rule 0.547, p = 0.08).
+  * The goal is always the unique 'G' tile; the final action always points at
+    a G neighbor (260/260), so a G-neighbor override is a perfect terminal rule.
+  * The first action is ~uniform; immediate reversals never occur.
+  * Hidden (public) levels can require more than 3 segments, so no hard cap on
+    turns is applied -- only the learned (soft) turn statistics.
+
+The policy never reads spatial metadata (start/goal/grid) from `level`.
+Only the standard library is used.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections import Counter
+
+ACTIONS = ("U", "D", "L", "R")
+DIRS = {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)}
+OPP = {"U": "D", "D": "U", "L": "R", "R": "L"}
+_NAME_MAP = {"up": "U", "down": "D", "left": "L", "right": "R"}
+_WALL_TOKENS = {"#", "wall", "walls", "none", "x", "blocked"}
+ALPHA = 1.0          # Laplace smoothing for all tables
+G_BOOST = 40.0       # additive boost for moving onto a visible 'G' neighbor
+DAMP = 0.1           # damping for low-signal (tile/depth/tail) feature groups
+RUN_CAP = 20         # run-length bucket cap
+TURNS_CAP = 4        # turns-so-far bucket cap
+
+
+# --------------------------------------------------------------------------
+# defensive parsing helpers
+# --------------------------------------------------------------------------
+
+def _norm_action(v):
+    if isinstance(v, str):
+        v = v.strip()
+        if v in ACTIONS:
+            return v
+        if v.lower() in _NAME_MAP:
+            return _NAME_MAP[v.lower()]
+    return None
+
+
+def _as_action_list(v):
+    out = []
+    if v is None:
+        return out
+    if isinstance(v, str):
+        for ch in v.upper():
+            a = _norm_action(ch)
+            if a:
+                out.append(a)
+    elif isinstance(v, (list, tuple)):
+        for item in v:
+            a = _norm_action(item)
+            if a:
+                out.append(a)
+    seen = set()
+    res = []
+    for a in out:
+        if a not in seen:
+            seen.add(a)
+            res.append(a)
+    return res
+
+
+def _history_to_list(state):
+    h = state.get("history")
+    if h is None:
+        h = state.get("history_tail")
+    if h is None:
+        return []
+    if isinstance(h, str):
+        return [a for a in (_norm_action(c) for c in h) if a]
+    if isinstance(h, (list, tuple)):
+        out = []
+        for item in h:
+            if isinstance(item, dict):
+                a = _norm_action(item.get("action"))
+            else:
+                a = _norm_action(item)
+            if a:
+                out.append(a)
+        return out
+    return []
+
+
+def _neighbors_to_dict(state):
+    nb = state.get("neighbors")
+    out = {}
+    if isinstance(nb, dict):
+        for k, v in nb.items():
+            a = _norm_action(k if isinstance(k, str) else str(k))
+            if a:
+                out[a] = v
+    elif isinstance(nb, (list, tuple)):
+        for a, v in zip(ACTIONS, nb):
+            out[a] = v
+    return out
+
+
+def _is_wall(v):
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() in _WALL_TOKENS
+    return False
+
+
+def _run_from_bucket(state):
+    b = state.get("run_length_bucket")
+    if isinstance(b, bool):
+        return None
+    if isinstance(b, int):
+        return min(max(b, 0), RUN_CAP)
+    if isinstance(b, str):
+        b = b.strip()
+        if b.isdigit():
+            return min(int(b), RUN_CAP)
+        digits = [int(t) for t in b.replace("+", " ").split("-")
+                  if t.strip().lstrip("-").isdigit()]
+        if digits:
+            return min(max(digits), RUN_CAP)
+    return None
+
+
+def _build_context(state, legal):
+    """Normalize a scorer state dict into the feature context used by the model."""
+    hist = _history_to_list(state)
+    prev = _norm_action(state.get("previous_action"))
+    if prev is None and hist:
+        prev = hist[-1]
+    run = 0
+    if prev:
+        for h in reversed(hist):
+            if h == prev:
+                run += 1
+            else:
+                break
+    if run == 0:
+        rb = _run_from_bucket(state)
+        if rb is not None:
+            run = rb
+    turns = 0
+    for i in range(1, len(hist)):
+        if hist[i] != hist[i - 1] and hist[i] != OPP[hist[i - 1]]:
+            turns += 1
+    nb = _neighbors_to_dict(state)
+    straight_legal = prev is not None and prev in legal
+    gdir = None
+    for a in ACTIONS:
+        if a in legal and nb.get(a) == "G":
+            gdir = a
+            break
+    depth = state.get("depth")
+    try:
+        depth = int(depth)
+    except (TypeError, ValueError):
+        depth = len(hist)
+    dmod = state.get("depth_mod")
+    try:
+        dmod = int(dmod)
+    except (TypeError, ValueError):
+        dmod = depth % 4
+    dphase = state.get("depth_phase")
+    if not isinstance(dphase, (str, int)):
+        dphase = "early" if depth < 10 else ("mid" if depth < 25 else "late")
+    cell = state.get("cell")
+    if not isinstance(cell, str):
+        cell = None
+    tail = "".join(hist[-4:])
+    return dict(prev=prev, run=min(run, RUN_CAP), turns=min(turns, TURNS_CAP),
+                nb=nb, legal=frozenset(legal), straight_legal=straight_legal,
+                gdir=gdir, depth=depth, dmod=dmod, dphase=dphase,
+                cell=cell, tail=tail)
+
+
+# --------------------------------------------------------------------------
+# smoothed frequency tables with log-odds weights
+# --------------------------------------------------------------------------
+
+class _Table:
+    """Laplace-smoothed conditional counts; weight(k, a) =
+    log P(a|k) - log P(a|.)  (unseen k -> uniform conditional -> ~0 weight)."""
+
+    def __init__(self, alpha=ALPHA):
+        self.alpha = alpha
+        self.c = Counter()          # (k, a) -> count
+        self.marg = Counter()       # k -> total count
+        self.gmarg = Counter()      # a -> total count
+        self.tot = 0
+        self.W = {}                 # (k, a) -> weight for seen pairs
+        self.n_keys = 0
+
+    def observe(self, k, a):
+        self.c[(k, a)] += 1
+        self.marg[k] += 1
+        self.gmarg[a] += 1
+        self.tot += 1
+
+    def fit(self):
+        self.n_keys = len(self.marg)
+        for (k, a), n in self.c.items():
+            pk = (n + self.alpha) / (self.marg[k] + 4 * self.alpha)
+            pg = (self.gmarg[a] + self.alpha) / (self.tot + 4 * self.alpha)
+            self.W[(k, a)] = math.log(pk / pg)
+
+    def weight(self, k, a):
+        w = self.W.get((k, a))
+        if w is not None:
+            return w
+        nk = self.marg.get(k)
+        pg = (self.gmarg[a] + self.alpha) / (self.tot + 4 * self.alpha)
+        if nk is None:
+            return math.log(0.25 / pg)          # unseen context -> uniform
+        return math.log((self.alpha / (nk + 4 * self.alpha)) / pg)
+
+    def stats(self):
+        if not self.W:
+            return 0.0, 0.0
+        return (max(abs(w) for w in self.W.values()),
+                sum(abs(w) for w in self.W.values()) / len(self.W))
+
+
+def _neigh_key(nb):
+    return "".join((nb.get(a) if isinstance(nb.get(a), str) else "_")
+                   for a in ACTIONS)
+
+
+def _feature_keys(ctx):
+    """Map context -> {group_name: key or None}."""
+    keys = {
+        "prev_sleg": None, "prev_run": None, "turns_sleg": None,
+        "gdir": None, "cell": None, "neigh": None,
+        "dphase": None, "dmod": None, "tail": None,
+    }
+    if ctx["prev"] is not None:
+        s = int(ctx["straight_legal"])
+        keys["prev_sleg"] = "p=%s|s=%d" % (ctx["prev"], s)
+        keys["prev_run"] = "p=%s|r=%d|s=%d" % (ctx["prev"], ctx["run"], s)
+        keys["turns_sleg"] = "t=%d|s=%d" % (ctx["turns"], s)
+    if ctx["gdir"] is not None:
+        keys["gdir"] = "g=%s" % ctx["gdir"]
+    if ctx["cell"]:
+        keys["cell"] = "c=%s" % ctx["cell"]
+    keys["neigh"] = "n=%s" % _neigh_key(ctx["nb"])
+    keys["dphase"] = "d=%s" % ctx["dphase"]
+    keys["dmod"] = "m=%d" % ctx["dmod"]
+    if ctx["tail"]:
+        keys["tail"] = "h=%s" % ctx["tail"]
+    return keys
+
+
+_STRUCTURAL = ("prev_sleg", "prev_run", "turns_sleg", "gdir")
+_NOISY = ("cell", "neigh", "dphase", "dmod", "tail")
+
+
+# --------------------------------------------------------------------------
+# training-time simulation of a solved level
+# --------------------------------------------------------------------------
+
+def _simulate_level(lvl):
+    """Walk a training solution; yield (context, action) per step."""
+    grid = lvl["grid"]
+    H, W = len(grid), len(grid[0])
+    y, x = lvl["start"]
+    hist = []
+    for a in lvl["solution"]:
+        nb = {}
+        for b in ACTIONS:
+            ny, nx = y + DIRS[b][1], x + DIRS[b][0]
+            nb[b] = grid[ny][nx] if 0 <= ny < H and 0 <= nx < W else "#"
+        legal = [b for b in ACTIONS if nb[b] != "#"]
+        ctx = _build_context(
+            {
+                "cell": grid[y][x],
+                "neighbors": nb,
+                "previous_action": hist[-1] if hist else None,
+                "history": list(hist),
+                "history_tail": list(hist[-4:]),
+                "run_length_bucket": None,
+                "depth": len(hist),
+                "depth_mod": len(hist) % 4,
+                "depth_phase": None,
+                "legal_mask": {b: (b in legal) for b in ACTIONS},
+                "legal_actions": legal,
+            },
+            legal,
+        )
+        yield ctx, a
+        hist.append(a)
+        y, x = y + DIRS[a][1], x + DIRS[a][0]
+
+
+# --------------------------------------------------------------------------
+# policy
+# --------------------------------------------------------------------------
+
+class Policy:
+    def __init__(self, records):
+        self.tables = {name: _Table() for name in _STRUCTURAL + _NOISY}
+        base_counts = Counter()
+        for ctx, a in records:
+            base_counts[a] += 1
+            keys = _feature_keys(ctx)
+            for name, k in keys.items():
+                if k is not None:
+                    self.tables[name].observe(k, a)
+        n = sum(base_counts.values())
+        self.base = {
+            a: math.log((base_counts.get(a, 0) + ALPHA) / (n + 4 * ALPHA))
+            for a in ACTIONS
+        }
+        for t in self.tables.values():
+            t.fit()
+        self.n_records = n
+
+    # -- scoring -----------------------------------------------------------
+    def _score(self, ctx, a):
+        s = self.base[a]
+        if ctx["prev"] is not None:
+            s += self.tables["prev_sleg"].weight(
+                "p=%s|s=%d" % (ctx["prev"], int(ctx["straight_legal"])), a)
+            s += self.tables["prev_run"].weight(
+                "p=%s|r=%d|s=%d" % (ctx["prev"], ctx["run"],
+                                    int(ctx["straight_legal"])), a)
+            s += self.tables["turns_sleg"].weight(
+                "t=%d|s=%d" % (ctx["turns"], int(ctx["straight_legal"])), a)
+        if ctx["gdir"] is not None:
+            s += self.tables["gdir"].weight("g=%s" % ctx["gdir"], a)
+        s += DAMP * self.tables["neigh"].weight("n=%s" % _neigh_key(ctx["nb"]), a)
+        s += DAMP * self.tables["dphase"].weight("d=%s" % ctx["dphase"], a)
+        s += DAMP * self.tables["dmod"].weight("m=%d" % ctx["dmod"], a)
+        if ctx["cell"]:
+            s += DAMP * self.tables["cell"].weight("c=%s" % ctx["cell"], a)
+        if ctx["tail"]:
+            s += DAMP * self.tables["tail"].weight("h=%s" % ctx["tail"], a)
+        if ctx["gdir"] is not None and a == ctx["gdir"]:
+            s += G_BOOST
+        return s
+
+    # -- public interface ---------------------------------------------------
+    def action_probs(self, level, state, legal_actions):
+        """Return a dict {action: probability} over exactly `legal_actions`.
+
+        `level` must contain only non-spatial metadata; no field of it is read.
+        """
+        state = state if isinstance(state, dict) else {}
+        legal = _as_action_list(legal_actions)
+        if not legal:
+            m = state.get("legal_mask")
+            if isinstance(m, dict):
+                for a in ACTIONS:
+                    if m.get(a, m.get(a.lower())):
+                        legal.append(a)
+            elif isinstance(m, str):
+                legal = _as_action_list(m)
+            elif isinstance(m, int):
+                legal = [a for i, a in enumerate(ACTIONS) if (m >> i) & 1]
+        if not legal:
+            nb = _neighbors_to_dict(state)
+            legal = [a for a in ACTIONS if a in nb and not _is_wall(nb[a])]
+        if not legal:
+            return {}
+        ctx = _build_context(state, legal)
+        scores = {a: self._score(ctx, a) for a in legal}
+        # The generator never immediately reverses (0/6464 training steps);
+        # zero the reverse action unless it is the only legal move, so that
+        # policy-guided beam/best-first searches do not waste branches on
+        # U-turn oscillations.
+        if ctx["prev"] is not None and len(legal) > 1:
+            back = OPP[ctx["prev"]]
+            # (the G-neighbor override must win even if G lies behind us)
+            if back in scores and back != ctx["gdir"]:
+                scores[back] = -math.inf
+        m = max(scores.values())
+        exps = {a: math.exp(s - m) for a, s in scores.items() if s > -math.inf}
+        z = sum(exps.values())
+        out = {a: 0.0 for a in legal}
+        for a, e in exps.items():
+            out[a] = float(e / z)
+        return out
+
+    # convenience: allow calling the policy directly
+    def __call__(self, level, state, legal_actions):
+        return self.action_probs(level, state, legal_actions)
+
+
+def _coerce_levels(training_data):
+    if training_data is None:
+        return []
+    if isinstance(training_data, str):
+        with open(training_data) as f:
+            training_data = json.load(f)
+    if isinstance(training_data, dict):
+        lv = training_data.get("levels")
+        return lv if isinstance(lv, list) else []
+    if isinstance(training_data, list):
+        return training_data
+    return []
+
+
+def make_policy(training_data: dict, config: dict | None = None):
+    """Fit the action-selection model on solved training levels."""
+    levels = _coerce_levels(training_data)
+    records = []
+    for lvl in levels:
+        if not isinstance(lvl, dict) or "grid" not in lvl or "solution" not in lvl:
+            continue
+        try:
+            records.extend(_simulate_level(lvl))
+        except Exception:
+            continue
+    return Policy(records)
+
+
+# --------------------------------------------------------------------------
+# self-validation (run: python3 analysis.py)
+# --------------------------------------------------------------------------
+
+def _self_test():
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    train_path = os.path.join(here, "data", "training_levels.json")
+    eval_path = os.path.join(here, "data", "public_eval_levels.json")
+    if not os.path.exists(train_path):
+        train_path = "data/training_levels.json"
+    if not os.path.exists(eval_path):
+        eval_path = "data/public_eval_levels.json"
+    with open(train_path) as f:
+        train = json.load(f)
+    with open(eval_path) as f:
+        ev = json.load(f)
+    budget = ev.get("budget", 95)
+
+    policy = make_policy(train)
+    print("=" * 72)
+    print("SELF-TEST  (fitted on %d training steps)" % policy.n_records)
+    print("=" * 72)
+
+    # ---- 1) training replay ----------------------------------------------
+    tot = 0
+    prob_sum = 0.0
+    by_type = Counter()
+    by_type_correct = Counter()
+    for lvl in train["levels"]:
+        grid = lvl["grid"]
+        H, W = len(grid), len(grid[0])
+        y, x = lvl["start"]
+        hist = []
+        for a in lvl["solution"]:
+            nb = {}
+            for b in ACTIONS:
+                ny, nx = y + DIRS[b][1], x + DIRS[b][0]
+                nb[b] = grid[ny][nx] if 0 <= ny < H and 0 <= nx < W else "#"
+            legal = [b for b in ACTIONS if nb[b] != "#"]
+            state = {
+                "cell": grid[y][x],
+                "neighbors": nb,
+                "previous_action": hist[-1] if hist else None,
+                "history": list(hist),
+                "history_tail": list(hist[-4:]),
+                "run_length_bucket": None,
+                "depth": len(hist),
+                "depth_mod": len(hist) % 4,
+                "depth_phase": None,
+                "legal_mask": {b: (b in legal) for b in ACTIONS},
+                "legal_actions": legal,
+            }
+            probs = policy.action_probs({}, state, legal)
+            p_true = probs.get(a, 0.0)
+            top = max(probs, key=lambda k: (probs[k], -ACTIONS.index(k)))
+            if hist:
+                if a == hist[-1]:
+                    t = "straight-legal"
+                elif nb.get(hist[-1]) == "#":
+                    t = "forced-corner"
+                else:
+                    t = "free-corner"
+            else:
+                t = "start"
+            if nb.get(a) == "G":
+                t = "g-adjacent"
+            by_type[t] += 1
+            by_type_correct[t] += int(top == a)
+            tot += 1
+            prob_sum += p_true
+            hist.append(a)
+            y, x = y + DIRS[a][1], x + DIRS[a][0]
+    print("\n[1] Training replay (%d levels, %d steps)" %
+          (len(train["levels"]), tot))
+    print("    mean P(true action)      : %.4f" % (prob_sum / tot))
+    print("    overall top-1 accuracy   : %.4f" %
+          (sum(by_type_correct.values()) / tot))
+    for t in ("start", "straight-legal", "forced-corner", "free-corner",
+              "g-adjacent"):
+        if by_type[t]:
+            print("    %-15s n=%-5d top-1=%.3f" %
+                  (t, by_type[t], by_type_correct[t] / by_type[t]))
+    # honest generalization estimate: structural contexts only (the damped
+    # tile/depth/tail tables memorize unique training contexts and do not
+    # transfer to unseen hidden states)
+    h_tot = 0
+    h_corr = 0
+    h_by = Counter()
+    h_byc = Counter()
+    for lvl in train["levels"]:
+        grid = lvl["grid"]
+        H, W = len(grid), len(grid[0])
+        y, x = lvl["start"]
+        hist = []
+        for a in lvl["solution"]:
+            nb = {}
+            for b in ACTIONS:
+                ny, nx = y + DIRS[b][1], x + DIRS[b][0]
+                nb[b] = grid[ny][nx] if 0 <= ny < H and 0 <= nx < W else "#"
+            legal = [b for b in ACTIONS if nb[b] != "#"]
+            ctx = _build_context(
+                {
+                    "cell": grid[y][x], "neighbors": nb,
+                    "previous_action": hist[-1] if hist else None,
+                    "history": list(hist), "history_tail": list(hist[-4:]),
+                    "run_length_bucket": None, "depth": len(hist),
+                    "depth_mod": len(hist) % 4, "depth_phase": None,
+                    "legal_mask": {b: (b in legal) for b in ACTIONS},
+                    "legal_actions": legal,
+                }, legal)
+            scores = {}
+            for b in legal:
+                s = policy.base[b]
+                if ctx["prev"] is not None:
+                    s += policy.tables["prev_sleg"].weight(
+                        "p=%s|s=%d" % (ctx["prev"],
+                                       int(ctx["straight_legal"])), b)
+                    s += policy.tables["prev_run"].weight(
+                        "p=%s|r=%d|s=%d" % (ctx["prev"], ctx["run"],
+                                            int(ctx["straight_legal"])), b)
+                    s += policy.tables["turns_sleg"].weight(
+                        "t=%d|s=%d" % (ctx["turns"],
+                                       int(ctx["straight_legal"])), b)
+                if ctx["gdir"] is not None:
+                    s += policy.tables["gdir"].weight(
+                        "g=%s" % ctx["gdir"], b)
+                scores[b] = s
+            if (ctx["prev"] is not None and len(legal) > 1
+                    and OPP[ctx["prev"]] in scores):
+                scores[OPP[ctx["prev"]]] = -1e9
+            top = max(scores, key=lambda b: (scores[b], -ACTIONS.index(b)))
+            if hist:
+                t = ("straight-legal" if a == hist[-1]
+                     else ("forced-corner" if nb.get(hist[-1]) == "#"
+                           else "free-corner"))
+            else:
+                t = "start"
+            if nb.get(a) == "G":
+                t = "g-adjacent"
+            h_by[t] += 1
+            h_byc[t] += int(top == a)
+            h_tot += 1
+            h_corr += int(top == a)
+            hist.append(a)
+            y, x = y + DIRS[a][1], x + DIRS[a][0]
+    print("    honest structural-only top-1 (no memorized tile/tail tables):")
+    print("      overall %.4f | " % (h_corr / h_tot) + " | ".join(
+        "%s=%.3f" % (t, h_byc[t] / h_by[t])
+        for t in ("start", "straight-legal", "forced-corner", "free-corner",
+                  "g-adjacent") if h_by[t]))
+    print("    (start steps are ~uniform by construction: 6/260 forced by")
+    print("     walls, 254/260 have 4 legal actions; free-corner direction is")
+    print("     an irreducible ~50/50 coin flip in the generator.)")
+
+    # ---- 2) fitted weight report ------------------------------------------
+    print("\n[2] Fitted compound-context weights "
+          "(max |W|, mean |W|, effective after damping)")
+    for name in _STRUCTURAL + _NOISY:
+        t = policy.tables[name]
+        mx, av = t.stats()
+        damp = 1.0 if name in _STRUCTURAL else DAMP
+        print("    %-11s contexts=%-6d max|W|=%7.3f mean|W|=%6.3f "
+              "x%.2f -> eff max %6.3f" %
+              (name, t.n_keys, mx, av, damp, damp * mx))
+    print("    Tile/depth/tail groups (cell, neigh, dphase, dmod, tail) carry")
+    print("    no decision signal: ~0 weights for unseen contexts, <= ~0.5")
+    print("    memorization for seen ones, further damped by x0.1.")
+
+    # ---- 3) local DFS-with-backtracking search on public levels ------------
+    print("\n[3] Local DFS-with-backtracking on public levels "
+          "(budget=%d expansions)" % budget)
+
+    def dfs_search(lvl):
+        grid = lvl["grid"]
+        H, W = len(grid), len(grid[0])
+        start = tuple(lvl["start"])
+        goal = tuple(lvl["goal"])
+        expansions = 0
+        stack = [[start, []]]
+        visited = {start}
+        while stack and expansions < budget:
+            pos, hist = stack[-1]
+            if pos == goal:
+                return expansions, True, hist
+            y, x = pos
+            nb = {}
+            for b in ACTIONS:
+                ny, nx = y + DIRS[b][1], x + DIRS[b][0]
+                nb[b] = grid[ny][nx] if 0 <= ny < H and 0 <= nx < W else "#"
+            legal = [b for b in ACTIONS if nb[b] != "#"]
+            state = {
+                "cell": grid[y][x],
+                "neighbors": nb,
+                "previous_action": hist[-1] if hist else None,
+                "history": list(hist),
+                "history_tail": list(hist[-4:]),
+                "run_length_bucket": None,
+                "depth": len(hist),
+                "depth_mod": len(hist) % 4,
+                "depth_phase": None,
+                "legal_mask": {b: (b in legal) for b in ACTIONS},
+                "legal_actions": legal,
+            }
+            probs = policy.action_probs({}, state, legal)
+            acts = sorted(legal, key=lambda b: (-probs.get(b, 0.0),
+                                                 ACTIONS.index(b)))
+            pushed = False
+            for b in acts:
+                n = (y + DIRS[b][1], x + DIRS[b][0])
+                if n not in visited:
+                    visited.add(n)
+                    stack.append([n, hist + [b]])
+                    pushed = True
+                    break
+            expansions += 1
+            if not pushed:
+                stack.pop()
+        return expansions, False, None
+
+    for lvl in ev["levels"]:
+        e, ok, hist = dfs_search(lvl)
+        print("    %-12s expansions=%-4d solved=%s pathlen=%s" %
+              (lvl["id"], e, ok, len(hist) if hist else "-"))
+
+    # ---- 4) beam-search reference (cumulative path probability) -----------
+    print("\n[4] Reference beam search (beam=4, ranked by cumulative path")
+    print("    probability, max_depth cap, expansions = nodes expanded)")
+
+    def beam_search(lvl, beam=4):
+        grid = lvl["grid"]
+        H, W = len(grid), len(grid[0])
+        start = tuple(lvl["start"])
+        goal = tuple(lvl["goal"])
+        maxd = lvl["max_depth"]
+        expansions = 0
+        current = [(start, [], 1.0)]   # (pos, hist, cumulative prob)
+        while current and expansions < budget:
+            cands = []
+            for pos, hist, cp in current:
+                if pos == goal:
+                    return expansions, True, hist
+                if len(hist) >= maxd:
+                    continue
+                y, x = pos
+                nb = {}
+                for b in ACTIONS:
+                    ny, nx = y + DIRS[b][1], x + DIRS[b][0]
+                    nb[b] = grid[ny][nx] if 0 <= ny < H and 0 <= nx < W else "#"
+                legal = [b for b in ACTIONS if nb[b] != "#"]
+                state = {
+                    "cell": grid[y][x], "neighbors": nb,
+                    "previous_action": hist[-1] if hist else None,
+                    "history": list(hist), "history_tail": list(hist[-4:]),
+                    "run_length_bucket": None, "depth": len(hist),
+                    "depth_mod": len(hist) % 4, "depth_phase": None,
+                    "legal_mask": {b: (b in legal) for b in ACTIONS},
+                    "legal_actions": legal,
+                }
+                probs = policy.action_probs({}, state, legal)
+                for b in legal:
+                    cands.append(((y + DIRS[b][1], x + DIRS[b][0]),
+                                  hist + [b], cp * probs[b]))
+            expansions += len(current)
+            if not cands:
+                break
+            cands.sort(key=lambda c: (-c[2],))
+            seen = set()
+            current = []
+            for c in cands:
+                if c[0] in seen:
+                    continue
+                seen.add(c[0])
+                current.append(c)
+                if len(current) >= beam:
+                    break
+        return expansions, False, None
+
+    for lvl in ev["levels"]:
+        e, ok, hist = beam_search(lvl)
+        print("    %-12s expansions=%-4d solved=%s pathlen=%s" %
+              (lvl["id"], e, ok, len(hist) if hist else "-"))
+    print("\nNote: both searches above are local stand-in simulations; the")
+    print("actual scorer owns its own search and expansion accounting.")
+
+
+if __name__ == "__main__":
+    _self_test()

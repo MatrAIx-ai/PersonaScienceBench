@@ -1,0 +1,562 @@
+"""
+Single-cell RNA-seq integrated analysis (asibench, B3 goal-only task).
+
+Pipeline (NumPy/SciPy only, no domain toolkits):
+
+  counts.npy (n_cells x n_genes) + system_info.json
+  1. median library-size normalization + log1p
+  2. HVG selection (top-100 by variance) + z-score
+  3. PCA via SVD (15 components)
+  4. KNN graph (k=10, Euclidean, symmetrized) on PCA embedding
+  5. Modularity-style graph clustering: hand-implemented Louvain (gamma=1)
+     refined to exactly n_clusters by marker-scored k-means split of the
+     largest Louvain community (clusters.npy, int32)
+  6. Pseudotime: kNN(k=15)+MST connected trajectory graph, Dijkstra
+     shortest-path distance from the PC1-min root cell, min-max -> [0,1]
+     (pseudotime.npy, float64). Root convention: origin = lowest PC1 cell.
+  7. Markers: per-cluster one-vs-rest Welch t-stat -> per-gene max ->
+     full ranked gene indices (de_genes.json)
+  8. GRN: directed ridge-regression scores among the first n_tf_genes
+     TF columns; grn_scores[i,j] = edge i->j (i regulator, j target),
+     diagonal zeroed (grn_scores.npy, float64 n_tf x n_tf).
+  9. method_choices.json documenting every step.
+"""
+import json
+import os
+import time
+
+import numpy as np
+from scipy.cluster.vq import kmeans2
+from scipy.linalg import svd
+from scipy.sparse import csgraph
+from scipy.sparse import diags
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
+from scipy.spatial.distance import pdist, squareform
+
+# ---------------------------------------------------------------------------
+# Configuration / determinism
+# ---------------------------------------------------------------------------
+SEED = 42
+DATA_DIR = "data"
+N_HVG = 100          # highly variable genes kept for PCA
+N_PC = 15            # principal components retained
+KNN_K_CLUSTER = 10   # neighbours for the clustering KNN graph
+KNN_K_TRAJ = 15      # neighbours for the trajectory graph
+LOUVAIN_GAMMA = 1.0  # modularity resolution
+RIDGE_ALPHA = 1.0    # L2 penalty for the directed GRN regression
+N_GRN_RESTARTS_CLUSTER = 200  # k-means restarts during Louvain refinement
+DETECT_T = 5.0       # |t| threshold for calling a 'strong' marker gene
+MIN_CLUSTER_SIZE = 20  # reject k-means splits with any tiny cluster
+
+
+def log_step(msg):
+    print(f"[analysis] {msg}", flush=True)
+
+
+def load_inputs():
+    info = json.load(open(os.path.join(DATA_DIR, "system_info.json")))
+    X = np.load(os.path.join(DATA_DIR, "counts.npy")).astype(np.float64)
+    assert X.ndim == 2
+    n_cells, n_genes = X.shape
+    n_tf = int(info["n_tf_genes"])
+    n_clusters = int(info["n_clusters"])
+    tf_idx = list(info["tf_gene_indices"])
+    assert n_cells == info["n_cells"] and n_genes == info["n_genes"]
+    assert list(range(n_tf)) == tf_idx, "TF genes must be the first columns"
+    if np.isnan(X).any() or np.isinf(X).any():
+        raise ValueError("counts contain NaN/inf")
+    return X, info, n_cells, n_genes, n_tf, n_clusters, tf_idx
+
+
+def normalize_log(X):
+    """Median library-size normalization then log1p."""
+    lib = X.sum(1)
+    median_lib = np.median(lib)
+    Xn = X / lib[:, None] * median_lib
+    return np.log1p(Xn)
+
+
+def pca_embedding(L, n_hvg, n_pc):
+    """HVG by variance + z-score + truncated SVD -> PC scores."""
+    var = L.var(0)
+    hvg = np.argsort(var)[::-1][:n_hvg]
+    Lh = L[:, hvg]
+    mean = Lh.mean(0)
+    std = Lh.std(0) + 1e-9
+    Z = (Lh - mean) / std
+    U, S, Vt = svd(Z, full_matrices=False)
+    P = U[:, : n_pc] * S[: n_pc]
+    return P, hvg
+
+
+def knn_graph(P, k):
+    """Symmetrized kNN graph. Unweighted adjacency (weight=1 on edges)."""
+    n = P.shape[0]
+    tree = cKDTree(P)
+    dist, neigh = tree.query(P, k=k + 1)
+    neigh = neigh[:, 1:].astype(np.int64)
+    rows = np.repeat(np.arange(n), k)
+    cols = neigh.ravel()
+    W = csr_matrix((np.ones(neigh.size), (rows, cols)), shape=(n, n))
+    W = W.maximum(W.T)
+    W = csr_matrix(W)
+    W.setdiag(0.0)
+    W.eliminate_zeros()
+    return W
+
+
+def louvain(W, gamma=1.0, seed=SEED):
+    """
+    Hand-implemented Louvain modularity maximization (Blondel et al. 2008).
+    Local-moving phase using the exact delta-Q formula with maintained
+    community sum-of-degrees and internal-weight arrays, then graph
+    aggregation, iterated to convergence. Returns int labels for original nodes.
+    """
+    Wg = csr_matrix(W)
+    n_orig = Wg.shape[0]
+    final = np.arange(n_orig)
+    rr = np.random.default_rng(seed)
+    while True:
+        ng = Wg.shape[0]
+        K = np.asarray(Wg.sum(1)).ravel()
+        M = 0.5 * K.sum()          # total edge weight
+        comm = np.arange(ng)
+        totdeg = K.copy()
+        inw = np.zeros(ng)
+        for u in range(ng):
+            inw[u] += Wg[u].sum()
+        inw /= 2.0                 # symmetric matrix counts each edge twice
+        moved = True
+        passes = 0
+        while moved and passes < 100:
+            moved = False
+            passes += 1
+            order = rr.permutation(ng)
+            for u in order:
+                r0, r1 = Wg.indptr[u], Wg.indptr[u + 1]
+                if r0 == r1:
+                    continue
+                c0 = comm[u]
+                ki = K[u]
+                k_in = {}
+                for j in range(r0, r1):
+                    cv = comm[Wg.indices[j]]
+                    k_in[cv] = k_in.get(cv, 0.0) + Wg.data[j]
+                cands = set(k_in.keys()) | {c0}
+                bestc = c0
+                bestg = 0.0
+                for c1 in cands:
+                    if c1 == c0:
+                        continue
+                    kiu = k_in.get(c1, 0.0)
+                    kiu0 = k_in.get(c0, 0.0)
+                    Qc = (inw[c0] - gamma * totdeg[c0] ** 2 / (2 * M)) + \
+                         (inw[c1] - gamma * totdeg[c1] ** 2 / (2 * M))
+                    Qn = (inw[c0] - kiu0 - gamma * (totdeg[c0] - ki) ** 2 / (2 * M)) + \
+                         (inw[c1] + kiu - gamma * (totdeg[c1] + ki) ** 2 / (2 * M))
+                    if (Qn - Qc) / M > bestg + 1e-12:
+                        bestg = (Qn - Qc) / M
+                        bestc = c1
+                if bestc != c0:
+                    kiu0 = k_in.get(c0, 0.0)
+                    kiu = k_in.get(bestc, 0.0)
+                    inw[c0] -= kiu0
+                    totdeg[c0] -= ki
+                    inw[bestc] += kiu
+                    totdeg[bestc] += ki
+                    comm[u] = bestc
+                    moved = True
+        labels, inv = np.unique(comm, return_inverse=True)
+        nnew = len(labels)
+        final = inv[final]
+        if nnew == ng:
+            break
+        coo = Wg.tocoo()
+        Ag = csr_matrix((coo.data, (inv[coo.row], inv[coo.col])),
+                        shape=(nnew, nnew))
+        Ag = (Ag + Ag.T) / 2
+        Ag.setdiag(0.0)
+        Ag.eliminate_zeros()
+        Wg = Ag
+    return final
+
+
+def modularity(W, labels):
+    """Modularity of a partition (diagnostic)."""
+    m = W.sum()
+    tot = np.bincount(labels, weights=np.asarray(W.sum(1)).ravel(),
+                      minlength=int(labels.max()) + 1)
+    coo = W.tocoo()
+    inw = 0.0
+    for a, b, w in zip(coo.row, coo.col, coo.data):
+        if labels[a] == labels[b]:
+            inw += w
+    inw /= 2.0
+    return (inw - (tot ** 2).sum() / (2 * m)) / m
+
+
+def one_vs_rest_t(L, labels):
+    """Per-cluster one-vs-rest Welch t-statistics (n_clusters x n_genes)."""
+    n_cl = int(labels.max()) + 1
+    T = np.zeros((n_cl, L.shape[1]))
+    for c in range(n_cl):
+        a = L[labels == c]
+        b = L[labels != c]
+        ma, mb = a.mean(0), b.mean(0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            va = a.var(0, ddof=1) if a.shape[0] > 1 else np.zeros(L.shape[1])
+            vb = b.var(0, ddof=1) if b.shape[0] > 1 else np.zeros(L.shape[1])
+            se = np.sqrt(va / a.shape[0] + vb / b.shape[0]) + 1e-3
+            T[c] = np.nan_to_num((ma - mb) / se)
+    return T
+
+
+def strong_marker_counts(L, labels, t_threshold=DETECT_T):
+    """# genes whose best one-vs-rest cluster is c with t > threshold."""
+    T = one_vs_rest_t(L, labels)
+    best = T.max(0)
+    argm = T.argmax(0)
+    return [int(((argm == c) & (best > t_threshold)).sum())
+            for c in range(int(labels.max()) + 1)]
+
+
+def refine_to_n_clusters(L, P, W, labels, n_clusters):
+    """
+    Force exactly n_clusters communities, graph-consistently:
+      - more than n_clusters: merge the two smallest communities (min
+        modularity-loss heuristic) until n_clusters remain;
+      - fewer than n_clusters: split the LARGEST community into
+        n_clusters - C + 1 sub-clusters by k-means on that community's PCA
+        points, choosing the restart with the best marker-balance score
+        (max of the min #strong markers), so no weak splinter cluster is
+        produced. The tight Louvain communities stay intact.
+    """
+    C = int(labels.max()) + 1
+    if C > n_clusters:
+        while int(labels.max()) + 1 > n_clusters:
+            sizes = np.bincount(labels)
+            small = np.argsort(sizes)[:2]
+            labels[labels == small[1]] = small[0]
+            _, inv = np.unique(labels, return_inverse=True)
+            labels = inv
+        return labels
+    if C < n_clusters:
+        k_sub = n_clusters - C + 1
+        sizes = np.bincount(labels)
+        big = int(np.argmax(sizes))
+        idx = np.where(labels == big)[0]
+        if len(idx) < k_sub * 4:
+            # community too small to split -> plain k-means fallback
+            _, labels = kmeans2(P, n_clusters, minit="++", seed=SEED)
+            return labels
+        best_trial = None
+        best_min = -1
+        best_st = None
+        for seed in range(N_GRN_RESTARTS_CLUSTER):
+            _, sub = kmeans2(P[idx], k_sub, minit="++", seed=seed)
+            trial = labels.copy()
+            trial[idx] = int(labels.max()) + 1 + sub
+            _, inv = np.unique(trial, return_inverse=True)
+            trial = inv
+            trial_sizes = np.bincount(trial)
+            if trial_sizes.min() < MIN_CLUSTER_SIZE:
+                continue  # reject degenerate (tiny) sub-clusters
+            st = strong_marker_counts(L, trial)
+            mn = min(st)
+            if mn > best_min:
+                best_min = mn
+                best_trial = trial
+                best_st = st
+        if best_trial is None:
+            _, best_trial = kmeans2(P, n_clusters, minit="++", seed=SEED)
+        log_step(f"    Louvain-refine: split community of {len(idx)} cells "
+                 f"into {k_sub}; strong marker counts = {best_st}")
+        return best_trial
+    return labels
+
+
+def pseudotime(P):
+    """
+    Graph trajectory pseudotime.
+    Graph: kNN(k=KNN_K_TRAJ, unit weights) + MST (over the full Euclidean
+    PC-distance matrix) to guarantee a single connected component.
+    Root = cell with the minimum PC1 coordinate (documented origin choice);
+    pseudotime = Dijkstra shortest-path distance from root, min-max -> [0,1].
+    """
+    n = P.shape[0]
+    W = knn_graph(P, KNN_K_TRAJ)
+    Dfull = squareform(pdist(P, "euclidean"))
+    MST = csgraph.minimum_spanning_tree(csr_matrix(Dfull))
+    Waug = csr_matrix(W.maximum(MST))
+    Waug.setdiag(0.0)
+    Waug.eliminate_zeros()
+    ncomp, _ = csgraph.connected_components(Waug, directed=False)
+    if ncomp != 1:
+        raise RuntimeError("trajectory graph not connected")
+    root = int(np.argmin(P[:, 0]))
+    dist = csgraph.shortest_path(Waug, directed=False, indices=root,
+                                 unweighted=False)
+    if not np.isfinite(dist).all():
+        raise RuntimeError("shortest path contains unreachable cells")
+    pt = dist / dist.max()
+    return pt, root
+
+
+def marker_ranking(L, labels):
+    """Full ranked gene-index list by max one-vs-rest Welch t across clusters."""
+    T = one_vs_rest_t(L, labels)
+    agg = T.max(0)
+    order = np.argsort(-agg, kind="stable")
+    return [int(i) for i in order]
+
+
+def grn_scores(L, n_tf, alpha=RIDGE_ALPHA):
+    """
+    Directed TF x TF regulatory scores.
+    Features: z-scored log-normalized TF columns (0..n_tf-1) + intercept.
+    For each target j, ridge-regress target on all *other* TF predictors.
+    grn[i, j] = standardized coefficient of regulator i in the model for
+    target j  =>  edge i -> j  (convention: row=regulator, col=target).
+    Diagonal zeroed.
+    """
+    TZ = L[:, :n_tf]
+    TZ = (TZ - TZ.mean(0)) / (TZ.std(0) + 1e-9)
+    n = TZ.shape[0]
+    G = np.zeros((n_tf, n_tf))
+    for j in range(n_tf):
+        y = TZ[:, j]
+        preds = [i for i in range(n_tf) if i != j]
+        Xm = TZ[:, preds]
+        Xa = np.hstack([Xm, np.ones((n, 1))])
+        A = Xa.T @ Xa
+        bvec = Xa.T @ y
+        nf = Xm.shape[1]
+        A[np.arange(nf), np.arange(nf)] += alpha   # L2 on features only
+        beta = np.linalg.solve(A, bvec)
+        G[preds, j] = beta[:nf]
+    np.fill_diagonal(G, 0.0)
+    return G
+
+
+def lasso_comparison(L, n_tf, lam=0.02, max_iter=3000, tol=1e-7):
+    """
+    Optional sparse-penalty (Lasso) variant via coordinate descent: used only
+    as a sanity check of whether sparsification changes the top inferred edges.
+    """
+    TZ = L[:, :n_tf]
+    TZ = (TZ - TZ.mean(0)) / (TZ.std(0) + 1e-9)
+    n = TZ.shape[0]
+    Gl = np.zeros((n_tf, n_tf))
+    for j in range(n_tf):
+        preds = [i for i in range(n_tf) if i != j]
+        Xm = TZ[:, preds]
+        nf = len(preds)
+        beta = np.zeros(nf)
+        y = TZ[:, j]
+        y_cent = y - y.mean()
+        Xc = Xm - Xm.mean(0)
+        for _ in range(max_iter):
+            beta_old = beta.copy()
+            for p in range(nf):
+                r = y_cent - Xc @ beta + Xc[:, p] * beta[p]
+                rho = Xc[:, p] @ r
+                xx = Xc[:, p] @ Xc[:, p]
+                beta[p] = np.sign(rho) * max(abs(rho) - lam, 0.0) / max(xx, 1e-12)
+            if np.max(np.abs(beta - beta_old)) < tol:
+                break
+        Gl[preds, j] = beta
+    np.fill_diagonal(Gl, 0.0)
+    return Gl
+
+
+def write_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    t0 = time.time()
+    log_step("loading inputs")
+    X, info, n_cells, n_genes, n_tf, n_clusters, tf_idx = load_inputs()
+
+    log_step("step 1: median normalization + log1p")
+    L = normalize_log(X)
+
+    log_step("step 2-3: HVG + z-score + PCA (15 PCs)")
+    P, hvg = pca_embedding(L, N_HVG, N_PC)
+
+    log_step("step 4: KNN graph (k=%d)" % KNN_K_CLUSTER)
+    W = knn_graph(P, KNN_K_CLUSTER)
+
+    log_step("step 5: Louvain modularity clustering (gamma=%.1f)" % LOUVAIN_GAMMA)
+    lv = louvain(W, gamma=LOUVAIN_GAMMA, seed=SEED)
+    Q_lv = modularity(W, lv)
+    log_step(f"    Louvain communities = {int(lv.max()) + 1}, sizes = "
+             f"{np.bincount(lv).tolist()}, modularity Q = {Q_lv:.4f}")
+
+    log_step("step 5b: refine to exactly n_clusters=%d" % n_clusters)
+    clusters = refine_to_n_clusters(L, P, W, lv, n_clusters)
+    cl_sizes = np.bincount(clusters).tolist()
+    cl_markers = strong_marker_counts(L, clusters)
+    log_step(f"    final clusters: sizes = {cl_sizes}, "
+             f"strong markers = {cl_markers}")
+
+    # optional robustness comparison: plain k-means 4-partition
+    _, km4 = kmeans2(P, n_clusters, minit="++", seed=SEED)
+    km4_sizes = np.bincount(km4).tolist()
+    km4_markers = strong_marker_counts(L, km4)
+
+    log_step("step 6: pseudotime (kNN+MST graph, Dijkstra, root=PC1-min)")
+    pt, root_cell = pseudotime(P)
+    log_step(f"    root cell = {root_cell} (min PC1), "
+             f"pseudotime range [{pt.min():.3f}, {pt.max():.3f}]")
+
+    log_step("step 7: marker ranking")
+    ranking = marker_ranking(L, clusters)
+
+    log_step("step 8: directed ridge GRN scores (n_tf=%d)" % n_tf)
+    G = grn_scores(L, n_tf, alpha=RIDGE_ALPHA)
+    diag_max = float(np.abs(np.diag(G)).max())
+
+    # optional lasso sanity check
+    try:
+        Gl = lasso_comparison(L, n_tf)
+    except Exception as exc:      # defensive: never block main outputs
+        log_step(f"    lasso comparison skipped: {exc}")
+        Gl = None
+    top8_ridge = {(int(k // n_tf), int(k % n_tf)) for k in
+                  np.argsort(-np.abs(G).ravel(), kind="stable")[:8]}
+    if Gl is not None:
+        top8_lasso = {(int(k // n_tf), int(k % n_tf)) for k in
+                      np.argsort(-np.abs(Gl).ravel(), kind="stable")[:8]}
+        overlap = len(top8_ridge & top8_lasso) / len(top8_ridge)
+        log_step(f"    top-8 inferred edges: ridge-vs-lasso overlap = "
+                 f"{overlap:.2%}")
+    else:
+        overlap = None
+
+    # ------------------------- write outputs ------------------------------
+    np.save("clusters.npy", clusters.astype(np.int32))
+    np.save("pseudotime.npy", pt.astype(np.float64))
+    np.save("grn_scores.npy", G.astype(np.float64))
+    write_json("de_genes.json", {"gene_indices": ranking})
+
+    top_edges = []
+    order = np.argsort(-np.abs(G).ravel(), kind="stable")
+    for k in order[:10]:
+        i, j = int(k // n_tf), int(k % n_tf)
+        top_edges.append({"regulator": i, "target": j,
+                          "score": round(float(G[i, j]), 5)})
+
+    method_choices = {
+        "task": "single-cell RNA-seq: clusters, pseudotime, markers, TF GRN",
+        "data": {
+            "counts.npy": {"shape": [n_cells, n_genes], "dtype": str(X.dtype)},
+            "system_info.json": {"n_cells": n_cells, "n_genes": n_genes,
+                                 "n_clusters": n_clusters,
+                                 "n_tf_genes": n_tf,
+                                 "tf_gene_indices": tf_idx}
+        },
+        "steps": {
+            "normalization": {
+                "method": "median library-size normalization + log1p",
+                "justification": "standard size-factor normalization for "
+                                 "droplet counts; log stabilizes variance"},
+            "hvg": {
+                "method": f"top-{N_HVG} genes by variance of log counts",
+                "justification": "focus on informative genes; standard "
+                                 "variance-based HVG"},
+            "pca": {
+                "method": f"truncated SVD on z-scored HVG matrix, {N_PC} PCs",
+                "justification": "denoise/decorrelate before graph"},
+            "clustering": {
+                "method": (f"KNN(k={KNN_K_CLUSTER}) graph + hand-implemented "
+                           f"Louvain modularity (gamma={LOUVAIN_GAMMA}, "
+                           f"seed={SEED}), refined to exactly "
+                           f"n_clusters={n_clusters}"),
+                "detail": (f"Louvain found {int(lv.max()) + 1} natural "
+                           "communities; the largest community was split into "
+                           f"{n_clusters - (int(lv.max()) + 1) + 1} "
+                           "sub-clusters by k-means (kmeans++, "
+                           "marker-balance-scored restarts) to honor the "
+                           "metadata n_clusters."),
+                "result": {"sizes": cl_sizes,
+                           "strong_marker_counts": cl_markers,
+                           "modularity_Q": round(float(Q_lv), 4)},
+                "robustness_check": {
+                    "kmeans_only_4partition": {
+                        "sizes": km4_sizes,
+                        "strong_marker_counts": km4_markers}},
+                "justification": "no Louvain/Leiden library available; "
+                                 "Louvain directly maximizes modularity on "
+                                 "the KNN graph"},
+            "pseudotime": {
+                "method": (f"kNN(k={KNN_K_TRAJ}) + MST-connected trajectory "
+                           "graph; Dijkstra shortest path from root"),
+                "root_convention": "root = cell with minimum PC1 "
+                                   "(documented orientation assumption; "
+                                   "sign is arbitrary)",
+                "normalization": "min-max to [0,1]",
+                "result": {"root_cell": root_cell,
+                           "corr_with_PC1": round(
+                               float(np.corrcoef(pt, P[:, 0])[0, 1]), 3)}},
+            "markers": {
+                "method": "per-cluster one-vs-rest Welch t-statistic on "
+                          "log-normalized counts; per-gene max over clusters",
+                "output": f"full ranked list of all {n_genes} gene indices, "
+                          "descending by aggregate score",
+                "top10": ranking[:10]},
+            "grn": {
+                "method": (f"directed ridge regression (L2 alpha="
+                           f"{RIDGE_ALPHA}) of each target TF on the other "
+                           "TFs (z-scored log counts)+intercept; coefficient "
+                           "of regulator i in target j's model -> "
+                           "grn_scores[i,j] = edge i->j"),
+                "dimensions": [n_tf, n_tf],
+                "diagonal": "zeroed (ignored)",
+                "top10_edges_i_to_j": top_edges,
+                "lasso_comparison": {
+                    "top8_edge_overlap": (round(overlap, 3)
+                                          if Gl is not None else None),
+                    "note": "coordinate-descent Lasso used only to sanity-"
+                            "check whether sparsification changes top edges"}}
+        },
+        "determinism": {
+            "seed": SEED,
+            "note": "all random draws use fixed seeds (default_rng + "
+                    "kmeans2 seed) -> re-run reproduces identical outputs"}
+    }
+    write_json("method_choices.json", method_choices)
+
+    # ------------------------- verification report ------------------------
+    print("\n" + "=" * 60)
+    print("VERIFICATION REPORT")
+    print("=" * 60)
+    saved_cl = np.load("clusters.npy")
+    saved_pt = np.load("pseudotime.npy")
+    saved_grn = np.load("grn_scores.npy")
+    print("clusters.npy   :", saved_cl.shape, saved_cl.dtype,
+          "sizes", np.bincount(saved_cl).tolist())
+    print("pseudotime.npy :", saved_pt.shape, saved_pt.dtype,
+          "range [%.3f, %.3f]" % (saved_pt.min(), saved_pt.max()))
+    print("grn_scores.npy :", saved_grn.shape, saved_grn.dtype,
+          "|max diag| =", float(np.abs(np.diag(saved_grn)).max()))
+    print("de_genes.json  : %d ranked gene indices, first 10 = %s"
+          % (len(ranking), ranking[:10]))
+    print("grn |scores|   : min=%.4f median=%.4f max=%.4f"
+          % (np.abs(G).min(), np.median(np.abs(G)), np.abs(G).max()))
+    print("cluster strong markers:", cl_markers)
+    print("top-10 inferred edges (regulator->target, score):")
+    for e in top_edges[:10]:
+        print("   %2d -> %2d : %.4f" % (e["regulator"], e["target"],
+                                        e["score"]))
+    print("elapsed: %.2fs" % (time.time() - t0))
+
+
+if __name__ == "__main__":
+    main()

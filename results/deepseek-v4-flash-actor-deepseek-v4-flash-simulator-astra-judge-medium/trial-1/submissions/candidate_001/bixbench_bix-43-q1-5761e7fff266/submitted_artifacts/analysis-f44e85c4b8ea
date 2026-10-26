@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+bix43_analysis.py
+=================
+Question (bixbench:bix-43-q1):
+  When comparing CBD/cisplatin combination treatment to the DMSO control, which
+  cellular process shows the lowest adjusted p-value in an enrichment analysis
+  using the gseapy package and GO_Biological_Process_2021 as the gene set library?
+
+Pipeline (approved plan):
+  Step 1  DE (DESeq2-style NB regression, Python/statsmodels)
+          - Groups (hard-coded from sample_layout labels):
+              DMSO control          = Group "DMSO"                    -> cols 3_1,3_2,3_3
+              CBD/cisplatin combo   = Group "Cisplatin_IC50_CBD_IC50" -> cols 9_1,9_2,9_3
+            (Serum_starvation_16h variants are out of scope per the question wording)
+          - Pre-filter: drop all-zero genes; keep row sum >= 10 (DESeq2 default).
+          - Normalization: DESeq2 median-of-ratios size factors over ALL 30 samples,
+            used as log-offset.
+          - Per-gene NB: log(mu)=log(sf)+b0+b1*I(combo); dispersion alpha estimated
+            per gene by NB2 method-of-moments, then fixed-alpha NB GLM; Wald z=b1/SE.
+          - BH-adjusted p-values reported (documentation).
+  Step 2  Map ENSG -> gene_name; drop unmapped; collapse duplicate gene names by
+          largest |Wald stat|; write unique rank file (gene,score), sorted desc.
+  Step 3  gseapy.prerank with gene_sets='GO_Biological_Process_2021'
+          (min_size=15, max_size=500, permutation_num=1000, seed=42, no_plot=True).
+          Answer = Term with the globally lowest FDR (adjusted p-value).
+
+ENV NOTE: gseapy and the Enrichr library need network access, unavailable in this
+sandbox (pip/HTTP fail on DNS). Step 1-2 run fully here; Step 3 runs only if gseapy
+is importable. On the provisioned runner this script is fully end-to-end.
+"""
+import os, sys, warnings, time
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(OUT_DIR, "data")
+
+GROUP_COLS = {
+    "DMSO":                    ["3_1", "3_2", "3_3"],
+    "Cisplatin_IC50_CBD_IC50": ["9_1", "9_2", "9_3"],
+}
+MIN_ROWS = 10
+ALPHA_FLOOR = 1e-3
+RANK_FILE = os.path.join(OUT_DIR, "rank_comb_vs_DMSO_Wald.tsv")
+DE_FILE   = os.path.join(OUT_DIR, "de_comb_vs_DMSO.csv")
+SF_FILE   = os.path.join(OUT_DIR, "size_factors_all30.csv")
+GSEA_OUT  = os.path.join(OUT_DIR, "gseapy_prerank_GO_BP_2021")
+GSEA_TSV  = os.path.join(OUT_DIR, "gseapy_prerank_GO_BP_2021_results.tsv")
+
+# ---------------- Step 0: load & validate ---------------
+counts = pd.read_csv(os.path.join(DATA_DIR, "counts_raw_unfiltered.csv"), index_col=0)
+layout = pd.read_csv(os.path.join(DATA_DIR, "sample_layout.csv"))
+mapping = pd.read_csv(os.path.join(DATA_DIR, "ensg_to_gene_name.tsv"), sep="\t")
+assert list(counts.columns) == [f"{i}_{r}" for i in range(1, 11) for r in range(1, 4)]
+layout["colkey"] = layout["SampleID"].str.replace("-", "_", regex=False)
+assert set(layout["colkey"]) == set(counts.columns)
+
+ctrl_cols, trt_cols = GROUP_COLS["DMSO"], GROUP_COLS["Cisplatin_IC50_CBD_IC50"]
+all6 = ctrl_cols + trt_cols
+print(f"[0] counts: {counts.shape[0]} x {counts.shape[1]} | "
+      f"{len(trt_cols)} combo vs {len(ctrl_cols)} DMSO samples")
+
+# ---------------- Step 1a: size factors (all 30 samples) ---------------
+geomean = np.exp(np.log(counts.where(counts > 0)).mean(axis=1)).fillna(0.0)
+gm_pos = geomean[geomean > 0]
+ratios = counts.loc[gm_pos.index].div(gm_pos, axis=0)
+size_factors = ratios.median(axis=0)
+pd.Series(size_factors).to_csv(SF_FILE, header=["sizeFactor"])
+print("[1a] median-of-ratios size factors (all 30):",
+      {k: round(float(v), 3) for k, v in size_factors.items()})
+
+# ---------------- Step 1b: pre-filter on the 6 samples ---------------
+sub = counts[all6].astype(float)
+sub = sub[sub.sum(axis=1) >= MIN_ROWS]
+print(f"[1b] pre-filter row-sum>={MIN_ROWS} on 6 samples -> {sub.shape[0]} genes")
+
+sf6 = size_factors[all6].values
+exog = np.column_stack([np.ones(6), [0, 0, 0, 1, 1, 1]])
+grp = np.array([0, 0, 0, 1, 1, 1])
+
+def _norm_cdf(x):
+    from math import erfc
+    return 0.5 * erfc(-x / np.sqrt(2.0))
+
+def _bh(p):
+    p = np.asarray(p, dtype=float)
+    n = p.size
+    order = np.argsort(p)
+    rev = np.empty(n, dtype=int); rev[order] = np.arange(n)
+    p_sorted = p[order]
+    tailmin = p_sorted[::-1].copy()
+    np.minimum.accumulate(tailmin, out=tailmin)
+    q = tailmin[::-1]  # q[i] = min(p[i..n-1])
+    adj = np.clip(q * n / np.arange(1, n + 1), None, 1.0)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]  # monotone non-decreasing
+    return adj[rev]
+
+def gene_stats(y):
+    """Two-step NB regression -> DESeq2-style Wald statistic.
+    Step A: group-mean Poisson fits (closed form with sf offset) -> mu_hat;
+            NB2 overdispersion alpha = max((Pearson X2 - df)/sum(mu^2), floor).
+    Step B: fixed-alpha NB GLM (IRLS) -> b1, SE; Wald z = b1/SE.
+            Fallback: Poisson GLM Wald if NB fit degenerate."""
+    tot = y.sum()
+    base_mean = tot / 6.0
+    mu = np.where(grp == 0, sf6 * (y[grp == 0].sum() / sf6[grp == 0].sum()),
+                  sf6 * (y[grp == 1].sum() / sf6[grp == 1].sum()))
+    mu = np.clip(mu, 1e-8, None)
+    pearson = np.sum((y - mu) ** 2 / mu)
+    alpha = max((pearson - 4.0) / np.dot(mu, mu), ALPHA_FLOOR)
+    try:
+        m = sm.GLM(y, exog, family=sm.families.NegativeBinomial(alpha=alpha),
+                   exposure=sf6).fit(disp=False, maxiter=300)
+        b1, se = m.params[1], m.bse[1]
+        if not np.isfinite(se) or se <= 0:
+            raise RuntimeError("degenerate SE")
+    except Exception:
+        m = sm.GLM(y, exog, family=sm.families.Poisson(),
+                   exposure=sf6).fit(disp=False, maxiter=300)
+        b1, se = m.params[1], m.bse[1]
+        if not np.isfinite(se) or se <= 0:
+            return base_mean, np.nan, np.nan, np.nan, np.nan, alpha
+    stat = b1 / se
+    pv = 2.0 * (1.0 - _norm_cdf(abs(stat)))
+    return base_mean, b1 / np.log(2.0), se / np.log(2.0), stat, pv, alpha
+
+# ---------------- Step 1c: DE loop ---------------
+t0 = time.time()
+genes = sub.index.tolist()
+rows = []
+for i, g in enumerate(genes):
+    rows.append(gene_stats(sub.loc[g].values))
+    if (i + 1) % 5000 == 0:
+        print(f"     ... {i+1}/{len(genes)} genes ({time.time()-t0:.0f}s)")
+de = pd.DataFrame(rows, index=genes,
+                  columns=["baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "dispersion"])
+de = de[de["stat"].notna()]
+de["padj"] = _bh(de["pvalue"].fillna(1.0).values)
+de.index.name = "ENSG"
+de.to_csv(DE_FILE)
+print(f"[1c] DE done: {de.shape[0]} genes with finite Wald stat ({time.time()-t0:.0f}s)")
+print(de.nlargest(5, "stat")[["baseMean", "log2FoldChange", "stat", "padj"]].round(3).to_string())
+
+# ---------------- Step 2: mapping, dedup, rank file ---------------
+m = mapping.drop_duplicates("ENSG").set_index("ENSG")["gene_name"].astype(str)
+de = de.join(m, how="inner")
+print(f"[2] after ENSG mapping: {de.shape[0]} genes with a gene_name "
+      f"(dropped unmapped/pathological)")
+
+de["absstat"] = de["stat"].abs()
+keep_idx = de.groupby("gene_name")["absstat"].idxmax()
+de_uniq = de.loc[keep_idx].drop(columns="absstat")
+print(f"     collapsed {int(de['gene_name'].duplicated().sum())} duplicate gene-name "
+      f"rows -> {de_uniq.shape[0]} unique genes for ranking")
+
+rank = de_uniq[["gene_name", "stat"]].rename(columns={"stat": "score"})
+rank = rank.sort_values("score", ascending=False).drop_duplicates("gene_name")
+assert rank["gene_name"].is_unique and rank["score"].notna().all()
+rank.to_csv(RANK_FILE, sep="\t", index=False)
+print(f"[2] rank file ready: {RANK_FILE} ({rank.shape[0]} genes). Top: "
+      f"{rank.head(3).to_dict('records')}")
+
+# ---------------- Step 3: gseapy prerank (GO_Biological_Process_2021) ---------------
+gseapy_ok = False
+try:
+    import gseapy as gp
+    gseapy_ok = True
+except Exception as e:
+    print(f"[3] gseapy NOT importable in this environment: {e}")
+
+final_term = None
+if gseapy_ok:
+    print("[3] running gseapy.prerank (GO_Biological_Process_2021, min_size=15, "
+          "max_size=500, 1000 perms, seed=42) ...")
+    pre = gp.prerank(rnk=RANK_FILE, gene_sets="GO_Biological_Process_2021",
+                     min_size=15, max_size=500, permutation_num=1000,
+                     seed=42, no_plot=True, outdir=GSEA_OUT, threads=4)
+    res = pre.res2d.sort_values("FDR q-val")
+    res.to_csv(GSEA_TSV, sep="\t", index=False)
+    best = res.iloc[0]
+    final_term = best["Term"]
+    print("\n===== RESULT =====")
+    print(f"Term with lowest adjusted p-value (FDR): {final_term}")
+    print(f"  NES={best['NES']:.3f}  pval={best['pval']:.3g}  FDR(q)={best['FDR q-val']:.3g}")
+    print("\nTop 10 terms by FDR:")
+    print(res.head(10)[["Term", "NES", "pval", "FDR q-val"]].to_string(index=False))
+    print(f"\nFull results table: {GSEA_TSV}")
+else:
+    print("\n[3] ENRICHMENT STEP NOT EXECUTED LOCALLY.")
+    print("    gseapy + Enrichr library require network access absent in this sandbox.")
+    print("    Step 1-2 (DE + rank file) ARE executed and valid. Run this same script on")
+    print("    the provisioned runner (gseapy/Enrichr present) to obtain the final term.")
+
+summary = {
+    "comparison": "Cisplatin_IC50_CBD_IC50 (9_1..9_3) vs DMSO (3_1..3_3)",
+    "n_genes_after_filter": int(sub.shape[0]),
+    "n_genes_after_mapping_dedup": int(rank.shape[0]),
+    "n_genes_with_finite_wald": int(de.shape[0]),
+    "rank_file": RANK_FILE,
+    "gseapy_executed_locally": bool(gseapy_ok),
+    "final_term": str(final_term),
+}
+import json
+with open(os.path.join(OUT_DIR, "analysis_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+print("\nSummary:", json.dumps(summary))

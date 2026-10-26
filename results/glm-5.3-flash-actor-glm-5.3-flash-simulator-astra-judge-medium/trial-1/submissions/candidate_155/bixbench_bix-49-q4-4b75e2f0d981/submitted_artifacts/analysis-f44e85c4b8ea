@@ -1,0 +1,196 @@
+"""
+DESeq2-style differential expression analysis (Python reimplementation) for:
+Issy ASXL1-mutation blood RNA-seq: disease (ASXL1 mutation) vs Control.
+
+Pipeline (faithful to DESeq2 methodology):
+  1. size factors: median-of-ratios
+  2. gene-wise dispersion: profile MLE over NB2 GLMs (grid + parabolic refinement)
+  3. parametric dispersion trend  alpha(mu) = a1/mu + a0
+  4. MAP dispersion: shrink log dispersion toward trend (empirical-Bayes prior)
+  5. NB GLM Wald test, BH (padj); design ~ sex + condition (Control reference)
+  6. apeglm-type posterior LFC shrinkage (Cauchy prior, scale from dispersion trend)
+     -> shrinkage affects reported LFCs only; padj comes from the Wald test and is unchanged.
+NOTE: no R/DESeq2/pydeseq2 and no network in this environment (verified), so this
+reimplementation is used; padj counts are close but not bit-identical to R DESeq2.
+"""
+import numpy as np, pandas as pd
+from scipy.special import gammaln
+from scipy.optimize import minimize_scalar
+from scipy.stats import norm
+from statsmodels.stats.multitest import multipletests
+
+LOG2 = np.log(2.0)
+
+cts = pd.read_csv('data/Issy_ASXL1_blood_featureCounts_GeneTable_final.txt', sep=r'\s+')
+cd  = pd.read_excel('data/Issy_ASXL1_blood_coldata_gender.xlsx')
+gencode = pd.read_csv('data/gencode.v31.primary_assembly.genes.csv', dtype=str)
+
+samples = sorted(set(cts.columns[1:]) & set(cd['sample']))   # 19 samples with metadata
+cd = cd.set_index('sample').loc[samples]
+Y = cts.set_index('Geneid').loc[:, samples].to_numpy(np.float64)
+genes = cts['Geneid'].to_numpy()
+print(f"samples used: {len(samples)}; condition counts:\n{cd['condition'].value_counts()}", flush=True)
+
+def design_matrix(cd):
+    cond = (cd['condition'] == 'ASXL1').to_numpy(float)
+    sexM = (cd['sex'] == 'M').to_numpy(float)
+    return np.column_stack([np.ones(len(cd)), sexM, cond]), ['Intercept', 'sex_M_vs_F', 'condition_ASXL1_vs_Control']
+
+def design_cond_only(cd):
+    cond = (cd['condition'] == 'ASXL1').to_numpy(float)
+    return np.column_stack([np.ones(len(cd)), cond]), ['Intercept', 'condition_ASXL1_vs_Control']
+
+def nb_loglik(Y, mu, alpha):
+    a = np.asarray(alpha)[:, None] if np.ndim(alpha) else alpha
+    theta = 1.0 / a
+    return np.sum(gammaln(Y + theta) - gammaln(theta) - gammaln(Y + 1.0)
+                  + theta * (np.log(theta) - np.log(theta + mu))
+                  + Y * (np.log(mu) - np.log(theta + mu)), axis=1)
+
+def irls(X, Y, alpha, n_iter=10, ridge=1e-6):
+    """Vectorized NB IRLS; alpha is per-gene (n_genes,)."""
+    n, p = X.shape
+    G = Y.shape[0]
+    Z = np.log(Y + 0.5)
+    beta = np.linalg.solve(X.T @ X + ridge * np.eye(p), X.T @ Z.T).T
+    for _ in range(n_iter):
+        eta = np.clip(beta @ X.T, -20, 30)
+        mu = np.exp(eta)
+        w = mu / (1.0 + alpha[:, None] * mu)
+        z = eta + (Y - mu) / np.maximum(mu * (1.0 + alpha[:, None] * mu), 1e-12)
+        A = np.einsum('gn,ni,nj->gij', w, X, X) + ridge * np.eye(p)
+        b = np.einsum('gn,gn,ni->gi', w, z, X)
+        beta_new = np.linalg.solve(A, b[..., None])[..., 0]
+        if np.max(np.abs(beta_new - beta)) < 1e-8:
+            beta = beta_new; break
+        beta = beta_new
+    return beta
+
+def size_factors(Y):
+    nz = Y > 0
+    loggeo = np.where(nz, np.log(np.where(nz, Y, 1.0)), np.nan)
+    ref = np.exp(np.nanmean(loggeo, axis=1))
+    ok = ref > 0
+    return np.median(Y[ok] / ref[ok][:, None], axis=0)
+
+def profile_loglik_grid(X, Y, alphas):
+    L = np.empty((len(alphas), Y.shape[0]))
+    for k, al in enumerate(alphas):
+        beta = irls(X, Y, np.full(Y.shape[0], al))
+        mu = np.exp(np.clip(beta @ X.T, -20, 30))
+        L[k] = nb_loglik(Y, mu, al)
+        if k % 10 == 0: print(f"  grid {k+1}/{len(alphas)}", flush=True)
+    return L
+
+def fit_trend(mu_hat, alpha_hat, df):
+    m = np.clip(mu_hat, 1e-8, None); la = np.log(alpha_hat)
+    w = np.full(len(alpha_hat), df / max(df, 1))
+    def obj_l0(t, a1):
+        return np.sum(w * (la - np.log(np.exp(t) + a1 / m)) ** 2)
+    def obj_l1(q, t0):
+        return np.sum(w * (la - np.log(np.exp(t0) + np.exp(q) / m)) ** 2)
+    best = None
+    for start in [np.log([0.01, 0.1]), np.log([0.05, 1.0]), np.log([0.2, 0.01])]:
+        t0, q0 = start
+        for _ in range(5):  # alternating bounded optimization on log scale
+            r = minimize_scalar(obj_l0, args=(np.exp(q0),), bounds=(t0-4, t0+4), method='bounded', options={'xatol':1e-3})
+            t0 = r.x
+            r2 = minimize_scalar(obj_l1, args=(t0,), bounds=(q0-5, q0+5), method='bounded', options={'xatol':1e-3})
+            q0 = r2.x
+        f = obj_l1(q0, t0)
+        if best is None or f < best[0]: best = (f, np.exp(t0), np.exp(q0))
+    return best[1], best[2]
+
+def parabolic_refine(grid, vals, i, logspace=False):
+    if i in (0, len(grid)-1): return grid[i]
+    v0, v1, v2 = vals[i-1], vals[i], vals[i+1]
+    den = v0 - 2*v1 + v2
+    if den == 0: return grid[i]
+    d = 0.5 * (v0 - v2) / den
+    if logspace:
+        return np.exp(np.log(grid[i]) + np.clip(d, -1, 1) * np.log(grid[i+1]/grid[i]))
+    return grid[i] + np.clip(d, -1, 1) * (grid[i+1]-grid[i])
+
+def run_de(Y, X, names, genes, min_rowsum=10, cpm_cut=None, label=''):
+    if cpm_cut is not None:
+        cpm = Y / Y.sum(0) * 1e6
+        keep = (cpm > cpm_cut).sum(1) >= 2
+    else:
+        keep = Y.sum(1) >= min_rowsum
+    n_all = Y.shape[0]
+    Yk = Y[keep]; genes_k = genes[keep]
+    print(f"[{label}] genes: {n_all} -> {keep.sum()} after filtering", flush=True)
+    sf = size_factors(Yk)
+    agrid = np.exp(np.linspace(np.log(1e-4), np.log(20.0), 60))
+    L = profile_loglik_grid(X, Yk, agrid)
+    idx = np.arange(Yk.shape[0])
+    alpha_hat = np.array([parabolic_refine(agrid, L[:, i], L[:, i].argmax(), logspace=True) for i in idx])
+    beta_hat = irls(X, Yk, alpha_hat)
+    mu_hat = np.exp(np.clip(beta_hat @ X.T, -20, 30)) * sf
+    mu_base = mu_hat.mean(1)
+    df = Yk.shape[0] - X.shape[1]
+    a0, a1 = fit_trend(mu_base, alpha_hat, df)
+    trend = a0 + a1 / np.clip(mu_base, 1e-8, None)
+    resid = np.log(alpha_hat) - np.log(trend)
+    sigma2 = float(min(max(np.median(resid**2), 0.04), 4.0))
+    pen = (np.log(agrid)[:, None] - np.log(trend)[None, :]) ** 2 / (2 * sigma2)
+    obj = -L + pen
+    km = obj.argmin(0)
+    alpha_map = np.array([parabolic_refine(agrid, obj[:, i], km[i], logspace=True) for i in idx])
+    print(f"[{label}] trend a0={a0:.4g} a1={a1:.4g} priorVar={sigma2:.3f} "
+          f"(median alpha_hat={np.median(alpha_hat):.3g}, median alpha_MAP={np.median(alpha_map):.3g})", flush=True)
+    beta = irls(X, Yk, alpha_map)
+    mu = np.exp(np.clip(beta @ X.T, -20, 30))
+    w = mu / (1.0 + alpha_map[:, None] * mu)
+    XtWX = np.einsum('gn,ni,nj->gij', w, X, X) + 1e-8 * np.eye(X.shape[1])
+    cov = np.linalg.inv(XtWX)
+    ci = names.index('condition_ASXL1_vs_Control')
+    b = beta[:, ci]; se = np.sqrt(np.maximum(cov[:, ci, ci], 1e-18))
+    z = b / se
+    pval = 2 * norm.sf(np.abs(z))
+    padj = multipletests(pval, method='fdr_bh')[1]
+    # apeglm-type shrinkage: Cauchy prior on tested coef, scale from dispersion trend
+    s = np.sqrt(a1 / np.clip(mu_base, 1e-8, None) + a0)
+    b_r = np.delete(beta, ci, axis=1)
+    Xr = np.delete(X, ci, axis=1)
+    eta_r = np.clip(b_r @ Xr.T, -20, 30)
+    bgrid = np.linspace(-8, 8, 321)
+    LL = np.empty((len(bgrid), Yk.shape[0]))
+    for gi, bg in enumerate(bgrid):
+        eta = eta_r + bg * X[:, ci]
+        mu_g = np.exp(eta)
+        LL[gi] = nb_loglik(Yk, mu_g, alpha_map)
+    lp = LL - np.log1p((bgrid[:, None] / s[None, :]) ** 2)
+    gi_star = lp.argmax(0)
+    b_shrunk = np.array([parabolic_refine(bgrid, lp[:, i], gi_star[i]) for i in idx])
+    res = pd.DataFrame({'gene_id': genes_k, 'baseMean': mu_base,
+                        'lfc_SH_vs_Control': b / LOG2,
+                        'lfc_shrunk_apeglm': b_shrunk / LOG2,
+                        'SE': se / LOG2, 'stat': z, 'pvalue': pval, 'padj': padj})
+    res = res.merge(gencode[['gene_id', 'gene_name', 'gene_type', 'hgnc_id']], on='gene_id', how='left')
+    sig = res[res['padj'] < 0.05]
+    up = int((sig['lfc_shrunk_apeglm'] > 0).sum()); down = int((sig['lfc_shrunk_apeglm'] < 0).sum())
+    flips = int((np.sign(sig['lfc_SH_vs_Control']) != np.sign(sig['lfc_shrunk_apeglm'])).sum())
+    print(f"[{label}] significant (padj<0.05): total={len(sig)}  up(ASXL1>Control)={up}  down={down}  "
+          f"(sign flips MLE vs shrunk among sig: {flips})", flush=True)
+    return res, dict(label=label, n_samples=int(Y.shape[1]), n_genes_total=n_all,
+                     n_filtered_out=int(n_all - keep.sum()), n_tested=int(keep.sum()),
+                     n_sig=len(sig), n_up=up, n_down=down,
+                     contrast='ASXL1 vs Control (Control = reference level)')
+
+X, names = design_matrix(cd)
+res_main, st_main = run_de(Y, X, names, genes, min_rowsum=10, label='MAIN: ~sex+condition, rowSums>=10')
+Xc, namesc = design_cond_only(cd)
+res_cond, st_cond = run_de(Y, Xc, namesc, genes, min_rowsum=10, label='SENS-a: ~condition, rowSums>=10')
+res_cpm, st_cpm = run_de(Y, X, names, genes, cpm_cut=1.0, label='SENS-b: ~sex+condition, CPM>1 (>=2 samples)')
+
+res_main.to_csv('analysis/deseq2_asxl1_results_main.csv', index=False)
+res_cond.to_csv('analysis/deseq2_results_sens_condition_only.csv', index=False)
+res_cpm.to_csv('analysis/deseq2_results_sens_cpm.csv', index=False)
+summ = pd.DataFrame([st_main, st_cond, st_cpm])
+summ.to_csv('analysis/deseq2_asxl1_summary.csv', index=False)
+
+cols = ['gene_id', 'gene_name', 'gene_type', 'baseMean', 'lfc_SH_vs_Control', 'lfc_shrunk_apeglm', 'padj']
+print('\nTOP 10 UP (main):');  print(res_main.sort_values('padj').query('lfc_shrunk_apeglm>0').head(10)[cols].to_string(index=False))
+print('\nTOP 10 DOWN (main):'); print(res_main.sort_values('padj').query('lfc_shrunk_apeglm<0').head(10)[cols].to_string(index=False))
+print('\nSUMMARY:'); print(summ.to_string(index=False))

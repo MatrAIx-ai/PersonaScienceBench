@@ -1,0 +1,689 @@
+"""
+analysis.py  --  self-contained action-selection policy for deterministic symbolic
+grid-search levels (asibench: math.levin_context_grid_search).
+
+Interface (public submission contract)
+--------------------------------------
+    def make_policy(training_data: dict, config: dict | None = None) -> Policy
+        policy.action_probs(level: dict, state: dict, legal_actions: list[str]) -> dict[str, float]
+
+The returned policy maps a *local* observation (state) to probabilities / nonnegative
+scores over the legal actions U, D, L, R.  The scorer owns the hidden transition
+system; this module never simulates it at inference time.
+
+Design (summary)
+----------------
+A hybrid policy:
+  * structural prior  -- encodes the regularities measured in the training
+    trajectories (90% of expert steps continue the current run; 100% of turns
+    happen exactly when continuing the current direction would hit a wall; when
+    a turn is forced by geometry it is deterministic; when two perpendicular
+    directions are both legal the expert picks the one that reduces Manhattan
+    distance to the goal -- a signal NOT available to the policy, so we fall
+    back to an empirical distribution learned from training).
+  * learned numpy MLP -- behavioural cloning: p(action | local features) trained
+    to maximise the probability of the expert action at every decision step of
+    the solved training trajectories.
+  * The two are combined in log-probability space with weights (config), always
+    masked to `legal_actions` and renormalised so that no illegal action is ever
+    emitted.
+
+Only numpy / scipy are used (sklearn, torch, lightgbm, xgboost are unavailable).
+"""
+from __future__ import annotations
+import math
+import numpy as np
+
+ACTIONS = ["U", "D", "L", "R"]
+DELTA = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+PERP = {"U": ["L", "R"], "D": ["L", "R"], "L": ["U", "D"], "R": ["U", "D"]}
+OPP = {"U": "D", "D": "U", "L": "R", "R": "L"}
+EPS = 1e-12
+
+
+def _tile(grid, r, c):
+    if 0 <= r < len(grid) and 0 <= c < len(grid[0]):
+        return grid[r][c]
+    return "#"
+
+
+def _simulate_trajectory(level):
+    """Reconstruct per-decision-step states from a solved training level.
+
+    Transition (verified against all 260 training levels): each action moves the
+    agent one cell in that direction ([row, col]); moving into '#' is blocked and
+    the agent stays.  Returns list of (state_dict, action).
+    """
+    grid = level["grid"]
+    start = level["start"]
+    sol = level["solution"]
+    r, c = int(start[0]), int(start[1])
+    cells = [(r, c)]
+    for a in sol:
+        dr, dc = DELTA[a]
+        nr, nc = r + dr, c + dc
+        if _tile(grid, nr, nc) != "#":
+            r, c = nr, nc
+        cells.append((r, c))
+    states = []
+    for i, a in enumerate(sol):
+        cell_r, cell_c = cells[i]
+        prev = sol[i - 1] if i > 0 else None
+        hist = sol[:i]
+        neighbors = {d: _tile(grid, cell_r + DELTA[d][0], cell_c + DELTA[d][1]) for d in ACTIONS}
+        legal_actions = [d for d in ACTIONS if neighbors[d] != "#"]
+        run = 0
+        if prev is not None:
+            for h in reversed(hist):
+                if h == prev:
+                    run += 1
+                else:
+                    break
+        depth = i
+        state = {
+            "cell": [cell_r, cell_c],
+            "neighbors": neighbors,
+            "previous_action": prev,
+            "history": list(hist),
+            "history_tail": hist[-6:] if hist else [],
+            "run_length_bucket": run,
+            "depth": depth,
+            "depth_mod": depth % 4,
+            "depth_phase": 0 if depth <= level.get("max_depth", 60) // 2 else 1,
+            "legal_mask": [d in legal_actions for d in ACTIONS],
+            "legal_actions": legal_actions,
+        }
+        states.append((state, a))
+    return states
+
+
+# ----------------------------------------------------------------------------
+# robust, tolerant feature extraction (SAME function at train and inference)
+# ----------------------------------------------------------------------------
+def _as_list(x):
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    if isinstance(x, str):
+        if "," in x:
+            return [s.strip() for s in x.split(",") if s.strip()]
+        return [c for c in x if c in ACTIONS]
+    if isinstance(x, (set, frozenset)):
+        return list(x)
+    return []
+
+
+def _extract_legal(state, legal_actions_arg):
+    """Priority: explicit legal_actions arg > state['legal_actions'] > legal_mask."""
+    if legal_actions_arg is not None:
+        return _as_list(legal_actions_arg)
+    if isinstance(state, dict):
+        if "legal_actions" in state:
+            return _as_list(state["legal_actions"])
+        if "legal_mask" in state and state["legal_mask"] is not None:
+            mask = state["legal_mask"]
+            if isinstance(mask, dict):
+                return [d for d in ACTIONS if mask.get(d, 0)]
+            return [d for d, m in zip(ACTIONS, _as_list(mask)) if m]
+    return []
+
+
+def _extract_prev(state):
+    if not isinstance(state, dict):
+        return None
+    p = state.get("previous_action")
+    if p is not None and isinstance(p, str) and p in ACTIONS:
+        return p
+    for key in ("history", "history_tail"):
+        h = _as_list(state.get(key))
+        if h and isinstance(h[-1], str) and h[-1] in ACTIONS:
+            return h[-1]
+    return None
+
+
+def _extract_run_length(state, prev):
+    """Current run length of the most recent action (trailing identical actions)."""
+    if not isinstance(state, dict):
+        return 0
+    if prev is None:
+        return 0
+    b = state.get("run_length_bucket")
+    if isinstance(b, (int, float)) and not isinstance(b, bool):
+        return int(max(0, min(50, b)))
+    # derive from history / history_tail
+    run = 0
+    for key in ("history", "history_tail"):
+        h = _as_list(state.get(key))
+        if not h:
+            continue
+        for a in reversed(h):
+            if isinstance(a, str) and a in ACTIONS and a == prev:
+                run += 1
+            else:
+                break
+        if run > 0:
+            break
+    return run
+
+
+def _extract_depth(state):
+    if isinstance(state, dict):
+        d = state.get("depth")
+        if isinstance(d, (int, float)) and not isinstance(d, bool):
+            return int(max(0, d))
+        h = _as_list(state.get("history"))
+        if h:
+            return len(h)
+        t = _as_list(state.get("history_tail"))
+        if t:
+            return len(t)
+    return 0
+
+
+def _extract_neighbors(state):
+    """Return dict {action: tile_char} if parseable, else None."""
+    if not isinstance(state, dict):
+        return None
+    nb = state.get("neighbors")
+    if nb is None:
+        return None
+    if isinstance(nb, dict):
+        out = {}
+        for d in ACTIONS:
+            if d in nb:
+                v = nb[d]
+                if isinstance(v, str) and len(v) == 1:
+                    if v in "#Gabcdefghijklmnopqrst":
+                        out[d] = v
+                elif isinstance(v, (list, tuple)) and len(v) == 2:
+                    out[d] = "open"
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    out[d] = "wall" if v == 0 else "open"
+        if len(out) == 4:
+            return out
+        return None
+    if isinstance(nb, (list, tuple)) and len(nb) >= 4:
+        out = {}
+        for d, v in zip(ACTIONS, nb[:4]):
+            if isinstance(v, str) and len(v) == 1 and v in "#Gabcdefghijklmnopqrst":
+                out[d] = v
+        if len(out) == 4:
+            return out
+    return None
+
+
+def _parse_cell(state):
+    if not isinstance(state, dict):
+        return None
+    c = state.get("cell")
+    if c is None:
+        return None
+    if isinstance(c, (list, tuple)) and len(c) == 2:
+        try:
+            return int(c[0]), int(c[1])
+        except Exception:
+            return None
+    if isinstance(c, str):
+        nums = _re_ints(c)
+        if len(nums) >= 2:
+            try:
+                return int(nums[0]), int(nums[1])
+            except Exception:
+                return None
+    return None
+
+
+def _re_ints(s):
+    out = []
+    cur = ""
+    for ch in s:
+        if ch.isdigit() or ch == "-":
+            cur += ch
+        else:
+            if cur:
+                out.append(cur)
+                cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _bucket_features(run):
+    b = [0, 0, 0, 0, 0]
+    if run <= 1:
+        b[0] = 1
+    elif run <= 3:
+        b[1] = 1
+    elif run <= 6:
+        b[2] = 1
+    elif run <= 9:
+        b[3] = 1
+    else:
+        b[4] = 1
+    return b
+
+
+def _level_max_depth(level, max_depth_default):
+    if isinstance(level, dict):
+        md = level.get("max_depth", level.get("budget", max_depth_default))
+        if isinstance(md, (int, float)) and md:
+            return int(md)
+    return int(max_depth_default)
+
+
+def build_features(level, state, legal_actions, max_depth_default=60, normalizer=None):
+    """Fixed-length feature vector.  Same function used in training and at
+    inference so the feature distribution is consistent regardless of the exact
+    format the scorer uses for observation fields."""
+    legal = set(_extract_legal(state, legal_actions))
+    prev = _extract_prev(state)
+    run = _extract_run_length(state, prev)
+    depth = _extract_depth(state)
+    neighbors = _extract_neighbors(state)
+    max_depth = _level_max_depth(level, max_depth_default)
+
+    f = []
+    # prev action one-hot
+    f += [1.0 if a == prev else 0.0 for a in ACTIONS]
+    f.append(1.0 if (prev is not None and prev in legal) else 0.0)   # prev legal
+    f.append(1.0 if prev is None else 0.0)                            # prev unknown
+    # run length (scaled) + buckets
+    f.append(float(min(run, 20)) / 20.0)
+    f += _bucket_features(run)
+    # depth features
+    f.append(float(min(depth, 64)) / 64.0)
+    f.append(float(depth) / max(1.0, float(max_depth)))
+    f.append(1.0 if depth <= max_depth // 2 else 0.0)
+    dm = depth % 4
+    f += [1.0 if dm == k else 0.0 for k in range(4)]
+    # legality per direction
+    f += [1.0 if a in legal else 0.0 for a in ACTIONS]
+    f.append(float(len(legal)) / 4.0)
+    # must-turn (prev known and prev illegal)
+    f.append(1.0 if (prev is not None and prev not in legal) else 0.0)
+    # turn context relative to prev direction
+    if prev is not None:
+        perp = PERP[prev]
+        pl = [1.0 if d in legal else 0.0 for d in perp]
+        f += pl
+        f.append(1.0 if sum(pl) == 2 else 0.0)   # free turn
+        f.append(1.0 if sum(pl) == 1 else 0.0)   # forced turn
+        f.append(1.0 if OPP[prev] in legal else 0.0)
+    else:
+        f += [0.0, 0.0, 0.0, 0.0, 0.0]
+    # neighbor tile passability / category features (tolerant)
+    if neighbors is not None:
+        for a in ACTIONS:
+            v = neighbors.get(a)
+            if v == "#":
+                f += [1.0, 0.0]
+            elif v is not None:
+                f += [0.0, 1.0]
+            else:
+                f += [0.0, 0.0]
+    else:
+        f += [0.0] * 8
+    # history-tail aggregates
+    tail = []
+    if isinstance(state, dict):
+        tail = _as_list(state.get("history_tail")) or _as_list(state.get("history"))
+    turns = 0
+    for i in range(1, len(tail)):
+        if isinstance(tail[i], str) and isinstance(tail[i - 1], str) and tail[i] != tail[i - 1]:
+            turns += 1
+    f.append(float(min(turns, 10)) / 10.0)
+    f.append(float(len(tail)) / 30.0)
+
+    x = np.asarray(f, dtype=np.float64)
+    if normalizer is not None:
+        x = (x - normalizer["mean"]) / (normalizer["std"] + 1e-9)
+    return x
+
+
+# ----------------------------------------------------------------------------
+# structural prior
+# ----------------------------------------------------------------------------
+def _structural_prior(level, state, legal_actions, free_turn_prior=None,
+                      w_cont=8.0, w_forced=10.0):
+    """Unnormalised nonnegative scores over ACTIONS encoding the strong,
+    guaranteed structure observed in training trajectories.
+
+    * continue a legal run with high weight (90% of expert steps do this)
+    * when the current direction is blocked and only one perpendicular is legal,
+      that move is forced -- highest weight
+    * when both perpendiculars are legal (free turn), use the empirical turn
+      distribution learned from training (no goal signal is available locally)
+    * otherwise uniform
+    """
+    legal = set(_extract_legal(state, legal_actions))
+    prev = _extract_prev(state)
+    scores = np.ones(4, dtype=np.float64)
+    if prev is not None and prev in ACTIONS:
+        if prev in legal:
+            scores[ACTIONS.index(prev)] = w_cont
+        else:
+            perp = PERP[prev]
+            pl = [d for d in perp if d in legal]
+            if len(pl) == 1:
+                scores[ACTIONS.index(pl[0])] = w_forced
+            elif len(pl) == 2 and free_turn_prior is not None:
+                p = free_turn_prior.get(prev)
+                if p is not None:
+                    for d, pr in zip(perp, p):
+                        scores[ACTIONS.index(d)] = 1.0 + pr
+    for i, a in enumerate(ACTIONS):
+        if a not in legal:
+            scores[i] = 0.0
+    return scores
+
+
+def _make_free_turn_prior(rows):
+    """Empirical perpendicular-choice distribution at free (both-options) turns,
+    keyed by current run direction: {dir: [p(first perp), p(second perp)]}."""
+    counts = {d: [0.0, 0.0] for d in ACTIONS}
+    for (state, a, _lid) in rows:
+        legal = set(_extract_legal(state, state.get("legal_actions")))
+        prev = _extract_prev(state)
+        if prev is None or prev in legal:
+            continue
+        perp = PERP[prev]
+        pl = [d for d in perp if d in legal]
+        if len(pl) == 2:
+            idx = 0 if a == pl[0] else 1
+            counts[prev][idx] += 1.0
+    out = {}
+    for d in ACTIONS:
+        tot = counts[d][0] + counts[d][1]
+        if tot > 0:
+            out[d] = [counts[d][0] / tot, counts[d][1] / tot]
+    return out
+
+
+# ----------------------------------------------------------------------------
+# tiny numpy MLP (softmax behaviour-cloning model)
+# ----------------------------------------------------------------------------
+class _MLP:
+    def __init__(self, d_in, h=64, seed=0, out=4):
+        self.D = d_in
+        self.H = h
+        self.O = out
+        rng = np.random.RandomState(seed)
+        scale = 1.0 / math.sqrt(d_in)
+        self.W1 = rng.uniform(-scale, scale, (d_in, h))
+        self.b1 = np.zeros(h, dtype=np.float64)
+        scale2 = 1.0 / math.sqrt(h)
+        self.W2 = rng.uniform(-scale2, scale2, (h, out))
+        self.b2 = np.zeros(out, dtype=np.float64)
+
+    def forward(self, X, return_probs=True):
+        Z = np.tanh(X @ self.W1 + self.b1)
+        logits = Z @ self.W2 + self.b2
+        if not return_probs:
+            return logits, None
+        e = np.exp(logits - logits.max(axis=1, keepdims=True))
+        return logits, e / e.sum(axis=1, keepdims=True)
+
+    def _init_adam(self):
+        self._m = {}
+        self._v = {}
+
+    def _adam(self, step, dW1, dW2, db1, db2, lr):
+        if not hasattr(self, "_m"):
+            self._m, self._v = {}, {}
+        b1m, b2m, eps = 0.9, 0.999, 1e-8
+        for name, W, g in (("W1", self.W1, dW1), ("W2", self.W2, dW2),
+                           ("b1", self.b1, db1), ("b2", self.b2, db2)):
+            m = self._m.get(name, np.zeros_like(W))
+            v = self._v.get(name, np.zeros_like(W))
+            m = b1m * m + (1 - b1m) * g
+            v = b2m * v + (1 - b2m) * (g * g)
+            self._m[name], self._v[name] = m, v
+            mhat = m / (1 - b1m ** step)
+            vhat = v / (1 - b2m ** step)
+            W -= lr * mhat / (np.sqrt(vhat) + eps)
+
+    def train(self, X, Y, epochs=500, lr=0.02, batch=64, l2=1e-4, seed=7):
+        n = X.shape[0]
+        rng = np.random.RandomState(seed)
+        step = 0
+        last_loss = 0.0
+        for _ in range(epochs):
+            perm = rng.permutation(n)
+            total_loss = 0.0
+            nbatch = 0
+            for s in range(0, n, batch):
+                idx = perm[s:s + batch]
+                Xb, Yb = X[idx], Y[idx]
+                Z = np.tanh(Xb @ self.W1 + self.b1)
+                logits = Z @ self.W2 + self.b2
+                logits -= logits.max(axis=1, keepdims=True)
+                e = np.exp(logits)
+                probs = e / e.sum(axis=1, keepdims=True)
+                loss = -np.mean(np.log(probs[np.arange(len(Yb)), Yb] + EPS))
+                total_loss += float(loss) * len(Yb)
+                nbatch += len(Yb)
+                dlogits = probs.copy()
+                dlogits[np.arange(len(Yb)), Yb] -= 1.0
+                dlogits /= len(Yb)
+                dW2 = Z.T @ dlogits + l2 * self.W2
+                db2 = dlogits.sum(axis=0)
+                dZ = dlogits @ self.W2.T
+                dact = dZ * (1.0 - Z * Z)
+                dW1 = Xb.T @ dact + l2 * self.W1
+                db1 = dact.sum(axis=0)
+                step += 1
+                self._adam(step, dW1, dW2, db1, db2, lr)
+            last_loss = total_loss / max(1, nbatch)
+        return last_loss
+
+
+def _fit_normalizer(X):
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std < 1e-9] = 1.0
+    return {"mean": mean, "std": std}
+
+
+# ----------------------------------------------------------------------------
+# Policy
+# ----------------------------------------------------------------------------
+class Policy:
+    """Learned + structural hybrid action-selection policy for grid search.
+
+    action_probs(level, state, legal_actions) -> dict[str, float]
+    """
+
+    def __init__(self, params, config=None):
+        self.params = params
+        self.cfg = dict(config) if config else {}
+        self.normalizer = params["normalizer"]
+        self.mlp = params["mlp"]
+        self.free_turn_prior = params.get("free_turn_prior") or {}
+        self.w_cont = float(self.cfg.get("prior_w_cont", 8.0))
+        self.w_forced = float(self.cfg.get("prior_w_forced", 10.0))
+        self.alpha = float(self.cfg.get("prior_weight", 0.7))
+        self.beta = float(self.cfg.get("mlp_weight", 0.8))
+        self.max_depth_default = float(self.cfg.get("max_depth_default", 60))
+
+    def action_probs(self, level, state, legal_actions):
+        legal = [a for a in _extract_legal(state, legal_actions) if a in ACTIONS]
+        if not legal:
+            return {a: 0.25 for a in ACTIONS}
+        # 1) MLP probabilities (masked to legal)
+        x = build_features(level, state, legal, max_depth_default=self.max_depth_default,
+                           normalizer=self.normalizer)
+        _, xp = self.mlp.forward(x.reshape(1, -1))
+        mlp_p = xp[0].copy()
+        for i, a in enumerate(ACTIONS):
+            if a not in legal:
+                mlp_p[i] = 0.0
+        s_mlp = mlp_p.sum()
+        mlp_p = mlp_p / (s_mlp + EPS)
+
+        # 2) structural prior
+        prior_s = _structural_prior(level, state, legal, self.free_turn_prior,
+                                    self.w_cont, self.w_forced)
+        pr = prior_s / (prior_s.sum() + EPS)
+
+        # 3) combine in log-probability space
+        comb = self.alpha * np.log(pr + EPS) + self.beta * np.log(mlp_p + EPS)
+        e = np.exp(comb - comb.max())
+        probs = e / (e.sum() + EPS)
+
+        # 4) final hard mask to provided legal actions and renormalise
+        out = {}
+        tot = 0.0
+        for a in legal:
+            v = float(probs[ACTIONS.index(a)])
+            out[a] = v
+            tot += v
+        if tot <= 0:
+            for a in legal:
+                out[a] = 1.0 / len(legal)
+        else:
+            for a in legal:
+                out[a] /= tot
+        return out
+
+
+class _DefaultPolicy:
+    """Fallback used when training data cannot be used: structural prior only."""
+
+    def __init__(self, config=None):
+        self.cfg = dict(config) if config else {}
+        self.w_cont = float(self.cfg.get("prior_w_cont", 8.0))
+        self.w_forced = float(self.cfg.get("prior_w_forced", 10.0))
+
+    def action_probs(self, level, state, legal_actions):
+        legal = [a for a in _extract_legal(state, legal_actions) if a in ACTIONS]
+        if not legal:
+            return {a: 0.25 for a in ACTIONS}
+        s = _structural_prior(level, state, legal, None, self.w_cont, self.w_forced)
+        out = {}
+        tot = 0.0
+        for a in legal:
+            out[a] = float(s[ACTIONS.index(a)])
+            tot += out[a]
+        if tot <= 0:
+            for a in legal:
+                out[a] = 1.0 / len(legal)
+        else:
+            for a in legal:
+                out[a] /= tot
+        return out
+
+
+# ----------------------------------------------------------------------------
+# training
+# ----------------------------------------------------------------------------
+def _prepare_training_rows(training_data):
+    levels = training_data.get("levels") if isinstance(training_data, dict) else None
+    if not levels:
+        raise ValueError("training_data has no 'levels'")
+    rows = []
+    for L in levels:
+        if not isinstance(L, dict) or "solution" not in L or "grid" not in L:
+            continue
+        for state, a in _simulate_trajectory(L):
+            rows.append((state, a, L.get("id")))
+    return rows
+
+
+def _build_feature_matrix(rows, level_index, max_depth_default=60):
+    X = []
+    Y = []
+    for (state, a, lid) in rows:
+        level = level_index.get(lid, {})
+        feats = build_features(level, state, state.get("legal_actions"),
+                               max_depth_default=max_depth_default)
+        X.append(feats)
+        Y.append(ACTIONS.index(a))
+    return np.vstack(X), np.asarray(Y, dtype=np.int64)
+
+
+def make_policy(training_data, config=None):
+    """Build the hybrid policy from solved training instances.
+
+    Returns a Policy object supporting
+        action_probs(level: dict, state: dict, legal_actions: list[str]) -> dict
+    """
+    cfg = dict(config) if config else {}
+    max_depth_default = float(cfg.get("max_depth_default", 60))
+    try:
+        level_index = {}
+        for i, L in enumerate(training_data.get("levels", [])):
+            if not isinstance(L, dict):
+                continue
+            level_index[L.get("id", i)] = {"max_depth": L.get("max_depth", 60),
+                                           "budget": L.get("budget")}
+        rows = _prepare_training_rows(training_data)
+        if not rows:
+            return _DefaultPolicy(config)
+        X, Y = _build_feature_matrix(rows, level_index, max_depth_default)
+        normalizer = _fit_normalizer(X)
+        Xn = (X - normalizer["mean"]) / (normalizer["std"] + 1e-9)
+
+        h = int(cfg.get("mlp_hidden", 64))
+        epochs = int(cfg.get("mlp_epochs", 500))
+        lr = float(cfg.get("mlp_lr", 0.02))
+        mlp = _MLP(X.shape[1], h=h, seed=int(cfg.get("mlp_seed", 0)))
+        mlp._init_adam()
+        final_loss = mlp.train(Xn, Y, epochs=epochs, lr=lr,
+                               batch=int(cfg.get("mlp_batch", 64)),
+                               l2=float(cfg.get("mlp_l2", 1e-4)))
+        mlp_probs = mlp.forward(Xn)[1]
+        acc = float(np.mean(mlp_probs.argmax(axis=1) == Y))
+        free_prior = _make_free_turn_prior(rows)
+
+        # structural-prior-only accuracy for a diagnostic comparison
+        prior_acc = 0.0
+        n = 0
+        for (state, a, lid) in rows:
+            legal = _extract_legal(state, state.get("legal_actions"))
+            if not legal:
+                continue
+            s = _structural_prior(level_index.get(lid, {}), state, legal,
+                                  None, 8.0, 10.0)
+            if s.argmax() == ACTIONS.index(a):
+                prior_acc += 1
+            n += 1
+        prior_acc = prior_acc / max(1, n)
+
+        params = {
+            "normalizer": normalizer,
+            "mlp": mlp,
+            "free_turn_prior": free_prior,
+            "train_ce": float(final_loss),
+            "train_acc": float(acc),
+            "prior_acc": float(prior_acc),
+            "n_rows": int(len(Y)),
+            "d_in": int(X.shape[1]),
+        }
+        policy = Policy(params, cfg)
+        policy._train_stats = params
+        return policy
+    except Exception:
+        try:
+            return _DefaultPolicy(config)
+        except Exception:
+            return _DefaultPolicy()
+
+
+# ----------------------------------------------------------------------------
+# __main__: quick self-test if run directly
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
+                     "training_levels.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            _td = json.load(f)
+        _pol = make_policy(_td)
+        print("train stats:", getattr(_pol, "_train_stats", {}))
+        _st = {"cell": [21, 7], "neighbors": {"U": "b", "D": "a", "L": "#", "R": "q"},
+               "previous_action": "U", "history": ["U", "U"], "depth": 2,
+               "legal_mask": [1, 1, 1, 1], "legal_actions": ["U", "D", "L", "R"]}
+        print("sample probs:", _pol.action_probs({}, _st, ["U", "D", "L", "R"]))

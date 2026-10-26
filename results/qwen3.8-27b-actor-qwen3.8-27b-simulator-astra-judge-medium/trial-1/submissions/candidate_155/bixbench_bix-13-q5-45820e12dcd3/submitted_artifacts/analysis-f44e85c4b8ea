@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+DESeq2-style differential expression analysis (Python re-implementation of the
+core DESeq2 algorithm: median-of-ratios size factors, gene-wise NB dispersion
+MLE, LOESS dispersion trend, empirical-Bayes shrinkage, NB-GLM IRLS, Wald test,
+BH FDR with DESeq2-style independent filtering).
+
+Question: relative to strain JBX1, how many genes are significantly
+differentially expressed (BH FDR padj < 0.05) in at least one of the
+dlasI / drhlI single mutants but NOT significantly DE in the dlasi_drhli
+double mutant?
+
+Strain mapping (approved assumption): metadata Strain 1=JBX1 (reference),
+97=dlasI, 98=drhlI, 99=dlasi_drhli.
+Primary design: ~ Media + Strain (reference JBX1).
+Significance: padj < 0.05 (strict); NA padj treated as not significant.
+"""
+import warnings as _w
+_w.filterwarnings('ignore', category=RuntimeWarning)
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+ALPHA = 0.05
+STRAIN_MAP = {'1': 'JBX1', '97': 'dlasI', '98': 'drhlI', '99': 'dlasi_drhli'}
+MEDIA = ['MMGluFeMinus', 'MMGluFePlus', 'Succinate']
+
+# ---------------------------------------------------------------- data
+def load_data():
+    meta = pd.read_csv('data/experiment_metadata.csv')
+    counts = pd.read_csv('data/raw_counts.csv', index_col=0)
+    order = meta.sort_values('SampleNumber')['AzentaName'].tolist()
+    counts = counts[order]
+    meta = meta.set_index('AzentaName').loc[order]
+    meta['Strain'] = meta['Strain'].astype(str)
+    meta['StrainName'] = meta['Strain'].map(STRAIN_MAP)
+    return counts, meta
+
+def design_matrix(meta, include_media):
+    cols, names = [np.ones(len(meta))], ['Intercept']
+    if include_media:
+        for m in ['MMGluFePlus', 'Succinate']:
+            cols.append((meta['Media'] == m).to_numpy(float))
+            names.append(f'Media_{m}')
+    for s in ['97', '98', '99']:
+        cols.append((meta['Strain'] == s).to_numpy(float))
+        names.append(f'Strain_{s}')
+    return np.column_stack(cols), names
+
+# ---------------------------------------------------------------- DESeq2 core
+def size_factors(C):
+    gmed = np.median(C, axis=1)
+    gm = np.where(gmed > 0, gmed, np.nan)[:, None]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = C / gm
+    return np.nanmedian(ratio, axis=0)
+
+def gene_disp_mle(cnorm):
+    mean_g = cnorm.mean(axis=1)
+    var_g = cnorm.var(axis=1, ddof=1)
+    disp = (var_g - mean_g) / mean_g**2
+    disp[~np.isfinite(disp)] = np.nan
+    disp[disp < 0] = np.nan
+    return disp
+
+def nb_glm_fit(cnorm, X, disp, variant='std', max_iter=500, tol=1e-8):
+    """NB-GLM IRLS, vectorized over genes.
+    variant 'std'    : DESeq2 fitNR style  W=1/V,  z=eta+(y-mu)/V   (quasi-GLM)
+    variant 'fisher' : exact NB MLE         W=mu^2/V, z=eta+(y-mu)/mu (Fisher scoring)
+    Returns beta (G,p), cov (G,p,p) [inv of X'WX with fit weights], conv, iters."""
+    G, n = cnorm.shape
+    p = X.shape[1]
+    beta = np.zeros((G, p))
+    means = cnorm.mean(axis=1)
+    beta[:, 0] = np.log(np.where(means > 0, means, 1.0))
+    eta = beta @ X.T
+    mu = np.exp(eta)
+    conv = np.zeros(G, bool)
+    it_used = np.zeros(G, int)
+    active = np.ones(G, bool)
+    I = np.eye(p)
+    for it in range(max_iter):
+        if not active.any():
+            break
+        a = np.where(active)[0]
+        m = mu[a]
+        var_i = m + disp[a][:, None] * m**2
+        if variant == 'std':
+            w = 1.0 / var_i
+            z = np.log(m) + (cnorm[a] - m) / var_i
+        else:  # fisher
+            w = m / var_i
+            z = np.log(m) + (cnorm[a] - m) / m
+        XtW = X.T[None, :, :] * w[:, None, :]          # (A, p, n)
+        XtWX = np.einsum('apn,nq->apq', XtW, X)        # (A, p, p)
+        XtWz = np.einsum('apn,an->ap', XtW, z)         # (A, p)
+        ridge = 1e-8 * np.trace(XtWX, axis1=1, axis2=2) / p
+        XtWXr = XtWX + ridge[:, None, None] * I[None, :, :]
+        try:
+            beta_new = np.linalg.solve(XtWXr, XtWz[..., None])[..., 0]
+        except np.linalg.LinAlgError:
+            beta_new = np.array([
+                np.linalg.lstsq(XtWXr[g], XtWz[g], rcond=None)[0]
+                for g in range(len(a))])
+        bad = ~np.all(np.isfinite(beta_new), axis=1)
+        if bad.any():
+            beta_new[bad] = beta[a][bad]
+        eta_new = beta_new @ X.T
+        delta = np.max(np.abs(eta_new - eta[a]), axis=1)   # per gene
+        beta[a] = beta_new
+        eta[a] = eta_new
+        mu[a] = np.exp(np.clip(eta_new, -700, 700))
+        done = (delta < tol) | bad
+        conv[a[done & ~bad]] = True
+        it_used[a[done]] = it + 1
+        active[a[done]] = False
+    var_i = mu + disp[:, None] * mu**2
+    if variant == 'std':
+        w = 1.0 / var_i
+    else:
+        w = mu / var_i
+    XtW = X.T[None, :, :] * w[:, None, :]
+    XtWX = np.einsum('apn,nq->apq', XtW, X)
+    ridge = 1e-8 * np.trace(XtWX, axis1=1, axis2=2) / p
+    XtWX = XtWX + ridge[:, None, None] * I[None, :, :]
+    try:
+        cov = np.linalg.inv(XtWX)
+    except np.linalg.LinAlgError:
+        cov = np.array([np.linalg.pinv(XtWX[g]) for g in range(G)])
+    return beta, cov, conv, it_used
+
+def fit_deseq2(cnorm, X, variant='std'):
+    """DESeq2 dispersion pipeline + final GLM fit."""
+    G, n = cnorm.shape
+    p = X.shape[1]
+    disp_mle = gene_disp_mle(cnorm)
+    n_na = int(np.isnan(disp_mle).sum())
+    d_fill = np.nanmedian(disp_mle)
+    disp_pre = np.where(np.isnan(disp_mle), d_fill, disp_mle)
+    beta_pre, _, _, _ = nb_glm_fit(cnorm, X, disp_pre, variant='fisher', max_iter=200, tol=1e-7)
+    mu_fit = np.exp(beta_pre @ X.T).mean(axis=1)         # per-gene mean fitted value
+    ok = ~np.isnan(disp_mle)
+    trend = lowess(np.log(disp_mle[ok]), np.log(mu_fit[ok]),
+                   xvals=np.log(mu_fit), frac=2/3, return_sorted=False)
+    df_deg = n - p
+    prior_w = 1.0 / np.sqrt(1.0 + df_deg / 2.0)
+    log_post = np.where(
+        np.isnan(disp_mle),
+        trend,
+        (df_deg * np.log(disp_mle) + prior_w * trend) / (df_deg + prior_w),
+    )
+    disp_final = np.exp(log_post)
+    beta, cov, conv, it_used = nb_glm_fit(cnorm, X, disp_final, variant=variant)
+    return disp_final, disp_mle, beta, cov, conv, it_used, n_na, df_deg
+
+# ---------------------------------------------------------------- FDR
+def bh(p):
+    p = np.asarray(p, float)
+    n = len(p)
+    order = np.argsort(p)
+    rank = np.empty(n, dtype=float)
+    rank[order] = np.arange(1, n + 1)
+    adj = p * n / rank
+    adj_sorted = np.minimum.accumulate(adj[order][::-1])[::-1]
+    out = np.empty(n)
+    out[order] = np.minimum(1.0, adj_sorted)
+    return out
+
+def indep_filter_padj(p, filter_stat, alpha=ALPHA):
+    """DESeq2-style independent filtering: rank genes by mean normalized count;
+    keep the expression cutoff that maximizes BH rejections; padj=NA below."""
+    G = len(p)
+    ord_desc = np.argsort(-filter_stat, kind='stable')
+    best_m, best_rej = G, -1
+    for m in range(G, 0, -1):
+        s = np.sort(p[ord_desc[:m]])
+        r = np.arange(1, m + 1)
+        hit = np.where(s <= r * alpha / m)[0]
+        rej = (hit[-1] + 1) if hit.size else 0
+        if rej > best_rej:
+            best_rej, best_m = rej, m
+    padj = np.full(G, np.nan)
+    sub = ord_desc[:best_m]
+    padj[sub] = bh(p[sub])
+    return padj, best_m, best_rej
+
+# ---------------------------------------------------------------- pipeline
+def run_design(counts, meta, X, names, tag, variant='std'):
+    C = counts.to_numpy(float)
+    sf = size_factors(C)
+    cnorm = C / sf
+    G = cnorm.shape[0]
+    disp, disp_mle, beta, cov, conv, it_used, n_na, df_deg = fit_deseq2(cnorm, X, variant=variant)
+    print(f'[{tag}] genes={G} samples={cnorm.shape[1]} params={X.shape[1]} '
+          f'df={df_deg} sf(min/med/max)={sf.min():.3f}/{np.median(sf):.3f}/{sf.max():.3f}')
+    print(f'[{tag}] NA gene-wise disp (neg variance)={n_na}  '
+          f'non-converged IRLS={int((~conv).sum())}  max iters={int(it_used.max())}')
+    res = {}
+    filter_stat = cnorm.mean(axis=1)
+    for s in ['97', '98', '99']:
+        k = names.index(f'Strain_{s}')
+        se = np.sqrt(np.maximum(cov[:, k, k], 0.0))
+        z = beta[:, k] / se
+        pval = 2.0 * stats.norm.sf(np.abs(z))
+        padj_if, m_if, rej_if = indep_filter_padj(pval, filter_stat)
+        padj_bh = bh(pval)
+        res[s] = pd.DataFrame({
+            'log2FC': beta[:, k], 'pvalue': pval,
+            'padj_IF': padj_if, 'padj_BH': padj_bh,
+        }, index=counts.index)
+        print(f'[{tag}] {STRAIN_MAP[s]:<12} vs JBX1:  sig(padj_IF<0.05)='
+              f'{int(np.nansum(padj_if < ALPHA))}  (IF kept {m_if}/{G} genes, '
+              f'{rej_if} rejections) | sig(pure BH<0.05)='
+              f'{int(np.sum(padj_bh < ALPHA))}')
+    return res, sf
+
+def set_logic(res, mode):
+    col = 'padj_IF' if mode == 'IF' else 'padj_BH'
+    sig = {s: (res[s][col].to_numpy() < ALPHA) & ~np.isnan(res[s][col].to_numpy())
+           for s in ['97', '98', '99']}
+    union = sig['97'] | sig['98']
+    return union, ~sig['99'], sig
+
+def main():
+    counts, meta = load_data()
+    X, names = design_matrix(meta, include_media=True)
+    res, sf = run_design(counts, meta, X, names, 'PRIMARY ~Media+Strain (NB-MLE)',
+                         variant='fisher')
+
+    union, nonsig_d, sig = set_logic(res, 'IF')
+    both_single = sig['97'] & sig['98']
+    only_las = sig['97'] & ~sig['98']
+    only_rhl = sig['98'] & ~sig['97']
+
+    print('\n=== SET LOGIC (primary design ~Media+Strain, independent filtering) ===')
+    print(f'sig dlasI vs JBX1        : {int(sig["97"].sum())}')
+    print(f'sig drhlI vs JBX1        : {int(sig["98"].sum())}')
+    print(f'sig in BOTH singles      : {int(both_single.sum())}')
+    print(f'sig in >=1 single (union): {int(union.sum())}')
+    print(f'  of union: also sig in double mutant : {int((union & sig["99"]).sum())}')
+    print(f'  of union: NOT sig in double mutant  : {int((union & nonsig_d).sum())}  <-- ANSWER')
+    print(f'breakdown (union x double-mutant):')
+    print(f'  dlasI-only  : sig_dbl={int((only_las & sig["99"]).sum())}  nonsig_dbl={int((only_las & nonsig_d).sum())}')
+    print(f'  drhlI-only  : sig_dbl={int((only_rhl & sig["99"]).sum())}  nonsig_dbl={int((only_rhl & nonsig_d).sum())}')
+    print(f'  both singles: sig_dbl={int((both_single & sig["99"]).sum())}  nonsig_dbl={int((both_single & nonsig_d).sum())}')
+    ans_if = int((union & nonsig_d).sum())
+
+    union_b, nonsig_b, sig_b = set_logic(res, 'BH')
+    ans_bh = int((union_b & nonsig_b).sum())
+    print('\n=== SENSITIVITY: pure BH (no independent filtering), ~Media+Strain ===')
+    print(f'sig singles: dlasI={int(sig_b["97"].sum())} drhlI={int(sig_b["98"].sum())} '
+          f'union={int(union_b.sum())}; NOT sig double: {ans_bh}  <-- pure-BH answer')
+
+    X2, names2 = design_matrix(meta, include_media=False)
+    res2, _ = run_design(counts, meta, X2, names2, 'sensitivity ~Strain (NB-MLE)',
+                         variant='fisher')
+    union2, nonsig2, sig2 = set_logic(res2, 'IF')
+    print(f'[~Strain, IF] union singles={int(union2.sum())} -> not sig double: '
+          f'{int((union2 & nonsig2).sum())}')
+
+    res_std, _ = run_design(counts, meta, X, names, 'SENS std-IRLS ~Media+Strain',
+                            variant='std')
+    us, nd, ss = set_logic(res_std, 'IF')
+    print(f'[std-IRLS ~Media+Strain] union singles={int(us.sum())} -> not sig double: '
+          f'{int((us & nd).sum())}')
+
+    per = {}
+    for md in MEDIA:
+        subm = meta[meta['Media'] == md]
+        Csub = counts[subm.index].to_numpy(float)
+        sfsub = size_factors(Csub)
+        cnsub = Csub / sfsub
+        Xs, ns = design_matrix(subm, include_media=False)
+        d, dm, b, cv, c_, i_, nna, dfd = fit_deseq2(cnsub, Xs, 'fisher')
+        for s in ['97', '98', '99']:
+            k = ns.index(f'Strain_{s}')
+            se = np.sqrt(np.maximum(cv[:, k, k], 0.0))
+            pval = 2.0 * stats.norm.sf(np.abs(b[:, k] / se))
+            per[(md, s)] = (bh(pval) < ALPHA)
+    u_pm = (per[('MMGluFeMinus','97')] | per[('MMGluFeMinus','98')] |
+            per[('MMGluFePlus','97')] | per[('MMGluFePlus','98')] |
+            per[('Succinate','97')] | per[('Succinate','98')])
+    dbl_all = ~ (per[('MMGluFeMinus','99')] | per[('MMGluFePlus','99')] |
+                 per[('Succinate','99')])
+    dbl_any = ~ (per[('MMGluFeMinus','99')] & per[('MMGluFePlus','99')] &
+                 per[('Succinate','99')])
+    print(f'[per-media] union singles(any media)={int(u_pm.sum())}; '
+          f'not sig double in ALL media: {int((u_pm & dbl_all).sum())}; '
+          f'not sig double in ANY media: {int((u_pm & dbl_any).sum())}')
+
+    out = pd.DataFrame(index=counts.index)
+    for s in ['97', '98', '99']:
+        out[f'log2FC_{STRAIN_MAP[s]}'] = res[s]['log2FC']
+        out[f'pvalue_{STRAIN_MAP[s]}'] = res[s]['pvalue']
+        out[f'padj_IF_{STRAIN_MAP[s]}'] = res[s]['padj_IF']
+        out[f'padj_BH_{STRAIN_MAP[s]}'] = res[s]['padj_BH']
+    out.to_csv('results/deseq2_results_primary.csv')
+
+    mask = union & nonsig_d
+    sub = out.loc[mask].copy()
+    sub['in_dlasI'] = sig['97'][mask]
+    sub['in_drhlI'] = sig['98'][mask]
+    sub.to_csv('results/answer_genes_single_not_double.csv')
+
+    with open('results/summary.txt', 'w') as f:
+        f.write(f'ANSWER (primary ~Media+Strain, DESeq2 default independent filtering): {ans_if}\n')
+        f.write(f'Sensitivity pure BH (no IF), ~Media+Strain: {ans_bh}\n')
+        f.write(f'Sensitivity ~Strain pooled (IF): {int((union2 & nonsig2).sum())}\n')
+        f.write(f'Sensitivity std-IRLS ~Media+Strain (IF): {int((us & nd).sum())}\n')
+        f.write(f'Sensitivity per-media union-singles, not-sig-double-all-media: {int((u_pm & dbl_all).sum())}\n')
+    print(f'\nFINAL ANSWER: {ans_if}')
+    print('saved: results/deseq2_results_primary.csv, '
+          'results/answer_genes_single_not_double.csv, results/summary.txt')
+
+if __name__ == '__main__':
+    main()

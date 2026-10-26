@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+Shared-mode recovery from complex response curves (asibench:materials.relaxation_mode_recovery).
+
+Model:  R_m(x) = a0_m + sum_{k=1..K} a_mk / (1 + (i x tau_k)^phi_k)
+  - tau_k, phi_k: shared across the 5 curves (unknown K)
+  - a0_m, a_mk:   curve-specific; modal amplitudes a_mk >= 0
+  - constraints:  tau_k > 0, 0 < phi_k <= 1, a_mk >= 0
+
+Method: multistart MAP via variable projection.
+  - Nonlinear parameters theta = (log10 tau_k, phi_k) optimized with
+    scipy.optimize.least_squares (trust-region reflective, phi in a bounded
+    box [1e-3, 1] -- no sigmoid transform, so phi = 1 (Debye) stays reachable).
+  - Given theta, the curve-specific linear parameters (a0_m, a_mk >= 0) are
+    solved exactly by nonnegative least squares on the stacked weighted
+    residuals (variable projection).
+  - K selected by: reduced chi-square ~ 1 + no coherent residual structure
+    (primary gate), delta-chi2 elbow, BIC as tiebreaker.
+  - Stability: multistart seed-family check, split-half grid, leave-one-
+    curve-out, and bootstrap refits at the chosen K.
+
+Assumption stated up front: tau is searched in [1e-4, 1e4] so every retained
+mode turns over inside the measured window; anything slower is absorbed by a0
+(a0 <-> very-slow-mode degeneracy is inherent to the data range).
+"""
+import json
+import os
+import itertools
+import numpy as np
+import pandas as pd
+from scipy.optimize import nnls, least_squares
+
+RNG = np.random.default_rng(20261019)
+DATA_CSV = "data/curves.csv"
+OUT_CSV = "results/modes.csv"
+
+TAU_LO, TAU_HI = 1e-4, 1e4          # search window (turn-over guaranteed in-window)
+PHI_LO, PHI_HI = 1e-3, 1.0          # bounded box, not a transform
+
+# ----------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------
+def load():
+    df = pd.read_csv(DATA_CSV)
+    curves = list(np.sort(df["curve"].unique()))
+    assert curves == list(range(len(curves))), "curve ids must be 0..M-1"
+    d0 = df[df.curve == curves[0]]
+    x = d0.x.to_numpy(float)
+    grids_identical = all(
+        np.array_equal(df[df.curve == c].x.to_numpy(float), x) for c in curves
+    )
+    RE = np.array([df[df.curve == c].re.to_numpy(float) for c in curves])
+    IM = np.array([df[df.curve == c].im.to_numpy(float) for c in curves])
+    return curves, x, RE, IM, grids_identical
+
+def noise_sigma(RE, IM):
+    """White-noise sigma per component from second differences (signal ~ smooth)."""
+    def sd(v):
+        d2 = v[..., 2:] - 2 * v[..., 1:-1] + v[..., :-2]
+        return d2.std() / np.sqrt(6)
+    return sd(RE), sd(IM)
+
+# ----------------------------------------------------------------------------
+# Model / variable projection
+# ----------------------------------------------------------------------------
+def mode_response(x, tau, phi):
+    """1 / (1 + (i x tau)^phi); principal branch: (x tau)^phi * e^{i phi pi/2}."""
+    return 1.0 / (1.0 + (1j * (x * tau)) ** phi)
+
+def design_block(x, tau, phi):
+    """Unweighted design for ONE curve: columns [1, z_1 ... z_K]; rows [re; im]."""
+    n = x.size
+    Z = np.array([mode_response(x, t, p) for t, p in zip(tau, phi)])  # (K, n)
+    A = np.zeros((2 * n, 1 + len(tau)))
+    A[:n, 0] = 1.0
+    for k in range(len(tau)):
+        A[:n, k + 1] = Z[k].real
+        A[n:, k + 1] = Z[k].imag
+    return A
+
+def stacked_system(x, RE, IM, tau, phi, s_re, s_im):
+    """Weighted BLOCK-DIAGONAL design: each curve gets its own (a0, a_1..a_K)
+    columns, so the NNLS solve yields curve-specific linear parameters."""
+    n = x.size
+    M = len(RE)
+    Ab = design_block(x, tau, phi)                       # (2n, K+1)
+    w = np.concatenate([np.full(n, 1.0 / s_re), np.full(n, 1.0 / s_im)])
+    Aw = Ab * w[:, None]
+    nc = Kc = Aw.shape[1]
+    A = np.zeros((M * 2 * n, M * nc))
+    b = np.zeros(M * 2 * n)
+    for m in range(M):
+        A[m*2*n:(m+1)*2*n, m*nc:(m+1)*nc] = Aw
+        b[m*2*n:(m+1)*2*n] = np.concatenate([RE[m] / s_re, IM[m] / s_im])
+    return A, b
+
+def pack(t_lin, phi):
+    return np.concatenate([t_lin, phi])
+
+def unpack(p, K):
+    return 10.0 ** p[:K], p[K:]
+
+def make_residual(K, x, RE, IM, s_re, s_im):
+    def fun(p):
+        tau, phi = unpack(p, K)
+        A, b = stacked_system(x, RE, IM, tau, phi, s_re, s_im)
+        coef, _ = nnls(A, b)
+        return A @ coef - b
+    return fun
+
+# ----------------------------------------------------------------------------
+# Initialization: shoulder positions + random draws
+# ----------------------------------------------------------------------------
+def shoulder_positions(x, RE):
+    """Shoulder candidates = local maxima of the cross-curve averaged, smoothed
+    -d(re)/dlog10(x). Peaks of the loss derivative mark mode turnovers."""
+    lx = np.log10(x)
+    k = np.ones(9) / 9.0
+    G = []
+    for c in range(RE.shape[0]):
+        s = np.convolve(RE[c], k, mode="same")
+        s[:4], s[-4:] = s[4], s[-5]
+        G.append(-np.gradient(s, lx))
+    g = np.mean(G, axis=0)
+    pk = [j for j in range(4, x.size - 4) if g[j] >= g[j-1] and g[j] >= g[j+1]]
+    # keep prominent peaks (>= 35% of max), dedupe within 0.6 decades
+    thr = 0.35 * g[pk].max()
+    out = []
+    for j in sorted(pk, key=lambda j: -g[j]):
+        if g[j] < thr:
+            continue
+        if all(abs(lx[j] - o) > 0.6 for o in out):
+            out.append(float(lx[j]))
+    return sorted(out)
+
+def initial_pool(x, RE, IM, K, s_re, s_im, shoulders):
+    """Shoulder-based inits + large random pool scored by VP objective (nnls only)."""
+    pool = []
+    sh = np.array(shoulders)
+    sh = sh[(sh > np.log10(TAU_LO) + 0.2) & (sh < np.log10(TAU_HI) - 0.2)]
+    combos = list(itertools.combinations(sh, K)) if len(sh) >= K else []
+    for combo in combos:
+        for jit in (0.0, 0.15, -0.15):
+            t = np.asarray(combo) + jit * RNG.normal(size=K)
+            pool.append((np.clip(t, np.log10(TAU_LO), np.log10(TAU_HI)),
+                         RNG.uniform(0.5, 1.0, size=K)))
+    lo, hi = np.log10(TAU_LO), np.log10(TAU_HI)
+    T = RNG.uniform(lo, hi, size=(2500, K))
+    P = RNG.uniform(0.3, 1.0, size=(2500, K))
+    for t, p in zip(T, P):
+        pool.append((t, p))
+    scored = []
+    for t, p in pool:
+        tau, phi = 10.0 ** np.asarray(t, float), np.asarray(p, float)
+        A, b = stacked_system(x, RE, IM, tau, phi, s_re, s_im)
+        coef, _ = nnls(A, b)
+        r = A @ coef - b
+        scored.append((float(r @ r), t, p))
+    scored.sort(key=lambda z: z[0])
+    starts = [pack(t, p) for _, t, p in scored[:40]]
+    for t, p in pool[:6]:                      # guarantee shoulder-family presence
+        s = pack(t, p)
+        if not any(np.allclose(s, z) for z in starts):
+            starts.append(s)
+    return starts
+
+# ----------------------------------------------------------------------------
+# Fit for a given K
+# ----------------------------------------------------------------------------
+def fit_K(K, x, RE, IM, s_re, s_im, shoulders, verbose=True):
+    starts = initial_pool(x, RE, IM, K, s_re, s_im, shoulders)
+    lo = np.concatenate([np.full(K, np.log10(TAU_LO)), np.full(K, PHI_LO)])
+    hi = np.concatenate([np.full(K, np.log10(TAU_HI)), np.full(K, PHI_HI)])
+    fun = make_residual(K, x, RE, IM, s_re, s_im)
+    best_sse, best_x = np.inf, None
+    fam_best = {}
+    for i, p0 in enumerate(starts):
+        p0 = np.clip(np.asarray(p0, float), lo + 1e-9, hi - 1e-9)
+        try:
+            res = least_squares(fun, p0, bounds=(lo, hi), method="trf",
+                                x_scale="jac", max_nfev=400 * (K + 1))
+        except Exception:
+            continue
+        sse = float(2 * res.cost)
+        fam = "shoulder" if i >= 40 else "random"
+        fam_best[fam] = min(fam_best.get(fam, np.inf), sse)
+        if sse < best_sse:
+            best_sse, best_x = sse, res.x
+        if verbose and (i + 1) % 10 == 0:
+            print(f"    K={K} start {i+1}/{len(starts)} best SSE {best_sse:.2f}", flush=True)
+    tau, phi = unpack(best_x, K)
+    order = np.argsort(tau)
+    return {"K": K, "sse": best_sse, "theta": best_x,
+            "tau": tau[order], "phi": phi[order], "seed_family_best": fam_best}
+
+def linear_solve(x, RE, IM, tau, phi, s_re, s_im):
+    A, b = stacked_system(x, RE, IM, tau, phi, s_re, s_im)
+    coef, _ = nnls(A, b)
+    return coef.reshape(len(RE), len(tau) + 1)   # rows: [a0_m, a_m1..a_mK]
+
+def residuals_of(x, RE, IM, tau, phi, coef):
+    Rm = np.empty_like(RE, dtype=complex)
+    for m in range(RE.shape[0]):
+        model = coef[m, 0] + sum(
+            coef[m, k + 1] * mode_response(x, tau[k], phi[k]) for k in range(len(tau))
+        )
+        Rm[m] = (RE[m] + 1j * IM[m]) - model
+    return Rm
+
+def diagnostics(Rm, s_re, s_im):
+    out = {"lag1_re": [], "lag1_im": [], "tail_re": [], "tail_im": []}
+    hi = slice(-12, None)
+    for m in range(Rm.shape[0]):
+        r = Rm[m]
+        out["lag1_re"].append(float(np.corrcoef(r.real[:-1], r.real[1:])[0, 1]))
+        out["lag1_im"].append(float(np.corrcoef(r.imag[:-1], r.imag[1:])[0, 1]))
+        out["tail_re"].append(float(r.real[hi].mean()))
+        out["tail_im"].append(float(r.imag[hi].mean()))
+    out["max_abs_tail_re"] = float(np.max(np.abs(out["tail_re"])))
+    out["max_abs_tail_im"] = float(np.max(np.abs(out["tail_im"])))
+    return out
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    curves, x, RE, IM, grids_ok = load()
+    M, n = len(curves), x.size
+    s_re, s_im = noise_sigma(RE, IM)
+    print(f"curves={M} n={n} grid_identical={grids_ok}")
+    print(f"noise sigma: re={s_re:.4f} im={s_im:.4f}")
+
+    shoulders = shoulder_positions(x, RE)
+    print("shoulder clusters (log10 x):", np.round(shoulders, 2))
+
+    N_tot = RE.size * 2
+    results = {}
+    for K in range(1, 9):
+        print(f"== fitting K={K} ==", flush=True)
+        fit = fit_K(K, x, RE, IM, s_re, s_im, shoulders)
+        coef = linear_solve(x, RE, IM, fit["tau"], fit["phi"], s_re, s_im)
+        Rm = residuals_of(x, RE, IM, fit["tau"], fit["phi"], coef)
+        dof = N_tot - (M * (K + 1) + 2 * K)
+        chi2_red = fit["sse"] / dof
+        p = 2 * K + M * (K + 1)
+        fit.update({"coef": coef, "diag": diagnostics(Rm, s_re, s_im),
+                    "chi2_red": float(chi2_red), "bic": float(fit["sse"] + p * np.log(N_tot)),
+                    "dof": dof, "p": p})
+        d = fit["diag"]
+        results[K] = fit
+        print(f"  K={K}: SSE={fit['sse']:.1f} chi2_red={chi2_red:.3f} BIC={fit['bic']:.1f} "
+              f"max|tail| re={d['max_abs_tail_re']:.3f} im={d['max_abs_tail_im']:.3f} "
+              f"lag1(re)={np.mean(d['lag1_re']):.2f} lag1(im)={np.mean(d['lag1_im']):.2f} "
+              f"fams={ {k: round(v,1) for k,v in fit['seed_family_best'].items()} }", flush=True)
+
+    print("\n== K selection table ==")
+    rows = [(K, results[K]["sse"], results[K]["chi2_red"], results[K]["bic"],
+             results[K]["diag"]["max_abs_tail_im"], np.mean(results[K]["diag"]["lag1_re"]),
+             np.mean(results[K]["diag"]["lag1_im"])) for K in sorted(results)]
+    tab = pd.DataFrame(rows, columns=["K", "SSE", "chi2_red", "BIC",
+                                      "max|tail_im|", "lag1_re", "lag1_im"])
+    tab["dSSE"] = tab["SSE"].diff()
+    print(tab.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+    def gate(K):
+        d = results[K]["diag"]
+        chi2_ok = results[K]["chi2_red"] < 1.35
+        resid_ok = (max(abs(np.mean(d["lag1_re"])), abs(np.mean(d["lag1_im"]))) < 0.35
+                    and d["max_abs_tail_im"] < 3.5 * s_im / np.sqrt(12)
+                    and d["max_abs_tail_re"] < 3.5 * s_re / np.sqrt(12))
+        return chi2_ok and resid_ok
+    passing = [K for K in sorted(results) if gate(K)]
+    print("K passing primary gate:", passing)
+    K_sel = min(passing, key=lambda K: results[K]["bic"]) if passing \
+        else min(results, key=lambda K: results[K]["bic"])
+    print(f"selected K = {K_sel}")
+
+    # --- stability checks at selected K -------------------------------------
+    print("\n== stability checks ==")
+    f = results[K_sel]
+    tau0, phi0 = f["tau"], f["phi"]
+    lo = np.concatenate([np.full(K_sel, np.log10(TAU_LO)), np.full(K_sel, PHI_LO)])
+    hi = np.concatenate([np.full(K_sel, np.log10(TAU_HI)), np.full(K_sel, PHI_HI)])
+    p_full = pack(np.log10(tau0), phi0)
+    for name, idx in [("even", np.arange(0, n, 2)), ("odd", np.arange(1, n, 2))]:
+        r = least_squares(make_residual(K_sel, x[idx], RE[:, idx], IM[:, idx],
+                                        s_re, s_im), p_full, bounds=(lo, hi),
+                          method="trf", max_nfev=2000)
+        t2, p2 = unpack(r.x, K_sel)
+        print(f"  split-half {name}: tau={np.round(t2,3)} phi={np.round(p2,3)}")
+    for m in range(M):
+        keep = [j for j in range(M) if j != m]
+        r = least_squares(make_residual(K_sel, x, RE[keep], IM[keep], s_re, s_im),
+                          p_full, bounds=(lo, hi), method="trf", max_nfev=2000)
+        t2, p2 = unpack(r.x, K_sel)
+        print(f"  leave-curve-{m}-out: tau={np.round(t2,3)} phi={np.round(p2,3)}")
+    bt, bp = [], []
+    for _ in range(20):
+        idx = RNG.integers(0, n, n)
+        r = least_squares(make_residual(K_sel, x[idx], RE[:, idx], IM[:, idx],
+                                        s_re, s_im), p_full, bounds=(lo, hi),
+                          method="trf", max_nfev=1500)
+        t2, p2 = unpack(r.x, K_sel)
+        bt.append(np.sort(t2)); bp.append(np.sort(p2))
+    bt, bp = np.array(bt), np.array(bp)
+    print(f"  bootstrap(20) tau median={np.round(np.median(bt,0),3)} "
+          f"IQR={np.round(np.percentile(bt,75,0)-np.percentile(bt,25,0),3)}")
+    print(f"  bootstrap(20) phi median={np.round(np.median(bp,0),3)} "
+          f"IQR={np.round(np.percentile(bp,75,0)-np.percentile(bp,25,0),3)}")
+    pinned = np.where((tau0 <= TAU_LO * 1.5) | (tau0 >= TAU_HI / 1.5))[0]
+    print("  boundary-pinned tau:", "NONE" if pinned.size == 0 else f"modes {pinned} (RED FLAG)")
+
+    # --- final outputs -------------------------------------------------------
+    os.makedirs("results", exist_ok=True)
+    coef = f["coef"]
+    out = pd.DataFrame({"tau": tau0})
+    for m in range(M):
+        out[f"a_{m}"] = coef[m, 1:]
+    out.to_csv(OUT_CSV, index=False)
+    print(f"\nwrote {OUT_CSV}")
+    print(out.to_string(index=False))
+    print("per-curve a0:", {m: round(float(coef[m, 0]), 4) for m in range(M)})
+
+    summary = {"K_selected": int(K_sel),
+               "tau": [float(v) for v in tau0], "phi": [float(v) for v in phi0],
+               "a0": {m: float(coef[m, 0]) for m in range(M)},
+               "chi2_reduced": f["chi2_red"],
+               "sigma_re": float(s_re), "sigma_im": float(s_im),
+               "K_table": {str(K): {"sse": results[K]["sse"], "chi2_red": results[K]["chi2_red"],
+                                    "bic": results[K]["bic"],
+                                    "tau": list(np.round(results[K]["tau"], 4)),
+                                    "phi": list(np.round(results[K]["phi"], 4)),
+                                    "seed_family_best": results[K]["seed_family_best"]}
+                           for K in sorted(results)}}
+    with open("results/fit_summary.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print("wrote results/fit_summary.json")
+
+if __name__ == "__main__":
+    main()

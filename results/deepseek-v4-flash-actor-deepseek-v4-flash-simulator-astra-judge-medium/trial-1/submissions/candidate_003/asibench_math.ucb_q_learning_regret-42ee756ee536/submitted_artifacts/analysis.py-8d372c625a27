@@ -1,0 +1,254 @@
+"""analysis.py
+
+Tabular, online, model-free optimistic Q-learning with low burn-in cost on
+finite-horizon episodic MDPs (hidden transitions/rewards).
+
+Design summary
+--------------
+Two statistically different optimistic Q estimates are maintained per
+(h, s, a), all with O(H*S*A) storage and a single bounded episode trace:
+
+  1) ONE-STEP BOOTSTRAP  Q1(h,s,a) <- mean of y1 = r + max_a Q1(h+1, s', a).
+     Its variance (m2_1) is *inflated* during burn-in because V targets
+     drift while downstream values are learned.
+  2) BOUNDED TRACE       Qm(h,s,a) <- mean of the realized return over a
+     bounded window (length min(M, H-h+1)) of the episode in which the
+     transition was *actually* observed. Inside the window no *estimated*
+     continuation value is used, so Qm carries delayed credit within an
+     episode without depending on drifting next-value targets.
+
+Optimism / confidence mechanism
+-------------------------------
+  - Variance-sensitive Bernstein-style bonuses built on NON-DRIFTING,
+    realized trace-return dispersion var_m (centered first/second moments
+    via Welford). Empirically var_m has the larger magnitude (it is a
+    window sum), but it never drifts with the value estimates; the one-step
+    estimator re-uses it as a stable dispersion proxy;
+  - the one-step bonus is additionally SELF-CALIBRATED: its injected
+    variance-optimism is clamped by the empirically observed one-step
+    target spread var_1 (upper/lower confidence information), which in
+    practice binds and prevents unbounded early optimism;
+  - pure optimism-driven exploration: the score of never-visited entries is
+    the maximum possible remaining value, so no external random noise is
+    needed;
+  - everything is clamped to the valid remaining-horizon range [0, H-h+1].
+  - selection = argmax over a variance/visit-sensitive blend of the two
+    optimistic estimates: early episodes (small n, drifting V) are dominated
+    by the optimistic one-step bootstrap, later by the precise trace.
+
+No explicit transition model, no next-state count tensors, no
+H*S*A*S tensor, no replay-based planning, no posterior sampling, and no
+branching on case_id/dimensions. One shared configuration is used for every
+MDP.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Shared, case-independent configuration (one set of constants for all MDPs).
+# Final values are chosen from a small sensitivity grid over the three public
+# calibration MDPs (see diagnostics) and are NOT tuned per case.
+# ---------------------------------------------------------------------------
+C_TRACE = 8          # bounded trace window length (steps) inside an episode
+BETA_C = 0.0         # weight of bootstrap-continuation inside trace target (0 = pure window return)
+C1 = 1.15            # variance-sensitive bonus coefficient (log-scaled)
+C2 = 1.35            # horizon-range bonus coefficient (1/n)
+KHI = 0.9            # self-calibration clamp multiplier for the one-step bonus
+N0 = 6.0             # blend scale: one-step dominates until ~N0 visits/entry
+ZMIX = 0.20          # minimum weight kept on the one-step bootstrap
+CDISC_LOG = 1.5      # log-count drift discount inside the one-step bonus's clamp
+C3 = 0.0             # Hoeffding-style exploration floor (tested; hurts here -> default off)
+
+
+def make_agent(env_spec, seed):
+    """Factory required by the official runner: make_agent(env_spec, seed)."""
+    return _Agent(env_spec, seed)
+
+
+class _Agent:
+    def __init__(self, env_spec, seed):
+        self.H = int(env_spec["H"])
+        self.S = int(env_spec["S"])
+        self.A = int(env_spec["A"])
+        self.K = int(env_spec.get("K", -1))
+        self.seed = int(seed)
+        self.h_last = None
+        self.in_episode = False
+        self.trace = []  # single bounded episode trace: [(state, action, reward)]
+        self.step = 1.0  # global transition counter (for the exploration floor)
+
+        H, S, A = self.H, self.S, self.A
+
+        # Per (h,s,a) statistics (O(H*S*A) total):
+        #   n    : visit count (shared by both estimators)
+        #   q1   : running mean of one-step bootstrap targets
+        #   m2_1 : sum of squared deviations (Welford) of one-step targets
+        #   qm   : running mean of bounded trace-return targets
+        #   m2_m : sum of squared deviations (Welford) of trace targets
+        self.n = np.zeros((H, S, A), dtype=np.float64)
+        self.q1 = np.zeros((H, S, A), dtype=np.float64)
+        self.m2_1 = np.zeros((H, S, A), dtype=np.float64)
+        self.qm = np.zeros((H, S, A), dtype=np.float64)
+        self.m2_m = np.zeros((H, S, A), dtype=np.float64)
+
+        # Maximum valid remaining value for 1-indexed h (rewards in [0,1]).
+        # maxval[h] = H - h + 1, i.e. maxval[0] = H (h=1), maxval[H-1] = 1.
+        self.maxval = (self.H - np.arange(1, H + 1) + 1).astype(np.float64)
+
+    # ------------------------------------------------------------------ #
+    # Episode management (works with the official runner's optional hooks
+    # reset_episode / end_episode AND with a bare act/observe protocol).
+    # ------------------------------------------------------------------ #
+    def reset_episode(self, episode, state):
+        self._start_episode()
+
+    def end_episode(self, episode, episode_reward):
+        if self.in_episode:
+            self._flush_trace()
+            self.in_episode = False
+
+    def _start_episode(self):
+        self.in_episode = True
+        self.trace = []
+        self.h_last = None
+
+    # ------------------------------------------------------------------ #
+    # Statistics
+    # ------------------------------------------------------------------ #
+    def _push(self, q, m2, n, hh, s, a, target):
+        """Incremental Welford update for mean q and sum-of-squared-devs m2."""
+        m = n[hh, s, a]
+        if m == 0.0:
+            q[hh, s, a] = target
+            m2[hh, s, a] = 0.0
+        else:
+            old = q[hh, s, a]
+            new = old + (target - old) / (m + 1.0)
+            q[hh, s, a] = new
+            m2[hh, s, a] += (target - old) * (target - new)
+        n[hh, s, a] = m + 1.0
+
+    def _flush_trace(self):
+        """End-of-episode credit: push bounded trace-return targets to Qm.
+
+        The trace is cleared after flushing so that credit is attributed
+        exactly once, regardless of whether episode boundaries are signalled
+        by observe(done=True), by the optional reset_episode/end_episode
+        hooks of the official runner, or by the bare act/observe fallback.
+        """
+        H, M, bet = self.H, C_TRACE, BETA_C
+        tr = self.trace
+        T = len(tr)
+        if T == 0:
+            return
+        for i in range(T):
+            s_i, a_i, r_i = tr[i]
+            hh = i
+            rem = H - hh  # remaining steps including this one (1-indexed h = i+1)
+            m_eff = min(M, rem)
+            y = 0.0
+            for j in range(i, i + m_eff):
+                y += tr[j][2]
+            if bet > 0.0 and m_eff < rem:
+                tail_idx = i + m_eff
+                s_tail = tr[tail_idx][0]
+                h_tail = min(tail_idx + 1, H - 1)
+                y += bet * float(self.q1[h_tail, s_tail, :].max())
+            y = min(y, self.maxval[hh])
+            self._push(self.qm, self.m2_m, self.n, hh, s_i, a_i, y)
+        self.trace = []  # consumed exactly once
+
+    # ------------------------------------------------------------------ #
+    # Optimistic score (variance-sensitive bonuses + upper/lower clamp)
+    # ------------------------------------------------------------------ #
+    def _score(self, hh, s, a):
+        n = self.n[hh, s, a]
+        mx = self.maxval[hh]
+        if n < 1.0:
+            # pure optimism: never-visited entries get max possible value
+            return mx * 2.0  # > mx, guarantees first-visit exploration of all (h,s,a)
+
+        # empirical variances from centered first/second moments
+        var_m = self.m2_m[hh, s, a] / n
+        var_1 = self.m2_1[hh, s, a] / n
+        lfac = float(np.log(max(1.0, CDISC_LOG * n)))
+        se_t = np.sqrt(var_m / n) if var_m > 0.0 else 0.0
+
+        # --- bounded trace estimator (low-variance, non-drifting) ---
+        range_m = min(C_TRACE, mx)
+        bonus_m = C1 * se_t * np.sqrt(lfac) + C2 * range_m / n
+        score_m = self.qm[hh, s, a] + bonus_m
+
+        # --- one-step bootstrap estimator ---
+        # variance-sensitive term uses the LOW-VARIANCE trace dispersion;
+        # the range term of the one-step target uses the full horizon range.
+        bonus_1 = C1 * se_t * np.sqrt(lfac) + C2 * mx / n
+        # upper/lower self-calibration: cap the injected variance-optimism by
+        # the *empirically observed* one-step target spread var_1 (which, if
+        # inflated by drifting V, also caps the noise paid during burn-in):
+        if var_1 > 0.0 and n > 1.0:
+            empirical = KHI * np.sqrt(var_1 / n)
+            bonus_1 = min(bonus_1, empirical) + C2 * mx / n
+        score_1 = self.q1[hh, s, a] + bonus_1
+        score_1 = min(score_1, mx)
+        score_m = min(score_m, mx)
+
+        # --- variance/visit-sensitive blend ---
+        # one-step bootstrap dominates the first ~N0 visits (optimism toward
+        # Q*), the low-variance trace takes over once evidence accumulates.
+        zeta = np.clip(N0 / (N0 + n), ZMIX, 1.0)
+        score = zeta * score_1 + (1.0 - zeta) * score_m
+        # Hoeffding-style exploration floor: keeps under-visited actions alive
+        # even after an unlucky early draw (forgiving near-equal forks).
+        score += C3 * np.sqrt(np.log(1.0 + self.step) / (n + 1.0))
+        return score
+
+    # ------------------------------------------------------------------ #
+    # Required interface
+    # ------------------------------------------------------------------ #
+    def act(self, h, state):
+        hh = int(h) - 1
+        if h == 1:
+            if len(self.trace) > 0:
+                # previous episode was not closed by observe(done=True)
+                self._flush_trace()
+                self._start_episode()
+            elif not self.in_episode:
+                self._start_episode()
+        else:
+            if not self.in_episode:
+                self._start_episode()
+        self.h_last = int(h)
+
+        best_a, best_score = 0, -1.0
+        for a in range(self.A):
+            sc = self._score(hh, int(state), a)
+            if sc > best_score:
+                best_score, best_a = sc, a
+        return best_a
+
+    def observe(self, h, state, action, reward, next_state, done):
+        hh = int(h) - 1
+        if not self.in_episode:
+            self._start_episode()
+
+        # --- one-step bootstrap target y1 = r + V(h+1, next) ---
+        if hh >= self.H - 1:
+            y1 = float(reward)
+        else:
+            Vnext = float(self.q1[hh + 1, int(next_state), :].max())
+            y1 = float(reward) + Vnext
+        y1 = min(y1, self.maxval[hh])
+        self._push(self.q1, self.m2_1, self.n, hh, int(state), int(action), y1)
+
+        # --- record one step in the single bounded episode trace ---
+        if len(self.trace) < self.H:
+            self.trace.append((int(state), int(action), float(reward)))
+
+        self.step += 1.0
+
+        if done:
+            self._flush_trace()
+            self.in_episode = False

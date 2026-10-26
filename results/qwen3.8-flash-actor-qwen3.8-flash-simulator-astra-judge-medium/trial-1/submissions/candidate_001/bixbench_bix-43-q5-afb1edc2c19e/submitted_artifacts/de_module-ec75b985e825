@@ -1,0 +1,186 @@
+"""
+deseq_np.py -- DESeq2-equivalent negative-binomial GLM (group-indicator design, log link,
+size-factor offsets) implemented in NumPy/SciPy, for use when R/DESeq2 or pydeseq2 are
+unavailable (offline runner).
+
+Algorithm mirrors DESeq2's default ('parametric'/'mle' path) at the level that matters for
+baseMean, log2FoldChange and Wald p-values:
+  1. size factors: median-of-ratios (Anders & Huber), genes with all counts > 0
+  2. normalized counts = counts / size factor;  baseMean = row mean of normalized counts
+     (DESeq2 'baseMean' definition, computed over ALL samples)
+  3. per-gene NB2 dispersion: closed-form MLE of group means (design = group indicators with
+     log(sizeFactor) offset  ->  exp(beta_g) = sum_{i in g} y_i / sum_{i in g} s_i), then
+     maximum-likelihood alpha (Var = mu + alpha*mu^2) by vectorised Newton on log alpha
+  4. dispersion trend: local fit (binned medians over log baseMean + smoothing) of gene-wise
+     alphas; MAP shrinkage of log alpha towards the trend with a Normal prior (sd = 0.2),
+     which is DESeq2's shrinkage design (prior width is DESeq2's default 0.2)
+  5. Wald test for any contrast c: z = c'b / sqrt(c' (X'WX)^-1 c), W_ii = mu_i/(1+alpha*mu_i)
+
+Documented deviations from R/DESeq2 (stated in the report, not hidden):
+  * dispersion trend uses binned-median local fit instead of DESeq2's parametric
+    'a1 + a2/mu' nbinomGLM fit (monotone-equivalent, no extra filtering)
+  * no Cook's-distance outlier replacement and no independent filtering (per analysis brief)
+  * MAP shrinkage uses a single fixed prior width 0.2 rather than DESeq2's sample-count
+    adjusted prior width
+"""
+import numpy as np
+from scipy.special import digamma, gammaln
+from scipy.stats import norm
+
+EPS = 1e-12
+
+
+def size_factors(counts):
+    """median-of-ratios; counts (genes x samples), returns sf (samples,)"""
+    ok = (counts > 0).all(axis=1)
+    lg = np.log(counts[ok])
+    ref = lg.mean(axis=1)
+    return np.exp(np.median(lg - ref[:, None], axis=0))
+
+
+def group_beta_means(counts, sf, group_index):
+    """closed-form MLE group means (genes x groups): sum y / sum s"""
+    G = group_index.max() + 1
+    Y = np.zeros((counts.shape[0], G))
+    S = np.zeros(G)
+    for g in range(G):
+        m = group_index == g
+        Y[:, g] = counts[:, m].sum(axis=1)
+        S[g] = sf[m].sum()
+    mu_g = Y / S[None, :]
+    mu_g = np.maximum(mu_g, EPS)
+    beta = np.log(mu_g)
+    # fitted mu per sample
+    mu = mu_g[:, group_index] * sf[None, :]
+    return beta, np.maximum(mu, EPS)
+
+
+def nb_loglik_alpha(y, mu, alpha):
+    """loglik of NB2, alpha (genes,) or (genes,1); y,mu (genes,samples)"""
+    a = alpha[..., None] if alpha.ndim < y.ndim else alpha
+    t1 = gammaln(y + 1.0 / a) - gammaln(1.0 / a) - gammaln(y + 1.0)
+    t2 = (1.0 / a) * np.log1p(a * mu) * -1.0
+    t3 = y * (np.log(a * mu) - np.log1p(a * mu))
+    return (t1 + t2 + t3).sum(axis=-1)
+
+
+def nb_score_alpha(y, mu, alpha):
+    """d/alpha of NB2 loglik (summed over samples), analytic."""
+    a = alpha[..., None] if np.ndim(alpha) < y.ndim else alpha
+    inv = 1.0 / a
+    d = ((digamma(np.broadcast_to(inv, y.shape)) - digamma(y + inv)) / (a * a)
+         + np.log1p(a * mu) / (a * a)
+         - mu / (a * (1.0 + a * mu))
+         + y / a - y * mu / (1.0 + a * mu))
+    return d.sum(axis=-1)
+
+
+def mom_alpha(y, mu):
+    """method-of-moments NB2 dispersion, vectorised over genes"""
+    v = ((y - mu) ** 2 - mu).sum(axis=1)
+    d = (mu ** 2).sum(axis=1)
+    return np.clip(v / np.maximum(d, EPS), 1e-6, None)
+
+
+def mle_alpha(y, mu, init, lo=-20.0, hi=6.0, iters=60):
+    """vectorised Newton on log(alpha) for NB2 dispersion MLE (alpha given fitted mu)"""
+    la = np.log(np.clip(init, np.exp(lo), np.exp(hi)))
+    for _ in range(iters):
+        a = np.exp(la)[:, None]
+        # score wrt alpha, chain rule * alpha for log-alpha
+        s = nb_score_alpha(y, mu, np.exp(la)) * np.exp(la)
+        # numerical Hessian wrt log alpha via central difference of the score
+        h = 1e-4
+        s_p = nb_score_alpha(y, mu, np.exp(la + h)) * np.exp(la + h)
+        s_m = nb_score_alpha(y, mu, np.exp(la - h)) * np.exp(la - h)
+        hs = (s_p - s_m) / (2 * h)
+        hs = np.where(np.isfinite(hs) & (hs < -1e-12), hs, -1e-6)
+        step = np.clip(-s / hs, -1.0, 1.0)
+        la_new = np.clip(la + step, lo, hi)
+        if np.all(np.abs(la_new - la) < 1e-6):
+            la = la_new
+            break
+        la = la_new
+    # guardrail: keep the better of {newton, init, bounds} by loglik
+    cand = np.stack([la, np.log(np.clip(init, np.exp(lo), np.exp(hi))),
+                     np.full_like(la, lo), np.full_like(la, hi)])
+    ll = np.stack([nb_loglik_alpha(y, mu, np.exp(c)) for c in cand])
+    best = np.argmax(ll, axis=0)
+    return np.exp(cand[best, np.arange(la.shape[0])])
+
+
+def dispersion_trend(alphas, base_mean, n_bins=60):
+    """local (binned-median + smoothing) fit of log-dispersion vs log baseMean"""
+    x = np.log10(np.clip(base_mean, 1e-6, None))
+    order = np.argsort(x)
+    xs, as_ = x[order], np.log(np.clip(alphas[order], 1e-10, None))
+    n = len(xs)
+    edges = np.linspace(0, n, n_bins + 1).astype(int)
+    bx, by = [], []
+    for i in range(n_bins):
+        sl = slice(edges[i], edges[i + 1])
+        if edges[i + 1] - edges[i] < 5:
+            continue
+        bx.append(xs[sl].mean())
+        by.append(np.median(as_[sl]))
+    bx, by = np.array(bx), np.array(by)
+    # monotone-ish smoothing: running median (window 7) then running mean (window 5)
+    def run(v, k, fn):
+        pad = k // 2
+        p = np.pad(v, pad, mode='edge')
+        return np.array([fn(p[i:i + k]) for i in range(len(v))])
+    by = run(run(by, 7, np.median), 5, np.mean)
+    xs_out, ys_out = bx, by
+    grid_x = np.linspace(xs.min() - 3, xs.max() + 3, len(xs_out) + 400)
+    grid_y = np.interp(grid_x, xs_out, ys_out,
+                       left=ys_out[0] + 1.5 * (grid_x[0] - xs_out[0]),
+                       right=ys_out[-1] + 0.5 * (grid_x[-1] - xs_out[-1]))
+    return grid_x, grid_y
+
+
+def shrink_alpha(y, mu, alpha_gene, grid_x, grid_y, base_mean, prior_sd=0.2, iters=30):
+    """MAP shrinkage of log alpha toward local trend (Normal prior, sd=prior_sd)"""
+    x = np.log10(np.clip(base_mean, 1e-6, None))
+    lt = np.interp(x, grid_x, grid_y)
+    la = np.log(np.clip(alpha_gene, 1e-8, None))
+    for _ in range(iters):
+        a = np.exp(la)
+        sc = nb_score_alpha(y, mu, a) * a                      # d loglik / d log alpha
+        h = 1e-4
+        scp = nb_score_alpha(y, mu, np.exp(la + h)) * np.exp(la + h)
+        scm = nb_score_alpha(y, mu, np.exp(la - h)) * np.exp(la - h)
+        curv = (scp - scm) / (2 * h)
+        post_s = sc - (la - lt) / prior_sd ** 2
+        post_h = curv - 1.0 / prior_sd ** 2
+        post_h = np.where(np.isfinite(post_h) & (post_h < -1e-12), post_h, -1e-6)
+        step = np.clip(-post_s / post_h, -1.0, 1.0)
+        la_new = np.clip(la + step, -20.0, 6.0)
+        if np.all(np.abs(la_new - la) < 1e-6):
+            la = la_new
+            break
+        la = la_new
+    return np.exp(la), lt
+
+
+def wald_contrast(y, mu, alpha, group_index, contrast, beta):
+    """Wald test for contrast (dict {group: weight}) on log scale.
+    Fisher information for group-indicator design is diagonal:
+      I_gg = sum_{i in g} mu_i / (1 + alpha*mu_i)      (per gene)
+    """
+    groups = np.arange(beta.shape[1])
+    cvec = np.zeros(beta.shape[1])
+    for g, w in contrast.items():
+        cvec[g] = w
+    mu_i = mu
+    I_g = np.zeros((y.shape[0], beta.shape[1]))
+    for g in groups:
+        m = group_index == g
+        I_g[:, g] = (mu_i[:, m] / (1.0 + alpha[:, None] * mu_i[:, m])).sum(axis=1)
+    var = (cvec ** 2 / np.maximum(I_g, EPS)).sum(axis=1)
+    est = beta @ cvec
+    se = np.sqrt(np.maximum(var, EPS))
+    z = est / se
+    lfc2 = est / np.log(2.0)
+    p = 2.0 * norm.sf(np.abs(z))
+    return dict(log2FoldChange=lfc2, lfcSE=se / np.log(2.0), stat=z, pvalue=p,
+                baseEstimate=np.exp(est))

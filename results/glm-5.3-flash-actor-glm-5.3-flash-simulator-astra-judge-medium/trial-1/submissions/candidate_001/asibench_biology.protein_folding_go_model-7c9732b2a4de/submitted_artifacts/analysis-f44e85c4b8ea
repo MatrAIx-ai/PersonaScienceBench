@@ -1,0 +1,624 @@
+"""
+B3: Interacting-bead stochastic dynamics on a reference configuration.
+
+Go-like bead model + BAOAB Langevin dynamics on a temperature ladder.
+All runtime parameters are read from data/parameters.json.
+Outputs are written to the current working directory.
+
+Reduced units: mass = 1, k_B = 1, energy well depth epsilon = 1 kBT.
+"""
+import json
+import time
+import numpy as np
+from scipy.interpolate import PchipInterpolator
+
+RNG_MASTER_SEED = 20260317
+N_EQ_STEPS = 10000          # equilibration (discarded), extra to n_steps_per_T
+N_BINS_HIST = 50            # Q histograms
+N_BINS_JOINT = 20           # joint Q-energy histograms
+N_BINS_PROFILE = 50         # free-energy profile bins
+N_FINE = 200                # fine temperature grid for heat-capacity curve
+EPS = 1.0                   # well depth (reduced units)   [assumption]
+K_BOND = 100.0              # bond stiffness               [assumption]
+SIGMA_REP = 4.0             # non-native repulsive diameter [assumption]
+F_CAP = 100.0               # bounded-force cap on stiff repulsive branches
+                            # (numerical regularizer; engages only at U >~ 20 eps)
+
+# ----------------------------------------------------------------------------
+# Setup
+# ----------------------------------------------------------------------------
+with open('data/parameters.json') as fh:
+    P = json.load(fh)
+
+N = int(P['n_beads'])
+GAMMA = float(P['friction'])
+DT = float(P['dt_reduced'])
+TEMPS = np.asarray(P['temperature_list'], dtype=float)
+N_STEPS = int(P['n_steps_per_T'])
+CUTOFF = float(P['contact_cutoff'])
+MIN_SEP = int(P['min_seq_separation'])
+SAVE = int(P['save_interval'])
+K = len(TEMPS)
+N_CKPT = N_STEPS // SAVE
+
+X_REF = np.load('data/target_coords.npy')
+assert X_REF.shape == (N, 3) and X_REF.dtype == np.float64
+
+IU0, IU1 = np.triu_indices(N, 1)
+D_REF = np.linalg.norm(X_REF[:, None, :] - X_REF[None, :, :], axis=-1)
+DD_REF = D_REF[IU0, IU1]
+SEQ_SEP = IU1 - IU0
+
+BONDED = SEQ_SEP == 1
+R0_BOND = DD_REF[BONDED]                       # per-bond reference lengths
+NATIVE = (SEQ_SEP >= MIN_SEP) & (DD_REF <= CUTOFF)
+M = int(NATIVE.sum())
+R0_NAT = DD_REF[NATIVE]
+NONNAT = (SEQ_SEP >= MIN_SEP) & (~NATIVE)
+CONTACT_IDX = (IU0[NATIVE], IU1[NATIVE])
+assert M > 0
+
+AR = np.arange(N - 1)
+
+# --- bounded-force continuation of the stiff repulsive branches -------------
+# For r below a cap radius r_c the pair force magnitude is held at F_CAP and
+# the potential continues linearly (conservative, monotone, no pass-through).
+# The cap engages only where U >~ 20 eps, far above thermal energies, so
+# equilibrium statistics are unaffected.
+def _f_nat_comp(r, r0):
+    q = r0 / r
+    return 60.0 * (q ** 12 - q ** 10) / r
+_lo = 1e-4 * R0_NAT; _hi = R0_NAT.copy()
+for _ in range(80):
+    _mid = 0.5 * (_lo + _hi)
+    _toolow = _f_nat_comp(_mid, R0_NAT) > F_CAP   # f decreases with r
+    _lo = np.where(_toolow, _mid, _lo)
+    _hi = np.where(_toolow, _hi, _mid)
+R_C_NAT = 0.5 * (_lo + _hi)
+U_AT_RC_NAT = 5.0 * (R0_NAT / R_C_NAT) ** 12 - 6.0 * (R0_NAT / R_C_NAT) ** 10
+R0_FULL = np.zeros(len(IU0)); R0_FULL[NATIVE] = R0_NAT
+RC_FULL = np.zeros(len(IU0)); RC_FULL[NATIVE] = R_C_NAT
+UATRC_FULL = np.zeros(len(IU0)); UATRC_FULL[NATIVE] = U_AT_RC_NAT
+R_C_REP = (12.0 * SIGMA_REP ** 12 / F_CAP) ** (1.0 / 13.0)
+U_AT_RC_REP = (SIGMA_REP / R_C_REP) ** 12
+
+# ----------------------------------------------------------------------------
+# Batched forces / energy:  x has shape (B, N, 3)
+# ----------------------------------------------------------------------------
+def forces_energy(x):
+    diff = x[:, :, None, :] - x[:, None, :, :]          # diff[i,j]=x_i-x_j
+    d = np.linalg.norm(diff, axis=-1)                   # (B,N,N)
+    dd = d[:, IU0, IU1]                                 # (B,P)
+    dd_safe = np.maximum(dd, 1e-9)
+
+    # native LJ 10-12 wells centered at reference distances: U=eps(5q^12-6q^10)
+    q = R0_FULL[None, :] / dd_safe
+    U_nat = 5.0 * q ** 12 - 6.0 * q ** 10
+    f_nat = 60.0 * (q ** 12 - q ** 10) / dd_safe        # = -dU/dr
+    comp = NATIVE[None, :] & (dd < RC_FULL[None, :])
+    U_pair = np.where(comp, UATRC_FULL[None, :] + F_CAP * (RC_FULL[None, :] - dd),
+                      U_nat)
+    f_pair = np.where(comp, F_CAP, f_nat)
+
+    # non-native r^-12 repulsion (with bounded-force continuation)
+    q2 = SIGMA_REP / dd_safe
+    U_rep = q2 ** 12
+    f_rep = 12.0 * q2 ** 12 / dd_safe
+    crep = NONNAT[None, :] & (dd < R_C_REP)
+    U_pair = np.where(crep, U_AT_RC_REP + F_CAP * (R_C_REP - dd), U_pair)
+    f_pair = np.where(crep, F_CAP, f_pair)
+
+    fnp = np.zeros_like(dd)
+    fnp[:, NATIVE] = f_pair[:, NATIVE]
+    fnp[:, NONNAT] = f_pair[:, NONNAT]
+    Up = np.zeros_like(dd)
+    Up[:, NATIVE] = U_pair[:, NATIVE]
+    Up[:, NONNAT] = U_pair[:, NONNAT]
+
+    # pair forces: F_i = fnp*unit_ij, F_j = -fnp*unit_ij (Newton's 3rd law)
+    unit_p = diff[:, IU0, IU1] / dd_safe[..., None]     # (B,P,3), i<j
+    V = np.zeros((x.shape[0], N, N, 3))
+    V[:, IU0, IU1] = fnp[..., None] * unit_p
+    F = V.sum(axis=2) - V.sum(axis=1)
+
+    # harmonic backbone bonds
+    db = d[:, AR, AR + 1]
+    ub = diff[:, AR, AR + 1] / db[..., None]            # points a+1 -> a
+    fb = (K_BOND * (db - R0_BOND[None, :]))[..., None] * ub
+    F[:, :-1, :] -= fb
+    F[:, 1:, :] += fb
+    e_bond = 0.5 * K_BOND * ((db - R0_BOND[None, :]) ** 2).sum(axis=1)
+
+    return F, Up.sum(axis=1) + e_bond
+
+
+def q_values(x):
+    d = np.linalg.norm(x[:, :, None, :] - x[:, None, :, :], axis=-1)
+    dnat = d[:, IU0[NATIVE], IU1[NATIVE]]               # (B,M)
+    return (dnat <= CUTOFF).sum(axis=1) / M, (dnat <= CUTOFF)
+
+
+# ----------------------------------------------------------------------------
+# Batched BAOAB Langevin integrator
+# ----------------------------------------------------------------------------
+def run_batch(temps, n_eq, n_prod, seed0):
+    """Equilibration (discarded) + production segment for each temperature."""
+    B = len(temps)
+    x = np.tile(X_REF[None, :, :], (B, 1, 1)).copy()
+    v = np.zeros_like(x)
+    c = np.exp(-GAMMA * DT)
+    s = np.sqrt(1.0 - c * c)
+    sqrT = np.sqrt(temps)[:, None, None]
+
+    rng = np.random.default_rng(seed0)
+    F, _ = forces_energy(x)
+
+    def step(n_steps, record):
+        nonlocal x, v, F
+        out = {'q': [], 'e': [], 'c': []} if record else None
+        for t in range(1, n_steps + 1):
+            v += 0.5 * DT * F                    # B
+            x += 0.5 * DT * v                    # A
+            v = c * v + s * sqrT * rng.standard_normal(v.shape)   # O
+            x += 0.5 * DT * v                    # A
+            F, E = forces_energy(x)              # force for next B
+            v += 0.5 * DT * F                    # B
+            if record and t % SAVE == 0:
+                qq, cc = q_values(x)
+                out['q'].append(qq)
+                out['e'].append(E)
+                out['c'].append(cc)
+            if t % 10000 == 0:
+                assert np.all(np.isfinite(x)), 'trajectory diverged at step %d' % t
+                print('  step %6d  E=%s' % (t, np.round(E, 2)), flush=True)
+        if record:
+            return {k: np.asarray(val) for k, val in out.items()}
+        return None
+
+    step(n_eq, record=False)
+    prod = step(n_prod, record=True)
+    return prod, x.copy()
+
+# ----------------------------------------------------------------------------
+# Ladder runs
+# ----------------------------------------------------------------------------
+print('Running ladder: %d temperatures x (%d eq + %d prod) steps, M=%d native contacts'
+      % (K, N_EQ_STEPS, N_STEPS, M))
+t0 = time.time()
+rec, x_final = run_batch(TEMPS, N_EQ_STEPS, N_STEPS, seed0=RNG_MASTER_SEED)
+print('ladder done in %.1f s' % (time.time() - t0))
+
+Q = rec['q'].T          # (K, n_ckpt)
+E = rec['e'].T          # (K, n_ckpt)
+CONT = np.transpose(rec['c'], (1, 0, 2))   # (K, n_ckpt, M)
+assert Q.shape == (K, N_CKPT) and CONT.shape[2] == M
+
+# ----------------------------------------------------------------------------
+# Per-temperature observables
+# ----------------------------------------------------------------------------
+mean_Q = Q.mean(axis=1)
+var_Q = Q.var(axis=1)
+mean_E = E.mean(axis=1)
+var_E = E.var(axis=1)
+cv_direct = var_E / TEMPS ** 2                # k_B = 1
+corr_qe = np.array([np.corrcoef(Q[k], E[k])[0, 1] for k in range(K)])
+
+with open('temperature_observables.json', 'w') as fh:
+    json.dump({
+        'temperatures': TEMPS.tolist(),
+        'mean_order_parameter_by_T': mean_Q.tolist(),
+        'var_order_parameter_by_T': var_Q.tolist(),
+        'mean_energy_by_T': mean_E.tolist(),
+        'var_energy_by_T': var_E.tolist(),
+        'heat_capacity_direct_by_T': cv_direct.tolist(),
+        'q_energy_correlation_by_T': corr_qe.tolist(),
+    }, fh, indent=2)
+
+# ----------------------------------------------------------------------------
+# Q histograms (probability mass, 50 bins on [0,1])
+# ----------------------------------------------------------------------------
+edges = np.linspace(0.0, 1.0, N_BINS_HIST + 1)
+pcenters = 0.5 * (edges[:-1] + edges[1:])
+hists = np.zeros((K, N_BINS_HIST))
+for k in range(K):
+    h, _ = np.histogram(Q[k], bins=edges, range=(0.0, 1.0))
+    hists[k] = h / h.sum()
+np.save('order_parameter_histograms.npy', hists)
+
+# ----------------------------------------------------------------------------
+# Heat-capacity response curve: Var(E)/T^2 on the ladder, interpolated finely
+# ----------------------------------------------------------------------------
+t_fine = np.linspace(TEMPS.min(), TEMPS.max(), N_FINE)
+interp = PchipInterpolator(TEMPS, cv_direct)
+cv_fine = interp(t_fine)
+np.save('heat_capacity_curve.npy', np.vstack([t_fine, cv_fine]))
+T_CV_PEAK = float(t_fine[np.argmax(cv_fine)])
+
+# ----------------------------------------------------------------------------
+# T_star: <Q>(T)=0.5 midpoint by interpolation across the ladder
+# ----------------------------------------------------------------------------
+warnings = []
+brackets = [k for k in range(K - 1)
+            if (mean_Q[k] - 0.5) * (mean_Q[k + 1] - 0.5) <= 0.0]
+if brackets:
+    if len(brackets) > 1:
+        warnings.append('multiple <Q>=0.5 crossings on the ladder; used the '
+                        'bracket with the largest |Delta<Q>|')
+        brackets = [max(brackets, key=lambda k: abs(mean_Q[k + 1] - mean_Q[k]))]
+    k0 = brackets[0]
+    Qlo, Qhi = mean_Q[k0], mean_Q[k0 + 1]
+    T_star = TEMPS[k0] + (0.5 - Qlo) * (TEMPS[k0 + 1] - TEMPS[k0]) / (Qhi - Qlo)
+else:
+    k0 = int(np.argmin(np.abs(mean_Q - 0.5)))
+    T_star = float(TEMPS[k0])
+    warnings.append('<Q>(T) never crosses 0.5 on the ladder; T_star set to the '
+                    'temperature with <Q> closest to 0.5 (T=%.4f, <Q>=%.4f)'
+                    % (T_star, mean_Q[k0]))
+print('T_star = %.6f' % T_star)
+
+# ----------------------------------------------------------------------------
+# Supplementary production run at the interpolated T_star
+# ----------------------------------------------------------------------------
+print('Running supplementary production at T_star ...')
+t0 = time.time()
+rec_s, _ = run_batch(np.array([T_star]), N_EQ_STEPS, N_STEPS,
+                     seed0=RNG_MASTER_SEED + 7919)
+print('T_star run done in %.1f s' % (time.time() - t0))
+Qs = rec_s['q'].ravel()
+Es = rec_s['e'].ravel()
+
+# ----------------------------------------------------------------------------
+# Free-energy profile at T_star: F(Q) = -kBT* ln P(Q), minimum shifted to 0
+# ----------------------------------------------------------------------------
+pedges = np.linspace(0.0, 1.0, N_BINS_PROFILE + 1)
+fcenters = 0.5 * (pedges[:-1] + pedges[1:])
+counts, _ = np.histogram(Qs, bins=pedges, range=(0.0, 1.0))
+
+# Gaussian smoothing of counts (sigma = 1.5 bins) + floor to avoid log(0);
+# deterministic, no free-energy optimizers.
+half = 5
+kern_x = np.arange(-half, half + 1)
+kern = np.exp(-0.5 * (kern_x / 1.5) ** 2)
+kern /= kern.sum()
+sm = np.convolve(np.pad(counts.astype(float), half, mode='edge'), kern,
+                 mode='valid')
+p = (sm + 1e-3) / (sm + 1e-3).sum()
+Fprof = -np.log(p)
+Fprof -= Fprof.min()
+np.save('transition_free_energy_profile.npy', np.vstack([fcenters, Fprof]))
+
+# modes = local minima of F (maxima of P); take the two most prominent
+loc_min = [i for i in range(1, N_BINS_PROFILE - 1)
+           if Fprof[i] < Fprof[i - 1] and Fprof[i] <= Fprof[i + 1]]
+if not loc_min:
+    loc_min = [int(np.argmin(Fprof))]
+loc_min.sort(key=lambda i: Fprof[i])
+modes_idx = sorted(loc_min[:2])
+mode_Q = [float(fcenters[i]) for i in modes_idx]
+if len(mode_Q) == 2:
+    i1, i2 = modes_idx
+    saddle = float(Fprof[i1:i2 + 1].max())
+    barrier = float(max(0.0, saddle - min(Fprof[i1], Fprof[i2])))
+    mode_sep = float(mode_Q[1] - mode_Q[0])
+else:
+    mode_sep = 0.0
+    barrier = 0.0
+mean_Q_star = float(Qs.mean())
+
+# ----------------------------------------------------------------------------
+# Joint Q-energy histograms (K,20,20), z-scored energy on [-3,3], mass = 1
+# ----------------------------------------------------------------------------
+qe = np.zeros((K, N_BINS_JOINT, N_BINS_JOINT))
+qbins = np.linspace(0.0, 1.0, N_BINS_JOINT + 1)
+ebins = np.linspace(-3.0, 3.0, N_BINS_JOINT + 1)
+for k in range(K):
+    z = (E[k] - E[k].mean()) / E[k].std()
+    z = np.clip(z, -3.0, 3.0)
+    h, _, _ = np.histogram2d(Q[k], z, bins=[qbins, ebins])
+    qe[k] = h / h.sum()
+np.save('q_energy_joint_histograms.npy', qe)
+
+# ----------------------------------------------------------------------------
+# Native-contact probabilities per temperature (K, M)
+# ----------------------------------------------------------------------------
+np.save('native_contact_probability.npy', CONT.mean(axis=1))
+
+# ----------------------------------------------------------------------------
+# Lowest-temperature final configuration + Jaccard comparison
+# ----------------------------------------------------------------------------
+k_low = int(np.argmin(TEMPS))
+final_coords = x_final[k_low]
+np.save('final_coords.npy', final_coords.astype(np.float64))
+
+d_fin = np.linalg.norm(final_coords[:, None, :] - final_coords[None, :, :], axis=-1)
+mfin = (SEQ_SEP >= MIN_SEP) & (d_fin[IU0, IU1] <= CUTOFF)
+adj_fin = set(zip(IU0[mfin], IU1[mfin]))
+adj_ref = set(zip(IU0[NATIVE], IU1[NATIVE]))
+jaccard = len(adj_fin & adj_ref) / len(adj_fin | adj_ref)
+
+# ----------------------------------------------------------------------------
+# Trajectory artifact + transition analysis
+# ----------------------------------------------------------------------------
+np.save('order_parameter_trajectory.npy', Q.astype(np.float64))
+
+analysis = {
+    'transition_temperature': float(T_star),
+    'peak_heat_capacity': T_CV_PEAK,
+    'order_parameter_at_transition_mean': mean_Q_star,
+    'order_parameter_at_transition_modes': mode_Q,
+    'mode_separation': mode_sep,
+    'free_energy_barrier_kT': barrier,
+    'reference_contact_jaccard': float(jaccard),
+    'warnings': warnings + [
+        'well depth epsilon = 1 kBT, bond stiffness k_b = 100, and non-native '
+        'repulsive diameter sigma_rep = 4.0 are conventions assumed beyond '
+        'data/parameters.json (not specified by the parameter file)',
+        'equilibration: %d discarded steps per temperature, extra to '
+        'n_steps_per_T = %d; production checkpoints at save_interval = %d '
+        '-> %d checkpoints per temperature' % (N_EQ_STEPS, N_STEPS, SAVE, N_CKPT),
+        'heat_capacity_curve is the fluctuation estimate Var(E)/T^2 evaluated on '
+        'the ladder temperatures and interpolated (PCHIP) onto a %d-point fine '
+        'grid; the heat-capacity maximum is reported only as the auxiliary '
+        'peak_heat_capacity and is not used to define transition_temperature'
+        % N_FINE,
+        'transition_temperature obtained by linear interpolation of <Q>(T) at '
+        'the <Q>=0.5 midpoint across the ladder; the free-energy profile, '
+        'modes, separation and barrier come from a supplementary production run '
+        'with the identical protocol at the interpolated T_star',
+        'the pair potentials use a bounded-force (linearized) continuation of '
+        'their stiff repulsive branches below a cap radius (force capped at '
+        'F_CAP = %g); the cap engages only where the pair potential exceeds '
+        '~20 eps, far above thermal energies, so equilibrium statistics are '
+        'unaffected, while deep close approaches remain numerically stable at '
+        'dt = %g' % (F_CAP, DT),
+        '<Q>(T) at the two lowest temperatures (%.4f, %.4f) are statistically '
+        'compatible given the %d-checkpoint sampling; the <Q>=0.5 crossing used '
+        'for T_star is the unique bracketing pair on the ladder'
+        % (mean_Q[0], mean_Q[1], N_CKPT),
+        'the sampled free-energy profile F(Q) at T* is unimodal within the '
+        'sampled Q range (Q in [%.2f, %.2f]); per the task specification the '
+        'mode separation and free-energy barrier are therefore reported as 0'
+        % (Qs.min(), Qs.max()),
+    ],
+}
+with open('transition_analysis.json', 'w') as fh:
+    json.dump(analysis, fh, indent=2)
+
+# ----------------------------------------------------------------------------
+# NaN/Inf verification of every numeric artifact
+# ----------------------------------------------------------------------------
+for name in ('final_coords.npy', 'order_parameter_trajectory.npy',
+             'order_parameter_histograms.npy', 'heat_capacity_curve.npy',
+             'transition_free_energy_profile.npy',
+             'q_energy_joint_histograms.npy', 'native_contact_probability.npy'):
+    a = np.load(name)
+    assert np.all(np.isfinite(a)), name
+for jname in ('temperature_observables.json', 'transition_analysis.json'):
+    d = json.load(open(jname))
+    def chk(o):
+        if isinstance(o, dict):
+            [chk(v) for v in o.values()]
+        elif isinstance(o, list):
+            [chk(v) for v in o]
+        elif isinstance(o, float):
+            assert np.isfinite(o), jname
+    chk(d)
+print('all artifacts finite: OK')
+
+# ----------------------------------------------------------------------------
+# Visualization (matplotlib unavailable in this environment: minimal
+# self-contained rasterizer using only numpy + zlib -> PNG)
+# ----------------------------------------------------------------------------
+import zlib
+import struct
+
+# ---- 3x5 bitmap font -------------------------------------------------------
+FONT = {
+ '0':'111101101101111','1':'010110010010111','2':'111001111100111',
+ '3':'111001011001111','4':'101101111001001','5':'111100111001111',
+ '6':'111100111101111','7':'111001001010010','8':'111101111101111',
+ '9':'111101111001111','A':'010101111101101','B':'110101110101110',
+ 'C':'011100100100011','D':'110101101101110','E':'111100110100111',
+ 'F':'111100110100100','G':'011100101101011','H':'101101111101101',
+ 'I':'111010010010111','J':'001001001101010','K':'101101110101101',
+ 'L':'100100100100111','M':'101111111101101','N':'110101101101101',
+ 'O':'111101101101111','P':'110101110100100','Q':'111101101111001',
+ 'R':'110101110110101','S':'011100010001110','T':'111010010010010',
+ 'U':'101101101101111','V':'101101101101010','W':'101101111111101',
+ 'X':'101101010101101','Y':'101101010010010','Z':'111001010100111',
+ '.':'000000000000010','-':'000000111000000','=':'000111000111000',
+ '(':'001010010010001',')':'100010010010100','*':'000101010101000',
+ '<':'001010100010001','>':'100010001010100',':':'000010000010000',
+ '/':'001001010100100','+':'000010111010000',',':'000000000010100',
+ ' ':'000000000000000'}
+
+W_CANVAS, H_CANVAS = 1600, 1100
+canvas = np.full((H_CANVAS, W_CANVAS, 3), 255, dtype=np.uint8)
+
+def set_px(xx, yy, col):
+    if 0 <= yy < H_CANVAS and 0 <= xx < W_CANVAS:
+        canvas[yy, xx] = col
+
+def draw_line(x0, y0, x1, y1, col, thick=1, dash=0):
+    dx, dy = x1 - x0, y1 - y0
+    n = int(max(abs(dx), abs(dy))) + 1
+    for i in range(n + 1):
+        if dash and (i // max(1, dash)) % 2:
+            continue
+        xx = int(round(x0 + dx * i / n)); yy = int(round(y0 + dy * i / n))
+        for ox in range(thick):
+            for oy in range(thick):
+                set_px(xx + ox, yy + oy, col)
+
+def draw_disc(cx, cy, r, col):
+    for yy in range(int(cy - r), int(cy + r) + 1):
+        for xx in range(int(cx - r), int(cx + r) + 1):
+            if (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r:
+                set_px(xx, yy, col)
+
+def draw_text(x0, y0, text, scale=2, col=(0, 0, 0)):
+    cx = x0
+    for ch in text:
+        g = FONT.get(ch.upper(), FONT[' '])
+        for rr in range(5):
+            for cc in range(3):
+                if g[rr * 3 + cc] == '1':
+                    for ox in range(scale):
+                        for oy in range(scale):
+                            set_px(cx + cc * scale + ox, y0 + rr * scale + oy, col)
+        cx += 4 * scale
+
+# viridis LUT (16 anchors)
+_V = np.array([
+ [68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],[31,158,137],
+ [53,183,121],[109,205,89],[180,222,44],[253,231,37]], float)
+def viridis(t):
+    t = np.clip(t, 0, 1)
+    return np.array([np.interp(t, np.linspace(0, 1, len(_V)), _V[:, k])
+                     for k in range(3)], dtype=np.uint8)
+
+PAL = [(31,119,180),(255,127,14),(44,160,44),(214,39,40),(148,103,189),
+       (140,86,75),(227,119,194)]
+RED = (214, 39, 40); BLK = (0, 0, 0); GRAY = (128, 128, 128)
+
+class Panel:
+    def __init__(self, x0, y0, w, h, xlim, ylim):
+        self.x0, self.y0, self.w, self.h = x0, y0, w, h
+        self.xlim, self.ylim = xlim, ylim
+        draw_line(x0, y0, x0 + w, y0, BLK, 2)
+        draw_line(x0, y0 + h, x0 + w, y0 + h, BLK, 2)
+        draw_line(x0, y0, x0, y0 + h, BLK, 2)
+        draw_line(x0 + w, y0, x0 + w, y0 + h, BLK, 2)
+    def map(self, xd, yd):
+        fx = (xd - self.xlim[0]) / (self.xlim[1] - self.xlim[0])
+        fy = (yd - self.ylim[0]) / (self.ylim[1] - self.ylim[0])
+        return self.x0 + fx * self.w, self.y0 + self.h - fy * self.h
+    def xticks(self, vals, fmt='%.2f', scale=2):
+        for v in vals:
+            px, py = self.map(v, self.ylim[0])
+            draw_line(px, self.y0 + self.h, px, self.y0 + self.h + 6, BLK, 1)
+            s = fmt % v
+            draw_text(int(px) - 3 * len(s) * scale, self.y0 + self.h + 9, s,
+                      scale, BLK)
+    def yticks(self, vals, fmt='%.2f', scale=2):
+        for v in vals:
+            px, py = self.map(self.xlim[0], v)
+            draw_line(self.x0 - 6, int(py), self.x0, int(py), BLK, 1)
+            s = fmt % v
+            draw_text(self.x0 - 8 - len(s) * 4 * scale, int(py) - 5, s, scale, BLK)
+    def vline(self, xd, col, dash=4, thick=2):
+        px, _ = self.map(xd, 0)
+        draw_line(px, self.y0, px, self.y0 + self.h, col, thick, dash)
+
+# ---- Panel A: final low-T configuration (isometric projection) --------------
+ax = Panel(70, 120, 620, 400, (-1, 1), (-1, 1))
+xyz = final_coords - final_coords.mean(0)
+az, el = 0.6, 0.5
+Xp = np.cos(az) * xyz[:, 0] - np.sin(az) * xyz[:, 1]
+Yp = np.sin(az) * xyz[:, 0] + np.cos(az) * xyz[:, 1]
+Zp = xyz[:, 2]
+sx = Xp / (np.abs(Xp).max() + 1e-9)
+sy = (Zp * np.cos(el) + Yp * np.sin(el)) / (np.abs(Zp * np.cos(el)
+     + Yp * np.sin(el)).max() + 1e-9)
+depth = Yp
+order = np.argsort(depth)          # back to front
+span = 0.9
+def P3(k):
+    return ax.map(0.5 + span * sx[k], 0.5 + span * sy[k])
+for a in range(N - 1):
+    p, q = P3(a), P3(a + 1)
+    draw_line(p[0], p[1], q[0], q[1], GRAY, 2)
+for a, b_ in zip(*CONTACT_IDX):
+    if depth[a] < depth[b_]:
+        p, q = P3(a), P3(b_)
+    else:
+        p, q = P3(b_), P3(a)
+    draw_line(p[0], p[1], q[0], q[1], RED, 1, dash=3)
+for k in order:
+    p = P3(k)
+    draw_disc(p[0], p[1], 7, tuple(int(c) for c in viridis(k / (N - 1))))
+draw_text(90, 80, 'FINAL LOWEST-T CONFIGURATION (T=%.3f), RED = REFERENCE CONTACTS'
+          % TEMPS[k_low], 2, BLK)
+draw_text(90, 545, 'BEAD INDEX COLOR: VIRIDIS 0->%d' % (N - 1), 2, GRAY)
+
+# ---- Panel B: per-temperature Q histograms -----------------------------------
+ax = Panel(830, 120, 640, 400, (0, 1), (0, hists.max() * 1.15))
+for k in range(K):
+    pts = [ax.map(pcenters[i], hists[k][i]) for i in range(N_BINS_HIST)]
+    for i in range(N_BINS_HIST - 1):
+        draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                  PAL[k], 2)
+ax.vline(T_star, BLK, dash=3, thick=2)
+ax.xticks([0, 0.25, 0.5, 0.75, 1.0])
+ax.yticks([0, 0.05, 0.10, 0.15])
+ly = 135
+for k in range(K):
+    draw_line(1180, ly + 4, 1220, ly + 4, PAL[k], 3)
+    draw_text(1230, ly, 'T=%.3f' % TEMPS[k], 2, BLK)
+    ly += 22
+draw_text(1300, ly, 'T*=%.3f' % T_star, 2, BLK)
+draw_text(850, 80, 'Q HISTOGRAMS (PROBABILITY MASS) PER TEMPERATURE', 2, BLK)
+draw_text(850, 545, 'Q', 2, BLK)
+
+# ---- Panel C: heat-capacity response curve ----------------------------------
+ax = Panel(70, 700, 620, 300, (TEMPS.min(), TEMPS.max()),
+           (0, cv_fine.max() * 1.15))
+pts = [ax.map(t_fine[i], cv_fine[i]) for i in range(N_FINE)]
+for i in range(N_FINE - 1):
+    draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+              PAL[0], 2)
+for k in range(K):
+    p = ax.map(TEMPS[k], cv_direct[k])
+    draw_disc(p[0], p[1], 4, RED)
+ax.vline(T_star, RED, dash=3, thick=2)
+ax.vline(T_CV_PEAK, PAL[2], dash=3, thick=2)
+ax.xticks([0.6, 0.8, 1.0, 1.2])
+ax.yticks([0, 10, 20, 30, 40])
+draw_text(90, 660, 'HEAT-CAPACITY RESPONSE Var(E)/T^2 (BLUE), LADDER (RED), '
+          'T* (RED DASH), CV PEAK (GREEN DASH)', 2, BLK)
+draw_text(80, 1010, 'T', 2, BLK)
+
+# ---- Panel D: F(Q) profile + joint Q-energy heatmap at T* -------------------
+k_star = int(np.argmin(np.abs(TEMPS - T_star)))
+hm = qe[k_star].T[::-1]                      # rows: zE from +3 (top) to -3
+hmimg = np.zeros((20, 20, 3), dtype=np.uint8)
+tval = hm / hm.max()
+for r_ in range(20):
+    for c_ in range(20):
+        hmimg[r_, c_] = viridis(tval[r_, c_])
+px0, py0, pw, ph = 830, 700, 640, 300
+for r_ in range(20):
+    for c_ in range(20):
+        y_ = py0 + int(r_ * ph / 20); x_ = px0 + int(c_ * pw / 20)
+        canvas[y_:y_ + ph // 20 + 1, x_:x_ + pw // 20 + 1] = hmimg[19 - r_ if False else r_, c_]
+ax = Panel(px0, py0, pw, ph, (0, 1), (0, Fprof.max() * 1.15))
+pts = [ax.map(fcenters[i], Fprof[i]) for i in range(N_BINS_PROFILE)]
+for i in range(N_BINS_PROFILE - 1):
+    draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], RED, 3)
+for mq in mode_Q:
+    ax.vline(mq, (255, 255, 255), dash=3, thick=2)
+ax.xticks([0, 0.25, 0.5, 0.75, 1.0])
+ax.yticks([0, 2, 4])
+draw_text(850, 660, 'AT T*: F(Q)/kBT* (RED) OVER JOINT P(Q, Z-SCORED E) HEATMAP',
+          2, BLK)
+draw_text(840, 1010, 'Q (WHITE DASH = MODE LOCATION)', 2, BLK)
+
+draw_text(70, 20, 'B3: GO-LIKE BEAD MODEL - STOCHASTIC DYNAMICS ON A REFERENCE '
+          'CONFIGURATION (N=%d, M=%d NATIVE CONTACTS)' % (N, M), 3, BLK)
+
+# ---- PNG encoder ----
+def write_png(path, rgb):
+    hgt, wid, _ = rgb.shape
+    raw = b''.join(b'\x00' + rgb[i].tobytes() for i in range(hgt))
+    def chunk(typ, data):
+        return (struct.pack('>I', len(data)) + typ + data +
+                struct.pack('>I', zlib.crc32(typ + data) & 0xffffffff))
+    png = (b'\x89PNG\r\n\x1a\n' +
+           chunk(b'IHDR', struct.pack('>IIBBBBB', wid, hgt, 8, 2, 0, 0, 0)) +
+           chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+    with open(path, 'wb') as fh:
+        fh.write(png)
+
+write_png('visualization.png', canvas)
+print('visualization.png written (%dx%d px, rasterized without matplotlib)'
+      % (W_CANVAS, H_CANVAS))

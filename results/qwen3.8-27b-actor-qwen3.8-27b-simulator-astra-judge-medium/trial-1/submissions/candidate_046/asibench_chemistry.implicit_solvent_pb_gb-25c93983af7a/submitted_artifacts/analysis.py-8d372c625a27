@@ -1,0 +1,199 @@
+import json, csv, os
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+from scipy.sparse import csr_matrix, diags
+from scipy.sparse.linalg import cg, spsolve
+import zlib, struct
+
+DATA="data"; RES="results"; os.makedirs(RES, exist_ok=True)
+CONST=332.06371; KB=0.001987204
+man=json.load(open(f"{DATA}/manifest.json"))
+order=man["case_order"]; cases={c["case_id"]:c for c in man["cases"]}
+planes={p["case_id"]:p for p in json.load(open(f"{DATA}/plane_spec.json"))["planes"]}
+queries=np.load(f"{DATA}/queries.npy"); volA=np.load(f"{DATA}/volume_a.npy"); volB=np.load(f"{DATA}/volume_b.npy")
+N=35; NI=33; NID=NI**3
+
+sites={}
+with open(f"{DATA}/sites.csv") as f:
+    for row in csv.DictReader(f):
+        key=(row["case_id"],row["entity_id"]); d=sites.setdefault(key,{"x":[],"y":[],"z":[],"q":[],"r":[]})
+        d["x"].append(float(row["x_angstrom"])); d["y"].append(float(row["y_angstrom"])); d["z"].append(float(row["z_angstrom"]))
+        d["q"].append(float(row["charge_e"])); d["r"].append(float(row["radius_angstrom"]))
+for k,d in sites.items():
+    d["pos"]=np.array([d["x"],d["y"],d["z"]]).T; d["q"]=np.array(d["q"]); d["r"]=np.array(d["r"])
+
+def grid_params(c):
+    g=c["grid"]; return np.array(g["box_center_angstrom"])-g["box_half_extent_angstrom"], g["spacing_angstrom"]
+
+def vdw_mask(pos,rad,base,sp):
+    inside=np.zeros((N,N,N),bool)
+    for (x,y,z),r in zip(pos,rad):
+        if r<=0:
+            i=np.round((np.array([x,y,z])-base)/sp).astype(int)
+            if np.all((i>=0)&(i<N)): inside[tuple(i)]=True
+            continue
+        lo=np.floor((np.array([x,y,z])-r-base)/sp).astype(int); hi=np.ceil((np.array([x,y,z])+r-base)/sp).astype(int)
+        lo=np.clip(lo,0,N-1); hi=np.clip(hi,0,N-1)
+        xs=np.arange(lo[0],hi[0]+1); ys=np.arange(lo[1],hi[1]+1); zs=np.arange(lo[2],hi[2]+1)
+        cx=base[0]+xs*sp; cy=base[1]+ys*sp; cz=base[2]+zs*sp
+        dist2=(cx[:,None,None]-x)**2+(cy[None,:,None]-y)**2+(cz[None,None,:]-z)**2
+        sub=inside[xs[:,None,None],ys[None,:,None],zs[None,None,:]]
+        inside[xs[:,None,None],ys[None,:,None],zs[None,None,:]] = np.where(dist2<=r*r, True, sub)
+    return inside
+
+def ses_mask(vdw,probe,sp):
+    rv=probe/sp
+    if rv<=1e-9: return vdw.copy()
+    dil = distance_transform_edt(~vdw) <= rv
+    er  = dil & (distance_transform_edt(dil) >= rv)
+    return (er | vdw)
+
+def signed_distance(mask):
+    d_out = distance_transform_edt(~mask); d_in = distance_transform_edt(mask)
+    return np.where(mask, -d_in, d_out).astype(np.float64)
+
+def deposit(q,pos,base,sp):
+    rho=np.zeros((N,N,N)); f=(pos-base)/sp; i0=np.floor(f).astype(int); w=f-i0
+    i0=np.clip(i0,0,N-2); w=np.clip(w,0,1); wx,wy,wz=w[:,0],w[:,1],w[:,2]; ix,iy,iz=i0[:,0],i0[:,1],i0[:,2]
+    terms=[((1-wx)*(1-wy)*(1-wz),(ix,iy,iz)),((1-wx)*(1-wy)*wz,(ix,iy,iz+1)),((1-wx)*wy*(1-wz),(ix,iy+1,iz)),
+           ((1-wx)*wy*wz,(ix,iy+1,iz+1)),(wx*(1-wy)*(1-wz),(ix+1,iy,iz)),(wx*(1-wy)*wz,(ix+1,iy,iz+1)),
+           (wx*wy*(1-wz),(ix+1,iy+1,iz)),(wx*wy*wz,(ix+1,iy+1,iz+1))]
+    for wt,(a,b,c) in terms: np.add.at(rho,(a,b,c),q*wt)
+    return rho
+
+def trilinear(field,pts,base,sp):
+    f=(pts-base)/sp; i0=np.floor(f).astype(int); w=f-i0; i0=np.clip(i0,0,N-2); w=np.clip(w,0,1)
+    wx,wy,wz=w[:,0],w[:,1],w[:,2]; ix,iy,iz=i0[:,0],i0[:,1],i0[:,2]
+    return ((1-wx)*(1-wy)*(1-wz)*field[ix,iy,iz]+(1-wx)*(1-wy)*wz*field[ix,iy,iz+1]
+      +(1-wx)*wy*(1-wz)*field[ix,iy+1,iz]+(1-wx)*wy*wz*field[ix,iy+1,iz+1]
+      +wx*(1-wy)*(1-wz)*field[ix+1,iy,iz]+wx*(1-wy)*wz*field[ix+1,iy,iz+1]
+      +wx*wy*(1-wz)*field[ix+1,iy+1,iz]+wx*wy*wz*field[ix+1,iy+1,iz+1])
+
+II=np.arange(1,NI+1); I,J,K=np.meshgrid(II,II,II,indexing="ij")
+IDF=(I-1)*NI*NI+(J-1)*NI+(K-1)
+DIRS=[(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+
+def build_and_solve(eps,sf,sp,kappa,b,nonlinear,phi_T):
+    b=b[1:NI+1,1:NI+1,1:NI+1].ravel()
+    def assemble(diag_extra, rhs=None, return_A=False):
+        diag=np.zeros((NI,NI,NI)); rlist=[];cl=[];dl=[]
+        for (di,dj,dk) in DIRS:
+            In=I+di;Jn=J+dj;Kn=K+dk
+            ef=2.0/(1.0/eps[I,J,K]+1.0/eps[In,Jn,Kn]); c=ef/sp**2; diag+=c
+            mask=(In>=1)&(In<=NI)&(Jn>=1)&(Jn<=NI)&(Kn>=1)&(Kn<=NI)
+            idn=(In-1)*NI*NI+(Jn-1)*NI+(Kn-1)
+            rlist.append(IDF[mask].ravel()); cl.append(idn[mask].ravel()); dl.append(-c[mask].ravel())
+        diag=diag+diag_extra
+        A=csr_matrix((np.concatenate([diag.ravel()]+dl),(np.concatenate([IDF.ravel()]+rlist),np.concatenate([IDF.ravel()]+cl))),shape=(NID,NID))
+        if return_A: return A
+        x,info=cg(A,rhs,rtol=1e-10,maxiter=20000,M=diags(1.0/A.diagonal()))
+        if info!=0: x=spsolve(A,rhs); info=0
+        res=np.linalg.norm(A@x-rhs)/(np.linalg.norm(rhs)+1e-300)
+        return x,res,info
+    sfi=sf[1:NI+1,1:NI+1,1:NI+1]
+    if not nonlinear:
+        x,res,info=assemble(kappa**2*sfi,b); it=0
+    else:
+        phi_prev=np.zeros((N,N,N)); it=0
+        for it in range(80):
+            ppi=np.clip(phi_prev[1:NI+1,1:NI+1,1:NI+1],-35*phi_T,35*phi_T)
+            cphi=np.cosh(ppi/phi_T); sh=np.sinh(ppi/phi_T)
+            x,res,info=assemble(kappa**2*sfi*(1.0/phi_T)*cphi, b+(kappa**2*sfi*((1.0/phi_T)*cphi*ppi-sh)).ravel())
+            pf=np.zeros((N,N,N)); pf[1:NI+1,1:NI+1,1:NI+1]=x.reshape((NI,NI,NI))
+            diff=np.linalg.norm(pf-phi_prev)/(np.linalg.norm(pf)+1e-300); phi_prev=pf
+            if diff<1e-9: break
+    phi_full=np.zeros((N,N,N)); phi_full[1:NI+1,1:NI+1,1:NI+1]=x.reshape((NI,NI,NI))
+    nres=0.0
+    if nonlinear:
+        A0=assemble(0.0,return_A=True)
+        arg=np.clip(x/phi_T,-35,35)
+        F=A0@x+kappa**2*sfi.ravel()*np.sinh(arg)-b
+        nres=np.linalg.norm(F)/(np.linalg.norm(b)+1e-300)
+    return phi_full,res,it,nres
+
+def sf_from_sd(sd,window):
+    return 0.5*(1.0+np.tanh(sd/window)) if window>0 else (sd>0).astype(np.float64)
+
+summary_rows=[]; field_samples=np.zeros((len(order),24),dtype=np.float32); field_slice=np.zeros((len(order),35,35),dtype=np.float32)
+diag={}
+for ci,cid in enumerate(order):
+    c=cases[cid]; base,sp=grid_params(c); rp=c["response_parameters"]; spm=c["surface_parameters"]
+    probe=spm["probe_radius_angstrom"]; window=spm["smoothing_window_angstrom"]; regime=rp["response_regime"]
+    phi_T=KB*rp["temperature_kelvin"]; kappa=rp["screening_kappa_per_angstrom"]; eps_in=rp["inner_dielectric"]; eps_out=rp["outer_dielectric"]
+    diag[cid]={"regime":regime,"nonlinear":regime=="nonlinear_screening","sp":sp}
+    def solve_for(sd,q,pos):
+        sf=sf_from_sd(sd,window); eps=eps_in+(eps_out-eps_in)*sf; rho=deposit(q,pos,base,sp); b=4*np.pi*CONST*rho/sp**3
+        phi_med,res_med,it,nres=build_and_solve(eps,sf,sp,kappa,b,regime=="nonlinear_screening",phi_T)
+        phi_vac,res_vac,_,_=build_and_solve(np.full((N,N,N),eps_in),np.zeros((N,N,N)),sp,0.0,b,False,phi_T)
+        return phi_med-phi_vac,res_med,it,res_vac,nres
+    E={}
+    for ent in ["assembly","part_a","part_b"]:
+        d=sites[(cid,ent)]; sd=signed_distance(ses_mask(vdw_mask(d["pos"],d["r"],base,sp),probe,sp))
+        rf,rm,it,rv,nr=solve_for(sd,d["q"],d["pos"]); E[ent]=0.5*np.sum(d["q"]*trilinear(rf,d["pos"],base,sp))
+        diag[cid][ent]={"n":len(d["q"]),"E":E[ent],"res_med":rm,"res_vac":rv,"nres":nr,"picard_it":(it if regime=="nonlinear_screening" else None)}
+    metric_primary=E["assembly"]-E["part_a"]-E["part_b"]
+    sdA=volA[ci].astype(np.float64); dA=sites[(cid,"assembly")]
+    rfA,resA,itA,resAvac,nrA=solve_for(sdA,dA["q"],dA["pos"])
+    diag[cid]["assembly_field"]={"res_med":resA,"res_vac":resAvac,"nres":nrA,"picard_it":(itA if regime=="nonlinear_screening" else None)}
+    field_samples[ci]=trilinear(rfA,queries[ci],base,sp).astype(np.float32)
+    pl=planes[cid]; sl=rfA[:, :, pl["plane_index"]] if pl["axis"]=="z" else rfA[:, pl["plane_index"], :]
+    field_slice[ci]=sl.astype(np.float32)
+    da=sites[(cid,"part_a")]; db=sites[(cid,"part_b")]
+    def bdist(ent):
+        d=sites[(cid,ent)]; sd=signed_distance(ses_mask(vdw_mask(d["pos"],d["r"],base,sp),probe,sp))
+        return np.abs(trilinear(sd,d["pos"],base,sp))
+    a=np.maximum(da["r"],bdist("part_a")); b=np.maximum(db["r"],bdist("part_b"))
+    D=np.linalg.norm(da["pos"][:,None,:]-db["pos"][None,:,:],axis=2); keep=D.min(axis=1)<=6.5; sec=0.0
+    for i in np.where(keep)[0]:
+        rij=D[i]; f=np.sqrt(rij**2+a[i]*b*np.exp(-rij**2/(4*a[i]*b))); sec+=da["q"][i]*np.sum(db["q"]*((1.0/eps_in)-np.exp(-kappa*f)/eps_out)/f)
+    metric_secondary=-CONST*sec; metric_gap=metric_primary-metric_secondary
+    summary_rows.append([cid,metric_primary,metric_secondary,metric_gap])
+
+with open(f"{RES}/summary_metrics.csv","w",newline="") as f:
+    w=csv.writer(f); w.writerow(["case_id","metric_primary_kcal_mol","metric_secondary_kcal_mol","metric_gap_kcal_mol"])
+    for r in summary_rows:
+        p6=f"{r[1]:.9f}"; s6=f"{r[2]:.9f}"; g6=f"{float(p6)-float(s6):.9f}"
+        w.writerow([r[0],p6,s6,g6])
+np.save(f"{RES}/field_samples.npy",field_samples.astype(np.float32)); np.save(f"{RES}/field_slice.npy",field_slice.astype(np.float32))
+# ---- manual PNG overview (no matplotlib available) ----
+def write_png(path,arr):
+    h,w,_=arr.shape
+    def chunk(t,d):
+        c=t+d; return struct.pack(">I",len(d))+c+struct.pack(">I",zlib.crc32(c)&0xffffffff)
+    raw=b"".join(b"\x00"+arr[y].tobytes() for y in range(h))
+    png=bytes([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a])+chunk(b"IHDR",struct.pack(">IIBBBBB",w,h,8,2,0,0,0))
+    png+=chunk(b"IDAT",zlib.compress(raw,9))+chunk(b"IEND",b"")
+    open(path,"wb").write(png)
+def cmap_div(t):
+    t=np.clip(t.ravel(),0,1); lo=np.array([59,76,192]); mid=np.array([247,247,247]); hi=np.array([180,4,38])
+    cond=(t<0.5)[:,None]
+    return np.where(cond, lo+(mid-lo)*(t/0.5)[:,None], mid+(hi-mid)*((t-0.5)/0.5)[:,None])
+vmin=np.percentile(field_slice,2); vmax=np.percentile(field_slice,98)
+up=4; cell=35*up; gap=12; cbw=22; margin=14
+cw=margin+2*cell+gap+margin+cbw+8
+ch=margin+4*cell+3*gap+margin
+canvas=np.full((ch,cw,3),255,np.uint8)
+for ci,cid in enumerate(order):
+    r,c=ci//2,ci%2
+    x0=margin+c*(cell+gap); y0=margin+r*(cell+gap)
+    t=(field_slice[ci]-vmin)/(vmax-vmin+1e-12)
+    rgb=cmap_div(t.reshape(-1)).reshape(35,35,3).astype(np.uint8)
+    blk=np.kron(rgb,np.ones((up,up,1),np.uint8))
+    canvas[y0:y0+cell,x0:x0+cell]=blk
+# colorbar
+cbx=margin+2*cell+gap+margin; cby=margin; cbh=4*cell+3*gap
+tt=np.linspace(1,0,cbh)[:,None]
+bar=cmap_div(tt/(1.0)).reshape(-1,3).astype(np.uint8)
+canvas[cby:cby+cbh,cbx:cbx+cbw]=np.repeat(bar[:,None,:],cbw,axis=1)
+write_png(f"{RES}/overview.png",canvas)
+print("=== SUMMARY ===")
+for r in summary_rows: print(f"{r[0]}: primary={r[1]:.4f} secondary={r[2]:.4f} gap={r[3]:.4f}")
+print("\n=== SOLVER DIAG ===")
+for cid in order:
+    d=diag[cid]; parts=[]
+    for ent in ["assembly","part_a","part_b"]:
+        e=d[ent]; extra=f" picard={e['picard_it']}" if d['nonlinear'] else ""
+        parts.append(f"{ent}(n={e['n']},E={e['E']:.2f},res_med={e['res_med']:.1e},nres={e['nres']:.1e}{extra})")
+    af=d["assembly_field"]
+    print(cid,d["regime"],"| "+" ; ".join(parts)); print("   field_asm res_med=%.1e res_vac=%.1e"%(af["res_med"],af["res_vac"]),("picard=%s"%af["picard_it"]) if d["nonlinear"] else "")
+print("\n=== OUTPUTS ==="); print("field_samples",field_samples.shape,field_samples.dtype); print("field_slice",field_slice.shape,field_slice.dtype)

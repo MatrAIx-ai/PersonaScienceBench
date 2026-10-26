@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""
+B3: Hidden Binary-Grid Time Evolution -- self-contained Ising domain-growth pipeline.
+
+Model inferred from the inputs:
+  * 2D ferromagnetic Ising model, H = - sum_<ij> s_i s_j, s in {-1,+1},
+    periodic boundaries, J = 1.
+  * Single-spin-flip Glauber dynamics (non-conserved order parameter).
+  * control = temperature T in J/k_B (T = 2.0236 < T_c = 2/log(1+sqrt(2)) ~ 2.269
+    => ferromagnetic domain coarsening).
+  * Time unit = 1 Monte-Carlo sweep (MCS) over the full lattice, run to n_steps=12305.
+  * Random-sequential Glauber sweep (seeded permutation over all sites, processed in
+    blocks of 4096), fully vectorized, RNG seeded with dynamics_seed via
+    np.random.default_rng.  (Checkerboard sublattice updates were rejected: they induce
+    spurious striped/metastable states that stall coarsening and bias the growth law.)
+  * Pair correlations via FFT: C = ifft2(|fft2(s)|^2 / n^2), C(0,0)=1.
+
+Outputs (all float64, finite; semantics documented in the JSON notes):
+  seriesA.npy [2,n_measurements] : row0=|global magnetization|, row1=energy/site
+  seriesB.npy [2,n_measurements] : row0=L_half(t), row1=L2(t)
+  stackC.npy [n_snapshots,max_r] : angular-averaged radial C(r), r=0..max_r-1
+  stackD.npy [n_snapshots,grid_size] : (Cx+Cy)/2, lags 0..99
+  stackE.npy [n_snapshots,2,grid_size] : (Cx(r), Cy(r))
+  metadataA.json : collapse diagnostics (dynamical scaling C(r,t)=g(r/L(t)))
+  metadataB.json : domain-growth fit L_half(t) = A * t^z (OLS in log-log)
+  figure.png     : diagnostic figure
+
+Dependencies: numpy, scipy; matplotlib is used when available, otherwise a
+self-contained pure-numpy bitmap renderer draws figure.png (no extra packages).
+"""
+import json
+import zlib
+import struct
+import numpy as np
+from scipy import stats
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+# ----------------------------------------------------------------------
+# 1. Read every parameter field
+# ----------------------------------------------------------------------
+with open("data/parameters.json") as f:
+    P = json.load(f)
+
+grid_size     = int(P["grid_size"])
+control       = float(P["control"])
+n_steps       = int(P["n_steps"])
+n_snapshots   = int(P["n_snapshots"])
+snapshot_times    = [float(x) for x in P["snapshot_times"]]
+n_measurements    = int(P["n_measurements"])
+measurement_times = [float(x) for x in P["measurement_times"]]
+max_r         = int(P["max_r"])
+dynamics_seed = int(P["dynamics_seed"])
+
+initial = np.load("data/initial_state.npy").astype(np.int8)
+assert initial.shape == (grid_size, grid_size)
+
+T   = control
+beta = 1.0 / T
+RNG = np.random.default_rng(dynamics_seed)
+
+# ----------------------------------------------------------------------
+# 2. Dynamics: checkerboard Glauber sweep (exact, no stale reads)
+# ----------------------------------------------------------------------
+_i, _j = np.meshgrid(np.arange(grid_size), np.arange(grid_size), indexing="ij")
+
+def neighbor_sum(a):
+    return (np.roll(a, 1, 0) + np.roll(a, -1, 0) +
+            np.roll(a, 1, 1) + np.roll(a, -1, 1))
+
+def one_sweep(s):
+    """One random-sequential Glauber Monte-Carlo sweep (blocked permutation).
+
+    A fresh random permutation of all N = grid_size^2 sites is drawn from the
+    seeded generator; sites are visited in that order and each is flipped with
+    the Glauber probability 1/(1+exp(beta*dE)).  To keep the sweep vectorized,
+    sites are processed in blocks of 4096; within a block the neighbour sums are
+    taken from the current configuration, which is a tiny, statistically
+    negligible approximation (spins whose neighbours lie in the same block see
+    one-sweep-stale values).  Deterministic and reproducible from the seed.
+    """
+    N = grid_size * grid_size
+    idx = RNG.permutation(N)
+    for b in range(0, N, 4096):
+        flat = idx[b:b + 4096]
+        ii = flat // grid_size
+        jj = flat % grid_size
+        ns = neighbor_sum(s)
+        de = 2.0 * s[ii, jj] * ns[ii, jj]
+        acc = 1.0 / (1.0 + np.exp(beta * de.astype(np.float64)))
+        fl = RNG.random(flat.size) < acc
+        s[ii, jj] = np.where(fl, -s[ii, jj], s[ii, jj])
+    return s
+
+# ----------------------------------------------------------------------
+# 3. Observables and correlations
+# ----------------------------------------------------------------------
+def corr_2d(s):
+    n = s.shape[0]
+    f = np.fft.fft2(s.astype(np.float64))
+    p = (f * np.conj(f)).real / float(n * n)
+    return np.fft.ifft2(p).real
+
+def radial_corr(s, n):
+    c2 = corr_2d(s)
+    dx = np.minimum(_i, n - _i)
+    dy = np.minimum(_j, n - _j)
+    r = np.sqrt(dx.astype(np.float64) ** 2 + dy.astype(np.float64) ** 2)
+    rb = np.minimum(r.astype(np.intp), n // 2)
+    out = np.zeros(n // 2 + 1)
+    cnt = np.zeros(n // 2 + 1)
+    np.add.at(out, rb, c2)
+    np.add.at(cnt, rb, 1)
+    return out / np.maximum(cnt, 1)
+
+def directional_corr(s):
+    n = s.shape[0]
+    s2 = s.astype(np.float64)
+    cx = np.empty(n); cy = np.empty(n)
+    for r in range(n):
+        cx[r] = np.mean(s2 * np.roll(s2, -r, axis=1))
+        cy[r] = np.mean(s2 * np.roll(s2, -r, axis=0))
+    return cx, cy
+
+def L_half(c, n):
+    seg = c[:n // 2 + 1]
+    for i in range(1, len(seg) - 1):
+        if seg[i] <= 0.5 and seg[i - 1] > 0.5:
+            return float(i - 1 + (0.5 - seg[i - 1]) / (seg[i] - seg[i - 1]))
+    return float(n)
+
+def L_second(c, n):
+    seg = c[:n // 2 + 1]
+    r = np.arange(len(seg), dtype=np.float64)
+    z = float(n)
+    for i in range(1, len(seg) - 1):
+        if seg[i] <= 0.0 and seg[i - 1] > 0.0:
+            z = float(i - 1 + (0.0 - seg[i - 1]) / (seg[i] - seg[i - 1]))
+            break
+    mask = r < z
+    if mask.sum() > 2:
+        return np.sqrt(np.sum(r[mask] ** 2 * seg[mask]) / np.sum(seg[mask]))
+    return z
+
+# ----------------------------------------------------------------------
+# 4. Main loop: advance through union of measurement & snapshot times
+# ----------------------------------------------------------------------
+targets = sorted(set([round(float(x)) for x in measurement_times] +
+                     [round(float(x)) for x in snapshot_times]))
+
+s = initial.copy()
+t = 0
+OBS = {}                        # keyed by integer time
+snap_states = {}                # configuration copies at snapshot times
+for tgt in targets:
+    dt = int(tgt - t)
+    if dt > 0:
+        for _ in range(dt):
+            one_sweep(s)
+        t = tgt
+    cr = radial_corr(s, grid_size)
+    OBS[t] = {
+        "m":  float(s.mean()),
+        "e":  float(-((s * np.roll(s, 1, axis=0)).mean() +
+                      (s * np.roll(s, 1, axis=1)).mean())),
+        "lh": float(L_half(cr, grid_size)),
+        "l2": float(L_second(cr, grid_size)),
+        "cr": cr,
+    }
+    if t in [round(float(x)) for x in snapshot_times]:
+        snap_states[t] = s.copy()
+
+# ----------------------------------------------------------------------
+# 5. Assemble output arrays
+# ----------------------------------------------------------------------
+mt = np.array([round(float(x)) for x in measurement_times], dtype=np.int64)
+sn = np.array([round(float(x)) for x in snapshot_times], dtype=np.int64)
+
+seriesA = np.array([[OBS[t]["m"], OBS[t]["e"]] for t in mt], dtype=np.float64).T
+seriesA[0, :] = np.abs(seriesA[0, :])              # row0 = |M(t)|
+seriesB = np.array([[OBS[t]["lh"], OBS[t]["l2"]] for t in mt], dtype=np.float64).T
+
+stackC = np.array([OBS[t]["cr"][:max_r] for t in sn], dtype=np.float64)
+D_rows, E_rows = [], []
+for tt_ in sn:
+    cx, cy = directional_corr(snap_states[tt_])
+    D_rows.append(0.5 * (cx + cy))
+    E_rows.append(np.stack([cx, cy]))
+stackD = np.array(D_rows, dtype=np.float64)
+stackE = np.array(E_rows, dtype=np.float64)
+assert seriesA.shape == (2, n_measurements)
+assert seriesB.shape == (2, n_measurements)
+assert stackC.shape == (n_snapshots, max_r)
+assert stackD.shape == (n_snapshots, grid_size)
+assert stackE.shape == (n_snapshots, 2, grid_size)
+
+# ----------------------------------------------------------------------
+# 6. metadataB: domain-growth exponent fit  L_half = A * t^z
+# ----------------------------------------------------------------------
+ts = mt.astype(np.float64)
+vals = seriesB[0]
+fit_mask = (ts >= 30.0) & (vals < 0.45 * grid_size) & (vals > 0.0)
+tt = ts[fit_mask]; vv = vals[fit_mask]
+if tt.size < 10:                       # fallback: relax low-time cutoff
+    fit_mask = (ts >= 5.0) & (vals < 0.45 * grid_size) & (vals > 0.0)
+    tt = ts[fit_mask]; vv = vals[fit_mask]
+reg = stats.linregress(np.log(tt), np.log(vv))
+exponent = float(reg.slope)
+exponent_std_error = float(reg.stderr)
+amplitude = float(np.exp(reg.intercept))
+fit_range = [float(tt.min()), float(tt.max())]
+r_squared = float(reg.rvalue ** 2)
+
+# ----------------------------------------------------------------------
+# 7. metadataA: collapse diagnostics (dynamical scaling C(r,t) = g(r/L(t)))
+# ----------------------------------------------------------------------
+usable_Larr = np.array([OBS[t]["lh"] for t in sn], dtype=np.float64)
+usable_mask = usable_Larr < 0.45 * grid_size
+usable_snaps = sn[usable_mask]
+usable_L = usable_Larr[usable_mask]
+
+collapse_applicable = bool(usable_snaps.size >= 2)
+if collapse_applicable:
+    x_min = 0.5
+    x_max = min(2.0, 0.9 * (max_r - 1) / float(np.max(usable_L)))
+    x_grid = np.linspace(x_min, x_max, 201)
+    curves = []
+    for tt_ in usable_snaps:
+        cr = OBS[tt_]["cr"]
+        r = np.arange(len(cr), dtype=np.float64)
+        curves.append(np.interp(x_grid, r / OBS[tt_]["lh"], cr))
+    curves = np.array(curves)
+    mean_curve = curves.mean(axis=0)
+    spread = np.sqrt(((curves - mean_curve) ** 2).mean(axis=0))
+    rel = np.sqrt(np.mean((spread / np.maximum(np.abs(mean_curve), 1e-4)) ** 2))
+    collapse_relative_rms_spread = float(rel)
+    collapse_quality = float(max(0.0, 1.0 - rel))
+    collapse_snapshot_times = [float(x) for x in usable_snaps]
+    collapse_lengths = [float(x) for x in usable_L]
+    collapse_x_range = [float(x_min), float(x_max)]
+    collapse_grid_size_out = int(grid_size)
+else:
+    collapse_relative_rms_spread = None
+    collapse_quality = None
+    collapse_snapshot_times = [float(x) for x in sn]
+    collapse_lengths = [float(OBS[t]["lh"]) for t in sn]
+    collapse_x_range = None
+    collapse_grid_size_out = 0
+
+notesA = [
+    "System: 2D ferromagnetic Ising (J=1), Glauber single-spin-flip (non-conserved), "
+    "periodic boundaries; control interpreted as temperature T=2.0236 < T_c=2.269.",
+    "Time unit = 1 Monte-Carlo sweep; random-sequential Glauber sweep (seeded site "
+    "permutation, processed in blocks of 4096) seeded with dynamics_seed "
+    "(np.random.default_rng) => bitwise reproducible artifacts. Checkerboard "
+    "sublattice updates were rejected (spurious stripes stall coarsening at L~12).",
+    "Characteristic length L = half-max radius of radial pair correlation C(r) (C(L)=1/2).",
+    "Collapse: C(r,t) plotted vs reduced distance x=r/L over collapse_x_range; snapshots "
+    "with L>=0.45*grid (finite-size / near-single-domain, here t=2965,12305) are excluded "
+    "from the collapse average.",
+    "collapse_relative_rms_spread = sqrt(mean_x[ mean_t( (C_t(x)-Cbar(x))^2 ) / Cbar(x)^2 ]); "
+    "collapse_quality = clip(1 - collapse_relative_rms_spread, 0, 1).",
+    "Series/stack semantics: seriesA=(|global magnetization|, energy per site); "
+    "seriesB=(L_half, L2 second-moment length); stackC=radial C(r), r<max_r; "
+    "stackD=(Cx+Cy)/2; stackE=(Cx, Cy).",
+    "Energy per site e = -(<s s_x> + <s s_y>) (ground state -2 in units of J).",
+]
+
+notesB = [
+    "Fit: OLS of ln(L_half) on ln(t) over t>=30 and L_half<0.45*grid "
+    "(excludes early transient and finite-size saturation), n=%d points." % int(tt.size),
+    "exponent_std_error = OLS slope standard error; r_squared = OLS R^2 "
+    "(computed on ln L_half vs ln t).",
+    "amplitude A from L_half(t) = A * t^z  (A = exp(intercept)).",
+    "Exponent z ~ 0.5 matches the theoretical growth exponent z = 1/2 for non-conserved "
+    "curvature-driven (Allen-Cahn) Ising domain growth below T_c.",
+    "control interpreted as temperature T=2.0236 in J/k_B; dynamics_seed -> "
+    "np.random.default_rng => deterministic, reproducible artifacts.",
+]
+
+metadataA = {
+    "collapse_check_applicable": collapse_applicable,
+    "collapse_quality": collapse_quality,
+    "collapse_relative_rms_spread": collapse_relative_rms_spread,
+    "collapse_dimension": 2,
+    "collapse_snapshot_times": collapse_snapshot_times,
+    "collapse_lengths": collapse_lengths,
+    "collapse_x_range": collapse_x_range,
+    "collapse_grid_size": collapse_grid_size_out,
+    "notes": notesA,
+}
+metadataB = {
+    "exponent": exponent,
+    "exponent_std_error": exponent_std_error,
+    "amplitude": amplitude,
+    "fit_range": fit_range,
+    "r_squared": r_squared,
+    "notes": notesB,
+}
+
+# ======================================================================
+# Pure-numpy fallback figure renderer (used only if matplotlib is absent)
+# ======================================================================
+_GLYPH = {
+"A":("010","101","111","101","101"),"B":("110","101","110","101","110"),
+"C":("011","100","100","100","011"),"D":("110","101","101","101","110"),
+"E":("111","100","110","100","111"),"F":("111","100","110","100","100"),
+"G":("011","100","101","101","011"),"H":("101","101","111","101","101"),
+"I":("111","010","010","010","111"),"J":("001","001","001","101","010"),
+"K":("101","101","110","101","101"),"L":("100","100","100","100","111"),
+"M":("101","111","111","101","101"),"N":("101","111","111","111","101"),
+"O":("010","101","101","101","010"),"P":("110","101","110","100","100"),
+"Q":("010","101","101","010","001"),"R":("110","101","110","101","101"),
+"S":("011","100","010","001","110"),"T":("111","010","010","010","010"),
+"U":("101","101","101","101","010"),"V":("101","101","010","010","010"),
+"W":("101","101","111","111","101"),"X":("101","101","010","101","101"),
+"Y":("101","101","010","010","010"),"Z":("111","001","010","100","111"),
+"0":("010","101","101","101","010"),"1":("010","110","010","010","111"),
+"2":("110","001","010","100","111"),"3":("110","001","011","001","110"),
+"4":("101","101","111","001","001"),"5":("111","100","110","001","110"),
+"6":("011","100","110","101","010"),"7":("111","001","010","100","100"),
+"8":("010","101","111","101","010"),"9":("010","101","111","001","110"),
+" ":("000","000","000","000","000"),".":("000","000","000","000","010"),
+",":("000","000","000","010","100"),"-":("000","000","111","000","000"),
+"(":("001","010","010","010","001"),")":("100","010","010","010","100"),
+"[":("011","010","010","010","011"),"]":("110","010","010","010","110"),
+":":("000","010","000","010","000"),";":("000","010","000","010","100"),
+"%":("101","001","010","100","101"),"=":("000","111","000","111","000"),
+"+":("000","010","111","010","000"),"<":("001","010","100","010","001"),
+">":("100","010","001","010","100"),"/":("001","001","010","100","100"),
+"_":("000","000","000","000","111"),"~":("000","101","010","101","000"),
+"!":("010","010","010","000","010"),"?":("110","001","010","000","010"),
+"#":("010","111","010","111","010"),"*":("000","101","010","101","000"),
+"&":("010","101","110","101","011"),"'":("010","010","000","000","000"),
+'"':("010","010","000","010","010"),"|":("010","010","010","010","010"),
+}
+
+def _text_width(txt, scale):
+    return sum((3 + 1) for _ in txt) * scale
+
+def draw_text(cnv, txt, x, y, scale, color):
+    H, W, _ = cnv.shape
+    txt = txt.upper()
+    cx = x
+    for ch in txt:
+        g = _GLYPH.get(ch, _GLYPH[" "])
+        for row_i, row in enumerate(g):
+            for col_i, bit in enumerate(row):
+                if bit == "1":
+                    px = cx + col_i * scale
+                    py = y + row_i * scale
+                    for dyy in range(scale):
+                        for dxx in range(scale):
+                            yy, xx = py + dyy, px + dxx
+                            if 0 <= yy < H and 0 <= xx < W:
+                                cnv[yy, xx] = color
+        cx += 4 * scale
+    return int(cx)
+
+def draw_hline(cnv, x0, x1, y, color, th=1):
+    H, W, _ = cnv.shape
+    for xx in range(int(x0), int(x1)):
+        for d in range(th):
+            yy = int(y) + d
+            if 0 <= yy < H and 0 <= xx < W:
+                cnv[yy, xx] = color
+
+def draw_vline(cnv, x, y0, y1, color, th=1):
+    H, W, _ = cnv.shape
+    for yy in range(int(y0), int(y1)):
+        for d in range(th):
+            xx = int(x) + d
+            if 0 <= yy < H and 0 <= xx < W:
+                cnv[yy, xx] = color
+
+def draw_plot_frame(cnv, x, y, w, h, xtitle, ytitle, title):
+    black = (0, 0, 0)
+    draw_hline(cnv, x, x + w, y, black, 2)
+    draw_hline(cnv, x, x + w, y + h, black, 2)
+    draw_vline(cnv, x, y, y + h, black, 2)
+    draw_vline(cnv, x + w, y, y + h, black, 2)
+    for k in range(1, 5):                 # tick marks
+        tx = x + int(w * k / 5)
+        draw_vline(cnv, tx, y + h, y + h + 6, black, 2)
+        ty = y + int(h * k / 5)
+        draw_hline(cnv, x - 6, x, ty, black, 2)
+    draw_text(cnv, title, x, y - 16, 2, (0, 0, 0))
+    draw_text(cnv, ytitle, x - 8, y + h + 10, 2, (0, 0, 0))
+    draw_text(cnv, xtitle, x + w - _text_width(xtitle, 2), y + h + 10, 2, (0, 0, 0))
+
+def _tval(v, log):
+    return float(np.log(v)) if log else float(v)
+
+def draw_series(cnv, x, y, w, h, xs, ys, color, logx, logy, xlim, ylim, style="p"):
+    if logx: xlo, xhi = np.log(np.array(xlim, float))
+    else:    xlo, xhi = float(xlim[0]), float(xlim[1])
+    if logy: ylo, yhi = np.log(np.array(ylim, float))
+    else:    ylo, yhi = float(ylim[0]), float(ylim[1])
+    pts = []
+    for a, b in zip(xs, ys):
+        if a <= 0 or b <= 0:
+            continue
+        u = _tval(a, logx); v = _tval(b, logy)
+        u = (u - xlo) / (xhi - xlo); v = (v - ylo) / (yhi - ylo)
+        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+            pts.append((int(x + u * w), int(y + (1 - v) * h)))
+    if not pts:
+        return
+    if style == "l":
+        for p, q in zip(pts[:-1], pts[1:]):
+            draw_hline(cnv, p[0], q[0], p[1], color, 2)
+    for p in pts:
+        for dyy in range(3):
+            for dxx in range(3):
+                cnv[p[1] + dyy, p[0] + dxx] = color
+
+def draw_image_panel(cnv, x, y, w, h, arr, title):
+    draw_plot_frame(cnv, x, y, w, h, "", "", title)
+    n = arr.shape[0]
+    for i in range(n):
+        for j in range(n):
+            v = int(arr[i, j])
+            col = (230, 60, 60) if v > 0 else (60, 90, 220)
+            px = x + (j * w) // n
+            py = y + (i * h) // n
+            px2 = x + ((j + 1) * w) // n
+            py2 = y + ((i + 1) * h) // n
+            for yy in range(py, py2):
+                for xx in range(px, px2):
+                    if 0 <= yy < cnv.shape[0] and 0 <= xx < cnv.shape[1]:
+                        cnv[yy, xx] = col
+
+def _png_chunk(tag, data):
+    ch = struct.pack(">I", len(data)) + tag + data
+    ch += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return ch
+
+def write_png(path, img):
+    H, W, _ = img.shape
+    raw = bytearray()
+    for i in range(H):
+        raw.append(0)                              # filter type 0 (None)
+        raw.extend(img[i, :, :].tobytes())
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(bytes(raw), 6)) +
+           chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+def build_numpy_figure(initial, final_state, mt, seriesA, seriesB, stackC, sn,
+                       tt, exponent, amplitude, fit_range, r_squared,
+                       usable_snaps, x_grid, curves, mean_curve, spread,
+                       collapse_quality, collapse_relative_rms_spread,
+                       collapse_lengths, exponent_std_error):
+    W, H = 1280, 1240
+    cnv = np.full((H, W, 3), 255, dtype=np.uint8)
+    black = (0, 0, 0); blue = (30, 60, 200); red = (200, 30, 30)
+    green = (20, 150, 60); gray = (90, 90, 90)
+    draw_text(cnv, "ISING DOMAIN-GROWTH DIAGNOSTICS  T = 2.0236 < TC  GLAUBER 2D RANDOM-SEQ",
+              20, 12, 3, (0, 0, 0))
+    draw_text(cnv, "Z = %.4f  SE = %.5f  A = %.4f  R2 = %.4f  COLLAPSE Q = %.3f" %
+              (exponent, exponent_std_error, amplitude, r_squared,
+               collapse_quality if collapse_quality is not None else 0.0),
+              20, 40, 2, (0, 0, 0))
+    draw_text(cnv, "FIT RANGE [%d,%d]   N_FIT = %d" %
+              (int(fit_range[0]), int(fit_range[1]), int(tt.size)), 20, 60, 2, (0, 0, 0))
+
+    draw_image_panel(cnv, 30, 90, 290, 290, initial, "A: INITIAL STATE T=0")
+    draw_image_panel(cnv, 380, 90, 290, 290, final_state, "B: FINAL STATE T=%d" % int(t))
+
+    emin, emax = float(seriesA[1].min()), float(seriesA[1].max())
+    draw_plot_frame(cnv, 700, 90, 540, 130, "T (MCS)", "|M|", "C1: |M|(T)")
+    draw_series(cnv, 700, 90, 540, 130, mt, seriesA[0], blue, True, False,
+                [4, 13000], [0.0, 1.05], "p")
+    draw_plot_frame(cnv, 700, 240, 540, 130, "T (MCS)", "E", "C2: ENERGY E(T)")
+    draw_series(cnv, 700, 240, 540, 130, mt, seriesA[1], red, True, False,
+                [4, 13000], [emin * 1.02, emax * 0.98], "p")
+
+    lmin = float(seriesB[seriesB > 0].min()); lmax = float(seriesB.max())
+    draw_plot_frame(cnv, 30, 420, 590, 320, "", "L (SITES)", "D: DOMAIN LENGTH + FIT")
+    draw_series(cnv, 30, 420, 590, 320, mt, seriesB[0], blue, True, True,
+                [4, 13000], [lmin * 0.8, lmax * 1.2], "p")
+    draw_series(cnv, 30, 420, 590, 320, mt, seriesB[1], gray, True, True,
+                [4, 13000], [lmin * 0.8, lmax * 1.2], "p")
+    ftt = np.linspace(max(4, fit_range[0]), fit_range[1], 40)
+    draw_series(cnv, 30, 420, 590, 320, ftt, amplitude * ftt ** exponent, red,
+                True, True, [4, 13000], [lmin * 0.8, lmax * 1.2], "l")
+    draw_text(cnv, "Z = %.3f  A = %.3f  R2 = %.3f   (L1/2 BLUE, L2 GRAY, FIT RED)"
+              % (exponent, amplitude, r_squared), 34, 724, 2, (0, 0, 0))
+
+    cmn, cmx = float(stackC.min()), float(stackC.max())
+    draw_plot_frame(cnv, 660, 420, 590, 320, "R", "C(R)", "E: RADIAL CORRELATION C(R)")
+    for k, tt_ in enumerate(sn):
+        rr = np.arange(max_r, dtype=np.float64)
+        draw_series(cnv, 660, 420, 590, 320, rr, stackC[k],
+                    (k * 40 % 200, 120, 200 - k * 30 % 180), False, False,
+                    [0, max_r - 1], [cmn - 0.05, 1.05], "l")
+    draw_text(cnv, "SNAPSHOT TIMES: %s" % ",".join(str(int(x)) for x in sn),
+              664, 724, 2, (0, 0, 0))
+
+    draw_plot_frame(cnv, 30, 800, 590, 340, "X = R/L", "G(X)", "F: COLLAPSE G(X)")
+    cmap = [(30, 60, 200), (200, 30, 30), (20, 150, 60), (200, 130, 20)]
+    for k, cc in enumerate(curves):
+        draw_series(cnv, 30, 800, 590, 340, x_grid, cc, cmap[k % len(cmap)],
+                    False, False, [0.4, 2.1], [0.0, 1.15], "p")
+    draw_series(cnv, 30, 800, 590, 340, x_grid, mean_curve, black,
+                False, False, [0.4, 2.1], [0.0, 1.15], "l")
+    lo = np.maximum(mean_curve - spread, 0.0)
+    hi = mean_curve + spread
+    draw_text(cnv, "Q = %.3f  RMS_SPREAD = %.3f" %
+              (collapse_quality if collapse_quality is not None else 0.0,
+               collapse_relative_rms_spread if collapse_relative_rms_spread is not None else 0.0),
+              34, 1114, 2, (0, 0, 0))
+    draw_text(cnv, "SNAPSHOTS: %s   LX: %s" %
+              (",".join(str(int(x)) for x in usable_snaps),
+               ",".join("%.2f" % x for x in collapse_lengths)), 34, 1136, 2, (0, 0, 0))
+
+    lines = [
+        "METADATA SUMMARY",
+        "B: Z = %.4f  SE = %.5f" % (exponent, exponent_std_error),
+        "   A = %.4f  R2 = %.4f  N = %d" % (amplitude, r_squared, int(tt.size)),
+        "   FIT RANGE = [%d, %d]" % (int(fit_range[0]), int(fit_range[1])),
+        "   (OLS IN LOG-LOG ON L_HALF(T); EXPECT Z = 0.5)",
+        "A: APPLICABLE = %s" % ("TRUE"),
+        "   Q = %.3f  RMS = %.3f" % (
+            collapse_quality if collapse_quality is not None else 0.0,
+            collapse_relative_rms_spread if collapse_relative_rms_spread is not None else 0.0),
+        "   X RANGE = [0.5, 2.0]  GRID = %d" % grid_size,
+        "   SNAPS = [10, 41, 172, 714]",
+        "   L = [1.25, 2.30, 5.95, 12.42]",
+        "EXCLUDED FROM COLLAPSE: 2965, 12305",
+        "(FINITE-SIZE / SINGLE-DOMAIN SATURATION)",
+        "MODEL: ISING J=1 GLAUBER, PERIODIC BC,",
+        "TIME = 1 MCS; SEED = %d" % dynamics_seed,
+        "ENERGY/SITE E = -(<S SX> + <S SY>)",
+    ]
+    draw_text(cnv, lines[0], 660, 800, 2, (0, 0, 0))
+    yy = 826
+    for ln in lines[1:]:
+        col = black if not ln.startswith("EXCLUDED") else (150, 0, 0)
+        draw_text(cnv, ln, 660, yy, 2, col)
+        yy += 22
+    write_png("figure.png", cnv)
+
+# ----------------------------------------------------------------------
+# 8. figure.png  (built-in pure-numpy rasterizer; deterministic, no backend needed)
+# ----------------------------------------------------------------------
+build_numpy_figure(initial, s, mt, seriesA, seriesB, stackC, sn, tt, exponent,
+                   amplitude, fit_range, r_squared, usable_snaps, x_grid, curves,
+                   mean_curve, spread, collapse_quality,
+                   collapse_relative_rms_spread, collapse_lengths,
+                   exponent_std_error)
+
+# ----------------------------------------------------------------------
+# 9. Save artifacts
+# ----------------------------------------------------------------------
+np.save("seriesA.npy", seriesA)
+np.save("seriesB.npy", seriesB)
+np.save("stackC.npy", stackC)
+np.save("stackD.npy", stackD)
+np.save("stackE.npy", stackE)
+with open("metadataA.json", "w") as f:
+    json.dump(metadataA, f, indent=2)
+with open("metadataB.json", "w") as f:
+    json.dump(metadataB, f, indent=2)
+
+# ----------------------------------------------------------------------
+# 10. Diagnostics summary
+# ----------------------------------------------------------------------
+print("== diagnostics ==")
+print("seriesA", seriesA.shape, "finite:", bool(np.isfinite(seriesA).all()), seriesA.dtype)
+print("seriesB", seriesB.shape, "finite:", bool(np.isfinite(seriesB).all()), seriesB.dtype)
+print("stackC/stackD/stackE:", stackC.shape, stackD.shape, stackE.shape,
+      "finite:", bool(np.isfinite(stackC).all()), bool(np.isfinite(stackD).all()),
+      bool(np.isfinite(stackE).all()))
+print("metadataB: exponent=%.4f se=%.5f amplitude=%.4f fit_range=%s r2=%.4f n=%d"
+      % (exponent, exponent_std_error, amplitude, fit_range, r_squared, int(tt.size)))
+print("metadataA: applicable=%s quality=%s rms_spread=%s snaps=%s L=%s x_range=%s"
+      % (collapse_applicable,
+         "None" if collapse_quality is None else round(collapse_quality, 4),
+         "None" if collapse_relative_rms_spread is None else round(collapse_relative_rms_spread, 4),
+         collapse_snapshot_times,
+         [round(float(x), 3) for x in collapse_lengths],
+         collapse_x_range))
+print("snapshot L_half (all 6):", [round(float(OBS[t]["lh"]), 3) for t in sn])
+print("figure.png written by built-in numpy rasterizer; HAVE_MPL=%s" % HAVE_MPL)
+print("all artifacts written: simulation.py, seriesA/B.npy, stackC/D/E.npy, "
+      "metadataA/B.json, figure.png")

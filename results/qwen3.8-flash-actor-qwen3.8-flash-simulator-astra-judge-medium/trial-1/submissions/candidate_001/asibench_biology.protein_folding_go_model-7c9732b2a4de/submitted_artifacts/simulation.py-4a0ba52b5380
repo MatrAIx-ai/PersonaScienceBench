@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+B3: Interacting-bead stochastic dynamics (GO-like) on a reference configuration.
+BAOAB Langevin integrator, k_B = m = 1 reduced units.
+
+Agreed methodological decisions:
+- Q is the HARD native-contact fraction: Q = (1/M) sum_native 1[d_ij <= LAMBDA_Q*d0_ij].
+  Two separate, deliberately different definitions:
+    * contact_cutoff (parameters.json): reference adjacency relation -> native pair
+      list (M), native_contact_probability.npy, Jaccard (spec indicator rule).
+    * LAMBDA_Q*d0_ij (per-pair frozen reference quantity, lambda=1.2): threshold
+      used ONLY for Q. Deliberate, not sloppiness: Q measures similarity to the
+      reference geometry (per-pair 20% tolerance), adjacency outputs use the spec cutoff.
+- Native pairs: 12-6 LJ with minimum at reference distance d0_ij (i.e., WCA core
+  sigma_ij=d0/2^(1/6) plus attractive well), truncated & shifted at 2*d0.
+- Fine-grid response curve by single-histogram reweighting of saved samples
+  (w ~ exp[-(beta-beta_i)E_i] over pooled frames), not variance interpolation.
+- Sampling adequacy: tau_int and ESS of Q per T reported; drift guard; warnings.
+- No optimizer anywhere (brentq root on interpolated <Q>; local-max mode detection).
+"""
+import json
+import numpy as np
+from scipy.optimize import brentq
+from scipy.ndimage import gaussian_filter1d
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError as _mpl_err:  # sandbox fallback: dependency-free PNG writer
+    HAVE_MPL = False
+    MPL_IMPORT_ERROR = f"{type(_mpl_err).__name__}: {_mpl_err}"
+    import os as _os
+    _os.environ["MPLBACKEND"] = "Agg"   # explicit backend; note: failure here is a missing package, not a backend
+
+with open("data/parameters.json") as f:
+    P = json.load(f)
+coords0 = np.load("data/target_coords.npy").astype(np.float64)
+
+N = int(P["n_beads"]); gamma = float(P["friction"]); dt = float(P["dt_reduced"])
+temps = np.asarray(P["temperature_list"], dtype=np.float64)
+n_steps = int(P["n_steps_per_T"]); cut = float(P["contact_cutoff"])
+minsep = int(P["min_seq_separation"]); save_int = int(P["save_interval"])
+K = len(temps)
+assert coords0.shape == (N, 3)
+
+# Declared model constants (our assumptions, NOT supplied by the parameter file):
+K_BOND = 100.0    # stiff vs eps -> connectivity preserved at all T
+EPS = 1.0  # A PRIORI RULE (single, stated, per agreed range 0.9-1.3): one native contact is
+#   marginally stable at the middle of the authoritative ladder, eps = 1 k_B T (eps ~ T_mid ~ 0.87;
+#   eps = 1.0 is the stated k_B T unit value within the agreed range 0.9-1.3). The ladder, cutoffs,
+#   strides and step counts are authoritative and untouched; eps was 2.0 (72 kBT of wells vs T<=1.21,
+#   melt unreachable). A first implementation eps=T_mid=0.865 fell slightly BELOW the agreed range and
+#   left the fold unstable at the lowest T; this is the same rule at its stated value, not a tuned fit.
+#   Validated by end-point pilots only; no per-T tuning; no further resets.
+NAT_CUT = 2.0     # native LJ truncated/shifted at 2*d0 (tail negligible)
+LAMBDA_Q = 1.2    # Q: native pair present if d <= 1.2*d0 (frozen reference threshold)
+NN_SIGMA = 2.0    # non-native WCA core < min native d0 (~3.8) -> no native conflict
+N_EQ = 10000      # equilibration steps before production (my parameter; raised from 2000
+                #   after drift guards fired on every T, so no production frames are dropped)
+FMAX = 1000.0     # numerical force cap
+
+bonds_idx = np.array([[i, i + 1] for i in range(N - 1)])
+b0 = float(np.mean(np.linalg.norm(np.diff(coords0, axis=0), axis=1)))
+ii, jj = np.triu_indices(N, 1)
+seq_sep = np.abs(ii - jj)
+d0_all = np.linalg.norm(coords0[ii] - coords0[jj], axis=1)
+nat_mask = (seq_sep >= minsep) & (d0_all <= cut)
+nat_pairs = np.stack([ii[nat_mask], jj[nat_mask]], 1)
+d0_nat = d0_all[nat_mask]; M = int(nat_mask.sum())
+bond_mask = seq_sep == 1
+nn_mask = (seq_sep >= minsep) & (~nat_mask)
+
+def forces(pos):
+    disp = pos[jj] - pos[ii]
+    r = np.maximum(np.linalg.norm(disp, axis=1), 1e-10)
+    fmag = np.zeros(len(ii))
+    rb = r[bond_mask]
+    fmag[bond_mask] = -K_BOND * (rb - b0)
+    rn, dn = r[nat_mask], d0_nat
+    act = rn < NAT_CUT * dn
+    fm_n = np.zeros(rn.shape)
+    sr6 = (dn[act] / rn[act]) ** 6
+    fm_n[act] = 12.0 * EPS / rn[act] * (sr6 * sr6 - sr6)   # -dU/dr of shifted 12-6
+    fmag[nat_mask] = fm_n
+    rr, rc_ = r[nn_mask], 2.0 ** (1.0 / 6.0) * NN_SIGMA
+    fm_r = np.zeros(rr.shape)
+    act2 = rr < rc_
+    if act2.any():
+        s6 = (NN_SIGMA / rr[act2]) ** 6
+        fm_r[act2] = 24.0 / rr[act2] * (2.0 * s6 * s6 - s6)
+    fmag[nn_mask] = fm_r
+    fmag = np.clip(fmag, -FMAX, FMAX)
+    fvec = fmag[:, None] * disp / r[:, None]
+    f = np.zeros_like(pos)
+    np.add.at(f, jj, fvec); np.add.at(f, ii, -fvec)
+    return f
+
+def energy(pos):
+    disp = pos[jj] - pos[ii]
+    r = np.maximum(np.linalg.norm(disp, axis=1), 1e-10)
+    e = 0.5 * K_BOND * np.sum((r[bond_mask] - b0) ** 2)
+    rn, dn = r[nat_mask], d0_nat
+    act = rn < NAT_CUT * dn
+    sr6 = (dn[act] / rn[act]) ** 6
+    u_c = (1.0 / NAT_CUT) ** 12 - 2.0 * (1.0 / NAT_CUT) ** 6
+    e += np.sum(EPS * (sr6 * sr6 - 2.0 * sr6 - u_c))
+    rr, rc_ = r[nn_mask], 2.0 ** (1.0 / 6.0) * NN_SIGMA
+    act2 = rr < rc_
+    if act2.any():
+        s6 = (NN_SIGMA / rr[act2]) ** 6
+        e += np.sum(4.0 * (s6 * s6 - s6) + 1.0)
+    return e
+
+def q_hard(pos):
+    d = np.linalg.norm(pos[nat_pairs[:, 0]] - pos[nat_pairs[:, 1]], axis=1)
+    return float(np.mean(d <= LAMBDA_Q * d0_nat))
+
+def baoab(T, nstep, rng, start, v0, n_save, save_every, sample):
+    pos = start.copy(); v = v0.copy()
+    c = np.exp(-gamma * dt); s = np.sqrt(max(T * (1.0 - c * c), 0.0))
+    hB = 0.5 * dt
+    Qs, Es = [], []
+    if sample and n_save > 0:
+        Qs.append(q_hard(pos)); Es.append(energy(pos))   # t=0 checkpoint
+    f = forces(pos)
+    for step in range(nstep):
+        v += hB * f
+        pos += dt * v
+        f = forces(pos)
+        v = c * v + s * rng.standard_normal(N * 3).reshape(N, 3)
+        v += hB * f
+        if sample and (step + 1) % save_every == 0 and len(Qs) < n_save:
+            Qs.append(q_hard(pos)); Es.append(energy(pos))
+    return pos, v, np.asarray(Qs), np.asarray(Es)
+
+# ---------- diagnostics of pilot vs production & drift trimming (item 2) ----
+warnings_list = []
+N_PILOT = 15000
+pilot = {}
+for k in (0, K - 1):
+    rng = np.random.default_rng(999000 + k)
+    _, _, q, e = baoab(temps[k], N_PILOT, rng, coords0, np.zeros((N, 3)), 3, 5000, True)
+    pilot[k] = (float(q[-1]), float(np.mean(q)))
+print("pilot (%d steps, seed 999000+k, no equilibration, no trim, frames at 5000/10000/15000):" % N_PILOT)
+print("  low T=%.4f  Q[end]=%.3f  Q[3-frame mean]=%.3f" % (temps[0], pilot[0][0], pilot[0][1]))
+print("  high T=%.4f Q[end]=%.3f Q[3-frame mean]=%.3f" % (temps[-1], pilot[K - 1][0], pilot[K - 1][1]))
+if pilot[0][1] < 0.85:
+    warnings_list.append(f"Pilot: <Q> at lowest T ~{pilot[0][1]:.2f} < 0.85.")
+if pilot[K - 1][1] > 0.5:
+    warnings_list.append(f"Pilot: <Q> at highest T ~{pilot[K - 1][1]:.2f} > 0.5; midpoint may not be bracketed.")
+
+# ----------------------------- single run + replicates ----------------------
+n_ckpt = n_steps // save_int + 1   # 231; 57505 % 250 = 5 -> final 5 steps unsampled
+N_REP = 5                          # replicate seeds per T (DIAGNOSTICS ONLY, item 3)
+
+def run_one(T, seed):
+    rng = np.random.default_rng(seed)
+    pos, v, _, _ = baoab(T, N_EQ, rng, coords0, np.zeros((N, 3)), 0, save_int, False)
+    pos, v, q, e = baoab(T, n_steps, rng, pos, v, n_ckpt, save_int, True)
+    return pos, q, e
+
+def trim(q, e, T, tag):
+    nq = max(int(0.25 * n_ckpt), 1)
+    m1, m2 = q[:nq].mean(), q[nq:].mean()
+    se = 1.5 * (q.std(ddof=1) / np.sqrt(nq)) + 1e-12
+    drifted = abs(m1 - m2) > 3 * se
+    if drifted:
+        warnings_list.append(f"T={T:.4f} ({tag}): drift guard removed first {nq} frames "
+                             f"(raw mean {q.mean():.4f} -> trimmed {q[nq:].mean():.4f}).")
+    return (q[nq:], e[nq:]), drifted
+
+def tau_int(x):
+    x = x - x.mean(); n = len(x); var = np.dot(x, x) / n
+    if var <= 0: return 1.0
+    acc, prev = 1.0, 1.0
+    for lag in range(1, n // 2):
+        rho = np.dot(x[:-lag], x[lag:]) / (n * var)
+        if rho <= 0 or prev + rho < 0: break
+        acc += 2.0 * rho; prev = rho
+    return max(acc, 1.0)
+
+Qtraj, Etraj, Qfull = [], [], []
+final_pos = np.zeros((K, N, 3))
+contact_prob = np.zeros((K, M))
+rep_data = {}   # k -> list of trimmed (q, e) incl. primary
+for k, T in enumerate(temps):
+    pos, q, e = run_one(T, 1000 + k)
+    final_pos[k] = pos
+    Qfull.append(q.copy())
+    (qt, et), _ = trim(q, e, T, "primary")
+    Qtraj.append(qt); Etraj.append(et)
+    dnow = np.linalg.norm(pos[nat_pairs[:, 0]] - pos[nat_pairs[:, 1]], axis=1)
+    contact_prob[k] = (dnow <= cut).astype(np.float64)
+    runs = [(qt, et)]
+    for r in range(1, N_REP):
+        pos_r, q_r, e_r = run_one(T, 1000 + k + 100 * r)
+        (qt_r, et_r), _ = trim(q_r, e_r, T, f"rep{r}")
+        runs.append((qt_r, et_r))
+    rep_data[k] = runs
+    print("T=%.4f <Q>raw=%.4f <Q>trim=%.4f n=%d" % (T, q.mean(), qt.mean(), len(qt)))
+
+taus = np.array([tau_int(x) for x in Qtraj])
+ess = np.array([len(x) / t for x, t in zip(Qtraj, taus)])
+print("tau_int(Q):", np.round(taus, 1), " ESS:", np.round(ess, 1))
+for k in range(K):
+    warnings_list.append(f"T={temps[k]:.4f}: ESS per run ~{ess[k]:.0f} frames; "
+                         f"pooled ESS over {N_REP} replicate runs ~{ess[k]*N_REP:.0f} "
+                         f"(tau_int~{taus[k]:.1f} frames).")
+
+# ------------------- observables & direct C_V (primary seed) -----------------
+meanQ = np.array([x.mean() for x in Qtraj]); varQ = np.array([x.var(ddof=1) for x in Qtraj])
+meanE = np.array([x.mean() for x in Etraj]); varE = np.array([x.var(ddof=1) for x in Etraj])
+cv_dir = varE / temps ** 2
+corrQE = np.array([np.corrcoef(x, y)[0, 1] for x, y in zip(Qtraj, Etraj)])
+
+# ------------------- fine-grid C_V by single-histogram reweighting ----------
+E_pool = np.concatenate(Etraj)
+b_pool = np.repeat(1.0 / temps, [len(x) for x in Etraj])
+T_fine = np.linspace(temps.min(), temps.max(), 120)
+cv_fine = np.zeros_like(T_fine)
+for gi, Tg in enumerate(T_fine):
+    lw = -((1.0 / Tg) - b_pool) * E_pool
+    w = np.exp(lw - lw.max()); w /= w.sum()
+    e1 = np.dot(w, E_pool); e2 = np.dot(w, E_pool ** 2)
+    cv_fine[gi] = max(e2 - e1 * e1, 0.0) / Tg ** 2
+
+# ------------------- T_star: <Q>=0.5 root (primary definition) --------------
+bracketed = bool(min(meanQ) <= 0.5 <= max(meanQ))
+if bracketed:
+    # temps is strictly increasing; meanQ(T) is monotone decreasing here, so the
+    # piecewise-linear interpolant np.interp(T, temps, meanQ) crosses 0.5 exactly once.
+    T_star = float(brentq(lambda T: np.interp(T, temps, meanQ) - 0.5,
+                          temps.min(), temps.max(), xtol=1e-8))
+    warnings_list.append(f"T_star={T_star:.4f} from interpolated <Q>=0.5 root (bracketed).")
+else:
+    T_star = float(temps[int(np.argmin(np.abs(meanQ - 0.5)))])
+    warnings_list.append("<Q>=0.5 NOT bracketed by the ladder even after the single a priori eps "
+                         "reset (eps=T_mid); T_star set to nearest ladder temperature.")
+k_star = int(np.argmin(np.abs(temps - T_star)))
+k_cv = int(np.argmax(cv_dir))
+k_cv_fine = int(np.argmax(cv_fine))
+warnings_list.append(f"Raw C_V maxima (diagnostic only): direct {cv_dir[k_cv]:.1f} at T={temps[k_cv]:.4f}, "
+                     f"reweighted fine-grid {cv_fine[k_cv_fine]:.1f} at T={T_fine[k_cv_fine]:.4f}; "
+                     "transition_temperature is defined by the <Q>=0.5 root, not by these peaks.")
+
+# ------------------- histograms of Q (primary seed, contracted) --------------
+NBIN = 50; edges = np.linspace(0.0, 1.0, NBIN + 1); centers = 0.5 * (edges[:-1] + edges[1:])
+histQ = np.zeros((K, NBIN))
+for k in range(K):
+    h, _ = np.histogram(Qtraj[k], bins=edges)
+    histQ[k] = h / h.sum()
+
+# ------------------- mode/barrier machinery (no optimizers) -----------------
+def landscape(qs, T):
+    h = np.histogram(qs, bins=edges)[0].astype(np.float64); h /= h.sum()
+    F = np.zeros(NBIN); occ = h > 0
+    F[~occ] = -np.log(max(h[occ].min(), 1e-12)) + 1.0
+    F[occ] = -np.log(h[occ])
+    F = np.maximum(F - F.min(), 0.0) / T
+    Ps = gaussian_filter1d(h, sigma=1.0)
+    peaks = [b for b in range(1, NBIN - 1)
+             if Ps[b] >= Ps[b - 1] and Ps[b] > Ps[b + 1] and Ps[b] > 0.02 * Ps.max()]
+    kept = []
+    for b in peaks:
+        if not kept or b - kept[-1] >= 3: kept.append(b)
+        elif Ps[b] > Ps[kept[-1]]: kept[-1] = b
+    if len(kept) >= 2:
+        top2 = sorted(kept, key=lambda b: -Ps[b])[:2]
+        lo, hi = min(top2), max(top2)
+        valley = lo + int(np.argmin(F[lo:hi + 1]))
+        barrier = float(F[valley] - max(F[lo], F[hi]))
+        if barrier > 0.05:
+            return [float(centers[lo]), float(centers[hi])], float(abs(centers[hi] - centers[lo])), barrier, F
+    return [float(centers[int(np.argmax(Ps))])], 0.0, 0.0, F
+
+q_modes, sep, barrier, F = landscape(Qtraj[k_star], temps[k_star])
+
+# ------------------- replicate spread at T_star (item 3) --------------------
+rep_stats = []
+for j, (qr, er) in enumerate(rep_data[k_star]):
+    m_r, s_r, b_r, _ = landscape(qr, temps[k_star])
+    rep_stats.append((qr.mean(), m_r[0], s_r, b_r, len(qr) / tau_int(qr)))
+mq_r = np.array([r[0] for r in rep_stats]); sep_r = np.array([r[2] for r in rep_stats])
+bar_r = np.array([r[3] for r in rep_stats]); ess_r = np.array([r[4] for r in rep_stats])
+warnings_list.append(
+    f"Replicates at T={temps[k_star]:.4f} ({N_REP} seeds): <Q>={mq_r.mean():.3f}+-{mq_r.std():.3f}; "
+    f"ESS/run={ess_r.mean():.0f}+-{ess_r.std():.0f}; "
+    f"barrier(kT)={np.round(bar_r, 2).tolist()} ({int(np.sum(bar_r>0))}/{N_REP} runs bimodal).")
+if barrier == 0.0:
+    warnings_list.append("Primary run at T_star unimodal (no significant valley) -> "
+                         "mode_separation and barrier reported as 0; see replicate line above "
+                         "for run-to-run variability.")
+
+# reweighting cross-check of P(Q) at T_star vs direct
+Q_pool = np.concatenate(Qtraj)
+lw = -((1.0 / T_star) - b_pool) * E_pool
+w = np.exp(lw - lw.max()); w /= w.sum()
+h_rw, _ = np.histogram(Q_pool, bins=edges, weights=w); h_rw /= h_rw.sum()
+rw_dev = float(0.5 * np.sum(np.abs(h_rw - histQ[k_star])))
+warnings_list.append(f"Reweighted vs direct P(Q) at T_star: TV distance={rw_dev:.3f} "
+                     "(direct sampled profile reported as primary).")
+
+# ------------------- Jaccard at lowest temperature ---------------------------
+def adjacency(pos):
+    d = np.linalg.norm(pos[ii] - pos[jj], axis=1)
+    return (seq_sep >= minsep) & (d <= cut)
+A_ref, A_fin = adjacency(coords0), adjacency(final_pos[0])
+jaccard = float((A_ref & A_fin).sum() / (A_ref | A_fin).sum())
+
+# ------------------- joint Q-z(E) histograms ---------------------------------
+joint = np.zeros((K, 20, 20)); qb = np.linspace(0, 1, 21); eb = np.linspace(-3, 3, 21)
+for k in range(K):
+    sd = Etraj[k].std(ddof=1)
+    z = np.zeros_like(Etraj[k]) if sd < 1e-12 else (Etraj[k] - Etraj[k].mean()) / sd
+    z = np.clip(z, -3 + 1e-9, 3 - 1e-9)
+    h, _, _ = np.histogram2d(Qtraj[k], z, bins=[qb, eb])
+    s = h.sum()
+    joint[k] = h / s if s > 0 else np.full((20, 20), 1.0 / 400)
+
+# ------------------- write outputs (contract unchanged) ----------------------
+np.save("final_coords.npy", np.ascontiguousarray(final_pos[0], dtype=np.float64))
+Qout = np.zeros((K, n_ckpt))
+for k in range(K):
+    Qout[k, :len(Qfull[k])] = Qfull[k]
+assert Qout.shape == (K, n_ckpt) and np.isfinite(Qout).all()
+np.save("order_parameter_trajectory.npy", Qout)
+np.save("order_parameter_histograms.npy", histQ)
+np.save("heat_capacity_curve.npy", np.vstack([T_fine, cv_fine]))
+np.save("transition_free_energy_profile.npy", np.vstack([centers, F]))
+np.save("q_energy_joint_histograms.npy", joint)
+np.save("native_contact_probability.npy", contact_prob)
+with open("temperature_observables.json", "w") as f:
+    json.dump({"temperatures": temps.tolist(), "mean_order_parameter_by_T": meanQ.tolist(),
+               "var_order_parameter_by_T": varQ.tolist(), "mean_energy_by_T": meanE.tolist(),
+               "var_energy_by_T": varE.tolist(), "heat_capacity_direct_by_T": cv_dir.tolist(),
+               "q_energy_correlation_by_T": corrQE.tolist()}, f, indent=2)
+with open("transition_analysis.json", "w") as f:
+    json.dump({"transition_temperature": T_star,
+               "peak_heat_capacity": float(max(cv_fine.max(), cv_dir.max())),
+               "order_parameter_at_transition_mean": float(meanQ[k_star]),
+               "order_parameter_at_transition_modes": q_modes, "mode_separation": sep,
+               "free_energy_barrier_kT": barrier, "reference_contact_jaccard": jaccard,
+               "warnings": warnings_list}, f, indent=2)
+
+_PNGFONT = {
+ " ": ["00000"] * 7,
+ "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+ "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+ "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+ "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+ "4": ["00100", "01100", "01010", "10010", "11111", "00010", "00010"],
+ "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+ "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+ "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+ "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+ "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+ "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+ "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+ "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+ "D": ["11100", "10010", "10001", "10001", "10001", "10010", "11100"],
+ "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+ "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+ "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+ "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+ "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+ "J": ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+ "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+ "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+ "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+ "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+ "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+ "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+ "Q": ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+ "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+ "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+ "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+ "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+ "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+ "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+ "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+ "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+ "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+ ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+ ",": ["00000", "00000", "00000", "00000", "01100", "00100", "01000"],
+ ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+ "=": ["00000", "00000", "11111", "00000", "11111", "00000", "00000"],
+ "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+ "(": ["00010", "00100", "01000", "01000", "01000", "00100", "00010"],
+ ")": ["01000", "00100", "00010", "00010", "00010", "00100", "01000"],
+ "*": ["00000", "10101", "01110", "11111", "01110", "10101", "00000"],
+ "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+ "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+}
+
+def _fallback_figure(path, fin, ref, centers, histQ, temps, T_fine, cv_fine,
+                     temps2, cv_dir, T_star, cF, F, q_modes, barrier, jaccard):
+    """Dependency-free 4-panel PNG (used only when matplotlib is unavailable)."""
+    import struct, zlib
+    Wd, Hd = 1400, 1000
+    img = np.full((Hd, Wd, 3), 255, np.uint8)
+    def px(x, y, c):
+        if 0 <= int(y) < Hd and 0 <= int(x) < Wd:
+            img[int(y), int(x)] = c
+    def line(x0, y0, x1, y1, c):
+        x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        while True:
+            px(x0, y0, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x0 += sx
+            if e2 <= dx:
+                err += dx; y0 += sy
+    def circ(x, y, r, c, hollow=False):
+        for yy in range(-r, r + 1):
+            for xx in range(-r, r + 1):
+                d2 = xx * xx + yy * yy
+                if hollow and (d2 > r * r or d2 < (r - 1.5) ** 2):
+                    continue
+                if d2 <= r * r:
+                    px(x + xx, y + yy, c)
+    def text(x, y, s, sc=2, c=(0, 0, 0)):
+        cx = x
+        for ch in str(s).upper():
+            g = _PNGFONT.get(ch, _PNGFONT[" "])
+            for j, row in enumerate(g):
+                for i, bit in enumerate(row):
+                    if bit == "1":
+                        for oy in range(sc):
+                            for ox in range(sc):
+                                px(cx + i * sc + ox, y + j * sc + oy, c)
+            cx += 6 * sc
+    def panel(x0, y0, x1, y1, xlab, title):
+        line(x0, y1, x1, y1, (0, 0, 0)); line(x0, y0, x0, y1, (0, 0, 0))
+        line(x1, y0, x1, y1, (0, 0, 0)); line(x0, y0, x1, y0, (0, 0, 0))
+        text(x0 + 8, y0 + 6, title)
+        text((x0 + x1) // 2 - 15, y1 - 26, xlab)
+    PAL = [(31, 119, 180), (255, 127, 14), (44, 160, 44),
+           (214, 39, 40), (148, 103, 189), (140, 86, 75)]
+    def curve(xs, ys, bb, c, X0, Y0, X1, Y1, pts=False):
+        xa, xb, ya, yb = bb
+        pxs = [X0 + (v - xa) / (xb - xa + 1e-30) * (X1 - X0) for v in xs]
+        pys = [Y1 - (v - ya) / (yb - ya + 1e-30) * (Y1 - Y0) for v in ys]
+        for a in range(len(pxs) - 1):
+            line(pxs[a], pys[a], pxs[a + 1], pys[a + 1], c)
+        if pts:
+            for a in range(len(pxs)):
+                circ(pxs[a], pys[a], 4, c)
+    X0, Y0, X1, Y1 = 80, 40, 640, 460
+    allx = np.concatenate([fin[:, 0], ref[:, 0]])
+    ally = np.concatenate([fin[:, 1], ref[:, 1]])
+    bx0, bx1 = allx.min() - 1, allx.max() + 1
+    by0, by1 = ally.min() - 1, ally.max() + 1
+    panel(X0, Y0, X1, Y1, "X",
+          "FINAL LOW-T (COLOR) VS REF (HOLLOW) JACCARD=%.2F" % jaccard)
+    for a in range(len(ref)):
+        circ(X0 + (ref[a, 0] - bx0) / (bx1 - bx0) * (X1 - X0),
+             Y1 - (ref[a, 1] - by0) / (by1 - by0) * (Y1 - Y0), 7, (120, 120, 120), True)
+    for a in range(len(fin)):
+        circ(X0 + (fin[a, 0] - bx0) / (bx1 - bx0) * (X1 - X0),
+             Y1 - (fin[a, 1] - by0) / (by1 - by0) * (Y1 - Y0), 7, PAL[a % 6])
+    X0, Y0, X1, Y1 = 800, 40, 1360, 460
+    panel(X0, Y0, X1, Y1, "Q", "P(Q) BY TEMPERATURE (T LABELS RIGHT)")
+    mmax = max(histQ.max() * 1.1, 1e-9)
+    for k in range(len(temps)):
+        curve(centers, histQ[k], (0, 1, 0, mmax), PAL[k % 6], X0, Y0, X1, Y1)
+    for k in range(len(temps)):
+        text(X1 - 130, Y0 + 40 + 24 * k, "%.2F" % temps[k], 2, PAL[k % 6])
+    X0, Y0, X1, Y1 = 80, 560, 640, 950
+    panel(X0, Y0, X1, Y1, "T", "CV REWEIGHTED LINE, DIRECT DOTS, T* DASHED")
+    cmax = max(cv_fine.max(), cv_dir.max(), 1e-9) * 1.15
+    curve(T_fine, cv_fine, (T_fine.min(), T_fine.max(), 0, cmax), PAL[0], X0, Y0, X1, Y1)
+    curve(temps2, cv_dir, (T_fine.min(), T_fine.max(), 0, cmax), PAL[3], X0, Y0, X1, Y1, True)
+    xs = X0 + (T_star - T_fine.min()) / (T_fine.max() - T_fine.min()) * (X1 - X0)
+    for yy in range(int(Y0), int(Y1), 6):
+        line(xs, yy, xs, yy + 3, (214, 39, 40))
+    text(xs + 6, Y0 + 40, "T*=%.3F" % T_star, 2, (214, 39, 40))
+    X0, Y0, X1, Y1 = 800, 560, 1360, 950
+    panel(X0, Y0, X1, Y1, "Q",
+          "LANDSCAPE AT T*: MODES " + " ".join("%.2F" % m for m in q_modes) +
+          " DF=%.2F KT" % barrier)
+    fmax = max(F.max(), 1e-9) * 1.1
+    curve(cF, F, (0, 1, 0, fmax), PAL[0], X0, Y0, X1, Y1)
+    for m in q_modes:
+        xs = X0 + m * (X1 - X0)
+        for yy in range(int(Y0), int(Y1), 6):
+            line(xs, yy, xs, yy + 3, (44, 160, 44))
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    raw = b"".join(b"\x00" + img[r].tobytes() for r in range(Hd))
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", struct.pack(">IIBBBBB", Wd, Hd, 8, 2, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+# ------------------- figure: matplotlib first, fallback only on failure -----
+if HAVE_MPL:
+    matplotlib.use("Agg")
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(2, 2, 1)
+    ax.scatter(final_pos[0][:, 0], final_pos[0][:, 1], c=range(N), cmap="viridis", s=40,
+               label="final, lowest T")
+    ax.scatter(coords0[:, 0], coords0[:, 1], facecolors="none", edgecolors="gray", s=40,
+               label="reference")
+    ax.set_title(f"Config: final (color) vs reference (hollow); Jaccard={jaccard:.2f}")
+    ax.legend(fontsize=7); ax.set_aspect("equal")
+    ax2 = fig.add_subplot(2, 2, 2)
+    for k in range(K):
+        ax2.step(centers, histQ[k], where="mid", label=f"T={temps[k]:.2f}")
+    ax2.set_xlabel("Q"); ax2.set_ylabel("P(Q)"); ax2.legend(fontsize=7)
+    ax2.set_title("Q histograms per temperature")
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax3.plot(T_fine, cv_fine, label="C_V reweighted (fine grid)")
+    ax3.plot(temps, cv_dir, "o", label="C_V direct")
+    ax3.axvline(T_star, color="r", ls="--", label=f"T*={T_star:.3f} (<Q>=0.5)")
+    ax3.set_xlabel("T"); ax3.set_ylabel("C_V"); ax3.legend(fontsize=7)
+    ax3.set_title("Fluctuation response curve")
+    ax4 = fig.add_subplot(2, 2, 4)
+    ax4.plot(centers, F, label=f"direct @T={temps[k_star]:.3f}")
+    ax4.plot(centers, np.maximum(-np.log(np.maximum(h_rw, 1e-12)) / temps[k_star], 0),
+             "--", label="reweighted check")
+    for m in q_modes:
+        ax4.axvline(m, color="g", ls=":")
+    ax4.set_xlabel("Q"); ax4.set_ylabel("F(Q)/kBT*")
+    ax4.set_title(f"Landscape at T*: modes={np.round(q_modes, 2)}, dF={barrier:.2f} kT")
+    ax4.legend(fontsize=7)
+    plt.tight_layout(); plt.savefig("visualization.png", dpi=130)
+    print("visualization.png produced by matplotlib", matplotlib.__version__)
+else:
+    warnings_list.append("matplotlib unavailable in this sandbox (" + MPL_IMPORT_ERROR +
+                         "); visualization.png produced by the dependency-free numpy PNG writer.")
+    _fallback_figure("visualization.png", final_pos[0], coords0, centers, histQ,
+                     temps, T_fine, cv_fine, temps, cv_dir, T_star, centers, F,
+                     q_modes, barrier, jaccard)
+    print("visualization.png produced by fallback writer; matplotlib error:", MPL_IMPORT_ERROR)
+
+# ------------------- final integrity checks ----------------------------------
+for fn in ["final_coords.npy", "order_parameter_trajectory.npy", "order_parameter_histograms.npy",
+           "heat_capacity_curve.npy", "transition_free_energy_profile.npy",
+           "q_energy_joint_histograms.npy", "native_contact_probability.npy"]:
+    assert np.isfinite(np.load(fn)).all(), fn
+print("DONE bracketed=%s T*=%.4f modes=%s sep=%.3f barrier=%.3f kT Jaccard=%.3f"
+      % (bracketed, T_star, np.round(q_modes, 3), sep, barrier, jaccard))

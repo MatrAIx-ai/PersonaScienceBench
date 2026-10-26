@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+DESeq2 workflow (Python implementation) - RNA-seq Paroxetine 2017 capsule
+==========================================================================
+Question: DE (DESeq2) between (final blood vs baseline blood), (dentate gyrus vs
+baseline blood), (dentate gyrus vs final blood); how many genes are DE across
+all comparisons?
+
+Why Python: no R/Bioconductor/DESeq2 in the environment and no network access
+to install them. This script implements the standard DESeq2 workflow
+(Love, Huber & Anders, 2014) in numpy/scipy:
+
+  1. Input: NormCount sample columns (normalized/scaled values, non-integer)
+     rounded to the nearest integer (DESeq2 requires integer counts; raw
+     counts are not in the capsule).
+  2. Size factors: median-of-ratios over all 90 samples.
+  3. Per-gene dispersion: Cox-Reid adjusted profile likelihood of the
+     intercept-only NB GLM (1-D, vectorized), mean trend via local
+     (tricube-weighted) regression of log(phi) on log(mean), gene-wise
+     shrinkage  log(phi) = w*log(phi_hat) + (1-w)*log(trend), w = 1/(1+se^2).
+  4. Full NB GLM (intercept + 2 tissue dummies, baseline_blood = reference,
+     all 90 samples), dispersion fixed, IRLS/Newton-Raphson; Wald test for
+     the three pairwise contrasts.
+  5. Benjamini-Hochberg padj per comparison, with (primary, DESeq2 default)
+     and without (sensitivity) independent filtering on mean normalized count.
+  6. DE = padj < 0.05 and |log2FC| > 1 (primary); padj < 0.05 only
+     (sensitivity). Reports per-comparison counts, union, intersection.
+
+Validation (run first): simulated NB data with known fold changes; reports FC
+recovery, FDR, power, and null false-positive rate.
+"""
+import json, os, time
+import numpy as np
+from scipy import stats
+from scipy.special import gammaln
+import openpyxl
+
+LN2 = np.log(2.0)
+HERE = os.path.dirname(os.path.abspath(__file__))
+XLSX = os.path.join(HERE, "data", "Data_deposition_RNAseq_Paroxetine_2017.xlsx")
+OUT = os.path.join(HERE, "results")
+PADJ_THR, LFC_THR = 0.05, 1.0
+# coefficient vectors on design [1, dentate, final] (baseline = reference)
+CONTRASTS = {
+    "final_vs_baseline":  np.array([0, 0, 1]),
+    "dentate_vs_baseline": np.array([0, 1, 0]),
+    "dentate_vs_final":   np.array([0, 1, -1]),
+}
+
+def load_counts(path):
+    wb = openpyxl.load_workbook(path, read_only=True)
+    ws = wb["NormCount"]
+    ids, vals = [], []
+    for i, r in enumerate(ws.iter_rows(min_col=1, max_col=92, values_only=True)):
+        if i < 4:
+            continue
+        if r[1] is None:
+            continue
+        ids.append(str(r[1]))
+        vals.append(r[2:92])
+    arr = np.array([[0.0 if v is None else float(v) for v in row] for row in vals])
+    K = np.rint(arr).astype(np.int64)
+    return ids, K, arr
+
+def load_authors_deg_counts(path):
+    """Recount the authors' in-file DEG flags (9 precomputed comparisons)."""
+    wb = openpyxl.load_workbook(path, read_only=True)
+    ws = wb["NormCount"]
+    cnt1, cnt2 = np.zeros(9, int), np.zeros(9, int)
+    for i, r in enumerate(ws.iter_rows(min_col=99, max_col=179, values_only=True)):
+        if i < 4:
+            continue
+        if r[0] is None:
+            continue
+        for k in range(9):
+            # relative col 0 = abs col 99 (1-based); DEG cols at abs 105/106 (0-based)
+            if r[7 + 9 * k] not in ("-", None):
+                cnt1[k] += 1
+            if r[8 + 9 * k] not in ("-", None):
+                cnt2[k] += 1
+    return cnt1, cnt2
+
+def size_factors(K):
+    logK = np.full(K.shape, np.nan)
+    np.log(K, out=logK, where=K > 0)
+    gm = np.exp(np.nanmean(logK, axis=1))
+    gm = np.where(np.isfinite(gm), gm, 0.0)
+    valid = gm > 0
+    ratios = np.full(K.shape, np.nan)
+    ratios[valid] = K[valid].astype(float) / gm[valid, None]
+    return np.nanmedian(ratios, axis=0)
+
+def profile_dispersion(Kn):
+    """Cox-Reid adjusted profile likelihood, intercept-only NB model.
+    Returns (logphi_hat, se_logphi) per gene (NaN where not estimable)."""
+    G, n = Kn.shape
+    m = Kn.mean(axis=1)
+    logphi_hat = np.full(G, np.nan); se = np.full(G, np.nan)
+    ok = m > 0
+    if not ok.any():
+        return logphi_hat, se
+    k = Kn[ok]; mm = m[ok]
+    def profl(lphi):
+        phi = np.exp(lphi)                 # (M,)
+        inv_ = (1.0 / phi)[:, None, None]  # (M,1,1)
+        kk = k[None, :, :]                 # (1,G,n)
+        mm_ = mm[None, :, None]            # (1,G,1)
+        val = (gammaln(kk + inv_) - gammaln(inv_)
+               + inv_ * np.log(inv_ / (mm_ + inv_))
+               + kk * np.log(mm_ / (mm_ + inv_)))
+        val = val.sum(axis=2).T            # (G,M)
+        I = (n * mm[None, :] ** 2 / (1.0 + phi[:, None] * mm[None, :])).T
+        return val - 0.5 * np.log(I)
+    grid = np.linspace(-8.0, 4.0, 241)
+    F = np.concatenate([profl(grid[i:i + 48]) for i in range(0, len(grid), 48)],
+                       axis=1)
+    gi = np.argmax(F, axis=1)
+    j = np.arange(len(gi))
+    gic = np.clip(gi, 1, grid.size - 2)
+    x0, x1, x2 = grid[gic - 1], grid[gic], grid[gic + 1]
+    y0, y1, y2 = F[j, gic - 1], F[j, gic], F[j, gic + 1]
+    A = ((y1 - y0) / (x1 - x0) - (y2 - y1) / (x2 - x1)) / (x0 - x2)
+    B = (y1 - y0) / (x1 - x0) - A * (x1 + x0)
+    peak = -B / (2.0 * A)
+    boundary = (gi == 0) | (gi == grid.size - 1) | ~np.isfinite(peak)
+    peak = np.clip(np.where(np.isfinite(peak), peak, grid[gi]), grid[0], grid[-1])
+    se2 = np.where(A < 0, -1.0 / (2.0 * A), np.inf)
+    logphi_hat[ok] = peak
+    se[ok] = np.where(boundary, 3.0, np.sqrt(np.clip(se2, 1e-4, None)))
+    return logphi_hat, se
+
+def fit_trend(logm, logphi, se, ngrid=200, frac=0.5):
+    """Local tricube-weighted linear regression of log(phi) on log(mean)."""
+    ok = np.isfinite(logphi) & np.isfinite(logm) & (logm > -20)
+    x = logm[ok]; y = logphi[ok]
+    w = 1.0 / np.maximum(se[ok], 0.01) ** 2
+    lo, hi = np.quantile(x, [0.001, 0.999])
+    bw = frac * (hi - lo) / 2.0
+    grid = np.linspace(lo, hi, ngrid)
+    trend = np.empty(ngrid)
+    for gi_, gx in enumerate(grid):
+        d = np.abs(x - gx)
+        msk = d < bw
+        if msk.sum() < 5:
+            msk = d < bw * 2
+        eff_bw = bw if msk.sum() >= 5 else bw * 2
+        tw = (1 - (d[msk] / eff_bw) ** 3) ** 3 * w[msk]
+        xm, ym = x[msk], y[msk]
+        sw = tw.sum(); smx = (tw * xm).sum(); smy = (tw * ym).sum()
+        smxx = (tw * xm * xm).sum(); smxy = (tw * xm * ym).sum()
+        den = sw * smxx - smx * smx
+        b1 = (sw * smxy - smx * smy) / den if den > 0 else 0.0
+        trend[gi_] = (smy - b1 * smx) / sw + b1 * gx
+    return np.interp(logm, grid, trend)
+
+def shrink_dispersion(logm, logphi, se):
+    trend = fit_trend(logm, logphi, se)
+    w = np.where(np.isfinite(logphi), 1.0 / (1.0 + se ** 2), 0.0)
+    logphi_final = (w * np.where(np.isfinite(logphi), logphi, trend)
+                    + (1.0 - w) * trend)
+    return logphi_final, trend
+
+def wald_contrasts(Kn, logphi, X, grp):
+    """NB GLM (dispersion fixed), Fisher-scoring IRLS; Wald test for 3 contrasts.
+    X: (n,3) design [1, dentate, final], baseline = reference.
+    Working weight W = mu/(1+phi*mu), z = eta + (k-mu)/mu (NB GLM)."""
+    G, n = Kn.shape
+    active = Kn.sum(axis=1) > 0
+    phi = np.exp(logphi)
+    res = {c: (np.full(G, np.nan), np.full(G, np.nan), np.full(G, np.nan),
+               np.full(G, np.nan)) for c in CONTRASTS}
+    Ka = Kn[active]
+    pa = phi[active]
+    idx = np.where(active)[0]
+    # per-gene start: log of per-group means (pseudocount 0.5)
+    mu0 = np.empty((Ka.shape[0], 3))
+    for g in range(3):
+        cols = np.where(grp == g)[0]
+        mu0[:, g] = Ka[:, cols].mean(axis=1) + 0.5
+    eta0 = np.log(mu0)
+    xtx_inv = np.linalg.inv(X.T @ X)
+    eta0s = eta0[:, grp]  # (G, n) sample-level start
+    beta = np.einsum("ij,gj->gi", xtx_inv, np.einsum("nj,gn->gj", X, eta0s))
+    for it in range(40):
+        eta = np.einsum("ij,gj->gi", X, beta)
+        mu = np.exp(np.clip(eta, -30, 30))
+        W = mu / (1.0 + pa[:, None] * mu)
+        z = eta + (Ka - mu) / mu
+        XtW = np.einsum("gn,ni,nj->gij", W, X, X)
+        XtWz = np.einsum("gn,ni->gi", W * z, X)
+        beta_new = np.einsum("gij,gj->gi", np.linalg.inv(XtW), XtWz)
+        delta = np.max(np.abs(beta_new - beta))
+        beta = beta_new
+        if delta < 1e-8:
+            break
+    eta = np.einsum("ij,gj->gi", X, beta)
+    mu = np.exp(np.clip(eta, -30, 30))
+    W = mu / (1.0 + pa[:, None] * mu)
+    V = np.linalg.inv(np.einsum("gn,ni,nj->gij", W, X, X))
+    for c, cv in CONTRASTS.items():
+        est = beta @ cv
+        var = np.einsum("i,j,gij->g", cv, cv, V)
+        se_c = np.sqrt(np.clip(var, 1e-300, None))
+        p = 2.0 * stats.norm.sf(np.abs(est / se_c))
+        f_est = np.full(G, np.nan); f_est[idx] = est
+        f_se = np.full(G, np.nan); f_se[idx] = se_c
+        f_p = np.full(G, np.nan); f_p[idx] = p
+        f_lfc = np.full(G, np.nan); f_lfc[idx] = est / LN2
+        res[c] = (f_est, f_se, f_p, f_lfc)
+    return res
+
+def bh(p):
+    p = np.asarray(p, dtype=float)
+    n = len(p)
+    out = np.ones(n)
+    ok = np.isfinite(p)
+    if not ok.any():
+        return out
+    m = int(ok.sum())
+    po = p[ok]
+    o = np.argsort(po)
+    adj = po[o] * m / np.arange(1, m + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    idx_ok = np.where(ok)[0]
+    out[idx_ok[o]] = np.clip(adj, 0, 1)
+    return out
+
+def independent_filter(p, mean_norm, padj_thr=PADJ_THR):
+    """DESeq2-style: threshold on mean normalized count maximizing rejections."""
+    qs = np.unique(np.quantile(mean_norm, np.linspace(0, 1, 51)))
+    best_n, best_padj = -1, None
+    for t in qs:
+        keep = mean_norm >= t
+        if keep.sum() == 0:
+            continue
+        padj = np.full(len(p), np.nan)
+        padj[keep] = bh(p[keep])
+        padj[keep & ~np.isfinite(p)] = 1.0
+        nrej = int((padj < padj_thr).sum())
+        if nrej > best_n:
+            best_n, best_padj = nrej, padj
+    return best_padj
+
+def run_pipeline(K):
+    G, n = K.shape
+    grp = np.repeat([0, 1, 2], n // 3)
+    X = np.column_stack([np.ones(n), (grp == 1).astype(float),
+                         (grp == 2).astype(float)])
+    s = size_factors(K)
+    Kn = K.astype(float) / s[None, :]
+    logphi_hat, se = profile_dispersion(Kn)
+    logm = np.log(Kn.mean(axis=1).clip(min=1e-12))
+    logphi, trend = shrink_dispersion(logm, logphi_hat, se)
+    grp = np.repeat([0, 1, 2], Kn.shape[1] // 3)
+    res = wald_contrasts(Kn, logphi, X, grp)
+    mean_norm = Kn.mean(axis=1)
+    out = {}
+    for c in CONTRASTS:
+        est, se_c, p, lfc2 = res[c]
+        out[c] = dict(est=est, se=se_c, p=p, log2FC=lfc2,
+                      padj_plain=bh(p),
+                      padj_if=independent_filter(p, mean_norm))
+    return out, Kn, logphi
+
+def de_sets(res):
+    sets = {}
+    for mode, key in (("if", "padj_if"), ("plain", "padj_plain")):
+        for thr in ("lfc", "padj"):
+            s = []
+            for c in CONTRASTS:
+                r = res[c]
+                lfc_ok = (np.abs(r["log2FC"]) > LFC_THR) if thr == "lfc" \
+                    else np.ones(len(r["p"]), bool)
+                if mode == "if":
+                    padj_ok = np.isfinite(r[key]) & (r[key] < PADJ_THR)
+                else:
+                    padj_ok = r[key] < PADJ_THR
+                s.append(np.where(padj_ok & lfc_ok)[0])
+            sets[f"{mode}_{thr}"] = s
+    return sets
+
+def simulate(G=4000, n=90, nDE=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    grp = np.repeat([0, 1, 2], n // 3)
+    logmu0 = rng.normal(5.0, 1.8, G).clip(1.5, 9.0)
+    mu0 = np.exp(logmu0)
+    phi_true = 0.05 + 0.5 / mu0
+    fc = np.zeros(G)
+    de = rng.choice(G, nDE, replace=False)
+    fc[de] = rng.choice([-2.0, -1.5, -1.0, 1.0, 1.5, 2.0], nDE)
+    mu = mu0[:, None] * np.where(grp[None, :] == 1, 2.0 ** fc[:, None], 1.0)
+    rpar = 1.0 / phi_true[:, None]
+    ppar = rpar / (rpar + mu)
+    K = rng.negative_binomial(rpar, ppar).astype(np.int64)
+    return K, fc, de, phi_true
+
+def validate():
+    print("=" * 70)
+    print("VALIDATION on simulated NB data (known fold changes)")
+    K, fc_true, de_idx, phi_true = simulate()
+    res, Kn, logphi = run_pipeline(K)
+    r = res["dentate_vs_baseline"]
+    est = r["log2FC"][de_idx]; truth = fc_true[de_idx]
+    per = {}
+    for v in sorted(set(truth)):
+        m = truth == v
+        per[f"fc={v:+.1f}"] = dict(n=int(m.sum()),
+                                   mean_est=round(float(np.mean(est[m])), 3),
+                                   mae=round(float(np.mean(np.abs(est[m] - v))), 3))
+    padj = r["padj_if"]
+    isDE = np.isfinite(padj) & (padj < PADJ_THR) & (np.abs(r["log2FC"]) > LFC_THR)
+    n_called = int(isDE.sum()); n_hit = int(isDE[de_idx].sum())
+    null = np.setdiff1d(np.arange(len(fc_true)), de_idx)
+    fp_rate = float(np.mean(np.isfinite(padj[null]) & (padj[null] < PADJ_THR)))
+    val = dict(
+        n_genes=int(K.shape[0]), n_DE_sim=int(len(de_idx)),
+        fc_recovery=dict(corr=round(float(np.corrcoef(est, truth)[0, 1]), 4),
+                         mae=round(float(np.mean(np.abs(est - truth))), 3),
+                         sign_accuracy=round(float(np.mean(np.sign(est) == np.sign(truth))), 4),
+                         per_level=per),
+        primary_threshold=dict(called=n_called,
+                               fdr=round(float(1.0 - n_hit / n_called), 4),
+                               power=round(float(n_hit / len(de_idx)), 4)),
+        null_fp_rate_padj05=fp_rate,
+        dispersion_corr_vs_true=round(float(np.corrcoef(np.exp(logphi),
+                                phi_true)[0, 1]), 4))
+    print(json.dumps(val, indent=2))
+    return val
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    t0 = time.time()
+    val = validate()
+    t1 = time.time()
+    print("=" * 70)
+    print("REAL ANALYSIS")
+    ids, K, arr = load_counts(XLSX)
+    G, n = K.shape
+    below_half = int(((arr < 0.5) & (arr > 0)).sum())
+    print(f"genes={G} samples={n} (cells 0<v<0.5 rounded to 0: {below_half})")
+    res, Kn, logphi = run_pipeline(K)
+    t2 = time.time()
+    s = size_factors(K)
+    print(f"size factors: min={s.min():.4f} max={s.max():.4f} median={np.median(s):.4f}")
+    print(f"dispersion final: median={np.exp(np.nanmedian(logphi)):.4f} "
+          f"min={np.exp(np.nanmin(logphi)):.5f} max={np.exp(np.nanmax(logphi)):.4f}")
+    sets = de_sets(res)
+    summary = dict(
+        n_genes=G, n_samples=n,
+        cells_rounded_to_zero_from_below_half=below_half,
+        size_factors=dict(min=float(s.min()), max=float(s.max()),
+                          median=float(np.median(s))),
+        dispersion=dict(median=float(np.exp(np.nanmedian(logphi)))),
+        timing_sec=dict(validation=round(t1 - t0, 1), analysis=round(t2 - t1, 1)),
+        validation=val)
+    counts = {}
+    for mode in ("if", "plain"):
+        for thr in ("lfc", "padj"):
+            per = {c: int(len(sets[f"{mode}_{thr}"][i]))
+                   for i, c in enumerate(CONTRASTS)}
+            uni = np.unique(np.concatenate(sets[f"{mode}_{thr}"]))
+            ss = sets[f"{mode}_{thr}"]
+            inter = np.intersect1d(np.intersect1d(ss[0], ss[1]), ss[2])
+            counts[f"{mode}_{thr}"] = dict(per_comparison=per,
+                                           union=int(len(uni)),
+                                           intersection=int(len(inter)),
+                                           sum_of_counts=int(sum(per.values())))
+    summary["de_counts"] = counts
+    detail = {}
+    for c in CONTRASTS:
+        r = res[c]
+        detail[c] = dict(n_padj05_plain=int((r["padj_plain"] < PADJ_THR).sum()),
+                         n_padj05_if=int((r["padj_if"] < PADJ_THR).sum()))
+    summary["per_comparison_detail"] = detail
+    a1, a2 = load_authors_deg_counts(XLSX)
+    summary["authors_infile_DEG_counts"] = dict(
+        first_DEG_col=[int(x) for x in a1], second_DEG_col=[int(x) for x in a2])
+    for c in CONTRASTS:
+        r = res[c]
+        tab = np.column_stack([r["est"], r["se"], r["p"], r["log2FC"],
+                               r["padj_plain"], r["padj_if"]])
+        np.savetxt(os.path.join(OUT, f"de_{c}.csv"), tab, delimiter=",",
+                   header="logFC,se,pvalue,log2FC,padj_plain,padj_independentFilter",
+                   comments="")
+    top = {}
+    for c in CONTRASTS:
+        r = res[c]
+        ok = np.isfinite(r["padj_if"])
+        o = np.argsort(np.where(ok, r["padj_if"], np.inf))[:8]
+        top[c] = [[ids[i], round(float(r["log2FC"][i]), 3),
+                   float(f"{r['padj_if'][i]:.3g}")] for i in o]
+    summary["top_genes_by_padj_if"] = top
+    with open(os.path.join(OUT, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print("\n--- DE gene counts ---")
+    print("(mode 'if' = DESeq2 default independent filtering; 'plain' = BH on all genes)")
+    for mode in ("if", "plain"):
+        for thr in ("lfc", "padj"):
+            d = counts[f"{mode}_{thr}"]
+            label = "padj<0.05 & |log2FC|>1" if thr == "lfc" else "padj<0.05 only"
+            print(f"[{mode} | {label}]")
+            for c in CONTRASTS:
+                print(f"   {c:20s}: {d['per_comparison'][c]}")
+            print(f"   UNION={d['union']}  INTERSECTION={d['intersection']}  (sum={d['sum_of_counts']})")
+    print("\nauthors' in-file DEG counts (9 precomputed comparisons, sanity check):")
+    print("  first DEG col :", [int(x) for x in a1])
+    print("  second DEG col:", [int(x) for x in a2])
+    print("\ntop genes (padj_if):")
+    for c, rows in top.items():
+        print(f"  {c}:")
+        for g, l, p in rows:
+            print(f"    {g:20s} log2FC={l:+.3f} padj={p}")
+    print(f"\nDone. total {time.time() - t0:.1f}s. Outputs in {OUT}")
+
+if __name__ == "__main__":
+    main()

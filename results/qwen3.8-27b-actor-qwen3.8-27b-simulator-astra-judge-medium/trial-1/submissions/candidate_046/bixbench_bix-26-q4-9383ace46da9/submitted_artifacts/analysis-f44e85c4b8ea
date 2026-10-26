@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+KEGG over-representation (ORA) analysis for Pseudomonas aeruginosa (KEGG org 'pa').
+
+QUESTION (bix-26-q4): how many different KEGG pathways are common in BOTH media
+conditions, using significantly downregulated genes, the latest KEGG db,
+logfold cutoff -1.5, adjusted p-value cutoff 0.05.
+
+METHOD (approved plan):
+  1. Load both DESeq2 result tables (RDS): GluFe vs GluFePlus, Succ vs GluFePlus.
+  2. Per condition, downregulated genes: padj < 0.05 AND log2FoldChange <= -1.5.
+  3. Map locus tags (PA14_xxxxx) -> KEGG 'pa' gene IDs.
+  4. Latest KEGG db: live REST (list/pathway/pa, list/gene/pa, link/pathway/pa)
+     with query timestamp; if offline, fall back to a local snapshot (annotated).
+  5. KEGG ORA per condition (Fisher exact per pathway + BH), universe=all 'pa' genes.
+  6. Keep pathways padj<0.05 per condition; intersect; count common pathways.
+
+NOTE: self-contained for steps 1-3 (parses the gzip RDS directly). Steps 4-6 need
+KEGG access. If KEGG unreachable and no snapshot, stops at step 4, reports the
+blocker + intermediates, and does NOT fabricate a final count.
+"""
+import os, sys, gzip, struct, math, json, datetime, re, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DATA = os.path.join(ROOT, "data")
+F_GLUFE = os.path.join(DATA, "res_GluFevsGluFePlus.rds")
+F_SUCC  = os.path.join(DATA, "res_SuccvsGluFePlus.rds")
+ORG = "pa"
+PADJ_CUT = 0.05
+LFC_CUT  = -1.5
+COLNAMES = ["baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj"]
+
+# ---------------- 1. minimal RDS reader (gzip -> R serialization) ----------------
+def _read_gz(fn):
+    with gzip.open(fn, "rb") as f:
+        return f.read()
+
+def _be_i32(b): return struct.unpack(">i", b)[0]
+def _be_d(b):   return struct.unpack(">d", b)[0]
+
+def find_be_len(data, n):
+    pat = struct.pack(">i", n); out, i = [], 0
+    while True:
+        i = data.find(pat, i)
+        if i < 0: break
+        out.append(i); i += 1
+    return out
+
+def _clean(vals, thresh=1e6, maxbad=50):
+    return sum(1 for v in vals if math.isnan(v) or abs(v) > thresh) < maxbad
+
+def parse_rds(fn):
+    data = _read_gz(fn)
+    p = data.find(b"PA14_")          # first rowname string
+    entry0 = p - 8                   # entry = [4 marker][4 BE len][bytes]; PA14_ at +8
+    n = _be_i32(data[entry0-4:entry0])
+    rownames = []; pos = entry0
+    for _ in range(n):
+        ln = _be_i32(data[pos+4:pos+8])
+        rownames.append(data[pos+8:pos+8+ln].decode("ascii", "replace"))
+        pos += 8 + ln
+    blocks = []
+    for x in find_be_len(data, n):
+        off = x + 4
+        if off + 8*n > len(data): continue
+        vals = [_be_d(data[off+8*i: off+8*i+8]) for i in range(n)]
+        if _clean(vals): blocks.append((x, vals))
+    blocks.sort(key=lambda t: t[0])
+    if len(blocks) != 6:
+        raise RuntimeError(f"{fn}: expected 6 clean numeric blocks, got {len(blocks)}")
+    cols = {name: vals for (off, vals), name in zip(blocks, COLNAMES)}
+    return {"rownames": rownames, "cols": cols, "n": n}
+
+# ---------------- 2. downregulated selection ----------------
+def downregulated(df, padj_cut=PADJ_CUT, lfc_cut=LFC_CUT):
+    rn = df["rownames"]; lfc = df["cols"]["log2FoldChange"]; padj = df["cols"]["padj"]
+    return [rn[i] for i in range(df["n"])
+            if (not math.isnan(padj[i])) and padj[i] < padj_cut and lfc[i] <= lfc_cut]
+
+# ---------------- 3. locus tag -> KEGG 'pa' gene id ----------------
+def locus_to_kegg_fallback(tag):
+    return "pa%04d" % (int(tag.split("_")[1]) // 10)   # PA14_00010 -> pa0001
+
+# ---------------- 4. KEGG access: live REST (latest) -> snapshot -> None ----------------
+KEGG_BASE = "https://rest.kegg.jp"
+SNAP_DIRS = [os.path.join(HERE, "kegg_snapshot"),
+             os.path.join(ROOT, "kegg_snapshot"),
+             os.path.join(DATA, "kegg_snapshot")]
+
+def _http_get(url, timeout=25):
+    req = urllib.request.Request(url, headers={"User-Agent": "bixbench-kegg/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+def _parse(path_txt, gene_txt, link_txt):
+    pathways = {}
+    for line in path_txt.splitlines():
+        if line.strip():
+            pid, _, desc = line.partition("\t"); pathways[pid.split(":")[1]] = desc
+    all_genes = set(); locus2kegg = {}
+    for line in gene_txt.splitlines():
+        if not line.strip(): continue
+        gid, _, desc = line.partition("\t"); gid = gid.split(":")[-1]
+        all_genes.add(gid)
+        m = re.search(r"PA14_\d+", desc)
+        if m: locus2kegg[m.group(0)] = gid
+    path2genes = {}
+    for line in link_txt.splitlines():
+        if not line.strip(): continue
+        a, _, b = line.partition("\t")
+        if a.startswith("path:") and b.startswith("gn:"):
+            path2genes.setdefault(a[5:], set()).add(b[3:])
+    return pathways, path2genes, all_genes, locus2kegg
+
+def fetch_kegg_live():
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    print(f"[KEGG] live REST query timestamp: {ts}")
+    path_txt = _http_get(f"{KEGG_BASE}/list/pathway/{ORG}")
+    gene_txt = _http_get(f"{KEGG_BASE}/list/gene/{ORG}")
+    link_txt = _http_get(f"{KEGG_BASE}/link/pathway/{ORG}")
+    pathways, path2genes, all_genes, locus2kegg = _parse(path_txt, gene_txt, link_txt)
+    print(f"[KEGG] live: {len(pathways)} pathways, {len(all_genes)} genes, "
+          f"{len(locus2kegg)} locus tags mapped")
+    return pathways, path2genes, all_genes, locus2kegg, f"live REST @ {ts}"
+
+def fetch_kegg_snapshot():
+    for d in SNAP_DIRS:
+        if not os.path.isdir(d): continue
+        try:
+            path_txt = open(os.path.join(d, f"pathway_{ORG}.txt")).read()
+            gene_txt = open(os.path.join(d, f"gene_{ORG}.txt")).read()
+            link_txt = open(os.path.join(d, f"link_pathway_{ORG}.txt")).read()
+        except FileNotFoundError:
+            continue
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        pathways, path2genes, all_genes, locus2kegg = _parse(path_txt, gene_txt, link_txt)
+        print(f"[KEGG] SNAPSHOT used from {d} (NOT live) at {ts}")
+        return pathways, path2genes, all_genes, locus2kegg, f"snapshot {d} @ {ts}"
+    return None
+
+def get_kegg():
+    try:
+        return fetch_kegg_live()
+    except Exception as e:
+        print(f"[KEGG] live REST FAILED: {e!r}")
+        return fetch_kegg_snapshot()
+
+# ---------------- 5. ORA: Fisher exact per pathway + BH ----------------
+def fisher_greater_2x2(a, b, c, d):
+    try:
+        from scipy.stats import fisher_exact
+        return float(fisher_exact([[a, b], [c, d]], alternative="greater")[1])
+    except Exception:
+        N = a+b+c+d; K = a+c; n = a+b
+        def lc(n, k):
+            if k < 0 or k > n: return -math.inf
+            return math.lgamma(n+1)-math.lgamma(k+1)-math.lgamma(n-k+1)
+        lo, hi = max(0, n-(N-K)), min(n, K)
+        lp = {x: lc(K,x)+lc(N-K,n-x) for x in range(lo, hi+1)}
+        lnZ = math.log(sum(math.exp(v) for v in lp.values()))
+        return min(1.0, sum(math.exp(lp[x]-lnZ) for x in range(a, hi+1)))
+
+def bh_adjust(pvals):
+    n = len(pvals)
+    if n == 0: return []
+    order = sorted(range(n), key=lambda i: pvals[i]); adj = [0.0]*n; prev = 1.0
+    for r in range(n-1, -1, -1):
+        i = order[r]; prev = min(prev, pvals[i]*n/(r+1)); adj[i] = min(1.0, prev)
+    return adj
+
+def ora(downreg_kegg, pathways, path2genes, all_genes):
+    N = len(all_genes); F = set(downreg_kegg); rows = []
+    for pid in pathways:
+        gset = path2genes.get(pid, set()) & all_genes
+        a = len(F & gset); b = len(F) - a; c = len(gset) - a; d = N - len(gset) - b
+        if a+b+c+d != N: continue
+        rows.append((pid, a, len(gset), len(F), fisher_greater_2x2(a, b, c, d)))
+    padj = bh_adjust([r[4] for r in rows])
+    return {r[0]: {"padj": q, "pvalue": r[4], "geneNum": f"{r[1]}/{r[3]}",
+                   "pathSize": r[2]} for r, q in zip(rows, padj)}
+
+# ---------------- main ----------------
+def main():
+    print("="*70)
+    print("KEGG ORA - P. aeruginosa ('pa') - downregulated genes - both media")
+    print("="*70)
+    dfs = {}
+    for name, fn in [("GluFe", F_GLUFE), ("Succ", F_SUCC)]:
+        df = parse_rds(fn); dfs[name] = df; c = df["cols"]
+        print(f"\n[{name}] {os.path.basename(fn)}: n={df['n']} genes "
+              f"(rownames {df['rownames'][0]}..{df['rownames'][-1]})")
+        print(f"   log2FoldChange range [{min(c['log2FoldChange']):.3f},"
+              f" {max(c['log2FoldChange']):.3f}]; padj [{min(c['padj']):.3g},"
+              f" {max(c['padj']):.3g}]; cols={list(c.keys())}")
+    down = {name: downregulated(df) for name, df in dfs.items()}
+    for name in down:
+        print(f"\n[{name}] downregulated (padj<{PADJ_CUT} & log2FC<={LFC_CUT}): "
+              f"{len(down[name])} genes")
+
+    print("\n" + "="*70); print("STEP 4: KEGG access (latest db)"); print("="*70)
+    kg = get_kegg()
+    if kg is None:
+        print("\n" + "#"*70)
+        print("RESULT: CANNOT COMPLETE - KEGG unreachable (no network) and no local")
+        print("KEGG snapshot. KEGG ORA (steps 5-6) NOT run. No final count fabricated.")
+        print("#"*70)
+        out = {"status": "BLOCKED_no_kegg", "organism": ORG,
+               "cutoffs": {"padj": PADJ_CUT, "log2FoldChange": LFC_CUT},
+               "downregulated_genes": down,
+               "downregulated_kegg_fallback_ids":
+                   {k: [locus_to_kegg_fallback(t) for t in v] for k, v in down.items()}}
+        with open(os.path.join(HERE, "intermediates.json"), "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Intermediates -> {os.path.join(HERE,'intermediates.json')}")
+        for k, v in down.items():
+            print(f"  {k}: {len(v)} downreg, e.g. {v[:5]}")
+        return 1
+
+    pathways, path2genes, all_genes, locus2kegg, source = kg
+    mapped = {}
+    for name in down:
+        ids = [locus2kegg.get(t) or locus_to_kegg_fallback(t) for t in down[name]]
+        mapped[name] = ids
+        print(f"\n[{name}] mapped {len(ids)} downreg genes to KEGG ids")
+    sig = {}
+    for name in mapped:
+        res = ora(mapped[name], pathways, path2genes, all_genes)
+        s = {pid: v for pid, v in res.items() if v["padj"] < PADJ_CUT}
+        sig[name] = s
+        print(f"\n[{name}] ORA: {len(res)} pathways tested, {len(s)} sig (padj<{PADJ_CUT})")
+        for pid, v in sorted(s.items(), key=lambda kv: kv[1]["padj"]):
+            print(f"   {pid:10s} padj={v['padj']:.3g} geneNum={v['geneNum']}")
+    common = set(sig["GluFe"]) & set(sig["Succ"])
+    print("\n" + "="*70)
+    print(f"FINAL ANSWER: common significant pathways in BOTH media = {len(common)}")
+    print("KEGG source:", source)
+    if common: print("common pathways:", sorted(common))
+    with open(os.path.join(HERE, "results.json"), "w") as f:
+        json.dump({"answer": len(common), "common_pathways": sorted(common),
+                   "sig_by_condition": {k: sorted(v) for k, v in sig.items()},
+                   "n_downreg": {k: len(down[k]) for k in down},
+                   "kegg_source": source}, f, indent=2)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

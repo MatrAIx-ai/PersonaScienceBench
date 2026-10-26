@@ -1,0 +1,215 @@
+"""
+analysis.py
+===========
+AsiBench task ``math.ucb_q_learning_regret``: low-regret, model-free, tabular
+optimistic Q-learning for hidden finite-horizon MDPs.
+
+Two-sequence design that attacks the *drifting-target burn-in cost* of plain
+Bernstein UCB-Q (UCB-B):
+
+  * Q1 -- one-step bootstrapped optimistic Q.  Online, visit-dependent running
+    mean of ``r + max_a Q1[h+1, next, a]`` (real one-step bootstrap -> keeps the
+    max-structure and genuine optimism needed by Q-learning).  Its centered
+    moments (EMA) are tracked online.
+
+  * Q2 -- bounded delayed-credit / multi-step return estimate.  At each episode
+    boundary (detected via the ``done`` flag, so no reliance on optional hooks)
+    the per-episode trace is rolled back: every visited ``(h,s,a)`` receives a
+    return ``G = sum of at most W raw rewards`` that follow it.  Q2 stores the
+    visit-dependent mean and Welford sum-of-squared-deviations (centered
+    moments).  These delayed returns contain *no bootstrap at all*, so their
+    variance is a drift-free, well-calibrated estimate of local return noise.
+
+  * The optimism/confidence mechanism combines both:
+      index(h,s,a) = KAPPA * (Q1 + b1) + (1-KAPPA) * (Q2 + b2)
+    where b1 and b2 are variance-sensitive bonuses.  b1's variance term uses
+    the *grounded* Q2 centered moments (not the drifting bootstrap variance),
+    which is exactly what removes the finite-sample burn-in of UCB-B: Q1 keeps
+    one-step optimism while its confidence width is calibrated against
+    drift-free statistics.  b2 adds a count-based exploration term so every
+    action remains reachable.
+
+Storage is O((H+1)*S*A) scalar statistics + one bounded per-episode trace
+(<= H entries).  No transition-model estimation, no H*S*A*S tensor, no
+next-state count tensors, no replay/planning, no posterior sampling, no
+enumeration of next states, and no case-id/dimension/MDP-specific branching
+(one shared configuration).
+
+Interface contract (matches data/public_calibration_runner.py):
+    make_agent(env_spec, seed) -> agent
+    agent.act(h, state) -> int in {0..A-1}                 (h in 1..H)
+    agent.observe(h, state, action, reward, next_state, done) -> None
+    optional hooks reset_episode/end_episode are supported but never needed.
+"""
+
+from __future__ import annotations
+
+import math
+
+# ---------------------------------------------------------------------------
+# Shared configuration (one configuration for every MDP; never branched on)
+# ---------------------------------------------------------------------------
+C1      = 0.25    # optimism coefficient of the one-step (Q1) index
+C2      = 0.20    # exploration coefficient of the grounded (Q2) index
+KAPPA   = 0.75    # blend: KAPPA * [Q1 index] + (1-KAPPA) * [Q2 index]
+LOGFACT = 2.5     # squared-log factor in the sqrt(log) bonus schedule
+N_FLOOR = 1.0     # count floor inside the variance-bonus denominators
+W       = 10      # bounded delayed-credit window (raw reward steps), shared
+ALPHA_RW = 0.94   # EMA forgetting for centered moments of one-step targets
+EPS     = 1e-6    # variance regulariser
+TAU     = 3000    # experience-decay time constant (total observed transitions)
+SC_MIN  = 0.25    # floor of the exploration schedule (keeps some optimism)
+
+
+class _Agent:
+    """Two-sequence optimistic Q-learner for one finite-horizon MDP."""
+
+    __slots__ = (
+        "S", "A", "H",
+        "Q1", "N1", "Q2", "N2", "M2", "Qrw", "Mrw",
+        "trace", "log_total",
+    )
+
+    def __init__(self, S: int, A: int, H: int):
+        self.S = int(S)
+        self.A = int(A)
+        self.H = int(H)
+        # arrays indexed [h0][s][a], h0 in 0..H (row H is terminal, all zero)
+        self.Q1 = [[[0.0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.N1 = [[[0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.Q2 = [[[0.0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.N2 = [[[0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.M2 = [[[0.0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        # centered moments of the one-step optimistic target (EMA form)
+        self.Qrw = [[[0.0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.Mrw = [[[0.0] * self.A for _ in range(self.S)] for _ in range(H + 1)]
+        self.trace = []        # single bounded per-episode trace (<= H entries)
+        self.log_total = 0.0   # scalar: total number of observed transitions
+
+    # -- helpers -------------------------------------------------------------
+    def _v1(self, h0: int, s: int) -> float:
+        """One-step optimistic continuation value (max over Q1)."""
+        if h0 >= self.H:
+            return 0.0
+        row = self.Q1[h0][s]
+        m = row[0]
+        for a in range(1, self.A):
+            if row[a] > m:
+                m = row[a]
+        return m
+
+    def _logf(self) -> float:
+        """Log schedule for the bonuses (scalar, shared across cells)."""
+        return math.sqrt(math.log(1.0 + LOGFACT * self.log_total))
+
+    # -- interface -----------------------------------------------------------
+    def reset_episode(self, episode: int, state: int) -> None:
+        self.trace = []
+
+    def start_episode(self, episode: int, state: int) -> None:
+        self.trace = []
+
+    def new_episode(self, episode: int, state: int) -> None:
+        self.trace = []
+
+    def act(self, h: int, state: int) -> int:
+        """Blended optimistic index; always returns an int in {0..A-1}."""
+        h0 = h - 1
+        rem = self.H - h0                    # value range of the remaining horizon
+        lf = self._logf()
+        sc = SC_MIN + (1.0 - SC_MIN) / (1.0 + self.log_total / TAU)
+        best_a = 0
+        best_v = -1.0
+        for a in range(self.A):
+            q1 = self.Q1[h0][state][a]
+            n1 = self.N1[h0][state][a]
+            var_g = 0.0                      # grounded return variance (from Q2)
+            n2 = self.N2[h0][state][a]
+            if n2 >= 2:
+                var_g = self.M2[h0][state][a] / (n2 - 1.0)
+            # optimistic one-step index: grounded-variance bonus + count term
+            b1 = sc * C1 * (
+                math.sqrt((var_g + EPS * rem * rem) * lf * lf / max(N_FLOOR, n2))
+                + rem * lf / (1.0 + math.sqrt(n1))
+            )
+            idx1 = q1 + b1
+
+            q2 = self.Q2[h0][state][a]
+            b2 = sc * C2 * (
+                math.sqrt((var_g + EPS * rem * rem) * lf * lf / max(N_FLOOR, n2))
+                + rem * lf / (1.0 + math.sqrt(n2))
+            )
+            idx2 = q2 + b2
+
+            idx = KAPPA * idx1 + (1.0 - KAPPA) * idx2
+            if idx > best_v:
+                best_v = idx
+                best_a = a
+        return best_a
+
+    def observe(self, h: int, state: int, action: int, reward: float,
+                next_state: int, done: bool) -> None:
+        """Visit-dependent updates; episode-boundary delayed-credit roll-back."""
+        h0 = h - 1
+        self.log_total += 1.0
+
+        # --- one-step optimistic sequence (genuine bootstrap) ---------------
+        n = self.N1[h0][state][action] + 1
+        self.N1[h0][state][action] = n
+        target1 = float(reward) + self._v1(h0 + 1, next_state)
+        old = self.Q1[h0][state][action]
+        self.Q1[h0][state][action] = old + (target1 - old) / n
+        # centered moments (EMA) of the one-step target
+        m = self.Qrw[h0][state][action]
+        if n == 1:
+            self.Qrw[h0][state][action] = target1
+            self.Mrw[h0][state][action] = 0.0
+        else:
+            d = target1 - m
+            self.Qrw[h0][state][action] = m + ALPHA_RW * d
+            self.Mrw[h0][state][action] = (1.0 - ALPHA_RW) * (
+                self.Mrw[h0][state][action] + d * d
+            )
+
+        # --- bounded per-episode trace -------------------------------------
+        self.trace.append((h0, state, action, float(reward)))
+
+        # --- delayed-credit reference roll-back at episode boundary ---------
+        if done:
+            self._rollback()
+            self.trace = []
+
+    def end_episode(self, episode: int, episode_reward: float) -> None:
+        # Fallback in case the runner never sets done=True.
+        if self.trace:
+            self._rollback()
+            self.trace = []
+
+    def finish_episode(self, episode: int, episode_reward: float) -> None:
+        self.end_episode(episode, episode_reward)
+
+    # -- delayed credit ------------------------------------------------------
+    def _rollback(self) -> None:
+        """Windowed K->0 return propagation over the buffered episode trace."""
+        tr = self.trace
+        L = len(tr)
+        for i in range(L):
+            h0, s, a, _ = tr[i]
+            j_end = min(i + W, L)            # bounded window, clipped to episode
+            g = 0.0
+            for j in range(i, j_end):
+                g += tr[j][3]
+            # Welford (centered moments) update of the reference sequence
+            n2 = self.N2[h0][s][a] + 1
+            self.N2[h0][s][a] = n2
+            delta = g - self.Q2[h0][s][a]
+            self.Q2[h0][s][a] += delta / n2
+            self.M2[h0][s][a] += delta * (g - self.Q2[h0][s][a])
+
+
+def make_agent(env_spec: dict, seed: int) -> _Agent:
+    """Factory required by the scorer: returns the two-sequence Q-learner."""
+    S = int(env_spec["S"])
+    A = int(env_spec["A"])
+    H = int(env_spec["H"])
+    return _Agent(S, A, H)

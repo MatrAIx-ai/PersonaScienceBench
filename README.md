@@ -4,14 +4,30 @@ Evaluate scientific agents collaborating with persona-conditioned researcher sim
 
 ```mermaid
 flowchart LR
-    P["Persona setting"] --> S["Researcher simulator"]
-    S <-->|"Interactions"| A["Scientific actor"]
-    A --> E["Evaluation"]
+    Q["Scientific task<br/>Frozen question + inputs"]
+    P["Persona setting<br/>Off or injected profile"]
+    S["Researcher simulator"]
+    A["Scientific actor"]
+    T[["Sandboxed tools"]]
+    E(["Native evaluation<br/>Scientific score"])
+
+    Q -->|"Context"| S
+    Q -->|"Public inputs"| A
+    P --> S
+    S -->|"Answers & feedback"| A
+    A -->|"Questions & proposals"| S
+    A <-->|"Tool calls / results"| T
+    A -->|"Submission"| E
+
+    classDef input fill:#eef2f6,stroke:#768394,color:#18212b
+    class Q,P input
     style S fill:#e6f3e7,stroke:#558b5a,color:#183c21
     style A fill:#eee8f8,stroke:#8970b1,color:#35234e
+    style T fill:#e6f0fa,stroke:#668daf,color:#1e3850
+    style E fill:#fff3dc,stroke:#b29555,color:#493a1c
 ```
 
-Same tasks, five simulator settings. The actor uses tools where applicable; all interactions are saved.
+Same tasks, five simulator settings. Interactions repeat until the benchmark’s stopping condition; tool use and submission review depend on the benchmark. Complete traces are saved.
 
 **Start here:** clone this branch → install dependencies/assets → restore frozen tasks → configure your models → run one trial. Setup and restoration make no model calls; evaluation does.
 

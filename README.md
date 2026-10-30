@@ -2,30 +2,7 @@
 
 Evaluate scientific agents collaborating with persona-conditioned researcher simulators. The simulator receives a persona; the actor solves the scientific task through conversation and tools. Native benchmark evaluators score the result.
 
-```mermaid
-flowchart LR
-    Q["Scientific task<br/>Frozen question + inputs"]
-    P["Persona setting<br/>Off or injected profile"]
-    S["Researcher simulator"]
-    A["Scientific actor"]
-    T[["Sandboxed tools"]]
-    E(["Native evaluation<br/>Scientific score"])
-
-    Q -->|"Context"| S
-    Q -->|"Public inputs"| A
-    P --> S
-    S -->|"Answers & feedback"| A
-    A -->|"Questions & proposals"| S
-    A <-->|"Tool calls / results"| T
-    A -->|"Submission"| E
-
-    classDef input fill:#eef2f6,stroke:#768394,color:#18212b
-    class Q,P input
-    style S fill:#e6f3e7,stroke:#558b5a,color:#183c21
-    style A fill:#eee8f8,stroke:#8970b1,color:#35234e
-    style T fill:#e6f0fa,stroke:#668daf,color:#1e3850
-    style E fill:#fff3dc,stroke:#b29555,color:#493a1c
-```
+[![PersonaScienceBench: task and persona inputs, simulator–actor interactions, tools, and evaluation.](docs/assets/workflow.svg)](docs/assets/workflow.svg)
 
 Same tasks, five simulator settings. Interactions repeat until the benchmark’s stopping condition; tool use and submission review depend on the benchmark. Complete traces are saved.
 

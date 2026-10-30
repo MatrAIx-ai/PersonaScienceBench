@@ -3,42 +3,15 @@
 Evaluate scientific agents collaborating with persona-conditioned researcher simulators. The simulator receives a persona; the actor solves the scientific task through conversation and tools. Native benchmark evaluators score the result.
 
 ```mermaid
-flowchart TB
-    Q["Frozen scientific task<br/>Same question and prepared inputs"]
-    P["Simulator setting<br/>Persona off / 155 / 001 / 003 / 046"]
-
-    subgraph interaction["Multi-round collaboration"]
-        direction LR
-        S["Researcher simulator"]
-        A["Scientific actor"]
-        T["Sandboxed tools<br/>Where applicable"]
-        S -->|"Brief, answers and feedback"| A
-        A -->|"Shared questions, plans and evidence"| S
-        A -->|"Tool calls"| T
-        T -->|"Outputs and observations"| A
-    end
-
-    Q -->|"Researcher context"| S
-    Q -->|"Public task inputs"| A
-    P -->|"Applied to simulator only"| S
-    A -->|"Accepted deliverable"| F["Controller records<br/>scientific submission"]
-    F --> E["Native benchmark evaluation<br/>Model judge where required"]
-    Q -->|"Evaluator-only references"| E
-    E --> R["Native scores and evaluation records"]
-
-    classDef input fill:#eef2f6,stroke:#768394,color:#18212b
-    classDef simulator fill:#e6f3e7,stroke:#558b5a,color:#183c21
-    classDef actor fill:#eee8f8,stroke:#8970b1,color:#35234e
-    classDef tool fill:#e6f0fa,stroke:#668daf,color:#1e3850
-    classDef output fill:#fff3dc,stroke:#b29555,color:#493a1c
-    class Q,P input
-    class S simulator
-    class A actor
-    class T tool
-    class F,E,R output
+flowchart LR
+    P["Persona setting"] --> S["Researcher simulator"]
+    S <-->|"Interactions"| A["Scientific actor"]
+    A --> E["Evaluation"]
+    style S fill:#e6f3e7,stroke:#558b5a,color:#183c21
+    style A fill:#eee8f8,stroke:#8970b1,color:#35234e
 ```
 
-Repeat this workflow for each question and all five simulator settings. The actor is not given the injected persona profile. Tools and submission review follow each benchmark’s protocol. Save messages, tool activity, submissions, evaluation records and termination status throughout the run, including runs without a submission.
+Same tasks, five simulator settings. The actor uses tools where applicable; all interactions are saved.
 
 **Start here:** clone this branch → install dependencies/assets → restore frozen tasks → configure your models → run one trial. Setup and restoration make no model calls; evaluation does.
 

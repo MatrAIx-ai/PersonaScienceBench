@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shlex
 import subprocess
 import sys
 import time
@@ -64,6 +65,28 @@ def load_native_result(output, source, task_id, key):
     return [result]
 
 
+def required_preparation_paths(rows, run):
+    """Return one prepared task entrypoint for each selected scientific question."""
+    from personasciencebench.packaging import safe_component
+    return [run / 'prepared' / safe_component(row['source'] + ':' + row['task_id']) /
+            ('tasks.jsonl' if row['source'] == 'expbench' else 'pilot_manifest.json')
+            for row in rows]
+
+
+def validate_prepared_tasks(rows, run):
+    """Fail offline before creating run state or checking provider access."""
+    required = required_preparation_paths(rows, run)
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        examples = '\n'.join(str(path) for path in missing[:3])
+        raise ValueError(
+            f'Frozen preparation missing: {len(missing)}/{len(required)} task entrypoints.\n'
+            f'{examples}\nRestore inputs before launching:\n'
+            f'.venv/bin/python scripts/restore_main_preparation.py --run-dir {shlex.quote(str(run))}\n'
+            'If prepared/ already exists but is incomplete, preserve it and restore into a fresh run directory.'
+        )
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir', type=Path, required=True)
@@ -103,7 +126,10 @@ def main():
     os.umask(0o077)
     if not 1 <= a.workers <= int(os.environ.get('SLURM_CPUS_PER_TASK', '30')):
         raise ValueError('Workers must fit the CPU allocation')
-    run = a.run_dir.resolve(); run.mkdir(parents=True, exist_ok=True)
+    run = a.run_dir.resolve()
+    if a.require_prepared:
+        validate_prepared_tasks(rows, run)
+    run.mkdir(parents=True, exist_ok=True)
     lock = (run/'coordinator.lock').open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.environ['PSB_FATAL_API_FILE'] = str(run/'fatal_api.json')

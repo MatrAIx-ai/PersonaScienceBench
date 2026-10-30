@@ -11,10 +11,10 @@ From the repository root, after installing dependencies and downloading the
 pinned public benchmark assets with `bash scripts/setup_main.sh`:
 
 ```bash
-RUN_DIR="$PWD/runs/main/gemini38-self-medium-trial-1"
+RUN_DIR="$PWD/runs/model-eval/trial-1"
 # Optional read-only check; requires a fresh preparation destination.
-python scripts/restore_main_preparation.py --run-dir "$RUN_DIR" --check-only
-python scripts/restore_main_preparation.py --run-dir "$RUN_DIR"
+.venv/bin/python scripts/restore_main_preparation.py --run-dir "$RUN_DIR" --check-only
+.venv/bin/python scripts/restore_main_preparation.py --run-dir "$RUN_DIR"
 ```
 
 Pass **that same run directory** and `--require-prepared` to the campaign
@@ -59,16 +59,17 @@ not assume a current run reproduces historical outcomes. Bubblewrap isolation
 must still work on the execution host. Successful restoration does not resolve
 namespace/mount restrictions or replace the sandbox readiness check.
 
-After collection, publish traces, submissions and provenance under
-`results/<model-slug>/trial-1/` following the handoff. Restoring inputs alone does
-not collect or deliver the 1,000-episode trial.
+After collection, retain the complete run directory, including traces, submissions,
+evaluations and provenance. See [Inspect and retain results](../../../../README.md#6-inspect-and-retain-results)
+for the output layout and sharing guidance. Restoring inputs alone does not
+collect the 1,000-episode trial.
 
-## Maintainer rebuild and verification
+## Verify the included bundle
+
+From the repository root, use the standard-library offline tests:
 
 ```bash
-python scripts/build_main_preparation_bundle.py \
-  --prepared runs/openai-astra-first-pass-20260929T075354Z/prepared
-python -m unittest discover -s tests -p test_frozen_preparation.py -v
+.venv/bin/python -m unittest discover -s tests -p test_frozen_preparation.py -v
 ```
 
 The archive preserves original metadata text; restored JSON may be reformatted

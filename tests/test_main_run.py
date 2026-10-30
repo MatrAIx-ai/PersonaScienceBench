@@ -1,5 +1,7 @@
 """Offline guards for the selected main-run inputs and launch interface."""
 import importlib.util
+import gzip
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('check_main', ROOT / 'scripts/check_main.py')
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
+runner_spec = importlib.util.spec_from_file_location('main_run', ROOT / 'scripts/run_main.py')
+runner = importlib.util.module_from_spec(runner_spec)
+runner_spec.loader.exec_module(runner)
 
 
 @pytest.fixture
@@ -56,6 +61,48 @@ def test_unshipped_persona_rejected_before_run_creation(tmp_path):
     assert result.returncode == 2
     assert 'invalid choice' in result.stderr
     assert not run.exists()
+
+
+def test_required_preparation_paths_match_all_shipped_tasks(tmp_path):
+    rows = check.validate_inputs()
+    actual = {str(path.relative_to(tmp_path / 'prepared'))
+              for path in runner.required_preparation_paths(rows, tmp_path)}
+    payload = json.loads(gzip.decompress(
+        (ROOT / 'configs/main_run/frozen/astra-20260929-v1/preparation.json.gz').read_bytes()))
+    expected = {name for name in payload['files']
+                if name.endswith(('/tasks.jsonl', '/pilot_manifest.json'))}
+    assert len(actual) == 200
+    assert actual == expected
+
+
+def test_missing_preparation_stops_before_run_creation_or_external_calls(tmp_path, monkeypatch):
+    from personasciencebench import inference
+    run = tmp_path / 'not-created'
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('Missing preparation must fail before external or credential operations')
+
+    monkeypatch.setitem(sys.modules, 'check_main', check)
+    monkeypatch.setattr(sys, 'argv', ['run_main.py', '--run-dir', str(run), '--require-prepared'])
+    monkeypatch.setattr(inference, 'preflight', unexpected)
+    monkeypatch.setattr(inference, 'load_env', unexpected)
+    monkeypatch.setattr(runner.subprocess, 'run', unexpected)
+    monkeypatch.setattr(runner.os, 'umask', lambda value: 0o022)
+    monkeypatch.chdir(ROOT)
+    with pytest.raises(ValueError, match='Frozen preparation missing: 200/200'):
+        runner.main()
+    assert not run.exists()
+
+
+def test_partial_preparation_reports_missing_tasks_without_writes(tmp_path):
+    rows = check.validate_inputs()
+    required = runner.required_preparation_paths(rows, tmp_path)
+    required[0].parent.mkdir(parents=True)
+    required[0].write_text('{}\n')
+    with pytest.raises(ValueError, match='Frozen preparation missing: 199/200'):
+        runner.validate_prepared_tasks(rows, tmp_path)
+    assert required[0].read_text() == '{}\n'
+    assert not (tmp_path / 'manifest.json').exists()
 
 
 @pytest.mark.parametrize('provider,key', [

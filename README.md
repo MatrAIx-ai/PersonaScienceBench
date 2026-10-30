@@ -2,6 +2,10 @@
 
 Evaluate scientific agents collaborating with persona-conditioned researcher simulators. The simulator receives a persona; the actor solves the scientific task through conversation and tools. Native benchmark evaluators score the result.
 
+**Start here:** clone this branch → install dependencies/assets → restore frozen tasks → configure your models → run one trial. Setup and restoration make no model calls; evaluation does.
+
+[Evaluation panel](#evaluation-panel) · [Install](#1-requirements-and-installation) · [Restore](#2-restore-the-frozen-tasks) · [Run](#3-run-evaluation) · [Resume](#4-monitor-resume-and-retry) · [Troubleshooting](#troubleshooting)
+
 ## Evaluation panel
 
 The frozen panel contains **200 questions × five simulator settings = 1,000 episodes per trial**.
@@ -18,21 +22,36 @@ Settings: `persona_off`, `candidate_155`, `candidate_001`, `candidate_003`, and 
 
 ## 1. Requirements and installation
 
-Use **Linux, Python 3.12+, uv, and Bubblewrap** (`bwrap`). The host must permit Bubblewrap user namespaces and mounts. Install Bubblewrap through your system package manager or set `PERSONASCIENCEBENCH_BWRAP` to an existing executable. API evaluation needs network access, model access and funded credentials. Downloaded benchmark assets require several GB of disk space; allow additional space for environments, scientific outputs and traces.
+Use **Linux, Git, uv, Python 3.12, and Bubblewrap** (`bwrap`). Setup selects Python 3.12 to match the actor dependency lock; `uv` can download that interpreter if needed. The host must permit Bubblewrap user namespaces and mounts. Install Bubblewrap through your system package manager or set `PERSONASCIENCEBENCH_BWRAP` to an existing executable. API evaluation needs network access, model access and funded credentials. The frozen asset set is roughly 2.8 GiB; allow additional space for downloaded source repositories, dependency environments, scientific outputs and traces. No local GPU is required for API evaluation. macOS and Windows hosts need a Linux execution environment that supports the sandbox.
 
-From the repository root:
+Clone **the release branch**, not `main` (which contains the research workspace):
+
+```bash
+git clone --branch public-release --single-branch \
+  https://github.com/MatrAIx-ai/PersonaScienceBench.git
+cd PersonaScienceBench
+```
+
+The repository currently requires GitHub access. A permission or “repository not found” error is an access issue, not a setup failure. If using GitHub's Download ZIP, first select `public-release`, extract it, and open that directory.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Bubblewrap if absent. On Debian/Ubuntu, a system administrator can install Bubblewrap with `sudo apt-get install bubblewrap`; other distributions use their package manager. Installation of the executable alone does not establish that the host permits its namespaces/mounts.
+
+From the checkout root:
 
 ```bash
 bash scripts/setup_main.sh
-cp .env.example .env
+# Create a local key file only if you do not already have one:
+[ -f .env ] || cp .env.example .env
 # Edit .env with your own provider key(s).
 ```
 
-Setup installs locked controller/actor environments, fetches pinned benchmark sources, downloads the selected public assets and checks sandbox support. It does not launch model episodes. Resolve setup or sandbox failures before running evaluation; do not disable isolation. Upstream asset licenses and access conditions still apply.
+Keep this working directory for the remaining commands. The setup script reports each stage and stops on an error; rerun it after fixing the reported issue.
+
+Setup checks sandbox namespace support before large downloads, installs locked controller/actor environments, fetches pinned benchmark sources, downloads selected public assets, and verifies the actor sandbox. It does not launch model episodes. Resolve setup or sandbox failures before running evaluation; do not disable isolation. Upstream asset licenses and access conditions still apply.
 
 The key names are `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and `XAI_API_KEY`. Populate only the providers you use. Keep `.env` local.
 
-Verify inputs and runtime:
+Verify inputs and runtime (both must succeed before evaluation):
 
 ```bash
 .venv/bin/python scripts/check_main.py
@@ -41,7 +60,7 @@ Verify inputs and runtime:
 
 ## 2. Restore the frozen tasks
 
-Create a separate directory for each independent trial:
+Create a separate directory for each independent trial. The preparation bundle is already included in Git; you do not need to request it from a maintainer:
 
 ```bash
 RUN_DIR="$PWD/runs/model-eval/trial-1"
@@ -64,6 +83,8 @@ The following template uses one target model for actor and simulator, and an ind
 ```
 
 **This command makes paid API calls.** `--model` and `--provider` set defaults for **all three roles**; actor/researcher overrides leave the judge on those defaults. `researcher` means the simulator. The template uses OpenRouter model IDs and `OPENROUTER_API_KEY`. To change providers, use `--provider openai` or `--provider xai`; `--actor-provider` and `--researcher-provider` support mixed-role configurations. For the full panel, current EXP accounting supports direct OpenAI IDs `gpt-6-astra` and `gpt-5.6-sol`, and direct xAI ID `grok-4.6`; other direct IDs need verified accounting support before use. OpenRouter uses catalog pricing. Native deterministic evaluators remain deterministic. Keep the judging configuration fixed when comparing models and record all role settings.
+
+Use `scripts/run_main.py` for this release panel. Lower-level package CLIs also expose adapters and historical research workflows; they require explicit configuration (and task cards for EXP) and are not the release quickstart.
 
 All five settings run by default. For an explicitly smaller evaluation, use `--arms persona_off candidate_155` (200 questions per setting). A standalone single setting requires `--standalone-arm --arms candidate_155`. Do not describe a subset as the full panel.
 
@@ -125,12 +146,31 @@ Preserve all attempt histories, role configs, task/selection hashes, preparation
 These checks make no API calls:
 
 ```bash
-uv sync --locked --extra test --extra api
-uv run --locked python scripts/check_main.py
-uv run --locked python -m pytest tests/test_main_run.py tests/test_frozen_preparation.py
+uv sync --locked --python 3.12 --all-extras --inexact
+.venv/bin/python scripts/check_main.py
+.venv/bin/python -m pytest tests -q
 ```
 
+`--inexact` retains the separately installed ASI evaluator if setup already installed it. Dependency installation needs network access; the checks themselves make no model calls. For a lightweight input check before installing dependencies, run `python3 scripts/check_main.py`.
+
+See [release validation](docs/VALIDATION.md) for what has been tested and its limits.
+
 Offline checks do not establish model availability, downloaded scientific asset completeness or sandbox readiness on another host. Complete the setup/runtime checks above before a full run.
+
+## Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| `uv` or `bwrap` not found | Install the missing prerequisite, reopen your shell if PATH changed, and rerun setup. |
+| Namespace/mount “Operation not permitted” | Use a host with working Bubblewrap or ask the administrator to enable the required isolation. More API credentials will not fix a sandbox restriction. |
+| Download/network failure | Check outbound access to GitHub, Hugging Face and package hosts, then rerun setup. Keep pinned source revisions and asset hashes intact. |
+| Missing public assets or hash mismatch during restoration | Finish setup. Preserve any locally modified data and reacquire the pinned files; do not edit the expected checksums. |
+| `prepared/` already exists | Resume that trial using the same run command. For a new independent trial, choose a new `RUN_DIR`. |
+| Missing preparation with `--require-prepared` | Restore into exactly the same `RUN_DIR` used by the run command. |
+| API 401/403, unsupported model/effort, or exhausted credit | Check the configured provider, model access, reasoning support and account balance. Resolve any fatal API marker before resuming. |
+| API 429 / repeated rate-limit retries | Reduce `--workers` to fit the provider quota. Thirty workers is a concurrency setting, not a throughput guarantee. |
+
+For an installation report, include the failing command, Python version, host/OS, and relevant error text. Never include `.env` or API keys.
 
 ## Layout and license
 

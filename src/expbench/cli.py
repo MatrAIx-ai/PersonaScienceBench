@@ -34,8 +34,8 @@ def read_key_file(path: Path) -> str:
 def main(argv=None):
     parser = argparse.ArgumentParser(description="EXP-Bench interactive experiment-design pilot")
     parser.add_argument("command", choices=["list", "validate", "run", "regrade"])
-    parser.add_argument("--tasks", type=Path, default=(ROOT / "data/conversion-v2-exp/tasks.jsonl"))
-    parser.add_argument("--config", type=Path, default=(ROOT / "configs/expbench/default.toml"))
+    parser.add_argument("--tasks", type=Path, required=True, help="Prepared task cards JSONL; use the frozen preparation for the main panel")
+    parser.add_argument("--config", type=Path, required=True, help="Explicit model/interaction configuration JSON or TOML")
     parser.add_argument("--task", help="Run just this task ID; otherwise run all cards")
     parser.add_argument("--designs-from", type=Path, help="Existing run directory for regrade; actor is not rerun")
     parser.add_argument("--mode", choices=["mock", "live"], default="mock")

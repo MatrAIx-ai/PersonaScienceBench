@@ -167,8 +167,12 @@ def selected_profiles(ids, root=None):
         if pid not in rows:
             raise ValueError("Unknown published persona ID")
         row = rows[pid]
-        text = (root / row["published_profile"]).read_text(encoding="utf-8")
-        prompt = text.split("```text\n", 1)[1].rsplit("\n```", 1)[0]
+        if "prompt" in row:
+            prompt = (root / row["prompt"]).read_text(encoding="utf-8")
+        else:
+            # Retain compatibility with historical Markdown profile exports.
+            text = (root / row["published_profile"]).read_text(encoding="utf-8")
+            prompt = text.split("```text\n", 1)[1].rsplit("\n```", 1)[0]
         if hashlib.sha256(prompt.encode()).hexdigest() != row["prompt_sha256"]:
             raise ValueError("Published persona hash mismatch")
         result[pid] = Persona(enabled=True, id=pid, version="full-persona-v2", system_prompt=prompt)

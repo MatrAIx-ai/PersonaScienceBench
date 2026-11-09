@@ -170,7 +170,7 @@ Follow the [Linux setup and migration guide](docs/reproducibility.md). The [pers
 | `docs/MAIN_RUN.md` | Selected five-setting campaign: setup, run, resume, and result delivery |
 | `docs/REPOSITORY_AUDIT.md` | Coherence fixes, offline validation, and remaining reproduction limits |
 | `docs/design/benchmark_paper_plan.md` | Broader paper and experiment planning |
-| `docs/persona_controls.md` | Noise-measuring arms: repeated persona-off, reordered profiles, neutral identities, mute and oracle researchers |
+| `docs/persona_controls.md` | Noise-measuring arms (repeated persona-off, reordered profiles, neutral identities, mute and oracle researchers) and post-hoc checks (persona visibility, SciConv per-item scores, fixed-agent replay) |
 | `src/`, `scripts/`, `tests/` | Runners, conversion/analysis tools and offline checks |
 | `manifests/` | Pinned upstream sources and checksums |
 | `data/`, `external/`, `prepared/`, `runs/` | Ignored local inputs and runtime artifacts; transfer or regenerate explicitly |
